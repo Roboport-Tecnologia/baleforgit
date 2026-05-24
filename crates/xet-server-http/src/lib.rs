@@ -1,11 +1,11 @@
 //! HTTP layer for the Xet CAS server.
 //!
 //! Routes exposed by [`router`]:
-//! - `POST /v1/xorbs/:prefix/:hash`             (xorb upload, write scope)
+//! - `POST /v1/xorbs/{prefix}/{hash}`           (xorb upload, write scope)
 //! - `POST /shards`                             (shard upload + indexing, write scope)
-//! - `GET  /v1/reconstructions/:file_id`        (reconstruction metadata, read scope)
-//! - `GET  /v1/chunks/:prefix/:hash`            (global dedup query, read scope)
-//! - `GET  /xorb/default/:hash` (signed)        (byte-range transfer, no bearer auth)
+//! - `GET  /v1/reconstructions/{file_id}`       (reconstruction metadata, read scope)
+//! - `GET  /v1/chunks/{prefix}/{hash}`          (global dedup query, read scope)
+//! - `GET  /xorb/default/{hash}` (signed)       (byte-range transfer, no bearer auth)
 //! - `GET  /api/{type}s/{ns}/{name}/xet-{rw}-token/{rev}` (mock HF Hub token endpoint)
 
 use axum::body::Bytes;
@@ -15,6 +15,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -73,13 +74,16 @@ where
     // actually issues. `prefix` is parameterized per the real protocol; it's
     // always "default" in practice today, but multi-tenancy in spirit.
     let v1 = Router::new()
-        .route("/v1/xorbs/:prefix/:hash", post(upload_xorb::<B, M, A>))
+        .route("/v1/xorbs/{prefix}/{hash}", post(upload_xorb::<B, M, A>))
         .route("/shards", post(upload_shard::<B, M, A>))
         .route(
-            "/v1/reconstructions/:file_id",
+            "/v1/reconstructions/{file_id}",
             get(get_reconstruction::<B, M, A>),
         )
-        .route("/v1/chunks/:prefix/:hash", get(get_dedup_chunk::<B, M, A>))
+        .route(
+            "/v1/chunks/{prefix}/{hash}",
+            get(get_dedup_chunk::<B, M, A>),
+        )
         .layer(middleware::from_fn_with_state(
             svc.clone(),
             auth_middleware::<B, M, A>,
@@ -87,9 +91,9 @@ where
 
     Router::new()
         .merge(v1)
-        .route("/xorb/default/:hash", get(get_xorb_transfer::<B, M, A>))
+        .route("/xorb/default/{hash}", get(get_xorb_transfer::<B, M, A>))
         .route(
-            "/api/:type_seg/:ns/:name/:tok_seg/:rev",
+            "/api/{type_seg}/{ns}/{name}/{tok_seg}/{rev}",
             get(issue_xet_token::<B, M, A>),
         )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -464,8 +468,7 @@ where
 
     // Per-response random HMAC key. Written into the shard footer so the client
     // can wrap its own candidate chunk hashes and look for matches.
-    let mut hmac_key = [0u8; HASH_LEN];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut hmac_key);
+    let hmac_key: [u8; HASH_LEN] = rand::random();
 
     let mut cas_blocks = Vec::with_capacity(near.len());
     for x in &near {

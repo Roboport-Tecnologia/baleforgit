@@ -7,6 +7,7 @@
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::Arc;

@@ -14,4 +14,4 @@ xet-server-core.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
-tempfile = "3"
+tempfile.workspace = true
