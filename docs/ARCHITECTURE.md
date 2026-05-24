@@ -57,9 +57,9 @@ This document describes the internals of `xet-server`: how the protocol pieces m
 ### Upload (write-token scope required)
 
 1. Client splits the file via gearhash CDC into chunks (~64 KiB target, 8 KiB min, 128 KiB max).
-2. Client may query `GET /v1/chunks/default-merkledb/{hash}` for any chunk whose hash matches the eligibility rule (last 8 bytes mod 1024 == 0); server replies with a shard whose CAS Info section lists nearby xorbs that contain that chunk (chunk hashes HMAC-wrapped — see *Global dedup* below). *Endpoint pending — M6.*
+2. Client may query `GET /v1/chunks/{prefix}/{hash}` (`prefix` is `default` in current xet-core) for any chunk whose hash matches the eligibility rule (last 8 bytes mod 1024 == 0); server replies with a shard whose CAS Info section lists nearby xorbs that contain that chunk (chunk hashes HMAC-wrapped — see *Global dedup* below).
 3. Client groups new chunks into xorbs (≤ 64 MiB serialized, ~1024 chunks each) and uploads them with `POST /v1/xorbs/default/{xorb_hash}`. Server verifies the URL hash is well-formed, persists the xorb blob, returns `{was_inserted: bool}`.
-4. Client builds a shard with **File Info** (each file → list of terms `(xorb_hash, chunk_index_range, unpacked_segment_bytes)` plus per-term verification hashes) and **CAS Info** (per new xorb: the chunk hashes and their byte offsets inside that xorb). Client POSTs the shard to `/v1/shards`.
+4. Client builds a shard with **File Info** (each file → list of terms `(xorb_hash, chunk_index_range, unpacked_segment_bytes)` plus per-term verification hashes) and **CAS Info** (per new xorb: the chunk hashes and their byte offsets inside that xorb). Client POSTs the shard to `/shards`.
 5. Server:
    - verifies every referenced xorb already exists (otherwise 400),
    - parses CAS Info and writes one `chunks` row per `(chunk_hash, xorb_hash, chunk_index, byte_start, unpacked_bytes)`,
@@ -75,12 +75,13 @@ This document describes the internals of `xet-server`: how the protocol pieces m
 
 `Range:` request-side support on `/v1/reconstructions/*` is **not yet implemented** — the prototype always returns the full file's terms. Range support on the transfer URL itself is fully implemented (and mandatory, since signatures cover the byte range).
 
-### Global dedup (M6 — pending)
+### Global dedup
 
 - Server stores `chunk_hash → xorb_hash` and a notion of "neighborhood" (the other chunks in the same xorb).
-- On hit, server builds a synthetic shard whose CAS Info section lists that xorb (and optionally nearby xorbs) with chunk hashes wrapped with a per-shard HMAC key.
-- The HMAC key is written into the shard footer. Client matches by HMAC-ing its own chunk hashes against the listing.
+- On hit, server builds a synthetic shard whose CAS Info section lists that xorb (and up to `DEDUP_NEIGHBORHOOD` other xorbs) with each chunk hash wrapped as `HMAC-SHA256(per_response_key, chunk_hash)`.
+- The per-response random key is written into the shard footer's `chunk_hash_hmac_key`. The client wraps its own candidate chunk hashes with the same key and looks for matches in the response.
 - This is what makes Xet's dedup secure: clients can confirm "I have chunk X" without the server ever revealing the full set of chunk hashes it knows about.
+- Handler lives at `get_dedup_chunk` in `xet-server-http`. Returns 404 if the chunk hash isn't indexed.
 
 ## Pluggable traits
 
@@ -142,9 +143,9 @@ CAS API (all behind `RepoAuthz::verify_xet_token`):
 | Method | Path | Scope | Purpose |
 |--------|------|-------|---------|
 | GET | `/v1/reconstructions/{file_id}` | read | File reconstruction metadata |
-| GET | `/v1/chunks/default-merkledb/{chunk_hash}` | read | Global dedup query (M6) |
+| GET | `/v1/chunks/{prefix}/{chunk_hash}` | read | Global dedup query |
 | POST | `/v1/xorbs/default/{xorb_hash}` | write | Xorb upload |
-| POST | `/v1/shards` | write | Shard upload + indexing |
+| POST | `/shards` | write | Shard upload + indexing |
 
 Transfer URL (referenced from `fetch_info`, signed query string, no bearer required):
 
@@ -223,10 +224,10 @@ These are the easy-to-get-wrong parts of the protocol. Calling them out explicit
 - **Xet hash hex encoding** (spec §"Converting Hashes to Strings"). Not plain hex. Bytes are reordered as four little-endian u64s before stringifying. The spec text shows a doc-typo example missing one byte; the actual algorithm produces 64 hex chars from 32 input bytes. See `xet_server_wire::{encode_hash, decode_hash}` and its `hash_hex_spec_vector` test.
 - **Shard upload validation** — every xorb referenced by an uploaded shard MUST already be in the `xorbs` table (we return 400 otherwise). Per-term `FileVerificationEntry` MUST be present (spec says "MUST be set for shard uploads"). We can additionally re-verify by recomputing the term verification hash against the chunk hashes we already indexed — *not done yet*; tracked as a hardening TODO.
 - **`url_range.end` is inclusive** in the wire format (matches HTTP `Range:` semantics). The chunk-index `range.end` is **exclusive**. We translate carefully in `get_reconstruction`.
-- **Idempotency** — `POST /v1/xorbs/default/{hash}` and `POST /v1/shards` are content-addressed; re-uploading the same content MUST return 200, not error. `was_inserted: false` on the xorb side; `result: 0` on the shard side (we currently always return `1`; both are spec-defined "success — value is informational").
+- **Idempotency** — `POST /v1/xorbs/{prefix}/{hash}` and `POST /shards` are content-addressed; re-uploading the same content MUST return 200, not error. `was_inserted: false` on the xorb side; `result: 0` on the shard side (we currently always return `1`; both are spec-defined "success — value is informational").
 - **The server never compresses or decompresses chunks.** Xorbs are opaque bytes on the wire. We verify the URL hash is well-formed on upload; the *content* hash of the xorb is part of the future hardening pass — it requires walking the chunk-hash merkle structure which is reconstructable from the shard CAS Info section, so the server *can* eventually re-verify, but the prototype doesn't.
 - **64 MiB limits** on both xorbs and shards — enforced via `DefaultBodyLimit`.
-- **Shard magic tag** — the 32-byte `MDB_SHARD_HEADER_TAG` magic isn't in the public spec text; the parser currently tolerates any 32-byte tag. The real value will be pinned in M7 when we test against a published reference shard from `xet-team/xet-spec-reference-files`.
+- **Shard magic tag** — the 32-byte `MDB_SHARD_HEADER_TAG` is `b"HFRepoMetaData" + [0, 85, 105, 103, 69, 106, 123, 129, 87, 131, 165, 189, 217, 92, 205, 209, 74, 169]`, lifted verbatim from xet-core's `mdb_shard::shard_format::MDB_SHARD_HEADER_TAG` at the `git-xet-v0.2.1` tag. Our parser still accepts any 32-byte tag (so shards from older toolchains round-trip), but the serializer emits this canonical value so xet-core's strict header check accepts what we produce.
 
 ## Where to look in the code
 

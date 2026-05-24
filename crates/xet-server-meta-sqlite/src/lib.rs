@@ -60,6 +60,27 @@ pub struct SqliteMetadataStore {
 }
 
 impl SqliteMetadataStore {
+    /// Total xorb count. Intended for tests/observability — not part of the
+    /// `MetadataStore` trait because nothing in the request path needs it.
+    pub async fn count_xorbs(&self) -> CoreResult<u64> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM xorbs")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CoreError::Internal(format!("count xorbs: {e}")))?;
+        let n: i64 = row.try_get("n").map_err(internal)?;
+        Ok(n as u64)
+    }
+
+    /// Total file count. Test/diagnostics helper.
+    pub async fn count_files(&self) -> CoreResult<u64> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM files")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CoreError::Internal(format!("count files: {e}")))?;
+        let n: i64 = row.try_get("n").map_err(internal)?;
+        Ok(n as u64)
+    }
+
     /// Open or create the SQLite database at `path`. Pass `":memory:"` for an
     /// in-memory test database (note: pool size is forced to 1 so the schema
     /// survives between calls).
@@ -337,7 +358,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn xorb_chunk_offsets(&self, xorb: &XorbHash) -> CoreResult<Vec<ChunkOffsetRow>> {
         let rows = sqlx::query(
-            "SELECT chunk_index, byte_start, unpacked_bytes
+            "SELECT chunk_hash, chunk_index, byte_start, unpacked_bytes
              FROM chunks WHERE xorb_hash = ? ORDER BY chunk_index ASC",
         )
         .bind(hash_to_blob(&xorb.0))
@@ -346,10 +367,12 @@ impl MetadataStore for SqliteMetadataStore {
         .map_err(|e| CoreError::Internal(format!("xorb offsets: {e}")))?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
+            let chunk_blob: Vec<u8> = r.try_get("chunk_hash").map_err(internal)?;
             let ci: i64 = r.try_get("chunk_index").map_err(internal)?;
             let bs: i64 = r.try_get("byte_start").map_err(internal)?;
             let unp: i64 = r.try_get("unpacked_bytes").map_err(internal)?;
             out.push(ChunkOffsetRow {
+                chunk_hash: ChunkHash(blob_to_hash(&chunk_blob)?),
                 chunk_index: ci as u32,
                 byte_start: bs as u32,
                 unpacked_segment_bytes: unp as u32,

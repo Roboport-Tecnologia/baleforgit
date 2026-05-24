@@ -1,10 +1,11 @@
 //! HTTP layer for the Xet CAS server.
 //!
 //! Routes exposed by [`router`]:
-//! - `POST /v1/xorbs/default/:hash`           (xorb upload, write scope)
-//! - `POST /v1/shards`                         (shard upload + indexing, write scope)
-//! - `GET  /v1/reconstructions/:file_id`       (reconstruction metadata, read scope)
-//! - `GET  /xorb/default/:hash` (signed)       (byte-range transfer, no bearer auth)
+//! - `POST /v1/xorbs/:prefix/:hash`             (xorb upload, write scope)
+//! - `POST /shards`                             (shard upload + indexing, write scope)
+//! - `GET  /v1/reconstructions/:file_id`        (reconstruction metadata, read scope)
+//! - `GET  /v1/chunks/:prefix/:hash`            (global dedup query, read scope)
+//! - `GET  /xorb/default/:hash` (signed)        (byte-range transfer, no bearer auth)
 //! - `GET  /api/{type}s/{ns}/{name}/xet-{rw}-token/{rev}` (mock HF Hub token endpoint)
 
 use axum::body::Bytes;
@@ -21,10 +22,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xet_server_core::{
-    BlobStore, ChunkRow, CoreError, FileHash, FileTerm, Hash32, MetadataStore, RepoAuthz, RepoRef,
-    RepoType, Scope, ShardHash, TokenClaims, XorbHash, XorbInfo, HASH_LEN,
+    BlobStore, ChunkHash, ChunkRow, CoreError, FileHash, FileTerm, Hash32, MetadataStore,
+    RepoAuthz, RepoRef, RepoType, Scope, ShardHash, TokenClaims, XorbHash, XorbInfo, HASH_LEN,
 };
-use xet_server_shard::ParsedShard;
+use xet_server_shard::{
+    serialize as serialize_shard, CasChunkEntry, ParsedCasBlock, ParsedShard, ShardFooter,
+    ShardHeader, FOOTER_SIZE, MDB_SHARD_FOOTER_VERSION, MDB_SHARD_HEADER_TAG,
+    MDB_SHARD_HEADER_VERSION,
+};
 use xet_server_wire::{
     decode_hash, encode_hash, CASReconstructionFetchInfo, CASReconstructionTerm,
     QueryReconstructionResponse, RangeJson, UploadShardResponse, UploadXorbResponse,
@@ -64,13 +69,17 @@ where
     M: MetadataStore + 'static,
     A: RepoAuthz + 'static,
 {
+    // Authenticated CAS routes — paths match what xet-core's RemoteClient
+    // actually issues. `prefix` is parameterized per the real protocol; it's
+    // always "default" in practice today, but multi-tenancy in spirit.
     let v1 = Router::new()
-        .route("/v1/xorbs/default/:hash", post(upload_xorb::<B, M, A>))
-        .route("/v1/shards", post(upload_shard::<B, M, A>))
+        .route("/v1/xorbs/:prefix/:hash", post(upload_xorb::<B, M, A>))
+        .route("/shards", post(upload_shard::<B, M, A>))
         .route(
             "/v1/reconstructions/:file_id",
             get(get_reconstruction::<B, M, A>),
         )
+        .route("/v1/chunks/:prefix/:hash", get(get_dedup_chunk::<B, M, A>))
         .layer(middleware::from_fn_with_state(
             svc.clone(),
             auth_middleware::<B, M, A>,
@@ -211,7 +220,7 @@ fn build_signed_url(
 async fn upload_xorb<B, M, A>(
     State(svc): State<Service<B, M, A>>,
     Extension(_claims): Extension<TokenClaims>,
-    Path(hash_hex): Path<String>,
+    Path((_prefix, hash_hex)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Json<UploadXorbResponse>, ApiError>
 where
@@ -417,6 +426,102 @@ where
         terms: wire_terms,
         fetch_info,
     }))
+}
+
+// ---- Handlers: global dedup ------------------------------------------------
+
+/// Cap on how many "neighborhood" xorbs we'll cite per dedup response. Each
+/// citation costs `48 + 48*num_chunks` shard bytes; a single ~1024-chunk xorb
+/// is ~48 KiB, and 8 of them is ~384 KiB — comfortably under the 64 MiB shard
+/// limit and small enough to keep the round trip fast.
+const DEDUP_NEIGHBORHOOD: usize = 8;
+
+/// Shard key lifetime — the client may HMAC-match against this key for as long
+/// as it's still valid. 1 day matches HF's published value.
+const DEDUP_KEY_TTL_SECS: u64 = 24 * 60 * 60;
+
+async fn get_dedup_chunk<B, M, A>(
+    State(svc): State<Service<B, M, A>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path((_prefix, hash_hex)): Path<(String, String)>,
+) -> Result<Response, ApiError>
+where
+    B: BlobStore,
+    M: MetadataStore,
+    A: RepoAuthz,
+{
+    let chunk_hash = ChunkHash(
+        decode_hash(&hash_hex).map_err(|e| bad_req(format!("malformed chunk hash: {e}")))?,
+    );
+
+    let near = svc
+        .meta
+        .xorbs_near_chunk(&chunk_hash, DEDUP_NEIGHBORHOOD)
+        .await?;
+    if near.is_empty() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "chunk not found".into()));
+    }
+
+    // Per-response random HMAC key. Written into the shard footer so the client
+    // can wrap its own candidate chunk hashes and look for matches.
+    let mut hmac_key = [0u8; HASH_LEN];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut hmac_key);
+
+    let mut cas_blocks = Vec::with_capacity(near.len());
+    for x in &near {
+        let chunks = svc.meta.xorb_chunk_offsets(&x.xorb).await?;
+        let entries: Vec<CasChunkEntry> = chunks
+            .iter()
+            .map(|c| CasChunkEntry {
+                chunk_hash: wrap_chunk_hash(&c.chunk_hash, &hmac_key),
+                byte_start: c.byte_start,
+                unpacked_segment_bytes: c.unpacked_segment_bytes,
+            })
+            .collect();
+        cas_blocks.push(ParsedCasBlock {
+            xorb: x.xorb,
+            cas_flags: 0,
+            num_bytes_in_cas: x.num_bytes_in_cas,
+            num_bytes_on_disk: x.num_bytes_on_disk,
+            chunks: entries,
+        });
+    }
+
+    let now = now_unix();
+    let shard = ParsedShard {
+        header: ShardHeader {
+            tag: MDB_SHARD_HEADER_TAG,
+            version: MDB_SHARD_HEADER_VERSION,
+            footer_size: FOOTER_SIZE as u64,
+        },
+        files: vec![],
+        cas_blocks,
+        footer: Some(ShardFooter {
+            version: MDB_SHARD_FOOTER_VERSION,
+            // The serializer overwrites these offsets with the true byte positions.
+            file_info_offset: 0,
+            cas_info_offset: 0,
+            chunk_hash_hmac_key: Hash32(hmac_key),
+            shard_creation_timestamp: now,
+            shard_key_expiry: now + DEDUP_KEY_TTL_SECS,
+            footer_offset: 0,
+        }),
+    };
+    let bytes = serialize_shard(&shard);
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response())
+}
+
+fn wrap_chunk_hash(chunk: &ChunkHash, key: &[u8; HASH_LEN]) -> ChunkHash {
+    let mut mac = HmacSha256::new_from_slice(key).expect("hmac key length");
+    mac.update(chunk.as_bytes());
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; HASH_LEN];
+    out.copy_from_slice(&result);
+    ChunkHash(Hash32(out))
 }
 
 #[derive(Debug, Deserialize)]

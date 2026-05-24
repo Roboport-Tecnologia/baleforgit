@@ -21,10 +21,15 @@ pub const MDB_SHARD_FOOTER_VERSION: u64 = 1;
 pub const FLAG_WITH_VERIFICATION: u32 = 1 << 31; // 0x8000_0000
 pub const FLAG_WITH_METADATA_EXT: u32 = 1 << 30; // 0x4000_0000
 
-/// We don't know the canonical magic tag bytes from the public spec text; the
-/// reference impl will tell us once we hash-check against a published shard.
-/// For now, parsing tolerates any 32-byte tag and serialization echoes it back.
-pub const PLACEHOLDER_TAG: [u8; HASH_LEN] = *b"MDB-SHARD-MAGIC-PLACEHOLDER-V2--";
+/// The canonical 32-byte magic that prefixes every MDB shard. Lifted verbatim
+/// from xet-core's `mdb_shard::shard_format::MDB_SHARD_HEADER_TAG` (see
+/// xet-core@git-xet-v0.2.1). Our parser only checks length, not identity, so
+/// shards written by older toolchains still round-trip; serialization uses
+/// this value so shards we produce are accepted by xet-core's strict check.
+pub const MDB_SHARD_HEADER_TAG: [u8; HASH_LEN] = [
+    b'H', b'F', b'R', b'e', b'p', b'o', b'M', b'e', b't', b'a', b'D', b'a', b't', b'a', 0, 85, 105,
+    103, 69, 106, 123, 129, 87, 131, 165, 189, 217, 92, 205, 209, 74, 169,
+];
 
 #[derive(Debug, Error)]
 pub enum ShardError {
@@ -526,7 +531,7 @@ mod tests {
 
         ParsedShard {
             header: ShardHeader {
-                tag: PLACEHOLDER_TAG,
+                tag: MDB_SHARD_HEADER_TAG,
                 version: MDB_SHARD_HEADER_VERSION,
                 footer_size: if with_footer { FOOTER_SIZE as u64 } else { 0 },
             },
@@ -600,7 +605,7 @@ mod tests {
         // A shard with zero file info entries (e.g. a global-dedup response).
         let shard = ParsedShard {
             header: ShardHeader {
-                tag: PLACEHOLDER_TAG,
+                tag: MDB_SHARD_HEADER_TAG,
                 version: MDB_SHARD_HEADER_VERSION,
                 footer_size: 0,
             },

@@ -14,7 +14,7 @@ use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_shard::{
     serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader,
-    FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_VERSION, PLACEHOLDER_TAG,
+    FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_storage_fs::FsBlobStore;
 use xet_server_wire::{encode_hash, UploadShardResponse, UploadXorbResponse};
@@ -82,7 +82,7 @@ async fn upload_xorb_then_shard_indexes_metadata() {
 
     let shard = ParsedShard {
         header: ShardHeader {
-            tag: PLACEHOLDER_TAG,
+            tag: MDB_SHARD_HEADER_TAG,
             version: MDB_SHARD_HEADER_VERSION,
             footer_size: 0,
         },
@@ -123,7 +123,7 @@ async fn upload_xorb_then_shard_indexes_metadata() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/shards")
+        .uri("/shards")
         .header("Authorization", "Bearer test")
         .body(Body::from(shard_bytes))
         .unwrap();
@@ -183,7 +183,7 @@ async fn shard_upload_rejects_missing_xorb() {
     let missing_xorb = XorbHash(h(0xBE));
     let shard = ParsedShard {
         header: ShardHeader {
-            tag: PLACEHOLDER_TAG,
+            tag: MDB_SHARD_HEADER_TAG,
             version: MDB_SHARD_HEADER_VERSION,
             footer_size: 0,
         },
@@ -203,7 +203,7 @@ async fn shard_upload_rejects_missing_xorb() {
     };
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/shards")
+        .uri("/shards")
         .header("Authorization", "Bearer test")
         .body(Body::from(serialize(&shard)))
         .unwrap();

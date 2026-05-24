@@ -146,9 +146,11 @@ pub struct ChunkLocation {
 }
 
 /// Per-chunk byte offsets inside one xorb. Used to translate chunk-index ranges
-/// into byte ranges when building `fetch_info`.
+/// into byte ranges when building `fetch_info`, and to enumerate a xorb's
+/// chunks (with their hashes) when building global-dedup responses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkOffsetRow {
+    pub chunk_hash: ChunkHash,
     pub chunk_index: u32,
     pub byte_start: u32,
     pub unpacked_segment_bytes: u32,

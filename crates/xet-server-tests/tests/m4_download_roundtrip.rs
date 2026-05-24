@@ -13,7 +13,7 @@ use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_shard::{
     serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader,
-    FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_VERSION, PLACEHOLDER_TAG,
+    FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_storage_fs::FsBlobStore;
 use xet_server_wire::{encode_hash, QueryReconstructionResponse};
@@ -81,7 +81,7 @@ async fn upload_then_reconstruct_byte_for_byte() {
     let file_hash = FileHash(h(0xF0));
     let shard = ParsedShard {
         header: ShardHeader {
-            tag: PLACEHOLDER_TAG,
+            tag: MDB_SHARD_HEADER_TAG,
             version: MDB_SHARD_HEADER_VERSION,
             footer_size: 0,
         },
@@ -154,7 +154,7 @@ async fn upload_then_reconstruct_byte_for_byte() {
     };
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/shards")
+        .uri("/shards")
         .header("Authorization", "Bearer test")
         .body(Body::from(serialize(&shard)))
         .unwrap();

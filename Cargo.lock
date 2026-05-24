@@ -2513,6 +2513,7 @@ dependencies = [
  "bytes",
  "hex",
  "hmac",
+ "rand",
  "serde",
  "serde_json",
  "sha2",
@@ -2570,9 +2571,12 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "hex",
+ "hmac",
  "http-body-util",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tower",
@@ -2582,6 +2586,7 @@ dependencies = [
  "xet-server-meta-sqlite",
  "xet-server-shard",
  "xet-server-storage-fs",
+ "xet-server-tokens",
  "xet-server-wire",
 ]
 

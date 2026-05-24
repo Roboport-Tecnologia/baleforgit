@@ -14,11 +14,11 @@ This repo is a from-scratch Rust implementation of the **server side** of the Xe
 |-----------|--------|------------------|
 | M1 — Wire types + shard parser | done | Hex encoding, JSON shapes, MDB shard binary format |
 | M2 — Filesystem + SQLite stores | done | `BlobStore` on disk, `MetadataStore` on SQLite |
-| M3 — Upload endpoints | done | `POST /v1/xorbs/...`, `POST /v1/shards` |
+| M3 — Upload endpoints | done | `POST /v1/xorbs/{prefix}/{hash}`, `POST /shards` |
 | M4 — Download endpoints | done | `GET /v1/reconstructions/...`, signed `/xorb/default/...` transfer |
 | M5 — Auth + mock HF Hub token endpoint | done | HS256 JWTs, scope enforcement, `GET /api/{type}s/.../xet-{rw}-token/{rev}` |
-| M6 — Global dedup endpoint | pending | `GET /v1/chunks/default-merkledb/{hash}` (HMAC-wrapped shard responses) |
-| M7 — End-to-end against `git-xet` | pending | Drive a real client against the server |
+| M6 — Global dedup endpoint | done | `GET /v1/chunks/{prefix}/{hash}` (per-response HMAC-wrapped shard) |
+| M7 — End-to-end against `git-xet` | done | `m7_git_xet` drives the real `git-xet transfer` binary over the LFS custom-transfer JSON protocol; skips if the binary isn't on PATH |
 | M8 — Pluggability sanity (in-memory impls) | pending | Validate the trait seams |
 
 
