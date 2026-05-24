@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target/
+
+# Per-crate target dirs (in case anyone runs cargo inside a sub-crate)
+**/target/
+
+# macOS finder turds
+.DS_Store
+
+# Editor swap / backup files
+*.swp
+*.swo
+*~
+
+# Default runtime data root for `xet-server` (see XET_DATA_ROOT in bin/main.rs)
+/xet-data/
+
+# Local SQLite files dropped by ad-hoc runs
+*.db
+*.db-shm
+*.db-wal
+
+# Environment / secrets — never commit real secrets
+.env
+.env.*
+!.env.example
+.claude/settings.local.json

@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xet-server-core",
+    "crates/xet-server-wire",
+    "crates/xet-server-shard",
+    "crates/xet-server-storage-fs",
+    "crates/xet-server-meta-sqlite",
+    "crates/xet-server-authz-mem",
+    "crates/xet-server-tokens",
+    "crates/xet-server-http",
+    "crates/xet-server-bin",
+    "crates/xet-server-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["macros"] }
+blake3 = "1"
+bytes = "1"
+hex = "0.4"
+hmac = "0.12"
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+xet-server-core = { path = "crates/xet-server-core" }
+xet-server-wire = { path = "crates/xet-server-wire" }
+xet-server-shard = { path = "crates/xet-server-shard" }
+xet-server-storage-fs = { path = "crates/xet-server-storage-fs" }
+xet-server-meta-sqlite = { path = "crates/xet-server-meta-sqlite" }
+xet-server-authz-mem = { path = "crates/xet-server-authz-mem" }
+xet-server-tokens = { path = "crates/xet-server-tokens" }
+xet-server-http = { path = "crates/xet-server-http" }

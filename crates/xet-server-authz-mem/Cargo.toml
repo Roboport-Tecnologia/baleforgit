@@ -1,0 +1,15 @@
+[package]
+name = "xet-server-authz-mem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+xet-server-core.workspace = true
+xet-server-tokens.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
