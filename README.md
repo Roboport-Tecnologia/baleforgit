@@ -20,11 +20,12 @@ This repo is a from-scratch Rust implementation of the **server side** of the Xe
 | M6 — Global dedup endpoint | done | `GET /v1/chunks/{prefix}/{hash}` (per-response HMAC-wrapped shard) |
 | M7 — End-to-end against `git-xet` | done | `m7_git_xet` drives the real `git-xet transfer` binary over the LFS custom-transfer JSON protocol; skips if the binary isn't on PATH |
 | M8 — Pluggability sanity (alternate impls) | done | `xet-server-storage-mem` (in-memory `BlobStore`) + `xet-server-authz-http` (HTTP-backed `RepoAuthz` skeleton), exercised end-to-end by `m8_pluggability` |
+| M9 — Real LFS push via Go adapter | done | `lfs-adapter/` (Go) bridges the standard git-lfs Batch API to xet-server; `m9_real_lfs_push` drives a real `git lfs push --all` through the full chain (git-lfs → adapter → xet-server → git-xet → CAS upload). Skips when `{go, git, git-lfs, git-xet}` aren't all on PATH. |
 
 
 ## Quick start
 
-Requires Rust 1.80+
+Requires Rust 1.88+
 
 ```bash
 # Build everything
@@ -73,9 +74,13 @@ crates/
 ├── xet-server-http/         # Axum router, handlers, middleware
 ├── xet-server-bin/          # The `xet-server` binary
 └── xet-server-tests/        # Cross-crate integration tests
+
+lfs-adapter/                 # Go: standalone git-lfs Batch API → xet-server bridge
+                             # (the reference shape for GitLab/Gitea integration)
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for request flows, trait surface, storage layout, and protocol notes.
+See [lfs-adapter/README.md](lfs-adapter/README.md) for the LFS bridge.
 
 ## Development
 

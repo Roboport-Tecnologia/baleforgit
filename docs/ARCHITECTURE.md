@@ -163,6 +163,44 @@ Mock HF Hub token endpoint:
 
 The token endpoint accepts the client's upstream hub bearer in `Authorization: Bearer ...`, calls `RepoAuthz::check_repo_access`, then `RepoAuthz::mint_xet_token`.
 
+## LFS adapter (the GitLab/Gitea integration seam)
+
+xet-server speaks the **Hugging Face Hub** flavor of the Xet protocol — token endpoint at `/api/{type}s/.../xet-{rw}-token/{rev}`, CAS API at `/v1/...`. Git-LFS doesn't know about this surface; it speaks the [git-lfs Batch API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md) and dispatches to a custom transfer agent (`git-xet`) when the batch response declares `transfer="xet"`. Something in the middle has to bridge the two protocols.
+
+`lfs-adapter/` (Go) is that bridge:
+
+```
+git lfs push ─▶ POST /repos/{o}/{n}/objects/batch (Basic auth, URL-embedded PAT)
+                       │
+                       ▼
+                lfs-adapter (Go, stateless)
+                   │ forwards bearer to
+                   ▼
+                GET /api/models/{o}/{n}/xet-{rw}-token/main  ─▶ xet-server
+                                                                   │
+                                                                   ▼ check_repo_access
+                                                            upstream PAT verifier
+                                                            (mock here; GitLab/Gitea in prod)
+                       ◀── {accessToken, exp, casUrl}
+                       │
+                       ▼ wraps as standard LFS Batch response
+                { "transfer": "xet",
+                  "objects": [ { "actions": { "upload": {
+                      "href": "<casUrl>",
+                      "header": { "X-Xet-Cas-Url", "X-Xet-Access-Token", "X-Xet-Token-Expiration" }
+                  } } } ] }
+                       │
+                       ▼ git-lfs spawns git-xet
+                git-xet transfer ─▶ POST /v1/xorbs/..., POST /shards (to xet-server, with Xet token)
+```
+
+Key properties:
+
+- The adapter is **stateless and credential-free**. It holds no JWT secret. It doesn't decode the user's PAT — it just forwards it to xet-server, where `RepoAuthz` is authoritative. This is the property that makes it cheap to drop in front of an existing GitLab/Gitea (no shared secrets to manage).
+- The adapter is intentionally written in **Go** so engineers maintaining the existing LFS code in those projects can read it without learning Rust.
+- For GitLab/Gitea integration: replace xet-server's `xet-server-authz-http` with a thin `/check_access` shim that hits `/api/v4/user` (or Gitea equivalent) and project-member lookups. Adapter and xet-server are unchanged.
+- The remote URL **must** be http(s)/ssh — git-xet rejects `file://` during credential helper setup. `lfs.url` only redirects LFS traffic; the remote URL still has to parse. The integration test (`m9_real_lfs_push`) uses `git lfs push` directly so the unreachable `origin` doesn't actually need to accept a ref push.
+
 ## Storage layout
 
 ### Filesystem `BlobStore`
