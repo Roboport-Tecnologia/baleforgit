@@ -18,9 +18,7 @@ use std::time::Duration;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use uuid::Uuid;
-use xet_server_core::{
-    BlobStore, CoreError, CoreResult, Hash32, ShardHash, XorbHash,
-};
+use xet_server_core::{BlobStore, CoreError, CoreResult, Hash32, ShardHash, XorbHash};
 
 pub struct FsBlobStore {
     root: PathBuf,

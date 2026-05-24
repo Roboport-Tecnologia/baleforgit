@@ -75,6 +75,16 @@ crates/
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for request flows, trait surface, storage layout, and protocol notes.
 
+## Development
+
+Install the [pre-commit](https://pre-commit.com) framework once (`brew install pre-commit` or `pipx install pre-commit`), then in this repo run:
+
+```bash
+pre-commit install
+```
+
+That wires up `.pre-commit-config.yaml`, which on every commit runs `cargo fmt --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+
 ## License
 
 Apache-2.0.

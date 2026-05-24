@@ -9,9 +9,8 @@
 //! - `XET_PUBLIC_URL`       (default `http://<XET_LISTEN>`)
 //! - `XET_JWT_SECRET_HEX`   (REQUIRED; 32+ bytes of hex)
 //! - `XET_TRANSFER_SECRET_HEX` (REQUIRED; exactly 32 bytes of hex / 64 chars)
-//! - `XET_GRANTS`           comma-separated `hub_token:user:repo_id:read|write`
-//!                          tuples. Example:
-//!                          `XET_GRANTS=hub-alice:alice:alice/m:write,hub-bob:bob:alice/m:read`
+//! - `XET_GRANTS`           comma-separated `hub_token:user:repo_id:read|write` tuples.
+//!   Example: `XET_GRANTS=hub-alice:alice:alice/m:write,hub-bob:bob:alice/m:read`
 
 use anyhow::{bail, Context, Result};
 use std::env;
@@ -33,7 +32,8 @@ async fn main() -> Result<()> {
         .init();
 
     let listen = env::var("XET_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
-    let data_root = PathBuf::from(env::var("XET_DATA_ROOT").unwrap_or_else(|_| "./xet-data".into()));
+    let data_root =
+        PathBuf::from(env::var("XET_DATA_ROOT").unwrap_or_else(|_| "./xet-data".into()));
     let db_path = env::var("XET_DB_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| data_root.join("meta.db"));
@@ -44,15 +44,22 @@ async fn main() -> Result<()> {
         bail!("XET_JWT_SECRET_HEX must decode to at least 32 bytes");
     }
     let transfer_secret_bytes = decode_hex_env("XET_TRANSFER_SECRET_HEX")?;
-    let transfer_secret: [u8; 32] = transfer_secret_bytes
-        .try_into()
-        .map_err(|v: Vec<u8>| anyhow::anyhow!("XET_TRANSFER_SECRET_HEX must decode to exactly 32 bytes (got {})", v.len()))?;
-
-    tokio::fs::create_dir_all(&data_root).await.with_context(|| {
-        format!("creating data root {}", data_root.display())
+    let transfer_secret: [u8; 32] = transfer_secret_bytes.try_into().map_err(|v: Vec<u8>| {
+        anyhow::anyhow!(
+            "XET_TRANSFER_SECRET_HEX must decode to exactly 32 bytes (got {})",
+            v.len()
+        )
     })?;
 
-    let blobs = Arc::new(FsBlobStore::open(&data_root).await.map_err(anyhow_from_core)?);
+    tokio::fs::create_dir_all(&data_root)
+        .await
+        .with_context(|| format!("creating data root {}", data_root.display()))?;
+
+    let blobs = Arc::new(
+        FsBlobStore::open(&data_root)
+            .await
+            .map_err(anyhow_from_core)?,
+    );
     let meta = Arc::new(
         SqliteMetadataStore::open_path(&db_path)
             .await

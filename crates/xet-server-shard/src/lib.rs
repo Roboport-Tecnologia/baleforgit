@@ -414,7 +414,11 @@ mod tests {
         Hash32(h)
     }
 
-    fn sample_shard(with_verification: bool, with_metadata: bool, with_footer: bool) -> ParsedShard {
+    fn sample_shard(
+        with_verification: bool,
+        with_metadata: bool,
+        with_footer: bool,
+    ) -> ParsedShard {
         let xorb1 = XorbHash(mk_hash(0x11));
         let xorb2 = XorbHash(mk_hash(0x22));
 
@@ -447,7 +451,11 @@ mod tests {
         } else {
             vec![]
         };
-        let sha256 = if with_metadata { Some(mk_hash(0xCC)) } else { None };
+        let sha256 = if with_metadata {
+            Some(mk_hash(0xCC))
+        } else {
+            None
+        };
 
         let files = vec![ParsedFile {
             file_hash: FileHash(mk_hash(0xF0)),
@@ -505,7 +513,7 @@ mod tests {
             Some(ShardFooter {
                 version: MDB_SHARD_FOOTER_VERSION,
                 file_info_offset: 0, // serializer will record real offsets in bytes,
-                                     // but stored value here is informational for the test
+                // but stored value here is informational for the test
                 cas_info_offset: 0,
                 chunk_hash_hmac_key: mk_hash(0xEE),
                 shard_creation_timestamp: 1_700_000_000,

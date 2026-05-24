@@ -26,7 +26,10 @@ async fn upload_indexes_and_reconstruction_can_be_assembled() {
     // Pretend we have one 1000-byte xorb that holds two chunks [0..400, 400..1000].
     let xorb = XorbHash(h(0x10));
     let xorb_body: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
-    blobs.put_xorb(&xorb, Bytes::from(xorb_body.clone())).await.unwrap();
+    blobs
+        .put_xorb(&xorb, Bytes::from(xorb_body.clone()))
+        .await
+        .unwrap();
     assert!(blobs.xorb_exists(&xorb).await.unwrap());
 
     meta.register_xorb(

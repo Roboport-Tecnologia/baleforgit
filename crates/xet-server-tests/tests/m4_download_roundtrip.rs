@@ -65,9 +65,17 @@ async fn upload_then_reconstruct_byte_for_byte() {
             .unwrap()
     };
 
-    let resp = app.clone().oneshot(post_xorb(xorb_a, body_a.clone())).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post_xorb(xorb_a, body_a.clone()))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let resp = app.clone().oneshot(post_xorb(xorb_b, body_b.clone())).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post_xorb(xorb_b, body_b.clone()))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let file_hash = FileHash(h(0xF0));
@@ -172,7 +180,10 @@ async fn upload_then_reconstruct_byte_for_byte() {
     // the bytes with the prescribed Range header, and accumulate.
     let mut reconstructed: Vec<u8> = Vec::new();
     for term in &recon.terms {
-        let entries = recon.fetch_info.get(&term.hash).expect("fetch_info present");
+        let entries = recon
+            .fetch_info
+            .get(&term.hash)
+            .expect("fetch_info present");
         let entry = entries
             .iter()
             .find(|e| e.range.start <= term.range.start && e.range.end >= term.range.end)
@@ -283,7 +294,9 @@ async fn reconstruction_404_when_file_unknown() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let bytes = to_bytes(resp.into_body(), 16 * 1024).await.unwrap();
-    assert!(std::str::from_utf8(&bytes).unwrap().contains("file not found"));
+    assert!(std::str::from_utf8(&bytes)
+        .unwrap()
+        .contains("file not found"));
 }
 
 /// Take an absolute URL emitted by the server and return just the path+query

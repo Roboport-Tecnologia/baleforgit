@@ -33,7 +33,7 @@ async fn read_json<T: serde::de::DeserializeOwned>(body: Body) -> T {
 async fn build_app() -> axum::Router {
     let dir = tempfile::tempdir().unwrap();
     // Leak the tempdir to keep the path alive for the whole test (cheap, test-only).
-    let path = dir.into_path();
+    let path = dir.keep();
     let blobs = Arc::new(FsBlobStore::open(path.join("blobs")).await.unwrap());
     let meta = Arc::new(SqliteMetadataStore::open_path(":memory:").await.unwrap());
 

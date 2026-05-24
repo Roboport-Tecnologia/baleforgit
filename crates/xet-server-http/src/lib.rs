@@ -5,8 +5,7 @@
 //! - `POST /v1/shards`                         (shard upload + indexing, write scope)
 //! - `GET  /v1/reconstructions/:file_id`       (reconstruction metadata, read scope)
 //! - `GET  /xorb/default/:hash` (signed)       (byte-range transfer, no bearer auth)
-//! - `GET  /api/{type}s/{ns}/{name}/xet-{rw}-token/{rev}`
-//!                                              (mock HF Hub token endpoint)
+//! - `GET  /api/{type}s/{ns}/{name}/xet-{rw}-token/{rev}` (mock HF Hub token endpoint)
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
@@ -22,8 +21,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xet_server_core::{
-    BlobStore, ChunkRow, CoreError, FileHash, FileTerm, MetadataStore, RepoAuthz, RepoRef,
-    RepoType, Scope, ShardHash, TokenClaims, XorbHash, XorbInfo, Hash32, HASH_LEN,
+    BlobStore, ChunkRow, CoreError, FileHash, FileTerm, Hash32, MetadataStore, RepoAuthz, RepoRef,
+    RepoType, Scope, ShardHash, TokenClaims, XorbHash, XorbInfo, HASH_LEN,
 };
 use xet_server_shard::ParsedShard;
 use xet_server_wire::{
@@ -141,7 +140,11 @@ where
     let token = raw
         .strip_prefix("Bearer ")
         .ok_or_else(|| unauthorized("expected 'Bearer <token>'"))?;
-    let claims = svc.authz.verify_xet_token(token).await.map_err(ApiError::from)?;
+    let claims = svc
+        .authz
+        .verify_xet_token(token)
+        .await
+        .map_err(ApiError::from)?;
 
     // POST methods require write scope.
     if method == Method::POST && claims.scope == Scope::Read {
@@ -216,8 +219,7 @@ where
     M: MetadataStore,
     A: RepoAuthz,
 {
-    let hash =
-        decode_hash(&hash_hex).map_err(|e| bad_req(format!("malformed xorb hash: {e}")))?;
+    let hash = decode_hash(&hash_hex).map_err(|e| bad_req(format!("malformed xorb hash: {e}")))?;
     if body.len() > MAX_BODY_BYTES {
         return Err(bad_req("xorb exceeds 64 MiB limit"));
     }
@@ -239,8 +241,8 @@ where
     if body.len() > MAX_BODY_BYTES {
         return Err(bad_req("shard exceeds 64 MiB limit"));
     }
-    let parsed: ParsedShard = xet_server_shard::parse(&body)
-        .map_err(|e| bad_req(format!("malformed shard: {e}")))?;
+    let parsed: ParsedShard =
+        xet_server_shard::parse(&body).map_err(|e| bad_req(format!("malformed shard: {e}")))?;
 
     for cb in &parsed.cas_blocks {
         if !svc.blobs.xorb_exists(&cb.xorb).await? {
@@ -338,9 +340,8 @@ where
     // prototype is permissive: any read token can fetch any file. In production
     // we'd want a `files.repo_id == claims.repo.repo_id` check (or fall back
     // to a cross-repo dedup policy).
-    let file_hash = FileHash(
-        decode_hash(&file_hex).map_err(|e| bad_req(format!("malformed file id: {e}")))?,
-    );
+    let file_hash =
+        FileHash(decode_hash(&file_hex).map_err(|e| bad_req(format!("malformed file id: {e}")))?);
     let terms = svc
         .meta
         .lookup_file(&file_hash)
@@ -437,9 +438,8 @@ where
     M: MetadataStore,
     A: RepoAuthz,
 {
-    let xorb_hash = XorbHash(
-        decode_hash(&hash_hex).map_err(|e| bad_req(format!("malformed xorb hash: {e}")))?,
-    );
+    let xorb_hash =
+        XorbHash(decode_hash(&hash_hex).map_err(|e| bad_req(format!("malformed xorb hash: {e}")))?);
 
     let expected = sign(
         &svc.transfer_secret,
@@ -460,16 +460,12 @@ where
     let range_header = headers
         .get("range")
         .ok_or_else(|| unauthorized("Range header required"))?;
-    let (req_start, req_end_inclusive) =
-        parse_byte_range_header(range_header).map_err(|m| bad_req(m))?;
+    let (req_start, req_end_inclusive) = parse_byte_range_header(range_header).map_err(bad_req)?;
     if req_start != q.s || req_end_inclusive != q.e {
         return Err(unauthorized("Range header does not match signed range"));
     }
 
-    let bytes = svc
-        .blobs
-        .get_xorb_range(&xorb_hash, q.s..(q.e + 1))
-        .await?;
+    let bytes = svc.blobs.get_xorb_range(&xorb_hash, q.s..(q.e + 1)).await?;
 
     let len = bytes.len();
     let mut resp = (StatusCode::PARTIAL_CONTENT, bytes).into_response();

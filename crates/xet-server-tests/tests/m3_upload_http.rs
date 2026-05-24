@@ -2,21 +2,19 @@
 //! upload a xorb and then a shard referencing it, then check the metadata
 //! layer was populated correctly.
 
-use axum::body::{Body, to_bytes};
+use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use std::sync::Arc;
 use tower::ServiceExt;
 use xet_server_authz_mem::AlwaysAllow;
-use xet_server_core::{
-    ChunkHash, FileHash, Hash32, MetadataStore, XorbHash,
-};
+use xet_server_core::{ChunkHash, FileHash, Hash32, MetadataStore, XorbHash};
 use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_shard::{
-    serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard,
-    ShardHeader, FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_VERSION, PLACEHOLDER_TAG,
+    serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader,
+    FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_VERSION, PLACEHOLDER_TAG,
 };
 use xet_server_storage_fs::FsBlobStore;
 use xet_server_wire::{encode_hash, UploadShardResponse, UploadXorbResponse};
@@ -37,11 +35,7 @@ async fn read_body_json<T: serde::de::DeserializeOwned>(body: Body) -> T {
 #[tokio::test]
 async fn upload_xorb_then_shard_indexes_metadata() {
     let dir = tempfile::tempdir().unwrap();
-    let blobs = Arc::new(
-        FsBlobStore::open(dir.path().join("blobs"))
-            .await
-            .unwrap(),
-    );
+    let blobs = Arc::new(FsBlobStore::open(dir.path().join("blobs")).await.unwrap());
     let meta = Arc::new(SqliteMetadataStore::open_path(":memory:").await.unwrap());
     let svc = Service {
         blobs: blobs.clone(),
@@ -142,17 +136,29 @@ async fn upload_xorb_then_shard_indexes_metadata() {
     //    the file's reconstruction terms.
     assert!(meta.xorb_exists(&xorb_hash).await.unwrap());
 
-    let loc = meta.lookup_chunk(&chunk0).await.unwrap().expect("chunk0 known");
+    let loc = meta
+        .lookup_chunk(&chunk0)
+        .await
+        .unwrap()
+        .expect("chunk0 known");
     assert_eq!(loc.xorb, xorb_hash);
     assert_eq!(loc.byte_start, 0);
 
-    let loc = meta.lookup_chunk(&chunk1).await.unwrap().expect("chunk1 known");
+    let loc = meta
+        .lookup_chunk(&chunk1)
+        .await
+        .unwrap()
+        .expect("chunk1 known");
     assert_eq!(loc.byte_start, 256);
 
     let offsets = meta.xorb_chunk_offsets(&xorb_hash).await.unwrap();
     assert_eq!(offsets.len(), 2);
 
-    let terms = meta.lookup_file(&file_hash).await.unwrap().expect("file known");
+    let terms = meta
+        .lookup_file(&file_hash)
+        .await
+        .unwrap()
+        .expect("file known");
     assert_eq!(terms.len(), 1);
     assert_eq!(terms[0].xorb, xorb_hash);
     assert_eq!(terms[0].chunk_idx_end, 2);
@@ -162,11 +168,7 @@ async fn upload_xorb_then_shard_indexes_metadata() {
 #[tokio::test]
 async fn shard_upload_rejects_missing_xorb() {
     let dir = tempfile::tempdir().unwrap();
-    let blobs = Arc::new(
-        FsBlobStore::open(dir.path().join("blobs"))
-            .await
-            .unwrap(),
-    );
+    let blobs = Arc::new(FsBlobStore::open(dir.path().join("blobs")).await.unwrap());
     let meta = Arc::new(SqliteMetadataStore::open_path(":memory:").await.unwrap());
     let svc = Service {
         blobs,
@@ -215,11 +217,7 @@ async fn shard_upload_rejects_missing_xorb() {
 #[tokio::test]
 async fn xorb_upload_rejects_malformed_hash() {
     let dir = tempfile::tempdir().unwrap();
-    let blobs = Arc::new(
-        FsBlobStore::open(dir.path().join("blobs"))
-            .await
-            .unwrap(),
-    );
+    let blobs = Arc::new(FsBlobStore::open(dir.path().join("blobs")).await.unwrap());
     let meta = Arc::new(SqliteMetadataStore::open_path(":memory:").await.unwrap());
     let svc = Service {
         blobs,

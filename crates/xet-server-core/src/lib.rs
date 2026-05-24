@@ -57,9 +57,15 @@ macro_rules! hash_newtype {
     };
 }
 
-hash_newtype!(ChunkHash, "Hash of a single chunk's raw uncompressed bytes.");
+hash_newtype!(
+    ChunkHash,
+    "Hash of a single chunk's raw uncompressed bytes."
+);
 hash_newtype!(XorbHash, "Hash of a xorb, computed over its chunks.");
-hash_newtype!(FileHash, "Hash of a file, computed over its reconstruction.");
+hash_newtype!(
+    FileHash,
+    "Hash of a file, computed over its reconstruction."
+);
 hash_newtype!(ShardHash, "Hash of a shard (for archival keying).");
 
 /// Token scope. `Write` is a superset of `Read` (per spec).
@@ -117,7 +123,7 @@ pub struct FileTerm {
 pub struct ChunkRow {
     pub chunk_hash: ChunkHash,
     pub chunk_index: u32,
-    pub byte_start: u32,            // offset inside the xorb body
+    pub byte_start: u32, // offset inside the xorb body
     pub unpacked_segment_bytes: u32,
 }
 

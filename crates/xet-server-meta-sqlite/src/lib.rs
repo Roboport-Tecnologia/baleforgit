@@ -366,7 +366,7 @@ fn internal<E: std::fmt::Display>(e: E) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xet_server_core::{RepoType, Hash32};
+    use xet_server_core::{Hash32, RepoType};
 
     fn h(seed: u8) -> Hash32 {
         let mut b = [0u8; 32];

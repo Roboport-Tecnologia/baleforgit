@@ -8,18 +8,16 @@
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-use xet_server_core::{
-    CoreError, CoreResult, RepoRef, RepoType, Scope, TokenClaims, UserId,
-};
+use xet_server_core::{CoreError, CoreResult, RepoRef, RepoType, Scope, TokenClaims, UserId};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct XetClaims {
-    pub sub: String,        // user id
-    pub repo_type: String,  // "model" | "dataset" | "space"
-    pub repo_id: String,    // "ns/name"
-    pub revision: String,   // git revision
-    pub scope: String,      // "read" | "write"
-    pub exp: u64,           // unix seconds
+    pub sub: String,       // user id
+    pub repo_type: String, // "model" | "dataset" | "space"
+    pub repo_id: String,   // "ns/name"
+    pub revision: String,  // git revision
+    pub scope: String,     // "read" | "write"
+    pub exp: u64,          // unix seconds
 }
 
 fn now_unix() -> u64 {

@@ -7,9 +7,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
-use xet_server_core::{
-    CoreError, CoreResult, RepoAuthz, RepoRef, Scope, TokenClaims, UserId,
-};
+use xet_server_core::{CoreError, CoreResult, RepoAuthz, RepoRef, Scope, TokenClaims, UserId};
 use xet_server_tokens as tokens;
 
 /// Accepts any non-empty bearer; grants write-scope on a generic placeholder
@@ -116,10 +114,7 @@ impl RepoAuthz for ConfigAuthz {
         repo: &RepoRef,
         requested: Scope,
     ) -> CoreResult<UserId> {
-        let u = self
-            .users
-            .get(hub_bearer)
-            .ok_or(CoreError::Unauthorized)?;
+        let u = self.users.get(hub_bearer).ok_or(CoreError::Unauthorized)?;
         let granted = u
             .repos
             .get(&repo.repo_id)
@@ -156,12 +151,8 @@ mod tests {
 
     #[tokio::test]
     async fn config_authz_grants_write_when_allowed() {
-        let authz = ConfigAuthz::new(b"k".to_vec()).grant(
-            "hub-alice",
-            "alice",
-            "alice/m",
-            Scope::Write,
-        );
+        let authz =
+            ConfigAuthz::new(b"k".to_vec()).grant("hub-alice", "alice", "alice/m", Scope::Write);
         let u = authz
             .check_repo_access("hub-alice", &repo("alice/m"), Scope::Write)
             .await
@@ -171,12 +162,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_authz_forbids_write_when_only_read() {
-        let authz = ConfigAuthz::new(b"k".to_vec()).grant(
-            "hub-bob",
-            "bob",
-            "bob/m",
-            Scope::Read,
-        );
+        let authz = ConfigAuthz::new(b"k".to_vec()).grant("hub-bob", "bob", "bob/m", Scope::Read);
         let r = authz
             .check_repo_access("hub-bob", &repo("bob/m"), Scope::Write)
             .await;
