@@ -19,7 +19,7 @@ This repo is a from-scratch Rust implementation of the **server side** of the Xe
 | M5 — Auth + mock HF Hub token endpoint | done | HS256 JWTs, scope enforcement, `GET /api/{type}s/.../xet-{rw}-token/{rev}` |
 | M6 — Global dedup endpoint | done | `GET /v1/chunks/{prefix}/{hash}` (per-response HMAC-wrapped shard) |
 | M7 — End-to-end against `git-xet` | done | `m7_git_xet` drives the real `git-xet transfer` binary over the LFS custom-transfer JSON protocol; skips if the binary isn't on PATH |
-| M8 — Pluggability sanity (in-memory impls) | pending | Validate the trait seams |
+| M8 — Pluggability sanity (alternate impls) | done | `xet-server-storage-mem` (in-memory `BlobStore`) + `xet-server-authz-http` (HTTP-backed `RepoAuthz` skeleton), exercised end-to-end by `m8_pluggability` |
 
 
 ## Quick start
@@ -65,8 +65,10 @@ crates/
 ├── xet-server-wire/         # JSON shapes + Xet hash hex encoding
 ├── xet-server-shard/        # MDB shard binary parser + serializer
 ├── xet-server-storage-fs/   # BlobStore on the local filesystem
+├── xet-server-storage-mem/  # BlobStore in memory (test / pluggability check)
 ├── xet-server-meta-sqlite/  # MetadataStore on SQLite
 ├── xet-server-authz-mem/    # In-memory RepoAuthz (AlwaysAllow, ConfigAuthz)
+├── xet-server-authz-http/   # RepoAuthz skeleton that proxies to an upstream HTTP service
 ├── xet-server-tokens/       # HS256 Xet JWT mint/verify
 ├── xet-server-http/         # Axum router, handlers, middleware
 ├── xet-server-bin/          # The `xet-server` binary

@@ -127,14 +127,16 @@ pub trait RepoAuthz: Send + Sync {
 | Trait | Crate | Impl |
 |-------|-------|------|
 | `BlobStore` | `xet-server-storage-fs` | `FsBlobStore` — atomic temp→rename writes, byte-range reads |
+| `BlobStore` | `xet-server-storage-mem` | `MemBlobStore` — `RwLock<HashMap>`, used for tests and the M8 pluggability check |
 | `MetadataStore` | `xet-server-meta-sqlite` | `SqliteMetadataStore` — runtime `sqlx` queries (no compile-time DB) |
 | `RepoAuthz` | `xet-server-authz-mem` | `AlwaysAllow` (tests) and `ConfigAuthz` (static map of hub bearers → users → repo scopes) |
+| `RepoAuthz` | `xet-server-authz-http` | `HttpAuthz` — skeleton that delegates `check_repo_access` to a small `POST /check_access` upstream contract. Validates the GitLab/Gitea seam without committing to either API surface. Xet token mint/verify stays local. |
 
 ### Planned implementations
 
 - `BlobStore` on S3-compatible object storage, with real presigned URLs returned from `presign_xorb_range` so the HTTP layer can hand them out directly in `fetch_info`.
 - `MetadataStore` on Postgres (only required when we outgrow SQLite — the schema is portable).
-- `RepoAuthz` proxying to GitLab or Gitea: verify the hub bearer by calling `/api/v4/user` (or Gitea equivalent), check repo membership via their API, mint Xet tokens with the same `xet-server-tokens` crate.
+- `RepoAuthz` proxying to GitLab or Gitea: replace the `/check_access` shim with calls to `/api/v4/user` (or the Gitea equivalent) and project-member lookups. `HttpAuthz` is the trait seam check; the production impls will likely be their own crates that talk directly to the upstream APIs.
 
 ## Wire surface
 
