@@ -245,6 +245,13 @@ pub trait MetadataStore: Send + Sync {
 
     async fn xorb_exists(&self, xorb: &XorbHash) -> CoreResult<bool>;
     async fn lookup_file(&self, file_hash: &FileHash) -> CoreResult<Option<Vec<FileTerm>>>;
+    /// Authorization helper for the reconstruction handler: returns `true`
+    /// iff `file_hash` has been registered in `repo_id` (via a prior
+    /// `register_file` call from a write-scoped session for that repo).
+    /// Cross-repo dedup is supported — the same `file_hash` can be
+    /// registered in multiple repos, and each registration independently
+    /// grants read access.
+    async fn file_in_repo(&self, file_hash: &FileHash, repo_id: &str) -> CoreResult<bool>;
     /// Resolve a file by its LFS-style sha256 OID. Returns the Xet `FileHash`
     /// the OID was registered under, or `None` if no shard has uploaded a file
     /// carrying that sha256 yet. The sha256 is the standard 32-byte hash —

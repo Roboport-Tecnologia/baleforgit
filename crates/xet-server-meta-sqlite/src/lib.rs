@@ -43,15 +43,21 @@ CREATE TABLE IF NOT EXISTS xorb_frames (
 );
 
 CREATE TABLE IF NOT EXISTS files (
-    file_hash    BLOB    PRIMARY KEY,
+    file_hash    BLOB    NOT NULL,
     repo_type    TEXT    NOT NULL,
     repo_id      TEXT    NOT NULL,
     revision     TEXT    NOT NULL,
     sha256       BLOB,
     total_bytes  INTEGER NOT NULL,
-    created_at   INTEGER NOT NULL
+    created_at   INTEGER NOT NULL,
+    -- Composite primary key so the same file_hash can be registered in
+    -- multiple repos (cross-repo dedup). The reconstruction handler uses
+    -- this row to authorize a read: token scoped to repo X can only
+    -- reconstruct file_hashes that have a (file_hash, repo_id=X) row.
+    PRIMARY KEY (file_hash, repo_id)
 );
 CREATE INDEX IF NOT EXISTS files_by_sha256 ON files(sha256) WHERE sha256 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS files_by_repo ON files(repo_id);
 
 CREATE TABLE IF NOT EXISTS file_terms (
     file_hash       BLOB    NOT NULL,
@@ -267,6 +273,16 @@ impl MetadataStore for SqliteMetadataStore {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| CoreError::Internal(format!("select xorb: {e}")))?;
+        Ok(row.is_some())
+    }
+
+    async fn file_in_repo(&self, file_hash: &FileHash, repo_id: &str) -> CoreResult<bool> {
+        let row = sqlx::query("SELECT 1 FROM files WHERE file_hash = ? AND repo_id = ? LIMIT 1")
+            .bind(hash_to_blob(&file_hash.0))
+            .bind(repo_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| CoreError::Internal(format!("select file_in_repo: {e}")))?;
         Ok(row.is_some())
     }
 
@@ -589,6 +605,47 @@ mod tests {
         assert_eq!(back[1].xorb, xorb_b);
         assert_eq!(back[1].unpacked_segment_bytes, 500);
         assert!(back[0].verification.is_some());
+    }
+
+    #[tokio::test]
+    async fn file_in_repo_supports_cross_repo_dedup() {
+        let s = store().await;
+        let file = FileHash(h(0xCC));
+        let alice = RepoRef {
+            repo_type: RepoType::Model,
+            repo_id: "alice/m".into(),
+            revision: "main".into(),
+        };
+        let bob = RepoRef {
+            repo_type: RepoType::Model,
+            repo_id: "bob/m".into(),
+            revision: "main".into(),
+        };
+        let terms = vec![FileTerm {
+            xorb: XorbHash(h(0x33)),
+            chunk_idx_start: 0,
+            chunk_idx_end: 1,
+            unpacked_segment_bytes: 16,
+            verification: None,
+        }];
+
+        // Initially unknown to either repo.
+        assert!(!s.file_in_repo(&file, "alice/m").await.unwrap());
+        assert!(!s.file_in_repo(&file, "bob/m").await.unwrap());
+
+        // After Alice's registration, only Alice sees it.
+        s.register_file(&file, &alice, None, &terms).await.unwrap();
+        assert!(s.file_in_repo(&file, "alice/m").await.unwrap());
+        assert!(!s.file_in_repo(&file, "bob/m").await.unwrap());
+
+        // Bob registers the same file_hash — both repos visible (cross-repo
+        // dedup), and Alice's registration is NOT displaced (composite PK).
+        s.register_file(&file, &bob, None, &terms).await.unwrap();
+        assert!(s.file_in_repo(&file, "alice/m").await.unwrap());
+        assert!(s.file_in_repo(&file, "bob/m").await.unwrap());
+
+        // Unrelated repo still 404s.
+        assert!(!s.file_in_repo(&file, "carol/m").await.unwrap());
     }
 
     #[tokio::test]

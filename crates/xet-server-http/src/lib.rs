@@ -388,7 +388,7 @@ fn shard_storage_hash(bytes: &[u8]) -> ShardHash {
 
 async fn get_reconstruction<B, M, A>(
     State(svc): State<Service<B, M, A>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path(file_hex): Path<String>,
 ) -> Result<Json<QueryReconstructionResponse>, ApiError>
 where
@@ -396,12 +396,19 @@ where
     M: MetadataStore,
     A: RepoAuthz,
 {
-    // TODO: scope-check the file's owning repo against `_claims.repo`. The
-    // prototype is permissive: any read token can fetch any file. In production
-    // we'd want a `files.repo_id == claims.repo.repo_id` check (or fall back
-    // to a cross-repo dedup policy).
     let file_hash =
         FileHash(decode_hash(&file_hex).map_err(|e| bad_req(format!("malformed file id: {e}")))?);
+    // Caller must have a registration of this file in their token's repo.
+    // Cross-repo dedup is allowed: if two repos register the same file_hash,
+    // both can read it. We return 404 (not 403) so an attacker can't probe
+    // for existence in another repo.
+    if !svc
+        .meta
+        .file_in_repo(&file_hash, &claims.repo.repo_id)
+        .await?
+    {
+        return Err(ApiError(StatusCode::NOT_FOUND, "file not found".into()));
+    }
     let resp = build_reconstruction_response(&svc, &file_hash).await?;
     Ok(Json(resp))
 }
@@ -411,7 +418,7 @@ where
 /// not the Xet weird-LE-u64 encoding used everywhere else.
 async fn get_reconstruction_by_sha256<B, M, A>(
     State(svc): State<Service<B, M, A>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path(sha256_hex): Path<String>,
 ) -> Result<Json<QueryReconstructionResponse>, ApiError>
 where
@@ -426,6 +433,15 @@ where
         .lookup_file_by_sha256(&sha256)
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "file not found".into()))?;
+    // Same scope check as the hash-keyed handler — see get_reconstruction.
+    // Returning 404 on miss avoids leaking which sha256s exist in other repos.
+    if !svc
+        .meta
+        .file_in_repo(&file_hash, &claims.repo.repo_id)
+        .await?
+    {
+        return Err(ApiError(StatusCode::NOT_FOUND, "file not found".into()));
+    }
     let resp = build_reconstruction_response(&svc, &file_hash).await?;
     Ok(Json(resp))
 }
