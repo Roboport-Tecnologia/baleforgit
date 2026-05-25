@@ -1,10 +1,4 @@
-//! Xet JWT mint / verify.
-//!
-//! These are HS256 tokens issued by our mock HF Hub endpoint and accepted by
-//! the CAS API. Symmetric secret because the same process mints and verifies;
-//! moving to RS256 (issuer ≠ verifier) is a future-proofing step we'll take
-//! if/when a `RepoAuthz` impl needs to mint tokens out-of-process and have
-//! xet-server verify them.
+//! Xet JWT mint / verify (HS256, symmetric secret).
 
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -13,12 +7,12 @@ use xet_server_core::{CoreError, CoreResult, RepoRef, RepoType, Scope, TokenClai
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct XetClaims {
-    pub sub: String,       // user id
-    pub repo_type: String, // "model" | "dataset" | "space"
-    pub repo_id: String,   // "ns/name"
-    pub revision: String,  // git revision
-    pub scope: String,     // "read" | "write"
-    pub exp: u64,          // unix seconds
+    pub sub: String,
+    pub repo_type: String,
+    pub repo_id: String,
+    pub revision: String,
+    pub scope: String,
+    pub exp: u64,
 }
 
 fn now_unix() -> u64 {
@@ -137,12 +131,8 @@ mod tests {
     #[test]
     fn verify_rejects_expired() {
         let secret = b"k";
-        // Mint a token with negative TTL relative to now by wrapping; we use
-        // a tiny ttl and assert verify accepts it now and would reject in the
-        // future. (Simpler than mucking with sys time.)
         let (tok, _) = mint(secret, &UserId("u".into()), &repo(), Scope::Read, 1).unwrap();
         assert!(verify(secret, &tok).is_ok());
-        // Manually mint a token already expired by 1 hour.
         let claims = XetClaims {
             sub: "u".into(),
             repo_type: "model".into(),

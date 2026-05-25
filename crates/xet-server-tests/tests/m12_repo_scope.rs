@@ -1,17 +1,7 @@
-//! M12: per-repo scope check on the reconstruction handler.
-//!
-//! Before this milestone, `/v1/reconstructions/{file_id}` was open to any
-//! valid read token — a token for repo A could fetch reconstruction terms
-//! for any file_id, including those uploaded to a different repo. This test
-//! pins down the new behavior:
-//!
-//! 1. Alice uploads a file (xorb + shard) into `alice/repo`. Alice's read
-//!    token can fetch the reconstruction.
-//! 2. Bob has a read token for `bob/repo`. The *same* file_id is invisible
-//!    to him — 404, not 403 (so existence is not leaked).
-//! 3. Bob uploads the same shard into `bob/repo` (cross-repo dedup; the
-//!    xorb is reused under the hood). Bob can now fetch the reconstruction.
-//! 4. Alice can still fetch (her registration was not displaced).
+//! Per-repo scope on the reconstruction handler. A read token for repo A must
+//! 404 (not 403, to avoid leaking existence) on a file_id registered only in
+//! repo B, and re-registering under B must coexist with A's row (composite PK
+//! on (file_hash, repo_id)).
 
 use std::sync::Arc;
 
@@ -44,7 +34,6 @@ async fn read_json<T: serde::de::DeserializeOwned>(body: Body) -> T {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-/// Two distinct repos, each with its own write- and read-token-bearing user.
 async fn build_two_repo_app() -> axum::Router {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.keep();
@@ -82,9 +71,8 @@ async fn issue_token(
     read_json(resp.into_body()).await
 }
 
-/// Uploads a xorb + shard registering `file` under the bearer's repo. The
-/// shard is identical across calls so re-upload from a different repo
-/// exercises cross-repo dedup (chunks already known).
+/// Uploads xorb + shard registering `file` under the bearer's repo. The
+/// shard is identical across calls so cross-repo dedup is exercised.
 async fn upload_file(app: &axum::Router, token: &str, xorb: XorbHash, file: FileHash) {
     let payload: Vec<u8> = (0..512u32).map(|i| i as u8).collect();
     let body = build_uncompressed_xorb_body(&[&payload]);
@@ -159,7 +147,6 @@ async fn cross_repo_isolation_and_dedup() {
     let xorb = XorbHash(h(0x10));
     let file = FileHash(h(0xF0));
 
-    // 1. Alice uploads. Her token can read the reconstruction.
     upload_file(&app, &alice_w.access_token, xorb, file).await;
     assert_eq!(
         reconstruction_status(&app, &alice_w.access_token, &file).await,
@@ -167,17 +154,15 @@ async fn cross_repo_isolation_and_dedup() {
         "alice should see her own file"
     );
 
-    // 2. Bob's token must NOT see the file. 404 (existence not leaked),
-    //    not 403.
+    // Bob's token must NOT see the file — 404 (existence not leaked), not 403.
     assert_eq!(
         reconstruction_status(&app, &bob_w.access_token, &file).await,
         StatusCode::NOT_FOUND,
         "bob must not be able to read alice's file"
     );
 
-    // 3. Bob re-uploads the same shard into his repo. The xorb is already
-    //    on the server (xorb-upload is content-addressed and idempotent),
-    //    but the shard creates a new (file_hash, repo_id=bob/repo) row.
+    // Re-upload from bob: xorb is idempotent (content-addressed), but the
+    // shard adds a new (file_hash, repo_id=bob/repo) row.
     upload_file(&app, &bob_w.access_token, xorb, file).await;
     assert_eq!(
         reconstruction_status(&app, &bob_w.access_token, &file).await,
@@ -185,8 +170,6 @@ async fn cross_repo_isolation_and_dedup() {
         "bob should see his own registration of the same file"
     );
 
-    // 4. Alice's registration was not displaced by Bob's — both rows
-    //    coexist (composite PK on (file_hash, repo_id)).
     assert_eq!(
         reconstruction_status(&app, &alice_w.access_token, &file).await,
         StatusCode::OK,
@@ -196,9 +179,8 @@ async fn cross_repo_isolation_and_dedup() {
 
 #[tokio::test]
 async fn missing_file_for_authorized_repo_is_404() {
-    // Sanity check that the 404 we return for "not in your repo" is
-    // indistinguishable from "doesn't exist anywhere" — the whole point
-    // of using 404 instead of 403.
+    // The 404 for "not in your repo" must match "doesn't exist anywhere" —
+    // that's the whole point of 404-not-403.
     let app = build_two_repo_app().await;
     let alice_w = issue_token(&app, "hub-alice", "alice/repo", "write").await;
     let nonexistent = FileHash(h(0xFE));

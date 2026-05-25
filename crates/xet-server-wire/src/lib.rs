@@ -25,10 +25,9 @@ pub fn encode_hash(h: &Hash32) -> String {
     let mut out = String::with_capacity(HASH_LEN * 2);
     for group in 0..4 {
         let start = group * 8;
-        // Reverse each 8-byte group before hex-encoding.
         for i in (0..8).rev() {
             use std::fmt::Write;
-            // Safe: writing to String never fails.
+            // Writing to String never fails.
             let _ = write!(out, "{:02x}", h.0[start + i]);
         }
     }
@@ -63,8 +62,6 @@ fn hex_nibble(c: u8) -> Result<u8, HexError> {
         _ => Err(HexError::BadHex),
     }
 }
-
-// ---- JSON wire types -------------------------------------------------------
 
 /// Half-open `[start, end)` range used for chunk indices and byte ranges.
 /// Matches the spec's JSON shape `{"start": N, "end": N}`.
@@ -127,9 +124,8 @@ pub struct XetTokenResponse {
 mod tests {
     use super::*;
 
-    /// Spec test vector (with the small typo in the spec text corrected — the
-    /// algorithm gives 64 hex chars; the published example string is missing
-    /// the byte "10").
+    /// Spec test vector. The published example string is missing the byte "10";
+    /// the algorithm gives 64 hex chars, so we reinstate it here.
     #[test]
     fn hash_hex_spec_vector() {
         let input = Hash32([

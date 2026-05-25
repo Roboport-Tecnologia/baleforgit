@@ -1,6 +1,3 @@
-//! M5: full token issuance → upload → download flow using `ConfigAuthz`.
-//! Also covers scope enforcement and missing-bearer rejection.
-
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -33,7 +30,6 @@ async fn read_json<T: serde::de::DeserializeOwned>(body: Body) -> T {
 
 async fn build_app() -> axum::Router {
     let dir = tempfile::tempdir().unwrap();
-    // Leak the tempdir to keep the path alive for the whole test (cheap, test-only).
     let path = dir.keep();
     let blobs = Arc::new(FsBlobStore::open(path.join("blobs")).await.unwrap());
     let meta = Arc::new(SqliteMetadataStore::open_path(":memory:").await.unwrap());
@@ -74,7 +70,6 @@ async fn write_token_unlocks_upload_then_download() {
     assert_eq!(tok.cas_url, "http://test.invalid");
     assert!(!tok.access_token.is_empty());
 
-    // Upload a xorb (real xorb container, one uncompressed frame).
     let xorb = XorbHash(h(0x10));
     let payload: Vec<u8> = (0..512u32).map(|i| i as u8).collect();
     let body = build_uncompressed_xorb_body(&[&payload]);
@@ -87,7 +82,6 @@ async fn write_token_unlocks_upload_then_download() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Upload a shard.
     let file = FileHash(h(0xF0));
     let shard = ParsedShard {
         header: ShardHeader {
@@ -130,7 +124,6 @@ async fn write_token_unlocks_upload_then_download() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Switch to a read token and fetch the reconstruction.
     let read_tok = issue_token(&app, "hub-bob", "read").await;
     let req = Request::builder()
         .method("GET")
@@ -206,8 +199,8 @@ async fn hub_endpoint_rejects_unknown_hub_token() {
 
 #[tokio::test]
 async fn hub_endpoint_rejects_unauthorized_write_request() {
-    let app = build_app().await;
     // hub-bob is only granted Read; asking for a write token should 403.
+    let app = build_app().await;
     let req = Request::builder()
         .method("GET")
         .uri("/api/models/alice/big-model/xet-write-token/main")

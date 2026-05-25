@@ -1,16 +1,6 @@
-//! M8 pluggability sanity check.
-//!
-//! Same wire-level behavior as M5 (token issuance → write upload → read
-//! download) but driving the HTTP router with alternate trait impls:
-//!
-//! - `BlobStore` -> `xet-server-storage-mem::MemBlobStore` (instead of `FsBlobStore`)
-//! - `RepoAuthz` -> `xet-server-authz-http::HttpAuthz` talking to an in-process
-//!   mock upstream (instead of `ConfigAuthz`'s in-memory map)
-//!
-//! The point isn't to test the impls themselves (their own crates do that);
-//! it's to confirm the trait seams are wide enough that the handlers don't
-//! care which impl they're wired to. If anything had to change in
-//! `xet-server-http` to make this work, the trait was wrong.
+//! Pluggability check: run the M5 flow against alternate trait impls
+//! (`MemBlobStore` + HTTP-backed `HttpAuthz` to an in-process mock upstream).
+//! If anything in `xet-server-http` had to change, the trait seam was wrong.
 
 use axum::body::{Body, Bytes as AxumBytes};
 use axum::extract::State;
@@ -48,8 +38,6 @@ async fn read_json<T: serde::de::DeserializeOwned>(body: Body) -> T {
     let bytes = body.collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
 }
-
-// ---- Mock upstream "repo authority" -----------------------------------------
 
 #[derive(Clone)]
 struct UpstreamState(Arc<Vec<(String, String, String, Scope)>>);
@@ -98,11 +86,8 @@ async fn spawn_upstream(grants: Vec<(String, String, String, Scope)>) -> String 
     format!("http://{addr}")
 }
 
-// ---- The test --------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn end_to_end_against_alternate_impls() {
-    // (1) Alternate `RepoAuthz`: HTTP-backed, pointing at a mock upstream.
     let upstream = spawn_upstream(vec![
         (
             "hub-alice".into(),
@@ -119,8 +104,6 @@ async fn end_to_end_against_alternate_impls() {
     ])
     .await;
     let authz = HttpAuthz::new(upstream, b"jwt-secret-32-bytes-padding-xxxx".to_vec()).unwrap();
-
-    // (2) Alternate `BlobStore`: in-memory.
     let blobs = Arc::new(MemBlobStore::new());
     let meta = Arc::new(SqliteMetadataStore::open_path(":memory:").await.unwrap());
 
@@ -133,7 +116,6 @@ async fn end_to_end_against_alternate_impls() {
     };
     let app = router(svc);
 
-    // ---- Token issuance via mock-HF endpoint (calls upstream) -------------
     let req = Request::builder()
         .method("GET")
         .uri("/api/models/alice/big-model/xet-write-token/main")
@@ -144,7 +126,7 @@ async fn end_to_end_against_alternate_impls() {
     assert_eq!(resp.status(), StatusCode::OK, "write token request");
     let write_tok: XetTokenResponse = read_json(resp.into_body()).await;
 
-    // hub-bob is read-only on this repo; write-token request should 403.
+    // hub-bob is read-only; write-token request should 403.
     let req = Request::builder()
         .method("GET")
         .uri("/api/models/alice/big-model/xet-write-token/main")
@@ -154,7 +136,7 @@ async fn end_to_end_against_alternate_impls() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    // Unknown hub bearer → 401 from upstream, surfaced as 401 to the client.
+    // Unknown hub bearer → 401 from upstream, surfaced as 401.
     let req = Request::builder()
         .method("GET")
         .uri("/api/models/alice/big-model/xet-read-token/main")
@@ -164,7 +146,6 @@ async fn end_to_end_against_alternate_impls() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    // ---- Upload xorb + shard with the write token --------------------------
     let xorb = XorbHash(h(0x20));
     let payload: Vec<u8> = (0..512u32).map(|i| (i as u8).wrapping_mul(3)).collect();
     let body = build_uncompressed_xorb_body(&[&payload]);
@@ -225,7 +206,6 @@ async fn end_to_end_against_alternate_impls() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // ---- Read-token download → reconstruction → byte compare --------------
     let req = Request::builder()
         .method("GET")
         .uri("/api/models/alice/big-model/xet-read-token/main")
@@ -248,8 +228,6 @@ async fn end_to_end_against_alternate_impls() {
         serde_json::from_slice(&body_to_bytes(resp.into_body()).await).unwrap();
     assert_eq!(recon.terms.len(), 1);
 
-    // Follow the transfer URL to actually read the xorb bytes back out of
-    // MemBlobStore.
     let term = &recon.terms[0];
     let entries = recon
         .fetch_info
@@ -272,8 +250,6 @@ async fn end_to_end_against_alternate_impls() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     let slice = body_to_bytes(resp.into_body()).await;
-    // The returned slice is the on-disk byte range covering the term's frame(s);
-    // walk the single uncompressed frame to recover the original payload.
     let frames = parse_xorb_frames(&slice).expect("term slice parses");
     assert_eq!(frames.len(), 1);
     let payload_start = frames[0].on_disk_start as usize + 8;

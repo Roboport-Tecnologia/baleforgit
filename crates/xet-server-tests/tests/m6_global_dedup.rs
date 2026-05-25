@@ -1,10 +1,3 @@
-//! M6: global dedup endpoint.
-//!
-//! Round-trip: register a xorb that contains two chunks (A and B). Query the
-//! dedup endpoint for chunk A. Verify the response is a parseable shard whose
-//! footer carries a fresh HMAC key, and that the response's CAS Info section
-//! lists both A and B with their chunk hashes HMAC-wrapped using that key.
-
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use bytes::Bytes;
@@ -58,9 +51,8 @@ async fn build_app() -> (axum::Router, Arc<SqliteMetadataStore>, Arc<FsBlobStore
     (router(svc), meta, blobs)
 }
 
-/// Helper: write a valid (uncompressed-frame) xorb body of `len` bytes to the
-/// blob store so xorb_exists() will succeed. Body content doesn't matter for
-/// dedup tests — only existence does.
+/// Write a valid (uncompressed-frame) xorb body so xorb_exists() succeeds.
+/// Body content doesn't matter for dedup — only existence does.
 async fn put_dummy_xorb(blobs: &Arc<FsBlobStore>, xorb: XorbHash, len: usize) {
     let payload = vec![0u8; len];
     let body = Bytes::from(build_uncompressed_xorb_body(&[&payload]));
@@ -142,8 +134,7 @@ async fn dedup_returns_shard_with_hmac_wrapped_chunks() {
     );
     let key = footer.chunk_hash_hmac_key.0;
 
-    // The CAS Info section's chunk hashes are HMAC-wrapped — neither raw
-    // chunk hash should appear in the block.
+    // CAS Info chunk hashes are HMAC-wrapped — no raw chunk hash should leak.
     for (i, entry) in block.chunks.iter().enumerate() {
         assert_ne!(
             entry.chunk_hash.as_bytes(),
@@ -157,8 +148,7 @@ async fn dedup_returns_shard_with_hmac_wrapped_chunks() {
         );
     }
 
-    // The client uses the footer key to HMAC its own candidate chunks and look
-    // for matches. We do the same here: both A and B should match.
+    // Mirror the client: HMAC each known chunk with the footer key and match.
     let expected_a = wrap(&key, &chunk_a);
     let expected_b = wrap(&key, &chunk_b);
     let entries: Vec<[u8; HASH_LEN]> = block
@@ -175,7 +165,7 @@ async fn dedup_returns_shard_with_hmac_wrapped_chunks() {
         "wrapped chunk_b not found in response — this is the cross-chunk dedup signal"
     );
 
-    // Byte offsets and unpacked sizes are pass-through (not wrapped).
+    // Byte offsets and unpacked sizes pass through unwrapped.
     assert_eq!(block.chunks[0].byte_start, 0);
     assert_eq!(block.chunks[0].unpacked_segment_bytes, 300);
     assert_eq!(block.chunks[1].byte_start, 300);
@@ -216,7 +206,6 @@ async fn dedup_skips_xorbs_whose_blobs_are_missing() {
     let ghost_xorb = XorbHash(h(0x80));
     let chunk = ChunkHash(h(0x71));
 
-    // Live xorb: row + blob.
     put_dummy_xorb(&blobs, live_xorb, 100).await;
     meta.register_xorb(
         &XorbInfo {
@@ -235,7 +224,7 @@ async fn dedup_skips_xorbs_whose_blobs_are_missing() {
     .await
     .unwrap();
 
-    // Ghost xorb: row only, no blob. Same chunk so xorbs_near_chunk returns both.
+    // Ghost: row only, no blob. Same chunk so xorbs_near_chunk returns both.
     meta.register_xorb(
         &XorbInfo {
             xorb: ghost_xorb,
@@ -306,9 +295,7 @@ async fn dedup_404s_when_only_ghost_xorbs_remain() {
 
 #[tokio::test]
 async fn dedup_returns_fresh_key_each_response() {
-    // Two back-to-back queries for the same chunk should return different HMAC
-    // keys (per-response randomness). If they ever coincide, callers could
-    // correlate queries; we treat that as a bug.
+    // Per-response key must be fresh; reuse would let callers correlate queries.
     let (app, meta, blobs) = build_app().await;
 
     let xorb = XorbHash(h(0x55));

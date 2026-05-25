@@ -1,36 +1,5 @@
-//! M9: full end-to-end `git lfs push` through git-lfs → xet-lfs-adapter (Go) →
-//! xet-server. Demonstrates the integration path a real Xet deployment behind
-//! a self-hosted git forge would follow: the adapter speaks the standard LFS
-//! Batch API, the xet-server is unchanged.
-//!
-//! Tools required on PATH (test skips with eprintln if any are missing):
-//!   - `go`        (to build the adapter)
-//!   - `git`       (to drive the repo)
-//!   - `git-lfs`   (to trigger the batch API)
-//!   - `git-xet`   (the custom transfer agent named "xet")
-//!
-//! Flow assembled inside the test:
-//!
-//!   ┌──────────────────────┐
-//!   │ git lfs push --all   │   (we don't push refs; LFS objects only)
-//!   └──┬───────────────────┘
-//!      │ spawns
-//!      ▼
-//!   ┌──────────┐  /repos/{o}/{r}/objects/batch  ┌────────────────────┐
-//!   │  git-lfs │───────────────────────────────▶│ xet-lfs-adapter    │ (Go)
-//!   └────┬─────┘                                └────────┬───────────┘
-//!        │                                               │ forwards PAT to
-//!        │ transfer=xet, action.header=X-Xet-*           │ /api/.../xet-write-token/main
-//!        ▼                                               ▼
-//!   ┌──────────┐  stdin/stdout JSON   ┌─────────────────────────────────┐
-//!   │ git-xet  │─────────────────────▶│         xet-server (Rust)       │
-//!   └──────────┘  uploads via HTTP    │  authz-http checks PAT upstream │
-//!                                     └──────────────┬──────────────────┘
-//!                                                    │ POST /check_access
-//!                                                    ▼
-//!                                          ┌────────────────────┐
-//!                                          │ mock PAT verifier  │ (axum)
-//!                                          └────────────────────┘
+//! End-to-end `git lfs push` through git-lfs → xet-lfs-adapter (Go) → xet-server.
+//! Skips silently if any of {go, git, git-lfs, git-xet} isn't on PATH.
 
 mod common;
 use common::*;
@@ -56,7 +25,6 @@ async fn git_push_through_lfs_adapter_to_xet_server() {
     let build_dir = tempfile::tempdir().unwrap();
     let adapter_bin = build_adapter(build_dir.path()).expect("lfs-adapter source missing");
 
-    // ---- xet-server stack -------------------------------------------------
     let verifier_url = spawn_verifier().await;
     let authz = HttpAuthz::new(&verifier_url, JWT_SECRET.to_vec()).unwrap();
 
@@ -82,10 +50,8 @@ async fn git_push_through_lfs_adapter_to_xet_server() {
     let app = xet_router(svc);
     let xet_handle = tokio::spawn(async move { axum::serve(xet_listener, app).await });
 
-    // ---- LFS adapter ------------------------------------------------------
     let adapter = spawn_adapter(&adapter_bin, &xet_url);
 
-    // ---- Working git repo -------------------------------------------------
     let work_root = tempfile::tempdir().unwrap();
     let work = work_root.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -100,8 +66,7 @@ async fn git_push_through_lfs_adapter_to_xet_server() {
     run_git(&work, &["add", ".gitattributes"]);
     run_git(&work, &["commit", "-q", "-m", "track .bin via lfs"]);
 
-    // ~300 KiB of deterministic non-trivial bytes — enough for CDC to make
-    // multiple chunks per xorb.
+    // ~300 KiB so CDC produces multiple chunks per xorb.
     let payload: Vec<u8> = (0..300_000u32)
         .map(|i| ((i.wrapping_mul(2654435761)) >> 16) as u8)
         .collect();
@@ -109,9 +74,8 @@ async fn git_push_through_lfs_adapter_to_xet_server() {
     run_git(&work, &["add", "big.bin"]);
     run_git(&work, &["commit", "-q", "-m", "add big.bin"]);
 
-    // `git lfs push` pushes only the LFS-tracked objects (not the git refs)
-    // to `lfs.url`. Failure here means the LFS chain broke somewhere:
-    // batch API → adapter → xet-server token endpoint → git-xet → CAS upload.
+    // Pushes only LFS objects (not refs). Failure here means the LFS chain
+    // broke: batch API → adapter → token endpoint → git-xet → CAS upload.
     let out = Command::new("git")
         .args(["lfs", "push", "--all", "origin"])
         .current_dir(&work)
@@ -124,20 +88,14 @@ async fn git_push_through_lfs_adapter_to_xet_server() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    // ---- Verify the bytes actually made it to xet-server ------------------
     let n_xorbs = meta.count_xorbs().await.unwrap();
     let n_files = meta.count_files().await.unwrap();
     assert!(n_xorbs > 0, "expected at least one xorb registered");
     assert!(n_files > 0, "expected at least one file registered");
 
-    // Best-effort cleanup. The Drop on `adapter` kills its child; the xet
-    // task is detached and dies with the runtime.
     drop(adapter);
     xet_handle.abort();
-
-    // Touch the tempdirs / build_dir so the compiler doesn't drop them early.
     let _ = (data_dir, work_root, build_dir);
-    // Give children a moment to settle so background reaper doesn't race the
-    // test runner shutting down.
+    // Let children settle before the runtime tears down.
     tokio::time::sleep(Duration::from_millis(50)).await;
 }

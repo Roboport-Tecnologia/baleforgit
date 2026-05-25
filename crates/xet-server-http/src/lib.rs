@@ -1,13 +1,6 @@
-//! HTTP layer for the Xet CAS server.
-//!
-//! Routes exposed by [`router`]:
-//! - `POST /v1/xorbs/{prefix}/{hash}`           (xorb upload, write scope)
-//! - `POST /shards`                             (shard upload + indexing, write scope)
-//! - `GET  /v1/reconstructions/{file_id}`       (reconstruction metadata, read scope)
-//! - `GET  /v1/reconstructions/by-sha256/{sha256}` (same, but keyed by LFS sha256 OID)
-//! - `GET  /v1/chunks/{prefix}/{hash}`          (global dedup query, read scope)
-//! - `GET  /xorb/default/{hash}` (signed)       (byte-range transfer, no bearer auth)
-//! - `GET  /api/{type}s/{ns}/{name}/xet-{rw}-token/{rev}` (mock HF Hub token endpoint)
+//! HTTP layer for the Xet CAS server. See `docs/ARCHITECTURE.md` for the full
+//! route table, wire formats, and the "Tricky bits" notes that explain *why*
+//! several handlers behave the way they do.
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
@@ -74,9 +67,7 @@ where
     M: MetadataStore + 'static,
     A: RepoAuthz + 'static,
 {
-    // Authenticated CAS routes — paths match what xet-core's RemoteClient
-    // actually issues. `prefix` is parameterized per the real protocol; it's
-    // always "default" in practice today, but multi-tenancy in spirit.
+    // `prefix` is parameterized per the protocol but always "default" today.
     let v1 = Router::new()
         .route("/v1/xorbs/{prefix}/{hash}", post(upload_xorb::<B, M, A>))
         .route("/shards", post(upload_shard::<B, M, A>))
@@ -97,11 +88,8 @@ where
             auth_middleware::<B, M, A>,
         ));
 
-    // TraceLayer wraps every request with a span and emits one log line per
-    // response. At default RUST_LOG=info you'll see `200 POST /shards`-style
-    // access logs; on 4xx/5xx the `on_failure` line fires at WARN so the
-    // status + latency are surfaced even when ApiError's own warn (below)
-    // already logged the message body.
+    // Access logs at INFO; on 4xx/5xx the on_failure line fires at WARN even
+    // when ApiError (below) already logged the response body.
     let trace = TraceLayer::new_for_http()
         .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
         .on_response(DefaultOnResponse::new().level(Level::INFO))
@@ -125,10 +113,8 @@ pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        // Log the response *before* dropping the message into the body, so the
-        // reason for any 4xx/5xx is visible in the server log even when the
-        // client (e.g. git-xet) swallows the response body. 5xx → error!,
-        // 4xx → warn!. TraceLayer's span carries the method/path/request_id.
+        // Log the message before it's consumed into the body — clients like
+        // git-xet swallow response bodies, so this is often the only trace.
         if self.0.is_server_error() {
             tracing::error!(status = %self.0.as_u16(), error = %self.1, "api 5xx");
         } else {
@@ -187,7 +173,6 @@ where
         .await
         .map_err(ApiError::from)?;
 
-    // POST methods require write scope.
     if method == Method::POST && claims.scope == Scope::Read {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
@@ -264,11 +249,9 @@ where
     if body.len() > MAX_BODY_BYTES {
         return Err(bad_req("xorb exceeds 64 MiB limit"));
     }
-    // Walk the xorb's chunk frames and stash their on-disk byte ranges.
-    // The shard's CAS Info only records uncompressed offsets, so reconstruction
-    // would otherwise have no way to compute correct HTTP byte ranges for
-    // real (compressed) xorbs. We parse before persisting so a malformed body
-    // is rejected up-front rather than half-stored.
+    // Record on-disk frame ranges: shard CAS Info has only uncompressed
+    // offsets, so reconstruction can't compute HTTP byte ranges without this.
+    // Parse before persisting to reject malformed bodies without half-storing.
     let frames =
         parse_xorb_frames(&body).map_err(|e| bad_req(format!("malformed xorb body: {e}")))?;
     let layout: Vec<XorbFrameRow> = frames
@@ -398,10 +381,7 @@ where
 {
     let file_hash =
         FileHash(decode_hash(&file_hex).map_err(|e| bad_req(format!("malformed file id: {e}")))?);
-    // Caller must have a registration of this file in their token's repo.
-    // Cross-repo dedup is allowed: if two repos register the same file_hash,
-    // both can read it. We return 404 (not 403) so an attacker can't probe
-    // for existence in another repo.
+    // 404 (not 403) on miss to avoid probing for files in other repos.
     if !svc
         .meta
         .file_in_repo(&file_hash, &claims.repo.repo_id)
@@ -413,9 +393,8 @@ where
     Ok(Json(resp))
 }
 
-/// LFS-keyed entry point into the same reconstruction response. The sha256 here
-/// is the standard LFS OID — a plain 64-char lowercase hex of the 32-byte hash,
-/// not the Xet weird-LE-u64 encoding used everywhere else.
+/// LFS-keyed reconstruction. `sha256` is a standard LFS OID (plain 64-char
+/// lowercase hex), not the Xet LE-u64 encoding used elsewhere.
 async fn get_reconstruction_by_sha256<B, M, A>(
     State(svc): State<Service<B, M, A>>,
     Extension(claims): Extension<TokenClaims>,
@@ -433,8 +412,7 @@ where
         .lookup_file_by_sha256(&sha256)
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "file not found".into()))?;
-    // Same scope check as the hash-keyed handler — see get_reconstruction.
-    // Returning 404 on miss avoids leaking which sha256s exist in other repos.
+    // Same scope check as get_reconstruction; 404 to avoid cross-repo probes.
     if !svc
         .meta
         .file_in_repo(&file_hash, &claims.repo.repo_id)
@@ -461,9 +439,8 @@ where
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "file not found".into()))?;
 
-    // Use the xorb's *on-disk* frame layout (recorded at xorb-upload time) —
-    // NOT the chunks table, whose byte_start/unpacked_segment_bytes come from
-    // the shard's CAS Info and live in uncompressed coordinate space.
+    // Use the xorb's on-disk frame layout — NOT the chunks table, whose
+    // offsets live in uncompressed coordinate space.
     let mut layout_by_xorb: BTreeMap<[u8; HASH_LEN], Vec<XorbFrameRow>> = BTreeMap::new();
     for t in &terms {
         layout_by_xorb.entry(*t.xorb.as_bytes()).or_default();
@@ -540,8 +517,7 @@ where
     })
 }
 
-/// Decode a 64-char lowercase hex string into a 32-byte hash. Standard hex
-/// (NOT the Xet LE-u64 encoding) — this is what LFS clients send as the `oid`.
+/// Decode a 64-char lowercase hex LFS OID. Standard hex, NOT the Xet LE-u64 encoding.
 fn decode_lfs_sha256(s: &str) -> Result<Hash32, String> {
     if s.len() != HASH_LEN * 2 {
         return Err(format!("must be {} chars", HASH_LEN * 2));
@@ -557,14 +533,11 @@ fn decode_lfs_sha256(s: &str) -> Result<Hash32, String> {
 
 // ---- Handlers: global dedup ------------------------------------------------
 
-/// Cap on how many "neighborhood" xorbs we'll cite per dedup response. Each
-/// citation costs `48 + 48*num_chunks` shard bytes; a single ~1024-chunk xorb
-/// is ~48 KiB, and 8 of them is ~384 KiB — comfortably under the 64 MiB shard
-/// limit and small enough to keep the round trip fast.
+/// Max xorbs cited per dedup response. 8 × ~1024-chunk xorbs is ~384 KiB,
+/// well under the 64 MiB shard limit and small enough to stay round-trip fast.
 const DEDUP_NEIGHBORHOOD: usize = 8;
 
-/// Shard key lifetime — the client may HMAC-match against this key for as long
-/// as it's still valid. 1 day matches HF's published value.
+/// Shard key lifetime — matches HF's published value.
 const DEDUP_KEY_TTL_SECS: u64 = 24 * 60 * 60;
 
 async fn get_dedup_chunk<B, M, A>(
@@ -586,12 +559,10 @@ where
         .xorbs_near_chunk(&chunk_hash, DEDUP_NEIGHBORHOOD)
         .await?;
 
-    // The chunks table can outlive the blob store — e.g. data root was wiped
-    // while SQLite was preserved, or a future GC removed an unreferenced xorb
-    // before its chunk rows. Advertising a missing xorb is a foot-gun: the
-    // client trusts dedup, skips re-uploading, then /shards rejects the
-    // resulting shard with "references missing xorb". Filter to xorbs whose
-    // blobs actually exist so dedup never advertises ghosts.
+    // Filter out xorbs whose blobs are gone — the chunks table can outlive
+    // the blob store (wiped data root, future GC). Advertising a missing xorb
+    // would make the client skip re-upload, then /shards rejects the shard
+    // with "references missing xorb".
     let mut near = Vec::with_capacity(candidates.len());
     let mut missing = 0usize;
     for x in candidates {
@@ -613,8 +584,8 @@ where
         return Err(ApiError(StatusCode::NOT_FOUND, "chunk not found".into()));
     }
 
-    // Per-response random HMAC key. Written into the shard footer so the client
-    // can wrap its own candidate chunk hashes and look for matches.
+    // Per-response HMAC key written into the footer; the client wraps its
+    // own candidate chunks with it to match against ours without learning them.
     let hmac_key: [u8; HASH_LEN] = rand::random();
 
     let mut cas_blocks = Vec::with_capacity(near.len());

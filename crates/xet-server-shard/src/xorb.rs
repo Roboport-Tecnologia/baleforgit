@@ -31,11 +31,9 @@ pub struct XorbChunkFrame {
     pub on_disk_start: u32,
     /// Total on-disk frame size: 8 (header) + compressed_length.
     pub on_disk_len: u32,
-    /// Payload size after decompression. The server records this so it can
-    /// cross-check the shard's CAS Info entries if we ever want to.
+    /// Payload size after decompression.
     pub uncompressed_len: u32,
-    /// Raw compression-scheme byte. Useful for diagnostics; the decompressor
-    /// in the LFS adapter is what actually consumes it.
+    /// Raw compression-scheme byte (0=none, 1=LZ4 frame, 2=BG4-LZ4).
     pub compression_scheme: u8,
 }
 

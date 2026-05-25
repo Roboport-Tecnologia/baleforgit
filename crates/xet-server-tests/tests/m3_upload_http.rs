@@ -1,7 +1,3 @@
-//! M3 integration: drive the HTTP router via in-process `tower::oneshot` to
-//! upload a xorb and then a shard referencing it, then check the metadata
-//! layer was populated correctly.
-
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use bytes::Bytes;
@@ -47,16 +43,14 @@ async fn upload_xorb_then_shard_indexes_metadata() {
     };
     let app = router(svc);
 
-    // Build a synthetic xorb body. The server doesn't currently re-verify the
-    // xorb hash against the body (see TODO in handler) so any 32-byte hash works.
-    // It DOES parse the body to extract the on-disk frame layout, so we have
-    // to wrap our two 256-byte "chunks" in valid xorb frames.
+    // Server parses the body to extract on-disk frame layout, so the two
+    // "chunks" must be wrapped in valid xorb frames. The hash is not re-verified
+    // against the body (see TODO in handler).
     let xorb_hash = XorbHash(h(0x10));
     let chunk0_payload: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
     let chunk1_payload: Vec<u8> = (0..256u32).map(|i| (i as u8).wrapping_add(0x80)).collect();
     let xorb_body = build_uncompressed_xorb_body(&[&chunk0_payload, &chunk1_payload]);
 
-    // 1) Upload the xorb.
     let req = Request::builder()
         .method("POST")
         .uri(format!("/v1/xorbs/default/{}", encode_hash(&xorb_hash.0)))
@@ -68,7 +62,7 @@ async fn upload_xorb_then_shard_indexes_metadata() {
     let body: UploadXorbResponse = read_body_json(resp.into_body()).await;
     assert!(body.was_inserted, "first xorb upload should insert");
 
-    // Second upload of the same xorb is idempotent.
+    // Re-upload is idempotent.
     let req = Request::builder()
         .method("POST")
         .uri(format!("/v1/xorbs/default/{}", encode_hash(&xorb_hash.0)))
@@ -80,7 +74,6 @@ async fn upload_xorb_then_shard_indexes_metadata() {
     let body: UploadXorbResponse = read_body_json(resp.into_body()).await;
     assert!(!body.was_inserted, "second xorb upload is a no-op");
 
-    // 2) Build a shard that references that xorb with two chunks.
     let chunk0 = ChunkHash(h(0xA0));
     let chunk1 = ChunkHash(h(0xA1));
     let file_hash = FileHash(h(0xF0));
@@ -137,8 +130,6 @@ async fn upload_xorb_then_shard_indexes_metadata() {
     let body: UploadShardResponse = read_body_json(resp.into_body()).await;
     assert_eq!(body.result, 1);
 
-    // 3) The metadata layer should now know about the xorb, the chunks, and
-    //    the file's reconstruction terms.
     assert!(meta.xorb_exists(&xorb_hash).await.unwrap());
 
     let loc = meta
@@ -184,7 +175,6 @@ async fn shard_upload_rejects_missing_xorb() {
     };
     let app = router(svc);
 
-    // Skip the xorb upload entirely.
     let missing_xorb = XorbHash(h(0xBE));
     let shard = ParsedShard {
         header: ShardHeader {

@@ -1,7 +1,4 @@
 //! SQLite-backed `MetadataStore` implementation.
-//!
-//! Uses sqlx runtime queries (no compile-time DB required). Hashes are stored
-//! as `BLOB` for compact PKs and exact-match indices.
 
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -50,10 +47,9 @@ CREATE TABLE IF NOT EXISTS files (
     sha256       BLOB,
     total_bytes  INTEGER NOT NULL,
     created_at   INTEGER NOT NULL,
-    -- Composite primary key so the same file_hash can be registered in
-    -- multiple repos (cross-repo dedup). The reconstruction handler uses
-    -- this row to authorize a read: token scoped to repo X can only
-    -- reconstruct file_hashes that have a (file_hash, repo_id=X) row.
+    -- Composite PK: same file_hash can live in multiple repos (cross-repo
+    -- dedup), and the reconstruction handler authorizes reads by requiring a
+    -- (file_hash, repo_id=token.repo) row to exist.
     PRIMARY KEY (file_hash, repo_id)
 );
 CREATE INDEX IF NOT EXISTS files_by_sha256 ON files(sha256) WHERE sha256 IS NOT NULL;
@@ -76,8 +72,7 @@ pub struct SqliteMetadataStore {
 }
 
 impl SqliteMetadataStore {
-    /// Total xorb count. Intended for tests/observability — not part of the
-    /// `MetadataStore` trait because nothing in the request path needs it.
+    /// Test/diagnostics helper — kept off the trait since no request path needs it.
     pub async fn count_xorbs(&self) -> CoreResult<u64> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM xorbs")
             .fetch_one(&self.pool)
@@ -87,7 +82,6 @@ impl SqliteMetadataStore {
         Ok(n as u64)
     }
 
-    /// Total file count. Test/diagnostics helper.
     pub async fn count_files(&self) -> CoreResult<u64> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM files")
             .fetch_one(&self.pool)
@@ -97,9 +91,8 @@ impl SqliteMetadataStore {
         Ok(n as u64)
     }
 
-    /// Open or create the SQLite database at `path`. Pass `":memory:"` for an
-    /// in-memory test database (note: pool size is forced to 1 so the schema
-    /// survives between calls).
+    /// Pass `":memory:"` for an in-memory test database — pool size is then
+    /// forced to 1 so the schema survives between calls.
     pub async fn open_path(path: impl AsRef<Path>) -> CoreResult<Self> {
         let p = path.as_ref().to_string_lossy().to_string();
         let url = if p == ":memory:" {
@@ -236,7 +229,7 @@ impl MetadataStore for SqliteMetadataStore {
         .await
         .map_err(|e| CoreError::Internal(format!("insert file: {e}")))?;
 
-        // Clear and rewrite terms (REPLACE semantics on (file_hash, term_index)).
+        // Rewrite the term list so a re-register with fewer terms can't leave stragglers.
         sqlx::query("DELETE FROM file_terms WHERE file_hash = ?")
             .bind(hash_to_blob(&file_hash.0))
             .execute(&mut *tx)
@@ -418,9 +411,8 @@ impl MetadataStore for SqliteMetadataStore {
         chunk_hash: &ChunkHash,
         limit: usize,
     ) -> CoreResult<Vec<XorbInfo>> {
-        // For the prototype: return the xorb containing the chunk, capped at `limit`.
-        // Future versions can expand the neighborhood (e.g. xorbs that share
-        // chunks with this one's xorb).
+        // Prototype: just the containing xorb. Real neighborhood expansion (e.g.
+        // xorbs sharing chunks with this one's xorb) is future work.
         let row = sqlx::query("SELECT xorb_hash FROM chunks WHERE chunk_hash = ? LIMIT 1")
             .bind(hash_to_blob(&chunk_hash.0))
             .fetch_optional(&self.pool)
@@ -557,7 +549,7 @@ mod tests {
             unpacked_segment_bytes: 64,
         }];
         s.register_xorb(&info, &chunks).await.unwrap();
-        s.register_xorb(&info, &chunks).await.unwrap(); // no-op
+        s.register_xorb(&info, &chunks).await.unwrap();
         assert!(s.xorb_exists(&xorb).await.unwrap());
     }
 
@@ -629,22 +621,18 @@ mod tests {
             verification: None,
         }];
 
-        // Initially unknown to either repo.
         assert!(!s.file_in_repo(&file, "alice/m").await.unwrap());
         assert!(!s.file_in_repo(&file, "bob/m").await.unwrap());
 
-        // After Alice's registration, only Alice sees it.
         s.register_file(&file, &alice, None, &terms).await.unwrap();
         assert!(s.file_in_repo(&file, "alice/m").await.unwrap());
         assert!(!s.file_in_repo(&file, "bob/m").await.unwrap());
 
-        // Bob registers the same file_hash — both repos visible (cross-repo
-        // dedup), and Alice's registration is NOT displaced (composite PK).
+        // Same file_hash in a second repo must NOT displace Alice's row (composite PK).
         s.register_file(&file, &bob, None, &terms).await.unwrap();
         assert!(s.file_in_repo(&file, "alice/m").await.unwrap());
         assert!(s.file_in_repo(&file, "bob/m").await.unwrap());
 
-        // Unrelated repo still 404s.
         assert!(!s.file_in_repo(&file, "carol/m").await.unwrap());
     }
 
@@ -672,7 +660,7 @@ mod tests {
         assert_eq!(hit, Some(file));
         let miss = s.lookup_file_by_sha256(&h(0xFF)).await.unwrap();
         assert!(miss.is_none());
-        // Files registered without sha256 must not collide via NULL.
+        // NULL sha256 rows must not collide with each other on lookup.
         let other = FileHash(h(0xBB));
         s.register_file(&other, &repo, None, &terms).await.unwrap();
         let still_no_match = s.lookup_file_by_sha256(&h(0)).await.unwrap();
@@ -727,7 +715,6 @@ mod tests {
             .await
             .unwrap();
         }
-        // Reopen and confirm the row survived.
         let s = SqliteMetadataStore::open_path(&path).await.unwrap();
         assert!(s.xorb_exists(&XorbHash(h(0x33))).await.unwrap());
     }

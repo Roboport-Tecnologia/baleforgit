@@ -1,9 +1,5 @@
-//! Shared scaffolding for the m9 (push) and m10 (pull) integration tests.
-//!
-//! Cargo treats every file in `tests/` as a separate binary, so we put the
-//! reusable bits in `tests/common/mod.rs` and pull them in with `mod common;`
-//! from each test file. Putting them in a submodule (not a top-level test
-//! file) keeps Cargo from compiling them as a standalone test binary.
+//! Shared scaffolding for m9/m10. Lives under `tests/common/mod.rs` (not a
+//! top-level test file) so Cargo doesn't compile it as its own binary.
 
 #![allow(dead_code)] // each test only uses a subset of these helpers
 
@@ -25,9 +21,7 @@ pub const REPO_OWNER: &str = "alice";
 pub const REPO_NAME: &str = "demo";
 
 pub fn tool_on_path(name: &str) -> bool {
-    // Different tools use different "give me your version" CLIs (`go version`
-    // vs `git --version` vs `git-xet --version`). Use `command -v` via the
-    // shell so we only check existence, not invocation conventions.
+    // `command -v` via shell so we test existence, not each tool's --version flag.
     Command::new("sh")
         .args(["-c", &format!("command -v {name}")])
         .stdout(Stdio::null())
@@ -51,8 +45,6 @@ pub fn run_git(repo: &Path, args: &[&str]) {
         String::from_utf8_lossy(&out.stderr),
     );
 }
-
-// ---- Mock PAT verifier (stand-in for the upstream repo authority) -----------
 
 #[derive(Clone)]
 struct VerifierState {
@@ -81,8 +73,8 @@ async fn check_access(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-/// Spawn the in-process PAT-verifier mock and return its base URL. The single
-/// granted PAT is [`HUB_PAT`] with write scope on `{REPO_OWNER}/{REPO_NAME}`.
+/// Spawn the in-process PAT-verifier mock; the only grant is [`HUB_PAT`] with
+/// write scope on `{REPO_OWNER}/{REPO_NAME}`.
 pub async fn spawn_verifier() -> String {
     let state = VerifierState {
         grants: Arc::new(vec![(
@@ -102,8 +94,6 @@ pub async fn spawn_verifier() -> String {
     });
     format!("http://{addr}")
 }
-
-// ---- Adapter binary management ---------------------------------------------
 
 fn workspace_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is the test crate; the workspace is two levels up.
@@ -157,7 +147,7 @@ pub fn spawn_adapter(bin: &Path, xet_server: &str) -> AdapterProcess {
         .spawn()
         .expect("spawn xet-lfs-adapter");
 
-    // First stdout line is "xet-lfs-adapter listening on http://host:port".
+    // First stdout line: "xet-lfs-adapter listening on http://host:port".
     let stdout = child.stdout.take().expect("stdout pipe");
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
@@ -168,10 +158,8 @@ pub fn spawn_adapter(bin: &Path, xet_server: &str) -> AdapterProcess {
         .expect("unexpected adapter stdout")
         .to_string();
 
-    // Forward remaining stdout / stderr to the parent's stderr in background
-    // threads. Cargo captures these unless `--nocapture` is passed; on failure
-    // the captured output gets printed under the test name, which is what we
-    // want when debugging the adapter from inside a Rust integration test.
+    // Forward remaining stdout/stderr to the parent's stderr so cargo prints
+    // it under the failing test name without needing --nocapture.
     std::thread::spawn(move || {
         use std::io::Read as _;
         let mut sink = reader;
@@ -198,14 +186,10 @@ pub fn spawn_adapter(bin: &Path, xet_server: &str) -> AdapterProcess {
     AdapterProcess { child, base_url }
 }
 
-/// Initialise an empty git working repo at `work` and configure it to drive
-/// LFS through the adapter:
-///   - origin remote set to a synthetic http://token:PAT@... URL pointing at
-///     the adapter (git-xet rejects file:// schemes when deriving auth hosts)
-///   - lfs.url overridden to the same URL
-///   - LFS hooks installed locally
-///   - git-xet registered as the "xet" custom transfer agent
-///   - lfs.locksverify off (we don't expose /locks/verify)
+/// Initialise an empty git repo wired to drive LFS through the adapter. Uses
+/// an http://token:PAT@... origin (git-xet rejects file:// for auth derivation),
+/// registers git-xet as the "xet" custom transfer, and disables locksverify
+/// (the adapter doesn't expose /locks/verify).
 pub fn init_lfs_workrepo(work: &Path, adapter_base_url: &str) -> String {
     run_git(work, &["init", "-q", "-b", "main", "."]);
     run_git(work, &["config", "user.email", "alice@test.invalid"]);

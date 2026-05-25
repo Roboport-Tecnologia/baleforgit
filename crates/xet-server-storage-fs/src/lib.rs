@@ -176,7 +176,6 @@ mod tests {
         let body = Bytes::from_static(b"hello xorb");
         assert!(store.put_xorb(&hash, body.clone()).await.unwrap());
         assert!(store.xorb_exists(&hash).await.unwrap());
-        // Second put is a no-op.
         assert!(!store.put_xorb(&hash, body).await.unwrap());
     }
 

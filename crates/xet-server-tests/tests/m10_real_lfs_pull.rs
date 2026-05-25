@@ -1,19 +1,7 @@
-//! M10: full end-to-end `git lfs pull` through git-lfs → xet-lfs-adapter (Go)
-//! → xet-server. The companion download test to M9.
-//!
-//! Flow:
-//!   1. Push a known file via the same path m9 exercises.
-//!   2. Wipe the local lfs object cache and the working-tree file, so the
-//!      next checkout has nothing to read from.
-//!   3. Run `git lfs pull`, which triggers a batch (operation=download) call.
-//!      The adapter advertises `transfer="basic"` with a per-object download
-//!      URL pointing back at itself; git-lfs follows that URL and the adapter
-//!      streams the file's bytes by querying xet-server's by-sha256
-//!      reconstruction endpoint and decoding chunk frames on the fly.
-//!   4. Read big.bin and assert it byte-matches the original payload.
-//!
-//! Tools required on PATH (test skips with eprintln if any are missing):
-//!   - `go`, `git`, `git-lfs`, `git-xet`
+//! End-to-end `git lfs pull` through git-lfs → xet-lfs-adapter (Go) → xet-server.
+//! Pushes a file, wipes the local LFS cache + worktree, then pulls and verifies
+//! the bytes round-trip. Skips silently if any of {go, git, git-lfs, git-xet}
+//! isn't on PATH.
 
 mod common;
 use common::*;
@@ -41,7 +29,6 @@ async fn git_pull_through_lfs_adapter_to_xet_server() {
     let build_dir = tempfile::tempdir().unwrap();
     let adapter_bin = build_adapter(build_dir.path()).expect("lfs-adapter source missing");
 
-    // ---- xet-server stack -------------------------------------------------
     let verifier_url = spawn_verifier().await;
     let authz = HttpAuthz::new(&verifier_url, JWT_SECRET.to_vec()).unwrap();
 
@@ -69,7 +56,6 @@ async fn git_pull_through_lfs_adapter_to_xet_server() {
 
     let adapter = spawn_adapter(&adapter_bin, &xet_url);
 
-    // ---- Working git repo + initial push ---------------------------------
     let work_root = tempfile::tempdir().unwrap();
     let work = work_root.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -84,7 +70,6 @@ async fn git_pull_through_lfs_adapter_to_xet_server() {
     run_git(&work, &["add", ".gitattributes"]);
     run_git(&work, &["commit", "-q", "-m", "track .bin via lfs"]);
 
-    // Same deterministic ~300 KiB payload as m9.
     let payload: Vec<u8> = (0..300_000u32)
         .map(|i| ((i.wrapping_mul(2654435761)) >> 16) as u8)
         .collect();
@@ -105,10 +90,8 @@ async fn git_pull_through_lfs_adapter_to_xet_server() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    // Sanity check: xet-server's metadata layer must know the file by its
-    // sha256 OID. If this fails the bug is in the upload/storage path; if it
-    // passes the bug is downstream (the adapter's reconstruction request or
-    // its byte-streaming logic).
+    // If this fails the upload/storage path is broken; if it passes the bug
+    // is downstream (adapter reconstruction request or byte streaming).
     let oid: [u8; 32] = Sha256::digest(&payload).into();
     let oid_hex = hex::encode(oid);
     let hit = meta
@@ -120,19 +103,13 @@ async fn git_pull_through_lfs_adapter_to_xet_server() {
         "expected file with sha256 {oid_hex} after push, got None"
     );
 
-    // ---- Wipe local cache and force a re-download ------------------------
-    // .git/lfs/objects/ is the LFS object cache. Delete it AND the worktree
-    // file so the checkout must call out to the LFS server.
+    // Wipe LFS object cache AND worktree file so checkout must hit the server.
     let lfs_cache = work.join(".git/lfs/objects");
     if lfs_cache.exists() {
         std::fs::remove_dir_all(&lfs_cache).unwrap();
     }
     std::fs::remove_file(&big_path).unwrap();
 
-    // `git lfs pull` = `git lfs fetch && git lfs checkout`. Fetch hits the
-    // batch API with operation=download → adapter returns transfer=basic with
-    // a download URL pointing at itself → git-lfs GETs that URL → adapter
-    // streams bytes from xet-server.
     let out = Command::new("git")
         .args(["lfs", "pull", "origin"])
         .current_dir(&work)
@@ -145,7 +122,6 @@ async fn git_pull_through_lfs_adapter_to_xet_server() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    // ---- Byte-for-byte verification --------------------------------------
     let pulled = std::fs::read(&big_path).expect("big.bin re-checked out");
     assert_eq!(
         pulled.len(),

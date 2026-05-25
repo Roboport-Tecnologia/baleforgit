@@ -1,25 +1,8 @@
-//! Single-binary launcher for the Xet CAS server. Reads configuration from
-//! environment variables; constructs the file-system + SQLite + config-authz
-//! stack and serves the HTTP router.
+//! Single-binary launcher for the Xet CAS server. See `README.md` for env vars.
 //!
-//! Env vars:
-//! - `XET_LISTEN`           (default `127.0.0.1:8080`)
-//! - `XET_DATA_ROOT`        (default `./xet-data`)
-//! - `XET_DB_PATH`          (default `<XET_DATA_ROOT>/meta.db`)
-//! - `XET_PUBLIC_URL`       (default `http://<XET_LISTEN>`)
-//! - `XET_JWT_SECRET_HEX`   (REQUIRED; 32+ bytes of hex)
-//! - `XET_TRANSFER_SECRET_HEX` (REQUIRED; exactly 32 bytes of hex / 64 chars)
-//!
-//! Authz selection (one of):
-//! - `XET_AUTHZ_HTTP_URL`   — base URL where the upstream `/check_access`
-//!   handler lives (any service speaking the wire contract documented in
-//!   `xet-server-authz-http`). When set, xet-server delegates repo-access
-//!   decisions to that upstream via `xet-server-authz-http::HttpAuthz`, and
-//!   `XET_GRANTS` is ignored.
-//! - `XET_GRANTS`           — comma-separated `hub_token:user:repo_id:read|write`
-//!   tuples for the in-process static authz (dev/test). Used only when
-//!   `XET_AUTHZ_HTTP_URL` is unset.
-//!   Example: `XET_GRANTS=hub-alice:alice:alice/m:write,hub-bob:bob:alice/m:read`
+//! Authz: `XET_AUTHZ_HTTP_URL` delegates to an HTTP upstream (`xet-server-authz-http`);
+//! otherwise `XET_GRANTS` (`hub_token:user:repo_id:read|write`, comma-separated)
+//! configures the in-process static authz used for dev/test.
 
 use anyhow::{bail, Context, Result};
 use std::env;
@@ -37,9 +20,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                // tower_http::trace gives per-request access logs (`200 POST
-                // /shards`); xet_server_http logs the JSON error body on every
-                // 4xx/5xx so failures are visible without flipping RUST_LOG.
+                // tower_http::trace gives per-request access logs; xet_server_http
+                // logs JSON error bodies on 4xx/5xx so failures are visible by default.
                 "info,sqlx=warn,tower_http::trace=info,xet_server_http=info".into()
             }),
         )
@@ -83,9 +65,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!(%listen, data_root = %data_root.display(), %public_url, "xet-server up");
 
-    // Build the router with the selected authz impl, then serve. Service is
-    // generic over A, so the two branches duplicate the build but everything
-    // else (blobs, meta, transfer_secret) is shared.
+    // Service is generic over the authz impl, so each branch builds its own.
     if let Ok(authz_url) = env::var("XET_AUTHZ_HTTP_URL") {
         if authz_url.is_empty() {
             bail!("XET_AUTHZ_HTTP_URL is set but empty");

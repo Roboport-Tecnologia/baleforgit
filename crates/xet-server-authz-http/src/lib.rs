@@ -1,12 +1,7 @@
-//! HTTP-backed `RepoAuthz` skeleton.
+//! HTTP-backed `RepoAuthz`: delegates `check_repo_access` to an upstream
+//! service; Xet token mint/verify stays local.
 //!
-//! Instead of storing user/repo permissions locally, this impl delegates
-//! `check_repo_access` to an external HTTP service — the "upstream repo
-//! authority". Xet token mint/verify stays local (same JWT secret as the
-//! rest of the server) — only the access decision is moved out of process.
-//!
-//! Wire contract (kept deliberately minimal so it can be implemented by a
-//! thin proxy in front of any upstream that knows about users and repos):
+//! Wire contract:
 //!
 //! ```text
 //! POST {base_url}/check_access
@@ -19,12 +14,8 @@
 //! 403 Forbidden      — known user, insufficient access
 //! ```
 //!
-//! `hub_bearer` is opaque from xet-server's point of view — the upstream is
-//! free to interpret it however it likes, but the recommended shape is a
-//! short-lived JWT minted by the upstream when the client authenticates, so
-//! that no long-lived credential ever reaches xet-server. The trait seam is
-//! exercised by a real HTTP round trip in the integration tests, and any
-//! upstream that wants to integrate need only implement the endpoint above.
+//! `hub_bearer` is opaque to xet-server — typically a short-lived JWT minted
+//! by the upstream so no long-lived credential reaches xet-server.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -53,7 +44,6 @@ impl HttpAuthz {
         })
     }
 
-    /// For tests / advanced setups that need to inject a pre-configured client.
     pub fn with_client(
         base_url: impl Into<String>,
         jwt_secret: impl Into<Vec<u8>>,

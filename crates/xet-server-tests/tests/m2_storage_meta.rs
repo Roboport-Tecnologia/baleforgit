@@ -1,6 +1,3 @@
-//! M2 integration: the FS blob store and the SQLite metadata store cooperate
-//! the way the upload+download path in M3/M4 will rely on.
-
 use bytes::Bytes;
 use xet_server_core::{
     BlobStore, ChunkHash, ChunkRow, FileHash, FileTerm, Hash32, MetadataStore, RepoRef, RepoType,
@@ -23,7 +20,6 @@ async fn upload_indexes_and_reconstruction_can_be_assembled() {
     let blobs = FsBlobStore::open(dir.path().join("blobs")).await.unwrap();
     let meta = SqliteMetadataStore::open_path(":memory:").await.unwrap();
 
-    // Pretend we have one 1000-byte xorb that holds two chunks [0..400, 400..1000].
     let xorb = XorbHash(h(0x10));
     let xorb_body: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
     blobs
@@ -57,7 +53,6 @@ async fn upload_indexes_and_reconstruction_can_be_assembled() {
     .await
     .unwrap();
 
-    // Pretend a file is just the second chunk of that xorb.
     let file = FileHash(h(0xF0));
     let repo = RepoRef {
         repo_type: RepoType::Model,
@@ -79,8 +74,6 @@ async fn upload_indexes_and_reconstruction_can_be_assembled() {
     .await
     .unwrap();
 
-    // Now simulate the reconstruction path: pull terms, find xorb byte range,
-    // fetch it from the blob store, sanity-check the bytes.
     let terms = meta.lookup_file(&file).await.unwrap().expect("registered");
     assert_eq!(terms.len(), 1);
     let t = &terms[0];
@@ -89,7 +82,6 @@ async fn upload_indexes_and_reconstruction_can_be_assembled() {
     let offsets = meta.xorb_chunk_offsets(&t.xorb).await.unwrap();
     assert_eq!(offsets.len(), 2);
 
-    // Translate chunk-index range [1, 2) into byte range [400, 1000).
     let start = offsets[t.chunk_idx_start as usize].byte_start as u64;
     let end_chunk = &offsets[(t.chunk_idx_end - 1) as usize];
     let end = end_chunk.byte_start as u64 + end_chunk.unpacked_segment_bytes as u64;
@@ -125,7 +117,6 @@ async fn chunk_lookup_drives_global_dedup() {
     .await
     .unwrap();
 
-    // The global-dedup endpoint will use these two queries:
     let loc = meta
         .lookup_chunk(&ChunkHash(h(0xAB)))
         .await

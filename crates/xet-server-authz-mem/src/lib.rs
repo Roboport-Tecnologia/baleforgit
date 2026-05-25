@@ -1,17 +1,12 @@
-//! In-memory `RepoAuthz` implementations.
-//!
-//! - [`AlwaysAllow`] is a stub used by tests in earlier milestones.
-//! - [`ConfigAuthz`] is the real prototype impl: a static map of hub-bearer
-//!   tokens to user permissions, plus a JWT secret used to mint/verify Xet
-//!   tokens.
+//! In-memory `RepoAuthz` implementations: [`AlwaysAllow`] for tests,
+//! [`ConfigAuthz`] for static hub-token → repo-scope configs.
 
 use async_trait::async_trait;
 use std::collections::HashMap;
 use xet_server_core::{CoreError, CoreResult, RepoAuthz, RepoRef, Scope, TokenClaims, UserId};
 use xet_server_tokens as tokens;
 
-/// Accepts any non-empty bearer; grants write-scope on a generic placeholder
-/// repo. Useful for tests and pre-M5 milestones; not for production.
+/// Test-only: accepts any non-empty bearer and grants write scope. Not for production.
 #[derive(Clone, Debug, Default)]
 pub struct AlwaysAllow;
 
@@ -52,12 +47,10 @@ impl RepoAuthz for AlwaysAllow {
     }
 }
 
-/// A static configuration: hub tokens → user, plus per-user repo permissions.
-/// `repo_id` matching is exact ("namespace/name").
+/// Static config: hub tokens → user + per-repo scope. `repo_id` matching is exact.
 #[derive(Clone, Debug, Default)]
 pub struct ConfigAuthz {
     pub jwt_secret: Vec<u8>,
-    /// hub_token → (user_id, repo_id → max_scope)
     pub users: HashMap<String, ConfigUser>,
 }
 
@@ -75,8 +68,6 @@ impl ConfigAuthz {
         }
     }
 
-    /// Convenience for setup: grant `user_id` `scope` on `repo_id` under the
-    /// hub bearer token `hub_token`.
     pub fn grant(
         mut self,
         hub_token: impl Into<String>,
@@ -92,14 +83,13 @@ impl ConfigAuthz {
                 user_id: user_id.clone(),
                 repos: HashMap::new(),
             });
-        // If multiple grants for the same hub token disagree on user_id, the
-        // first wins.
+        // Conflicting user_id grants for the same hub token: first wins.
         entry.repos.insert(repo_id.into(), scope);
         self
     }
 }
 
-/// Default TTL for minted Xet tokens (one hour).
+/// One hour.
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 3600;
 
 #[async_trait]

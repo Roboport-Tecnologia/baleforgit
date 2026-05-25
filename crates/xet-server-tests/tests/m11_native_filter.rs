@@ -1,22 +1,5 @@
-//! M11: end-to-end push and pull through the native `git-dfs` filter — no
-//! git-lfs, no Go adapter, no whole-file local cache. The flow under test:
-//!
-//! ```text
-//!   git add → filter.dfs.process (long-running) ─▶ git-dfs filter-process
-//!                                                  │ chunk (CDC)
-//!                                                  │ upload xorbs + shard
-//!                                                  ▼ via HTTP
-//!                                          ┌──────────────────────────┐
-//!                                          │   xet-server (Rust)      │
-//!                                          └─────────────┬────────────┘
-//!                                                        ▲
-//!   git checkout → filter.dfs.process (smudge) ──────────┘ download by file_id
-//!                                                          (chunks land in
-//!                                                           ~/.cache/dfs/chunks
-//!                                                           — shared across repos)
-//! ```
-//!
-//! Skipped (with eprintln) when any of `git` or `cargo` isn't on PATH.
+//! End-to-end push + pull through the native `git-dfs` filter (no git-lfs, no
+//! Go adapter). Skips silently when `git` or `cargo` isn't on PATH.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,9 +15,8 @@ use xet_server_http::{router as xet_router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_storage_fs::FsBlobStore;
 
-/// Increments `recon_hits` for every request whose path starts with
-/// `/v1/reconstructions/`. The hot smudge path is asserted to be a no-op
-/// against this counter.
+/// Counts hits on `/v1/reconstructions/*`. The hot smudge path must not
+/// increment this counter.
 async fn count_recon_hits(
     State(recon_hits): State<Arc<AtomicUsize>>,
     req: Request,
@@ -111,7 +93,6 @@ async fn native_filter_push_then_pull() {
         return;
     }
 
-    // ---- xet-server stack -------------------------------------------------
     let data_dir = tempfile::tempdir().unwrap();
     let blobs = Arc::new(
         FsBlobStore::open(data_dir.path().join("blobs"))
@@ -131,14 +112,12 @@ async fn native_filter_push_then_pull() {
         transfer_secret: [0x55u8; 32],
         public_base_url: xet_url.clone(),
     };
-    // Counter so the test can assert that the hot path (after a manifest is
-    // cached in `.git/dfs/manifests/` *and* every chunk is in the local
-    // chunk cache) makes zero requests to `/v1/reconstructions/`.
+    // The hot path (manifest in .git/dfs/manifests/ + chunks in local cache)
+    // must make zero requests to /v1/reconstructions/.
     let recon_hits = Arc::new(AtomicUsize::new(0));
     let app = xet_router(svc).layer(from_fn_with_state(recon_hits.clone(), count_recon_hits));
     let xet_handle = tokio::spawn(async move { axum::serve(xet_listener, app).await });
 
-    // ---- Working repo + git-dfs install ----------------------------------
     let work_root = tempfile::tempdir().unwrap();
     let work = work_root.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -149,8 +128,7 @@ async fn native_filter_push_then_pull() {
     run_git(&work, &["config", "user.email", "alice@test.invalid"]);
     run_git(&work, &["config", "user.name", "alice"]);
 
-    // Wire git-dfs as the dfs filter driver using the absolute path to the
-    // built binary; PATH might not include `target/debug`.
+    // Use absolute path: PATH might not include `target/debug`.
     let filter_cmd = format!("{} filter-process", git_dfs_bin.display());
     run_git(
         &work,
@@ -173,8 +151,7 @@ async fn native_filter_push_then_pull() {
     run_git(&work, &["add", ".gitattributes"]);
     run_git(&work, &["commit", "-q", "-m", "enable dfs filter"]);
 
-    // ~300 KiB of deterministic non-trivial bytes — enough for CDC to make
-    // multiple chunks per xorb.
+    // ~300 KiB so CDC produces multiple chunks per xorb.
     let payload: Vec<u8> = (0..300_000u32)
         .map(|i| ((i.wrapping_mul(2654435761)) >> 16) as u8)
         .collect();
@@ -183,7 +160,7 @@ async fn native_filter_push_then_pull() {
     run_git(&work, &["add", "big.bin"]);
     run_git(&work, &["commit", "-q", "-m", "add big.bin via dfs filter"]);
 
-    // ---- Confirm the staged blob is the JSON pointer (not the raw file) --
+    // Staged blob must be the JSON pointer, not the raw file.
     let out = Command::new("git")
         .args(["cat-file", "-p", "HEAD:big.bin"])
         .current_dir(&work)
@@ -204,22 +181,18 @@ async fn native_filter_push_then_pull() {
         "expected file_size key:\n{blob}"
     );
 
-    // ---- Confirm the bytes landed on the server --------------------------
     let n_xorbs = meta.count_xorbs().await.unwrap();
     let n_files = meta.count_files().await.unwrap();
     assert!(n_xorbs > 0, "expected at least one xorb registered");
     assert!(n_files > 0, "expected at least one file registered");
 
-    // ---- Force a smudge round-trip: wipe the worktree file and the chunk
-    // ---- cache, then re-check out HEAD. The bytes must come from the server.
+    // Force a cold smudge: wipe worktree file, shared chunk cache, and the
+    // .git/dfs/manifests/ dir (so the manifest-save side effect is exercised).
     std::fs::remove_file(&big_path).unwrap();
-    // Clear the shared chunk cache so the smudge path has to hit the server.
     if cache_root.exists() {
         std::fs::remove_dir_all(&cache_root).unwrap();
         std::fs::create_dir_all(&cache_root).unwrap();
     }
-    // Also wipe `.git/dfs/manifests/` so the first smudge truly cold-paths
-    // through xet-data and exercises the manifest-save side effect.
     let manifests_dir = work.join(".git").join("dfs").join("manifests");
     if manifests_dir.exists() {
         std::fs::remove_dir_all(&manifests_dir).unwrap();
@@ -240,7 +213,7 @@ async fn native_filter_push_then_pull() {
     );
     assert_eq!(recovered, payload, "content mismatch on reconstruct");
 
-    // ---- Cold path must have saved a manifest under `.git/dfs/manifests/`.
+    // Cold path must have saved a manifest under .git/dfs/manifests/.
     let manifest_files: Vec<_> = std::fs::read_dir(&manifests_dir)
         .expect("manifests dir should exist after cold smudge")
         .map(|e| e.unwrap().path())
@@ -261,8 +234,8 @@ async fn native_filter_push_then_pull() {
         "manifest should contain a non-null `terms` array: {manifest_json}"
     );
 
-    // ---- Hot path: chunks already cached, manifest cached. Second smudge
-    // ---- must reconstruct without calling `/v1/reconstructions/` at all.
+    // Hot path: with chunks + manifest cached, second smudge must reconstruct
+    // without calling /v1/reconstructions/.
     std::fs::remove_file(&big_path).unwrap();
     let hot_recon_before = recon_hits.load(Ordering::Relaxed);
     run_git(&work, &["checkout", "--", "big.bin"]);
@@ -277,14 +250,12 @@ async fn native_filter_push_then_pull() {
         "content mismatch on hot-path reconstruct"
     );
 
-    // ---- And verify there is NO `.git/lfs/` directory anywhere -----------
     let lfs_dir = work.join(".git").join("lfs");
     assert!(
         !lfs_dir.exists(),
         "unexpected .git/lfs directory; the LFS path should not be involved"
     );
 
-    // ---- Cleanup ---------------------------------------------------------
     xet_handle.abort();
     let _ = (data_dir, work_root);
     tokio::time::sleep(Duration::from_millis(50)).await;

@@ -1,7 +1,3 @@
-//! M4 round-trip: upload a synthetic xorb + shard, GET the reconstruction,
-//! follow the signed URLs with the prescribed Range header, reassemble the
-//! "file" bytes and byte-compare to what we uploaded.
-
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -46,17 +42,13 @@ async fn upload_then_reconstruct_byte_for_byte() {
     };
     let app = router(svc);
 
-    // Build a "file" that lives in two xorbs:
-    //   xorb_a: chunk0 (300 B) | chunk1 (400 B)
-    //   xorb_b: chunk0 (250 B) | chunk1 (250 B) | chunk2 (200 B)
-    //   file = xorb_a[0..2) + xorb_b[1..3)
-    // Total file bytes = 300+400 + 250+200 = 1150.
+    // File lives in two xorbs (a: c0=300B|c1=400B, b: c0=250B|c1=250B|c2=200B)
+    // and consumes a[0..2) + b[1..3) = 1150 bytes. Each xorb is a real container
+    // (one frame per chunk, compression scheme 0); reconstruction returns frame
+    // bytes (header + payload), walked below to extract payloads.
     let xorb_a = XorbHash(h(0x10));
     let xorb_b = XorbHash(h(0x20));
 
-    // Per-chunk payloads. The xorb body is now a real xorb container (one frame
-    // per chunk, compression scheme 0). The reconstruction path returns frame
-    // bytes (header + payload); we walk frames below to extract payloads.
     let a_c0: Vec<u8> = (0..300u32).map(|i| (i as u8).wrapping_add(0x10)).collect();
     let a_c1: Vec<u8> = (0..400u32).map(|i| (i as u8).wrapping_add(0x40)).collect();
     let b_c0: Vec<u8> = (0..250u32).map(|i| (i as u8).wrapping_add(0x80)).collect();
@@ -170,7 +162,6 @@ async fn upload_then_reconstruct_byte_for_byte() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Reconstruction GET.
     let req = Request::builder()
         .method("GET")
         .uri(format!("/v1/reconstructions/{}", encode_hash(&file_hash.0)))
@@ -185,8 +176,6 @@ async fn upload_then_reconstruct_byte_for_byte() {
     assert_eq!(recon.terms.len(), 2);
     assert_eq!(recon.fetch_info.len(), 2);
 
-    // Walk terms in order; for each, find the matching fetch_info entry, GET
-    // the bytes with the prescribed Range header, and accumulate.
     let mut reconstructed: Vec<u8> = Vec::new();
     for term in &recon.terms {
         let entries = recon
@@ -213,10 +202,7 @@ async fn upload_then_reconstruct_byte_for_byte() {
             "transfer GET status"
         );
         let slice = body_to_bytes(resp.into_body()).await;
-        // The slice is the on-disk byte range covering this term's chunk frames
-        // (header + compressed payload per chunk). Since our test xorbs use
-        // compression scheme 0 (None), each payload IS the raw chunk bytes.
-        // Walk frames and concatenate payloads.
+        // Compression scheme 0: each frame's payload is the raw chunk bytes.
         let frames = parse_xorb_frames(&slice).expect("term slice parses as frames");
         for f in frames {
             let header_end = f.on_disk_start as usize + 8;
@@ -225,7 +211,6 @@ async fn upload_then_reconstruct_byte_for_byte() {
         }
     }
 
-    // Expected file bytes: xorb_a[0..2) (a_c0 || a_c1) then xorb_b[1..3) (b_c1 || b_c2).
     let mut expected = Vec::new();
     expected.extend_from_slice(&a_c0);
     expected.extend_from_slice(&a_c1);
@@ -248,7 +233,6 @@ async fn transfer_url_rejects_tampered_range() {
     };
     let app = router(svc);
 
-    // Upload a small xorb (one uncompressed chunk so it parses as a valid frame).
     let xorb = XorbHash(h(0xCC));
     let payload: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
     let body = build_uncompressed_xorb_body(&[&payload]);
@@ -263,7 +247,7 @@ async fn transfer_url_rejects_tampered_range() {
         StatusCode::OK
     );
 
-    // No signature at all: the parser rejects with 400 because the query is missing.
+    // Missing signature → 400 from query parser.
     let req = Request::builder()
         .method("GET")
         .uri(format!("/xorb/default/{}", encode_hash(&xorb.0)))
@@ -273,7 +257,6 @@ async fn transfer_url_rejects_tampered_range() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    // Forged signature.
     let req = Request::builder()
         .method("GET")
         .uri(format!(
@@ -315,8 +298,7 @@ async fn reconstruction_404_when_file_unknown() {
         .contains("file not found"));
 }
 
-/// Take an absolute URL emitted by the server and return just the path+query
-/// suitable for `oneshot` (which ignores scheme/host).
+/// Strip scheme+host from a server-emitted URL so `oneshot` can route it.
 fn strip_base(url: &str) -> String {
     if let Some(idx) = url.find("/xorb/") {
         url[idx..].to_string()

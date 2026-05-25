@@ -52,8 +52,6 @@ pub type ShardResult<T> = Result<T, ShardError>;
 
 const MAX_SHARD_BYTES: usize = 64 * 1024 * 1024;
 
-// ---- Parsed in-memory shape ------------------------------------------------
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardHeader {
     pub tag: [u8; HASH_LEN],
@@ -115,8 +113,6 @@ pub struct ParsedShard {
     pub cas_blocks: Vec<ParsedCasBlock>,
     pub footer: Option<ShardFooter>,
 }
-
-// ---- Parsing ---------------------------------------------------------------
 
 struct Cursor<'a> {
     buf: &'a [u8],
@@ -343,12 +339,8 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
     })
 }
 
-// ---- Serialization ---------------------------------------------------------
-
-/// Serialize a `ParsedShard`. Used in tests for round-tripping; the server only
-/// *receives* shards for upload (no footer) and *produces* synthesized shards
-/// for the global-dedup response (which calls `serialize_dedup_response`
-/// instead in a later milestone).
+/// Serialize a `ParsedShard`. The server only *receives* shards for upload
+/// (no footer); footer serialization is exercised by round-trip tests.
 pub fn serialize(s: &ParsedShard) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_SIZE + ENTRY_SIZE * 16);
     // Header
@@ -540,8 +532,8 @@ mod tests {
         let footer = if with_footer {
             Some(ShardFooter {
                 version: MDB_SHARD_FOOTER_VERSION,
-                file_info_offset: 0, // serializer will record real offsets in bytes,
-                // but stored value here is informational for the test
+                // Offsets are recomputed by the serializer; the values here are ignored.
+                file_info_offset: 0,
                 cas_info_offset: 0,
                 chunk_hash_hmac_key: mk_hash(0xEE),
                 shard_creation_timestamp: 1_700_000_000,
