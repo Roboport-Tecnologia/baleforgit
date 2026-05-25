@@ -1,17 +1,7 @@
-//! Git pkt-line framing for the long-running filter protocol.
-//!
-//! Format (from `Documentation/gitprotocol-common.txt`):
-//!
-//! ```text
-//!   pkt-line = 4-byte-hex-length payload
-//!   "0000"   = flush packet
-//!   "0001"   = delim packet
-//!   "0002"   = response-end packet
-//! ```
-//!
-//! Length is the total packet length including the 4-byte header. Max packet
-//! length is 65520 (so max payload = 65516). Reference: git-lfs's use of the
-//! `pktline` Go crate in `git/filter_process_scanner.go`.
+//! Git pkt-line framing. See `Documentation/gitprotocol-common.txt`:
+//! 4-byte hex length prefix (including header), then payload; `0000` =
+//! flush, `0001` = delim, `0002` = response-end. Max packet = 65520, so
+//! max payload = 65516.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 
@@ -159,16 +149,15 @@ impl<W: Write> PktWriter<W> {
     }
 
     pub fn flush_packet(&mut self) -> io::Result<()> {
-        // The "0000" terminator carries no newline, so a LineWriter-backed
-        // stdout would hold it in the buffer indefinitely. Pair every flush
-        // packet with an explicit stream flush so the peer sees it now.
+        // "0000" has no trailing newline, so a LineWriter-backed stdout would
+        // hold it in the buffer indefinitely. Explicit flush every time.
         self.inner.write_all(b"0000")?;
         self.inner.flush()
     }
 
     pub fn write_text(&mut self, line: &str) -> io::Result<()> {
-        // git-lfs appends \n to text lines; we follow suit so the payloads
-        // round-trip through both newline-aware and not-aware peers.
+        // Append \n so payloads round-trip through both newline-aware and
+        // not-aware peers (git-lfs does the same).
         let bytes = line.as_bytes();
         if bytes.len() + 1 > MAX_PKT_PAYLOAD {
             return Err(io::Error::new(

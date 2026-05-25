@@ -1,15 +1,8 @@
 //! Install / uninstall the `dfs` filter driver in git config.
 //!
-//! The driver section is `filter.dfs.*`:
-//!
-//! ```text
-//!   filter.dfs.process  = git-dfs filter-process
-//!   filter.dfs.required = true
-//! ```
-//!
-//! No `clean`/`smudge` keys are written — Git falls back to `process` when
-//! present, and we always want that path (it's faster and stays alive across
-//! files). Reference: git-lfs's `lfs/attribute.go`.
+//! We only set `filter.dfs.process` (not `clean`/`smudge`): Git prefers the
+//! long-running process when present, and it's faster than spawning a fresh
+//! `clean`/`smudge` subprocess per file.
 
 use std::path::Path;
 use std::process::Command;
@@ -33,8 +26,7 @@ pub fn install(scope: Scope, repo: Option<&Path>) -> Result<()> {
 }
 
 pub fn uninstall(scope: Scope, repo: Option<&Path>) -> Result<()> {
-    // Use `--unset-all` so leftover or duplicated entries from older versions
-    // get cleared. Ignore "key not set" exit status 5 from `git config`.
+    // --unset-all clears duplicated entries from older installs in one pass.
     let _ = unset_config(scope, repo, "process");
     let _ = unset_config(scope, repo, "required");
     Ok(())

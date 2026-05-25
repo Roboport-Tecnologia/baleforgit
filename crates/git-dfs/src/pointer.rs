@@ -1,30 +1,16 @@
-//! Dfs pointer file: pretty-printed JSON wrapping a [`xet_data::processing::XetFileInfo`].
-//!
-//! Field order is stable (matches the struct declaration order in `xet_file.rs`):
-//!
-//! ```json
-//! {
-//!   "hash": "<merkle hex>",
-//!   "file_size": <u64>,
-//!   "sha256": "<sha256 hex>"
-//! }
-//! ```
-//!
-//! Empty fields are omitted (see `#[serde(skip_serializing_if = "Option::is_none")]`
-//! on `XetFileInfo`). The pointer always ends with a single trailing newline so
-//! `git diff` displays cleanly and editors that auto-strip trailing newlines
-//! don't churn it on save.
+//! Dfs pointer file: pretty-printed JSON wrapping a [`XetFileInfo`], with a
+//! trailing newline so `git diff` and trailing-newline-stripping editors
+//! don't churn it. Field order is stable (struct declaration order).
 
 use std::io::{self, Read, Write};
 
 use xet_data::processing::XetFileInfo;
 
-/// Soft cap on the size of a pointer file. Real pointers are ~150 bytes; anything
+/// Soft cap on pointer file size. Real pointers are ~150 bytes; anything
 /// over this is almost certainly a real binary that wasn't filtered.
 pub const POINTER_MAX_BYTES: usize = 4096;
 
-/// Sentinel: pointer bytes must start with `{"hash":` (after optional whitespace)
-/// to be recognized as a pointer. This is a cheap pre-check before JSON parse.
+/// Cheap pre-check before JSON parse — real pointers always contain `"hash"`.
 const POINTER_SENTINEL: &str = "\"hash\"";
 
 #[derive(Debug, thiserror::Error)]
@@ -63,13 +49,11 @@ pub fn parse_pointer(bytes: &[u8]) -> Result<XetFileInfo, PointerError> {
     Ok(serde_json::from_str(text.trim())?)
 }
 
-/// Read up to `POINTER_MAX_BYTES` from `r` and parse as a pointer. Returns the
-/// parsed pointer and any bytes we read so the caller can spool real content
-/// through if parsing fails.
+/// Returns the parsed pointer and the bytes we read, so the caller can spool
+/// real content through if parsing fails. Reads `POINTER_MAX_BYTES + 1` to
+/// distinguish "exactly the cap" from "over it".
 pub fn read_pointer<R: Read>(mut r: R) -> Result<(XetFileInfo, Vec<u8>), PointerError> {
     let mut buf = Vec::with_capacity(256);
-    // Read at most POINTER_MAX_BYTES + 1 to distinguish "exactly that size" from
-    // "over the cap".
     r.by_ref()
         .take((POINTER_MAX_BYTES + 1) as u64)
         .read_to_end(&mut buf)?;
@@ -77,9 +61,7 @@ pub fn read_pointer<R: Read>(mut r: R) -> Result<(XetFileInfo, Vec<u8>), Pointer
     Ok((info, buf))
 }
 
-/// Cheap check that does not allocate or parse — returns true if `bytes` is small
-/// enough and contains `"hash"` near the start, suggesting it's a pointer that
-/// was re-staged through `git add` and shouldn't be re-cleaned.
+/// Cheap allocation-free check for re-staged pointers.
 pub fn looks_like_pointer(bytes: &[u8]) -> bool {
     if bytes.len() > POINTER_MAX_BYTES {
         return false;

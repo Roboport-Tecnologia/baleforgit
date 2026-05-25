@@ -1,10 +1,8 @@
-//! Fetches a fresh reconstruction manifest from the CAS server and converts
-//! it to our cache shape ([`CachedManifest`]). Used only on the cold path —
-//! once cached under `.git/dfs/manifests/`, the hot path skips the network.
+//! Fetch a reconstruction manifest and convert it to [`CachedManifest`].
+//! Called on the cold path only — once cached, the hot path skips the network.
 //!
-//! We deliberately call `RemoteClient::get_reconstruction_v1` directly rather
-//! than going through the `Client` trait, which would probe `/v2/...` first
-//! and fall back on 404. xet-server only speaks v1, so the probe is wasted.
+//! Calls `get_reconstruction_v1` directly. The `Client` trait would probe
+//! `/v2/...` first and fall back on 404, and xet-server only speaks v1.
 
 use anyhow::{anyhow, Context, Result};
 use xet_client::cas_client::auth::AuthConfig;
@@ -15,9 +13,8 @@ use xet_runtime::core::XetContext;
 use crate::config::DfsConfig;
 use crate::manifest_cache::{CachedManifest, CachedTerm, CURRENT_VERSION};
 
-/// Hits `GET /v1/reconstructions/<file_id>` and returns just the
-/// content-addressed parts. Signed URLs in the response (`fetch_info`) are
-/// thrown away since they expire and aren't safe to persist.
+/// Returns the content-addressed parts only. `fetch_info` is discarded —
+/// signed URLs expire (`SIGNATURE_TTL_SECS` = 600s) and aren't safe to persist.
 pub async fn fetch_manifest(
     ctx: &XetContext,
     cfg: &DfsConfig,
@@ -32,10 +29,9 @@ pub async fn fetch_manifest(
         .with_context(|| format!("fetching reconstruction manifest for {}", file_id.hex()))?
         .ok_or_else(|| anyhow!("server returned no reconstruction for {}", file_id.hex()))?;
 
-    // xet-client deserializes `terms[].hash` as a `HexMerkleHash` newtype and
-    // `unpacked_length` as `u32` (whereas the wire crate uses `u64`). We
-    // normalize to a plain hex `String` + `u64` here so the persisted shape
-    // doesn't depend on xet-client's internal types.
+    // Normalize to plain hex `String` + `u64`: xet-client uses a `HexMerkleHash`
+    // newtype and a `u32` `unpacked_length`, both of which would tie our
+    // persisted shape to xet-client's internal types.
     let terms = response
         .terms
         .into_iter()

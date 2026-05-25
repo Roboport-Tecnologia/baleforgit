@@ -1,22 +1,9 @@
-//! Implementation of `git-dfs filter-process` — Git's long-running filter
-//! protocol. Loosely modeled after git-lfs's `commands/command_filter_process.go`
-//! and `git/filter_process_scanner.go`, but in Rust over pkt-line and wired to
-//! xet-core's `FileUploadSession` / `FileDownloadSession` instead of git-lfs's
-//! transfer queue.
+//! `git-dfs filter-process` — Git's long-running filter protocol over
+//! pkt-line, wired to xet-core's `FileUploadSession` / `FileDownloadSession`.
 //!
-//! Per-request wire shape (Git side ↔ filter side):
-//!
-//! ```text
-//! → key=value header packets, flush
-//! → payload data packets, flush
-//! ← "status=success", flush
-//! ← payload data packets, flush
-//! ← "status=success" (or "status=error"), flush
-//! ```
-//!
-//! On `command=clean`, payload is file content and we respond with the pointer.
-//! On `command=smudge`, payload is the pointer and we respond with the
-//! reconstructed file content.
+//! On `command=clean`, the payload is file content and we respond with the
+//! pointer. On `command=smudge`, the payload is the pointer and we respond
+//! with the reconstructed file content.
 
 use std::io::{stdin, stdout, Read, Write};
 use std::sync::Arc;
@@ -54,9 +41,8 @@ pub fn run() -> Result<()> {
     handshake(&mut reader, &mut writer)?;
     negotiate_capabilities(&mut reader, &mut writer)?;
 
-    // Resolved auth is cached per scope. A single filter-process invocation
-    // typically only does one of {push, fetch/checkout}, so usually only one
-    // of these ends up populated.
+    // Auth is cached per scope. A single filter-process invocation typically
+    // does only push or only fetch/checkout, so usually only one fills in.
     let mut clean_cfg: Option<DfsConfig> = None;
     let mut smudge_cfg: Option<DfsConfig> = None;
 
@@ -84,14 +70,12 @@ pub fn run() -> Result<()> {
 
         match command {
             "clean" => {
-                // Clean always needs the network — no local-only fallback.
+                // Clean always needs the network.
                 let cfg = resolve_cached(&mut clean_cfg, &raw, &ctx, resolver::Scope::Write)?;
                 handle_clean(&ctx, cfg, &mut reader, &mut writer, pathname)?;
             }
             "smudge" => {
-                // Smudge can short-circuit via the manifest + chunk caches.
-                // Pass the raw config + an empty auth slot so resolution only
-                // runs when the hot path misses.
+                // Smudge defers auth resolution until the hot path misses.
                 handle_smudge(
                     &ctx,
                     &raw,
@@ -102,7 +86,7 @@ pub fn run() -> Result<()> {
                 )?;
             }
             other => {
-                // Drain payload before responding so the stream stays in sync.
+                // Drain payload so the stream stays in sync.
                 drain_payload(&mut reader)?;
                 let err_line = format!("error=unknown command \"{other}\"");
                 writer.write_text_list(&["status=error", err_line.as_str()])?;
@@ -112,8 +96,6 @@ pub fn run() -> Result<()> {
     }
 }
 
-/// Resolve the auth pair for `scope` on first use, then return the cached
-/// value on subsequent calls.
 fn resolve_cached<'a>(
     slot: &'a mut Option<DfsConfig>,
     raw: &crate::config::RawConfig,
@@ -194,10 +176,8 @@ fn handle_clean<R: Read, W: Write>(
     writer: &mut PktWriter<W>,
     _pathname: &str,
 ) -> Result<()> {
-    // Spool the incoming bytes to a temp file. We could stream straight into
-    // `start_clean` + `add_data`, but spooling lets us reuse the path-based
-    // `clean_file` API and keeps the upload session creation off the hot
-    // pkt-line loop.
+    // Spooling to a temp file lets us reuse the path-based `clean_file` API
+    // and keeps `FileUploadSession::new` off the hot pkt-line loop.
     let mut tmp = NamedTempFile::new()?;
     reader.read_binary_to(&mut tmp)?;
     tmp.flush()?;
@@ -242,9 +222,8 @@ fn handle_smudge<R: Read, W: Write>(
         .ok_or_else(|| anyhow!("dfs pointer missing file_size"))?;
     let file_id_hex = info.hash().to_string();
 
-    // Shared chunk cache, used by both the hot (cache-only) path and the
-    // fallback path (which lets xet-data populate it). Driven from raw
-    // config so building the cache never triggers auth resolution.
+    // Built from raw config so cache initialization never triggers auth
+    // resolution (the hot path stays purely local).
     let cache_cfg = CacheConfig {
         cache_directory: raw.cache_dir.clone(),
         cache_size: ctx.config.chunk_cache.size_bytes,
@@ -252,17 +231,13 @@ fn handle_smudge<R: Read, W: Write>(
     let chunk_cache = get_cache(&ctx.config, &cache_cfg)
         .map_err(|e| anyhow!("init chunk cache at {}: {e}", raw.cache_dir.display()))?;
 
-    // ---- Hot path: cache-only reconstruction -----------------------------
-    // If we have a cached manifest *and* every chunk it references is in the
-    // local chunk cache, assemble the file without touching the network —
-    // and crucially, without resolving auth (no token-exchange round trip).
+    // ---- Hot path: cache-only reconstruction ----------------------------
     let tmp = NamedTempFile::new()?;
     let cache_hit = if let Some(git_dir) = raw.git_dir.as_deref() {
         match manifest_cache::load(git_dir, &file_id_hex) {
             Ok(Some(manifest)) => {
-                // Reopen via the path so the async block owns its own File
-                // handle without moving `tmp` — `tmp` is still used below to
-                // stream bytes back to git after we're done.
+                // Reopen by path so the async block owns its own File handle
+                // and `tmp` stays usable for the byte-streaming below.
                 let dest_file = tmp.reopen()?;
                 let ctx_for_cache = ctx.clone();
                 let cache_for_cache = chunk_cache.clone();
@@ -294,12 +269,9 @@ fn handle_smudge<R: Read, W: Write>(
         false
     };
 
-    // ---- Cold / lukewarm path: delegate to xet-data ----------------------
-    // Either we had no cached manifest, or a chunk was missing. This is the
-    // first point where we know we'll hit the network, so resolve auth now.
+    // ---- Cold / lukewarm path: delegate to xet-data ---------------------
     if !cache_hit {
-        // Truncate any partial bytes from a failed cache-only attempt. We
-        // reopen via the path so we don't have to thread `&mut tmp` around.
+        // Discard any partial bytes from a failed hot-path attempt.
         let mut trunc = tmp.reopen()?;
         trunc.set_len(0)?;
         std::io::Seek::seek(&mut trunc, std::io::SeekFrom::Start(0))?;
@@ -307,17 +279,16 @@ fn handle_smudge<R: Read, W: Write>(
 
         let cfg = resolve_cached(auth_slot, raw, ctx, resolver::Scope::Read)?;
 
-        // We must pass an explicit `0..file_size` range here. xet-data's
-        // `download_file` calls into `FileReconstructor` with
-        // `FileRange::full()` (0..u64::MAX), and `ReconstructionTermManager`
-        // prefetches up to `min_reconstruction_fetch_size` (default 256 MiB)
-        // ahead of EOF. Our xet-server does not implement Range support on
-        // `/v1/reconstructions/*` (see docs/ARCHITECTURE.md), so every
-        // prefetched block re-receives the full-file terms — and xet-data
-        // accumulates them, shifting `cur_file_byte_offset` forward by 256
-        // MiB each round and tripping the SequentialWriter's contiguity
-        // check. Capping the range by the known file size avoids the
-        // speculative prefetch entirely.
+        // The `0..file_size` range cap is load-bearing. xet-data's
+        // `download_file` passes `FileRange::full()` (0..u64::MAX) into
+        // `FileReconstructor`, and `ReconstructionTermManager` prefetches
+        // up to `min_reconstruction_fetch_size` (default 256 MiB) past EOF.
+        // xet-server has no Range support on `/v1/reconstructions/*` (see
+        // docs/ARCHITECTURE.md), so every prefetched block re-receives the
+        // full-file terms — xet-data accumulates them, shifting
+        // `cur_file_byte_offset` forward by 256 MiB each round and tripping
+        // the SequentialWriter's contiguity check. Capping the range at
+        // `file_size` skips the speculative prefetch entirely.
         let translator = build_translator_config(ctx, cfg)?;
         let dest_file = tmp.reopen()?;
         let info_for_dl = info.clone();
@@ -333,11 +304,9 @@ fn handle_smudge<R: Read, W: Write>(
             })
             .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 
-        // Cold path only: refresh `.git/dfs/manifests/<file_id>.json` so the
-        // next checkout can take the hot path. This is one extra small HTTP
-        // request per file on first encounter; subsequent checkouts pay
-        // nothing. Best-effort — a failure here only means the cache stays
-        // cold, not that the smudge fails.
+        // One extra small request per cold-path file; subsequent checkouts
+        // hit the hot path. Best-effort — failure here only keeps the cache
+        // cold, it doesn't fail the smudge.
         if let Some(git_dir) = raw.git_dir.as_deref() {
             let merkle = match info.merkle_hash() {
                 Ok(h) => h,
@@ -370,8 +339,6 @@ fn handle_smudge<R: Read, W: Write>(
     finish_smudge(writer, tmp.path())
 }
 
-/// Streams the temp file's bytes back through pkt-line and writes the
-/// terminating `status=success` packets.
 fn finish_smudge<W: Write>(writer: &mut PktWriter<W>, tmp_path: &std::path::Path) -> Result<()> {
     writer.write_text_list(&["status=success"])?;
     let mut f = std::fs::File::open(tmp_path)?;

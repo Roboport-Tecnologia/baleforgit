@@ -14,27 +14,17 @@ use anyhow::{anyhow, Context, Result};
 
 #[derive(Clone, Debug)]
 pub struct DfsConfig {
-    /// Base URL of the CAS server (e.g. `http://127.0.0.1:8080`).
     pub server_url: String,
-    /// Static bearer token for `Authorization: Bearer <token>`. The MVP uses a
-    /// long-lived JWT; a future `dfs.tokenHelper` config can mint short-lived
-    /// tokens.
     pub token: String,
-    /// Token expiration as a unix timestamp. Used by xet-client to decide when
-    /// to refresh; with no helper we just push it far into the future.
     pub token_expiration: u64,
-    /// Directory holding cached chunks. Shared across repos by default.
     pub cache_dir: PathBuf,
-    /// Resolved git directory (the path `.git` points at). `None` when we
-    /// couldn't determine it — e.g. the filter is being driven from a unit
-    /// test or a non-git context. Per-repo caches like the manifest cache
-    /// are disabled in that case.
+    /// Resolved git directory (the path `.git` points at). `None` outside a
+    /// git context (e.g. unit tests); per-repo caches are disabled then.
     pub git_dir: Option<PathBuf>,
 }
 
 /// Local-config-only fields. Produced synchronously at startup, then handed
-/// to [`crate::resolver::resolve`] alongside the requested scope to fill in
-/// any missing pieces.
+/// to [`crate::resolver::resolve`] to fill in any missing pieces.
 #[derive(Clone, Debug)]
 pub struct RawConfig {
     pub server_url: Option<String>,
@@ -45,9 +35,8 @@ pub struct RawConfig {
 }
 
 impl RawConfig {
-    /// Read everything from env vars / git config that doesn't require
-    /// network IO. Server URL and token are optional here — the resolver
-    /// auto-discovers them when absent.
+    /// Server URL and token are optional — the resolver auto-discovers them
+    /// from `git remote` + a forge auth roundtrip when absent.
     pub fn load(repo: Option<&Path>) -> Result<Self> {
         let server_url = lookup(repo, "DFS_SERVER_URL", "XET_SERVER_URL", "dfs.serverUrl")?;
         let token = lookup(repo, "DFS_TOKEN", "XET_TOKEN", "dfs.token")?;
@@ -74,10 +63,9 @@ impl RawConfig {
 }
 
 impl DfsConfig {
-    /// Strict synchronous loader for environments that supply every piece
-    /// via local config (the m11 test path; manual `git config dfs.token`
-    /// setups). Returns the "missing" error directly so the caller can
-    /// distinguish "we want to auto-resolve" from "something is wrong".
+    /// Strict loader: requires `server_url` + `token` to be locally configured.
+    /// Errors (rather than auto-resolving) so callers that want the fast path
+    /// can tell "config missing" from "real failure".
     pub fn load(repo: Option<&Path>) -> Result<Self> {
         let raw = RawConfig::load(repo)?;
         let server_url = raw
@@ -96,10 +84,8 @@ impl DfsConfig {
     }
 }
 
-/// Resolves the path that `.git` refers to (top-level repo, linked worktree,
-/// submodule, ...) by shelling out to `git rev-parse --git-dir`. The path is
-/// canonicalized to an absolute one when possible so subsequent IO doesn't
-/// depend on the filter's process-level cwd.
+/// `git rev-parse --git-dir`, made absolute. Subsequent IO shouldn't depend
+/// on the filter's process-level cwd.
 fn resolve_git_dir(repo: Option<&Path>) -> Option<PathBuf> {
     let mut cmd = Command::new("git");
     if let Some(p) = repo {
@@ -115,8 +101,6 @@ fn resolve_git_dir(repo: Option<&Path>) -> Option<PathBuf> {
         return None;
     }
     let p = PathBuf::from(s);
-    // `git rev-parse --git-dir` returns either an absolute path or a relative
-    // path from the cwd it was invoked in (`.git` for the common case).
     if p.is_absolute() {
         Some(p)
     } else {
@@ -195,8 +179,7 @@ fn resolve_cache_dir(repo: Option<&Path>) -> Result<PathBuf> {
         .join("chunks"))
 }
 
-/// 100 years past epoch — used as a token expiration sentinel when the caller
-/// hasn't set one and isn't doing token refresh.
+/// Sentinel "never expires" for tokens with no configured refresh path.
 fn far_future_epoch() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()

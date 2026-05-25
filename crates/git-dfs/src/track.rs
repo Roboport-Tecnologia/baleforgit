@@ -1,9 +1,5 @@
-//! Append `filter=dfs` lines to `.gitattributes`. Mirrors `git-lfs track` but
-//! writes `filter=dfs -text` instead of `filter=lfs diff=lfs merge=lfs -text`.
-//! We don't claim `diff` / `merge` drivers — the pointer is JSON and Git's
-//! default diff handles it fine.
-//!
-//! See `git-lfs/commands/command_track.go` for the original.
+//! Append `filter=dfs` lines to `.gitattributes`. We don't claim `diff` /
+//! `merge` drivers — the pointer is JSON and Git's default diff handles it.
 
 use std::fs;
 use std::io::Write;
@@ -36,7 +32,6 @@ pub fn track(repo: &Path, patterns: &[String]) -> Result<()> {
         .open(&attrs_path)
         .with_context(|| format!("opening {}", attrs_path.display()))?;
 
-    // If the existing file lacks a trailing newline, add one before appending.
     if !existing.is_empty() && !existing.ends_with('\n') && !existing.ends_with("\r\n") {
         file.write_all(line_end.as_bytes())?;
     }
@@ -52,12 +47,6 @@ pub fn track(repo: &Path, patterns: &[String]) -> Result<()> {
         }
         writeln!(file, "{pattern} {FILTER_SUFFIX}")
             .map_err(|e| std::io::Error::new(e.kind(), format!(".gitattributes write: {e}")))?;
-        // writeln! always emits "\n"; on Windows-style files git tolerates the
-        // mix, but for cleanliness rewrite the terminator when needed.
-        if line_end == "\r\n" {
-            // Fall back: hard to amend after the fact without re-reading; the
-            // mixed-EOL case is rare enough to accept the inconsistency.
-        }
         appended += 1;
         println!("Tracking \"{pattern}\"");
     }

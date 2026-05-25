@@ -1,14 +1,5 @@
-//! `git-dfs` — Git filter driver that stores file content as deduplicated
-//! chunks on a Xet-protocol CAS server instead of as whole-file LFS blobs.
-//!
-//! Subcommands:
-//!
-//! ```text
-//!   git-dfs install [--system | --local [--path <repo>]]
-//!   git-dfs uninstall [--all | --system | --local [--path <repo>]]
-//!   git-dfs track <pattern>...
-//!   git-dfs filter-process            # invoked by Git, not by users
-//! ```
+//! Git filter driver that stores file content as deduplicated chunks on a
+//! Xet-protocol CAS server instead of as whole-file LFS blobs.
 
 use std::path::PathBuf;
 
@@ -40,7 +31,7 @@ enum Command {
     Uninstall(UninstallArgs),
     /// Append patterns to .gitattributes with `filter=dfs`.
     Track(TrackArgs),
-    /// Run the long-running filter protocol. Invoked by Git.
+    /// Run the long-running filter protocol. Invoked by Git, not by users.
     FilterProcess,
 }
 
