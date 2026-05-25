@@ -21,4 +21,5 @@ xet-server-http.workspace = true
 xet-server-storage-fs.workspace = true
 xet-server-meta-sqlite.workspace = true
 xet-server-authz-mem.workspace = true
+xet-server-authz-http.workspace = true
 xet-server-tokens.workspace = true

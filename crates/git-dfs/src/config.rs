@@ -32,35 +32,66 @@ pub struct DfsConfig {
     pub git_dir: Option<PathBuf>,
 }
 
-impl DfsConfig {
-    pub fn load(repo: Option<&Path>) -> Result<Self> {
-        let server_url = lookup(repo, "DFS_SERVER_URL", "XET_SERVER_URL", "dfs.serverUrl")?
-            .ok_or_else(|| anyhow!("dfs.serverUrl is unset; set it with `git config dfs.serverUrl <url>` or DFS_SERVER_URL"))?;
-        let token = lookup(repo, "DFS_TOKEN", "XET_TOKEN", "dfs.token")?.ok_or_else(|| {
-            anyhow!("dfs.token is unset; set it with `git config dfs.token <jwt>` or DFS_TOKEN")
-        })?;
+/// Local-config-only fields. Produced synchronously at startup, then handed
+/// to [`crate::resolver::resolve`] alongside the requested scope to fill in
+/// any missing pieces.
+#[derive(Clone, Debug)]
+pub struct RawConfig {
+    pub server_url: Option<String>,
+    pub token: Option<String>,
+    pub token_expiration: Option<u64>,
+    pub cache_dir: PathBuf,
+    pub git_dir: Option<PathBuf>,
+}
 
+impl RawConfig {
+    /// Read everything from env vars / git config that doesn't require
+    /// network IO. Server URL and token are optional here — the resolver
+    /// auto-discovers them when absent.
+    pub fn load(repo: Option<&Path>) -> Result<Self> {
+        let server_url = lookup(repo, "DFS_SERVER_URL", "XET_SERVER_URL", "dfs.serverUrl")?;
+        let token = lookup(repo, "DFS_TOKEN", "XET_TOKEN", "dfs.token")?;
         let token_expiration = match lookup(
             repo,
             "DFS_TOKEN_EXPIRATION",
             "XET_TOKEN_EXPIRATION",
             "dfs.tokenExpiration",
         )? {
-            Some(s) => s
-                .parse::<u64>()
-                .context("dfs.tokenExpiration must be a unix timestamp")?,
-            None => far_future_epoch(),
+            Some(s) => Some(
+                s.parse::<u64>()
+                    .context("dfs.tokenExpiration must be a unix timestamp")?,
+            ),
+            None => None,
         };
-
-        let cache_dir = resolve_cache_dir(repo)?;
-        let git_dir = resolve_git_dir(repo);
-
         Ok(Self {
             server_url,
             token,
             token_expiration,
-            cache_dir,
-            git_dir,
+            cache_dir: resolve_cache_dir(repo)?,
+            git_dir: resolve_git_dir(repo),
+        })
+    }
+}
+
+impl DfsConfig {
+    /// Strict synchronous loader for environments that supply every piece
+    /// via local config (the m11 test path; manual `git config dfs.token`
+    /// setups). Returns the "missing" error directly so the caller can
+    /// distinguish "we want to auto-resolve" from "something is wrong".
+    pub fn load(repo: Option<&Path>) -> Result<Self> {
+        let raw = RawConfig::load(repo)?;
+        let server_url = raw
+            .server_url
+            .ok_or_else(|| anyhow!("dfs.serverUrl is unset; set it with `git config dfs.serverUrl <url>` or DFS_SERVER_URL"))?;
+        let token = raw.token.ok_or_else(|| {
+            anyhow!("dfs.token is unset; set it with `git config dfs.token <jwt>` or DFS_TOKEN")
+        })?;
+        Ok(Self {
+            server_url,
+            token,
+            token_expiration: raw.token_expiration.unwrap_or_else(far_future_epoch),
+            cache_dir: raw.cache_dir,
+            git_dir: raw.git_dir,
         })
     }
 }

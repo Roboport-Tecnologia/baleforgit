@@ -9,5 +9,7 @@ pub mod local_reconstruct;
 pub mod manifest_cache;
 pub mod pktline;
 pub mod pointer;
+pub mod remote;
 pub mod remote_manifest;
+pub mod resolver;
 pub mod track;

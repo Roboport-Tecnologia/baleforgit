@@ -1122,8 +1122,10 @@ name = "git-dfs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "hex",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -4331,6 +4333,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "xet-server-authz-http",
  "xet-server-authz-mem",
  "xet-server-core",
  "xet-server-http",

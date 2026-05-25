@@ -17,6 +17,7 @@ path = "src/lib.rs"
 anyhow.workspace = true
 clap = { version = "=4.5.50", features = ["derive"] }
 hex.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -32,4 +33,6 @@ xet-client = { path = "../../xet-core/xet_client" }
 xet-runtime = { path = "../../xet-core/xet_runtime" }
 
 [dev-dependencies]
+axum.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

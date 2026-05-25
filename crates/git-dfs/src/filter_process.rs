@@ -36,11 +36,13 @@ use crate::manifest_cache;
 use crate::pktline::{PktReader, PktWriter, MAX_PKT_PAYLOAD};
 use crate::pointer;
 use crate::remote_manifest::fetch_manifest;
+use crate::resolver;
 
 const VERSION: &str = "version=2";
 
 pub fn run() -> Result<()> {
-    let cfg = DfsConfig::load(Some(std::env::current_dir()?.as_path()))?;
+    let cwd = std::env::current_dir()?;
+    let raw = crate::config::RawConfig::load(Some(cwd.as_path()))?;
     let ctx = XetContext::default().context("starting xet runtime")?;
 
     let stdin_lock = stdin().lock();
@@ -51,6 +53,12 @@ pub fn run() -> Result<()> {
 
     handshake(&mut reader, &mut writer)?;
     negotiate_capabilities(&mut reader, &mut writer)?;
+
+    // Resolved auth is cached per scope. A single filter-process invocation
+    // typically only does one of {push, fetch/checkout}, so usually only one
+    // of these ends up populated.
+    let mut clean_cfg: Option<DfsConfig> = None;
+    let mut smudge_cfg: Option<DfsConfig> = None;
 
     loop {
         let headers = match reader.read_text_list() {
@@ -75,8 +83,14 @@ pub fn run() -> Result<()> {
             .unwrap_or("<unknown>");
 
         match command {
-            "clean" => handle_clean(&ctx, &cfg, &mut reader, &mut writer, pathname)?,
-            "smudge" => handle_smudge(&ctx, &cfg, &mut reader, &mut writer, pathname)?,
+            "clean" => {
+                let cfg = resolve_cached(&mut clean_cfg, &raw, &ctx, resolver::Scope::Write)?;
+                handle_clean(&ctx, cfg, &mut reader, &mut writer, pathname)?;
+            }
+            "smudge" => {
+                let cfg = resolve_cached(&mut smudge_cfg, &raw, &ctx, resolver::Scope::Read)?;
+                handle_smudge(&ctx, cfg, &mut reader, &mut writer, pathname)?;
+            }
             other => {
                 // Drain payload before responding so the stream stays in sync.
                 drain_payload(&mut reader)?;
@@ -86,6 +100,31 @@ pub fn run() -> Result<()> {
             }
         }
     }
+}
+
+/// Resolve the auth pair for `scope` on first use, then return the cached
+/// value on subsequent calls.
+fn resolve_cached<'a>(
+    slot: &'a mut Option<DfsConfig>,
+    raw: &crate::config::RawConfig,
+    ctx: &XetContext,
+    scope: resolver::Scope,
+) -> Result<&'a DfsConfig> {
+    if slot.is_none() {
+        let raw_clone = raw.clone();
+        let resolved = ctx
+            .runtime
+            .bridge_sync(async move { resolver::resolve(&raw_clone, scope).await })
+            .map_err(|e| anyhow!("xet runtime error during DFS auth resolution: {e:?}"))??;
+        *slot = Some(DfsConfig {
+            server_url: resolved.server_url,
+            token: resolved.token,
+            token_expiration: resolved.token_expiration,
+            cache_dir: raw.cache_dir.clone(),
+            git_dir: raw.git_dir.clone(),
+        });
+    }
+    Ok(slot.as_ref().unwrap())
 }
 
 fn handshake<R: Read, W: Write>(

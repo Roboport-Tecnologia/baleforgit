@@ -9,13 +9,22 @@
 //! - `XET_PUBLIC_URL`       (default `http://<XET_LISTEN>`)
 //! - `XET_JWT_SECRET_HEX`   (REQUIRED; 32+ bytes of hex)
 //! - `XET_TRANSFER_SECRET_HEX` (REQUIRED; exactly 32 bytes of hex / 64 chars)
-//! - `XET_GRANTS`           comma-separated `hub_token:user:repo_id:read|write` tuples.
+//!
+//! Authz selection (one of):
+//! - `XET_AUTHZ_HTTP_URL`   — base URL where the upstream `/check_access`
+//!   handler lives (e.g. `http://localhost:3000/-/dfs` for gitea). When set,
+//!   xet-server delegates repo-access decisions to that upstream via
+//!   `xet-server-authz-http::HttpAuthz`, and `XET_GRANTS` is ignored.
+//! - `XET_GRANTS`           — comma-separated `hub_token:user:repo_id:read|write`
+//!   tuples for the in-process static authz (dev/test). Used only when
+//!   `XET_AUTHZ_HTTP_URL` is unset.
 //!   Example: `XET_GRANTS=hub-alice:alice:alice/m:write,hub-bob:bob:alice/m:read`
 
 use anyhow::{bail, Context, Result};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+use xet_server_authz_http::HttpAuthz;
 use xet_server_authz_mem::ConfigAuthz;
 use xet_server_core::Scope;
 use xet_server_http::{router, Service};
@@ -70,36 +79,57 @@ async fn main() -> Result<()> {
             .map_err(anyhow_from_core)?,
     );
 
-    let mut authz = ConfigAuthz::new(jwt_secret);
-    if let Ok(raw) = env::var("XET_GRANTS") {
-        for tuple in raw.split(',').filter(|s| !s.is_empty()) {
-            let parts: Vec<&str> = tuple.split(':').collect();
-            if parts.len() != 4 {
-                bail!("XET_GRANTS tuple must be 'hub_token:user:repo_id:scope' (got '{tuple}')");
-            }
-            let scope = match parts[3] {
-                "read" => Scope::Read,
-                "write" => Scope::Write,
-                other => bail!("invalid scope '{other}' in XET_GRANTS"),
-            };
-            authz = authz.grant(parts[0], parts[1], parts[2], scope);
-        }
-    } else {
-        tracing::warn!("XET_GRANTS is empty; no users authorized — all requests will 401/403");
-    }
-
-    let svc = Service {
-        blobs,
-        meta,
-        authz: Arc::new(authz),
-        transfer_secret,
-        public_base_url: public_url.clone(),
-    };
-    let app = router(svc);
-
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!(%listen, data_root = %data_root.display(), %public_url, "xet-server up");
-    axum::serve(listener, app).await?;
+
+    // Build the router with the selected authz impl, then serve. Service is
+    // generic over A, so the two branches duplicate the build but everything
+    // else (blobs, meta, transfer_secret) is shared.
+    if let Ok(authz_url) = env::var("XET_AUTHZ_HTTP_URL") {
+        if authz_url.is_empty() {
+            bail!("XET_AUTHZ_HTTP_URL is set but empty");
+        }
+        let authz = HttpAuthz::new(authz_url.clone(), jwt_secret).map_err(anyhow_from_core)?;
+        tracing::info!(%authz_url, "using HttpAuthz upstream");
+        let svc = Service {
+            blobs,
+            meta,
+            authz: Arc::new(authz),
+            transfer_secret,
+            public_base_url: public_url.clone(),
+        };
+        axum::serve(listener, router(svc)).await?;
+    } else {
+        let mut authz = ConfigAuthz::new(jwt_secret);
+        if let Ok(raw) = env::var("XET_GRANTS") {
+            for tuple in raw.split(',').filter(|s| !s.is_empty()) {
+                let parts: Vec<&str> = tuple.split(':').collect();
+                if parts.len() != 4 {
+                    bail!(
+                        "XET_GRANTS tuple must be 'hub_token:user:repo_id:scope' (got '{tuple}')"
+                    );
+                }
+                let scope = match parts[3] {
+                    "read" => Scope::Read,
+                    "write" => Scope::Write,
+                    other => bail!("invalid scope '{other}' in XET_GRANTS"),
+                };
+                authz = authz.grant(parts[0], parts[1], parts[2], scope);
+            }
+        } else {
+            tracing::warn!(
+                "XET_GRANTS is empty and XET_AUTHZ_HTTP_URL is unset; no users authorized — all requests will 401/403"
+            );
+        }
+        let svc = Service {
+            blobs,
+            meta,
+            authz: Arc::new(authz),
+            transfer_secret,
+            public_base_url: public_url.clone(),
+        };
+        axum::serve(listener, router(svc)).await?;
+    }
     Ok(())
 }
 
