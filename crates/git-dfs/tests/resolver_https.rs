@@ -3,14 +3,17 @@
 //!   git remote (origin) ──┬── POST /<owner>/<repo>.git/info/dfs/authenticate
 //!                         │   (HTTPS Basic auth from `git credential fill`)
 //!                         │   → {href, header.Authorization=Bearer <jwt>, expires_at}
-//!                         │   The password is verified by gitea and never
-//!                         │   leaves it — only the JWT travels onward.
+//!                         │   The password is verified by the forge and
+//!                         │   never leaves it — only the JWT travels onward.
 //!                         └── GET <xet>/api/.../xet-{rw}-token/main
 //!                             (Bearer the JWT from above)
 //!                             → {accessToken, exp, casUrl}
 //!
-//! Both gitea and xet-server are mocked by a single axum router on a temp
+//! Both forge and xet-server are mocked by a single axum router on a temp
 //! port. Skipped (with eprintln) when `git` isn't on PATH.
+//!
+//! See `docs/DFS_FORGE_PROTOCOL.md` for the forge-side contract this test
+//! exercises.
 
 use std::path::Path;
 use std::process::Command;
@@ -140,7 +143,7 @@ fn build_router(state: MockState) -> Router {
     Router::new()
         // axum 0.8 disallows literal segments next to a param within one
         // segment, so the literal `.git` is captured as part of `{repo}` and
-        // ignored — gitea strips it the same way server-side.
+        // ignored — a real forge strips it the same way server-side.
         .route(
             "/{owner}/{repo}/info/dfs/authenticate",
             post(authenticate_handler),
@@ -238,8 +241,8 @@ async fn https_resolve_end_to_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_server_url_still_calls_authenticate() {
     // Even with a manually-configured `dfs.serverUrl`, the HTTPS flow must
-    // still hit gitea's authenticate endpoint to obtain a JWT — that's the
-    // whole password-stays-in-gitea property.
+    // still hit the forge's authenticate endpoint to obtain a JWT — that's
+    // the whole password-stays-in-the-forge property.
     if !tool_on_path("git") {
         eprintln!("skipping: `git` not on PATH");
         return;

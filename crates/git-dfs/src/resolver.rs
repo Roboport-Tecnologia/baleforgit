@@ -5,16 +5,17 @@
 //! output is already known:
 //!
 //! 1. **Remote parse** — `git remote get-url origin` → HTTPS or SSH URL.
-//! 2. **Obtain a gitea-minted JWT** (also yields the xet-server URL):
+//! 2. **Obtain a forge-minted JWT** (also yields the xet-server URL). See
+//!    `docs/DFS_FORGE_PROTOCOL.md` for the wire shape any forge must speak.
 //!    - HTTPS: `git credential fill` → username + password (or PAT). POST
-//!      `<gitea>/<owner>/<repo>.git/info/dfs/authenticate?op=<op>` with HTTPS
-//!      Basic auth. Gitea verifies the credentials locally and returns
-//!      `{href, header.Authorization=Bearer <jwt>}`. The user's password
-//!      never leaves gitea.
+//!      `<forge>/<owner>/<repo>.git/info/dfs/authenticate?op=<op>` with
+//!      HTTPS Basic auth. The forge verifies the credentials locally and
+//!      returns `{href, header.Authorization=Bearer <jwt>}`. The user's
+//!      password never leaves the forge.
 //!    - SSH: `ssh git@host git-dfs-authenticate <repo> <op>` returns the
 //!      same shape over the existing SSH session.
 //! 3. **Token exchange** — `GET <xet-server>/api/models/<owner>/<repo>/xet-{rw}-token/<rev>`
-//!    with `Authorization: Bearer <gitea-jwt>` → final xet token.
+//!    with `Authorization: Bearer <forge-jwt>` → final xet token.
 //!
 //! Step 3 is skipped when the caller's local config already holds a literal
 //! xet token (the m11 test path; manual `git config dfs.token` setups).
@@ -77,7 +78,7 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
     let (owner, repo_name) = remote.owner_and_repo()?;
     let revision = "main"; // TODO: derive from HEAD when we want branch-scoped tokens.
 
-    let (server_url, gitea_bearer) = match remote.scheme {
+    let (server_url, forge_bearer) = match remote.scheme {
         RemoteScheme::Ssh => {
             let auth = ssh_authenticate(&remote, owner, repo_name, scope).await?;
             let bearer = strip_bearer(&auth.authorization)
@@ -88,11 +89,12 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
             (url, bearer)
         }
         RemoteScheme::Http | RemoteScheme::Https => {
-            // POST gitea's /info/dfs/authenticate with HTTPS Basic auth from
-            // git-credential. Gitea verifies the password locally and returns
-            // a short-lived JWT plus the xet-server URL. The password never
-            // leaves gitea — that's the whole point of going through this
-            // endpoint instead of forwarding the password to xet-server.
+            // POST the forge's /info/dfs/authenticate with HTTPS Basic auth
+            // from git-credential. The forge verifies the password locally
+            // and returns a short-lived JWT plus the xet-server URL. The
+            // password never leaves the forge — that's the whole point of
+            // going through this endpoint instead of forwarding the password
+            // to xet-server.
             let (username, password) = git_credential_fill(&remote, repo_cwd)?;
             let auth =
                 authenticate_http(&remote, owner, repo_name, scope, &username, &password).await?;
@@ -119,7 +121,7 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
         repo_name,
         revision,
         scope,
-        &gitea_bearer,
+        &forge_bearer,
     )
     .await
 }
@@ -131,10 +133,10 @@ struct AuthenticateHTTPResponse {
     header: std::collections::HashMap<String, String>,
 }
 
-/// POST gitea's `/<owner>/<repo>.git/info/dfs/authenticate?op=...` with
-/// HTTPS Basic auth. Returns the gitea-minted JWT plus the xet-server URL.
-/// The user's password is verified inside gitea and never forwarded to
-/// xet-server.
+/// POST the forge's `/<owner>/<repo>.git/info/dfs/authenticate?op=...` with
+/// HTTPS Basic auth. Returns the forge-minted JWT plus the xet-server URL.
+/// The user's password is verified inside the forge and never forwarded to
+/// xet-server. See `docs/DFS_FORGE_PROTOCOL.md` for the wire shape.
 async fn authenticate_http(
     remote: &RemoteUrl,
     owner: &str,
@@ -189,8 +191,8 @@ struct SshAuthenticateResponse {
     href: String,
     #[serde(rename = "Authorization", default)]
     authorization: String,
-    // Mirror gitea's shape: `header` is the canonical place; we keep
-    // `Authorization` as a fallback for tools that flatten it.
+    // Mirror the protocol's shape: `header` is the canonical place; we
+    // keep `Authorization` as a fallback for tools that flatten it.
     #[serde(default)]
     header: std::collections::HashMap<String, String>,
 }
@@ -265,9 +267,9 @@ async fn ssh_authenticate(
 
 /// Run `git credential fill` to pull the user's stored credential for the
 /// remote's host. Returns `(username, password)`. The password is held
-/// briefly in memory by this process and then handed to gitea's HTTPS
+/// briefly in memory by this process and then handed to the forge's HTTPS
 /// authenticate endpoint via standard Basic auth — it never travels beyond
-/// gitea (xet-server only ever sees the JWT gitea mints in response).
+/// the forge (xet-server only ever sees the JWT the forge mints in response).
 /// `cwd` is the repo path so the repo's local `credential.helper` setting
 /// is honored (otherwise only `--global` / system helpers apply).
 fn git_credential_fill(remote: &RemoteUrl, cwd: Option<&Path>) -> Result<(String, String)> {
@@ -322,8 +324,8 @@ fn git_credential_fill(remote: &RemoteUrl, cwd: Option<&Path>) -> Result<(String
     }
     let password =
         password.ok_or_else(|| anyhow!("git credential fill returned no password field"))?;
-    // Username may be absent if the credential helper only stored a PAT; gitea
-    // accepts "<any>:PAT" via its PAT-fallback path, so we default to "git".
+    // Username may be absent if the credential helper only stored a token;
+    // forges typically accept "<any>:token" via Basic auth, so default to "git".
     let username = username.unwrap_or_else(|| "git".to_string());
     Ok((username, password))
 }
@@ -343,7 +345,7 @@ async fn exchange_token(
     repo: &str,
     revision: &str,
     scope: Scope,
-    gitea_bearer: &str,
+    forge_bearer: &str,
 ) -> Result<ResolvedAuth> {
     let url = format!(
         "{}/api/models/{}/{}/{}/{}",
@@ -356,7 +358,7 @@ async fn exchange_token(
     let client = http_client()?;
     let resp = client
         .get(&url)
-        .header(header::AUTHORIZATION, format!("Bearer {gitea_bearer}"))
+        .header(header::AUTHORIZATION, format!("Bearer {forge_bearer}"))
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;

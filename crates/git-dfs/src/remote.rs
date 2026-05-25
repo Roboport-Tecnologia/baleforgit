@@ -1,13 +1,13 @@
 //! Parse a `git remote get-url origin` value into the parts we need for
 //! discovery and auth: protocol, host, optional port, repo path.
 //!
-//! Recognized shapes (matches git-lfs / gitea):
+//! Recognized shapes (the standard set git-lfs and most forges accept):
 //!
 //! ```text
-//!   https://gitea.example.com/alice/repo.git
+//!   https://git.example.com/alice/repo.git
 //!   http://localhost:3000/alice/repo.git
-//!   git@gitea.example.com:alice/repo.git           (scp-style SSH)
-//!   ssh://git@gitea.example.com:2222/alice/repo.git
+//!   git@git.example.com:alice/repo.git             (scp-style SSH)
+//!   ssh://git@git.example.com:2222/alice/repo.git
 //! ```
 //!
 //! The `.git` suffix on the path is optional and stripped if present.
@@ -33,7 +33,7 @@ pub struct RemoteUrl {
     /// `None` means "use the scheme default" — 22 for ssh, 80 for http, 443 for https.
     pub port: Option<u16>,
     /// "alice/repo", `.git` suffix stripped. May contain extra path segments
-    /// for sub-repo routes, though gitea doesn't use those.
+    /// if a forge nests repos under additional path prefixes.
     pub repo_path: String,
 }
 
@@ -53,11 +53,11 @@ impl RemoteUrl {
         Ok((owner, repo))
     }
 
-    /// Reconstruct the base URL the gitea discovery endpoint lives under for
+    /// Reconstruct the base URL the forge's DFS endpoints live under for
     /// this remote, regardless of which scheme the remote actually uses. For
     /// SSH remotes we assume https on the same host on the default port —
     /// the caller can override via `dfs.serverUrl` if the deployment splits
-    /// gitea's HTTP and SSH onto different hosts.
+    /// the forge's HTTP and SSH onto different hosts.
     pub fn https_base(&self) -> String {
         match self.scheme {
             RemoteScheme::Http => format!("http://{}", self.host_with_port(80)),
@@ -184,29 +184,29 @@ mod tests {
 
     #[test]
     fn https_default_port() {
-        let r = parse_remote("https://gitea.example.com/ns/name").unwrap();
+        let r = parse_remote("https://git.example.com/ns/name").unwrap();
         assert_eq!(r.port, None);
-        assert_eq!(r.https_base(), "https://gitea.example.com");
+        assert_eq!(r.https_base(), "https://git.example.com");
     }
 
     #[test]
     fn scp_style_ssh() {
-        let r = parse_remote("git@gitea.example.com:alice/repo.git").unwrap();
+        let r = parse_remote("git@git.example.com:alice/repo.git").unwrap();
         assert_eq!(r.scheme, RemoteScheme::Ssh);
         assert_eq!(r.user.as_deref(), Some("git"));
-        assert_eq!(r.host, "gitea.example.com");
+        assert_eq!(r.host, "git.example.com");
         assert_eq!(r.port, None);
         assert_eq!(r.repo_path, "alice/repo");
-        // SSH remote should suggest https for the gitea web endpoints.
-        assert_eq!(r.https_base(), "https://gitea.example.com");
+        // SSH remote should suggest https for the forge's web endpoints.
+        assert_eq!(r.https_base(), "https://git.example.com");
     }
 
     #[test]
     fn ssh_url_with_port() {
-        let r = parse_remote("ssh://git@gitea.example.com:2222/alice/repo.git").unwrap();
+        let r = parse_remote("ssh://git@git.example.com:2222/alice/repo.git").unwrap();
         assert_eq!(r.scheme, RemoteScheme::Ssh);
         assert_eq!(r.user.as_deref(), Some("git"));
-        assert_eq!(r.host, "gitea.example.com");
+        assert_eq!(r.host, "git.example.com");
         assert_eq!(r.port, Some(2222));
         assert_eq!(r.repo_path, "alice/repo");
     }
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn ssh_url_default_user() {
         // ssh:// without `<user>@` still defaults to git for our purposes.
-        let r = parse_remote("ssh://gitea.example.com/alice/repo.git").unwrap();
+        let r = parse_remote("ssh://git.example.com/alice/repo.git").unwrap();
         assert_eq!(r.user.as_deref(), Some("git"));
     }
 
