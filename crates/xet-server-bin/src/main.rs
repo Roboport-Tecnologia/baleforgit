@@ -26,8 +26,12 @@ use xet_server_storage_fs::FsBlobStore;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,sqlx=warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // tower_http::trace gives per-request access logs (`200 POST
+                // /shards`); xet_server_http logs the JSON error body on every
+                // 4xx/5xx so failures are visible without flipping RUST_LOG.
+                "info,sqlx=warn,tower_http::trace=info,xet_server_http=info".into()
+            }),
         )
         .init();
 

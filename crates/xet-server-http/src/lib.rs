@@ -23,6 +23,8 @@ use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 use xet_server_core::{
     BlobStore, ChunkHash, ChunkRow, CoreError, FileHash, FileTerm, Hash32, MetadataStore,
     RepoAuthz, RepoRef, RepoType, Scope, ShardHash, TokenClaims, XorbFrameRow, XorbHash, XorbInfo,
@@ -95,6 +97,16 @@ where
             auth_middleware::<B, M, A>,
         ));
 
+    // TraceLayer wraps every request with a span and emits one log line per
+    // response. At default RUST_LOG=info you'll see `200 POST /shards`-style
+    // access logs; on 4xx/5xx the `on_failure` line fires at WARN so the
+    // status + latency are surfaced even when ApiError's own warn (below)
+    // already logged the message body.
+    let trace = TraceLayer::new_for_http()
+        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+        .on_response(DefaultOnResponse::new().level(Level::INFO))
+        .on_failure(DefaultOnFailure::new().level(Level::WARN));
+
     Router::new()
         .merge(v1)
         .route("/xorb/default/{hash}", get(get_xorb_transfer::<B, M, A>))
@@ -103,6 +115,7 @@ where
             get(issue_xet_token::<B, M, A>),
         )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(trace)
         .with_state(svc)
 }
 
@@ -112,6 +125,15 @@ pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Log the response *before* dropping the message into the body, so the
+        // reason for any 4xx/5xx is visible in the server log even when the
+        // client (e.g. git-xet) swallows the response body. 5xx → error!,
+        // 4xx → warn!. TraceLayer's span carries the method/path/request_id.
+        if self.0.is_server_error() {
+            tracing::error!(status = %self.0.as_u16(), error = %self.1, "api 5xx");
+        } else {
+            tracing::warn!(status = %self.0.as_u16(), error = %self.1, "api 4xx");
+        }
         let body = Json(serde_json::json!({ "error": self.1 }));
         (self.0, body).into_response()
     }
@@ -543,10 +565,34 @@ where
         decode_hash(&hash_hex).map_err(|e| bad_req(format!("malformed chunk hash: {e}")))?,
     );
 
-    let near = svc
+    let candidates = svc
         .meta
         .xorbs_near_chunk(&chunk_hash, DEDUP_NEIGHBORHOOD)
         .await?;
+
+    // The chunks table can outlive the blob store — e.g. data root was wiped
+    // while SQLite was preserved, or a future GC removed an unreferenced xorb
+    // before its chunk rows. Advertising a missing xorb is a foot-gun: the
+    // client trusts dedup, skips re-uploading, then /shards rejects the
+    // resulting shard with "references missing xorb". Filter to xorbs whose
+    // blobs actually exist so dedup never advertises ghosts.
+    let mut near = Vec::with_capacity(candidates.len());
+    let mut missing = 0usize;
+    for x in candidates {
+        if svc.blobs.xorb_exists(&x.xorb).await? {
+            near.push(x);
+        } else {
+            missing += 1;
+        }
+    }
+    if missing > 0 {
+        tracing::warn!(
+            chunk = %hash_hex,
+            missing,
+            kept = near.len(),
+            "dedup: dropped xorbs whose blobs are gone (chunks table is stale vs blob store)"
+        );
+    }
     if near.is_empty() {
         return Err(ApiError(StatusCode::NOT_FOUND, "chunk not found".into()));
     }
