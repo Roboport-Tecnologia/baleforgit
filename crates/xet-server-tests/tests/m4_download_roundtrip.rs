@@ -12,8 +12,9 @@ use xet_server_core::{ChunkHash, FileHash, Hash32, XorbHash};
 use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_shard::{
-    serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader,
-    FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
+    build_uncompressed_xorb_body, parse_xorb_frames, serialize, CasChunkEntry, FileTermEntry,
+    ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION,
+    MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_storage_fs::FsBlobStore;
 use xet_server_wire::{encode_hash, QueryReconstructionResponse};
@@ -53,8 +54,16 @@ async fn upload_then_reconstruct_byte_for_byte() {
     let xorb_a = XorbHash(h(0x10));
     let xorb_b = XorbHash(h(0x20));
 
-    let body_a: Vec<u8> = (0..700u32).map(|i| (i as u8).wrapping_add(0x10)).collect();
-    let body_b: Vec<u8> = (0..700u32).map(|i| (i as u8).wrapping_add(0x80)).collect();
+    // Per-chunk payloads. The xorb body is now a real xorb container (one frame
+    // per chunk, compression scheme 0). The reconstruction path returns frame
+    // bytes (header + payload); we walk frames below to extract payloads.
+    let a_c0: Vec<u8> = (0..300u32).map(|i| (i as u8).wrapping_add(0x10)).collect();
+    let a_c1: Vec<u8> = (0..400u32).map(|i| (i as u8).wrapping_add(0x40)).collect();
+    let b_c0: Vec<u8> = (0..250u32).map(|i| (i as u8).wrapping_add(0x80)).collect();
+    let b_c1: Vec<u8> = (0..250u32).map(|i| (i as u8).wrapping_add(0xA0)).collect();
+    let b_c2: Vec<u8> = (0..200u32).map(|i| (i as u8).wrapping_add(0xC0)).collect();
+    let body_a = build_uncompressed_xorb_body(&[&a_c0, &a_c1]);
+    let body_b = build_uncompressed_xorb_body(&[&b_c0, &b_c1, &b_c2]);
 
     let post_xorb = |hash: XorbHash, body: Vec<u8>| {
         Request::builder()
@@ -112,7 +121,7 @@ async fn upload_then_reconstruct_byte_for_byte() {
                 xorb: xorb_a,
                 cas_flags: 0,
                 num_bytes_in_cas: 700,
-                num_bytes_on_disk: 700,
+                num_bytes_on_disk: body_a.len() as u32,
                 chunks: vec![
                     CasChunkEntry {
                         chunk_hash: ChunkHash(h(0xA0)),
@@ -130,7 +139,7 @@ async fn upload_then_reconstruct_byte_for_byte() {
                 xorb: xorb_b,
                 cas_flags: 0,
                 num_bytes_in_cas: 700,
-                num_bytes_on_disk: 700,
+                num_bytes_on_disk: body_b.len() as u32,
                 chunks: vec![
                     CasChunkEntry {
                         chunk_hash: ChunkHash(h(0xB0)),
@@ -204,18 +213,24 @@ async fn upload_then_reconstruct_byte_for_byte() {
             "transfer GET status"
         );
         let slice = body_to_bytes(resp.into_body()).await;
-        // The slice here is xorb bytes for the URL's chunk range. For our
-        // hand-built "xorbs" (raw bytes, not Xet-format containers) the slice
-        // is the file contribution directly. The wire-level term range
-        // [term.range.start, term.range.end) is encompassed by the fetch entry,
-        // so the entire `slice` is contributed.
-        reconstructed.extend_from_slice(&slice);
+        // The slice is the on-disk byte range covering this term's chunk frames
+        // (header + compressed payload per chunk). Since our test xorbs use
+        // compression scheme 0 (None), each payload IS the raw chunk bytes.
+        // Walk frames and concatenate payloads.
+        let frames = parse_xorb_frames(&slice).expect("term slice parses as frames");
+        for f in frames {
+            let header_end = f.on_disk_start as usize + 8;
+            let payload_end = f.on_disk_start as usize + f.on_disk_len as usize;
+            reconstructed.extend_from_slice(&slice[header_end..payload_end]);
+        }
     }
 
-    // Expected file bytes: body_a[0..700] then body_b[250..700].
+    // Expected file bytes: xorb_a[0..2) (a_c0 || a_c1) then xorb_b[1..3) (b_c1 || b_c2).
     let mut expected = Vec::new();
-    expected.extend_from_slice(&body_a[0..700]);
-    expected.extend_from_slice(&body_b[250..700]);
+    expected.extend_from_slice(&a_c0);
+    expected.extend_from_slice(&a_c1);
+    expected.extend_from_slice(&b_c1);
+    expected.extend_from_slice(&b_c2);
     assert_eq!(reconstructed, expected);
 }
 
@@ -233,9 +248,10 @@ async fn transfer_url_rejects_tampered_range() {
     };
     let app = router(svc);
 
-    // Upload a small xorb.
+    // Upload a small xorb (one uncompressed chunk so it parses as a valid frame).
     let xorb = XorbHash(h(0xCC));
-    let body: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+    let payload: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+    let body = build_uncompressed_xorb_body(&[&payload]);
     let req = Request::builder()
         .method("POST")
         .uri(format!("/v1/xorbs/default/{}", encode_hash(&xorb.0)))

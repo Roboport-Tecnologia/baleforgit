@@ -21,6 +21,7 @@ This repo is a from-scratch Rust implementation of the **server side** of the Xe
 | M7 — End-to-end against `git-xet` | done | `m7_git_xet` drives the real `git-xet transfer` binary over the LFS custom-transfer JSON protocol; skips if the binary isn't on PATH |
 | M8 — Pluggability sanity (alternate impls) | done | `xet-server-storage-mem` (in-memory `BlobStore`) + `xet-server-authz-http` (HTTP-backed `RepoAuthz` skeleton), exercised end-to-end by `m8_pluggability` |
 | M9 — Real LFS push via Go adapter | done | `lfs-adapter/` (Go) bridges the standard git-lfs Batch API to xet-server; `m9_real_lfs_push` drives a real `git lfs push --all` through the full chain (git-lfs → adapter → xet-server → git-xet → CAS upload). Skips when `{go, git, git-lfs, git-xet}` aren't all on PATH. |
+| M10 — Real LFS pull via Go adapter | done | Symmetric `git lfs pull` path: adapter advertises `transfer="basic"` for downloads, serves bytes itself by querying xet-server's new `/v1/reconstructions/by-sha256/{oid}` endpoint, then streams xorb frames (LZ4 / raw / BG4-LZ4) chunk-by-chunk back to git-lfs. `m10_real_lfs_pull` round-trips a 300 KiB payload through push then pull and byte-compares. |
 
 
 ## Quick start

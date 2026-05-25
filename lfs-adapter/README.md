@@ -9,24 +9,46 @@ users, and delegates all authorization to the upstream xet-server.
 
 ## What it does
 
-For every `POST /repos/{owner}/{name}/objects/batch` request from git-lfs:
+### Uploads (`operation: upload`)
+
+For every `POST /repos/{owner}/{name}/objects/batch` from git-lfs:
 
 1. Reads the caller's `Authorization` header (Bearer or Basic — git-lfs uses
    Basic when credentials are URL-embedded; the adapter normalizes Basic to
    Bearer using the password part).
 2. Forwards that bearer to xet-server's HF-Hub-compatible token endpoint:
-   `GET {xet-server}/api/models/{owner}/{name}/xet-{read|write}-token/main`
+   `GET {xet-server}/api/models/{owner}/{name}/xet-write-token/main`
 3. Repackages xet-server's `{accessToken, exp, casUrl}` response into a
    standard LFS Batch response with `transfer="xet"` and per-object
-   `action.header` carrying:
-   - `X-Xet-Cas-Url`
-   - `X-Xet-Access-Token`
-   - `X-Xet-Token-Expiration`
-4. Returns the batch response. git-lfs then dispatches to the `git-xet` custom
-   transfer agent, which reads those headers and uploads/downloads bytes
-   directly to/from xet-server.
+   `action.header` carrying `X-Xet-Cas-Url`, `X-Xet-Access-Token`,
+   `X-Xet-Token-Expiration`.
+4. Returns the batch response. git-lfs dispatches to the `git-xet` custom
+   transfer agent, which reads those headers and uploads bytes directly to
+   xet-server. The adapter never touches blob bytes.
 
-The adapter never touches blob bytes. It is pure protocol glue.
+### Downloads (`operation: download`)
+
+git-xet's custom-transfer agent is **upload-only**, so for pulls the adapter
+takes over byte serving:
+
+1. Batch response advertises `transfer="basic"` with each object's
+   `action.download.href` pointing back at the adapter
+   (`/repos/{owner}/{name}/objects/{sha256}`), `header.Authorization`
+   echoing the caller's bearer.
+2. git-lfs follows that URL; the adapter mints a Xet **read** token,
+   queries xet-server's `GET /v1/reconstructions/by-sha256/{sha256}` to
+   get the file's terms and signed xorb byte ranges, then **streams**:
+   - For each term, GET the signed URL with the prescribed `Range` header.
+   - Parse 8-byte chunk frame headers in flight, decompress per scheme
+     (0 = raw, 1 = LZ4 frame, 2 = ByteGrouping4-LZ4), drain any decoder
+     leftovers to stay aligned with the next frame.
+   - Write raw bytes straight into the LFS response.
+3. The only per-file buffering is per-chunk (≤ 16 MiB by xorb spec,
+   typically ~64 KiB) when scheme 2 forces a full decode before regroup.
+   Schemes 0 and 1 are end-to-end streaming.
+
+The adapter never persists blob bytes. It is pure protocol glue with a
+small lz4 dependency for download decoding.
 
 ## Where authorization actually happens
 
@@ -76,11 +98,16 @@ git add big.bin
 git commit -m 'add big.bin'
 
 git lfs push --all origin
+
+# Wipe and re-pull to exercise the download path:
+rm -rf .git/lfs/objects big.bin
+git lfs pull origin
+diff <(echo hello) big.bin   # should be empty
 ```
 
 ## Wire shape
 
-Batch request (from git-lfs):
+### Upload batch
 
 ```json
 POST /repos/alice/demo/objects/batch
@@ -92,14 +119,12 @@ Content-Type: application/vnd.git-lfs+json
   "objects": [{"oid": "<sha256>", "size": 307200}] }
 ```
 
-Batch response (from adapter):
+Response:
 
 ```json
 { "transfer": "xet",
   "objects": [
-    { "oid": "<sha256>",
-      "size": 307200,
-      "authenticated": true,
+    { "oid": "<sha256>", "size": 307200, "authenticated": true,
       "actions": {
         "upload": {
           "href": "http://xet-server:8080",
@@ -107,7 +132,26 @@ Batch response (from adapter):
             "X-Xet-Cas-Url":          "http://xet-server:8080",
             "X-Xet-Access-Token":     "<jwt>",
             "X-Xet-Token-Expiration": "1716580000"
-          }
-        }
-      } } ] }
+          } } } } ] }
 ```
+
+### Download batch
+
+```json
+POST /repos/alice/demo/objects/batch  ... { "operation": "download", "objects": [...] }
+```
+
+Response (note: `transfer="basic"` and the action `href` points back at the adapter):
+
+```json
+{ "transfer": "basic",
+  "objects": [
+    { "oid": "<sha256>", "size": 307200, "authenticated": true,
+      "actions": {
+        "download": {
+          "href": "http://adapter:9090/repos/alice/demo/objects/<sha256>",
+          "header": { "Authorization": "Bearer <PAT>" }
+        } } } ] }
+```
+
+git-lfs then issues `GET http://adapter:9090/repos/alice/demo/objects/<sha256>` with the supplied Authorization, and the adapter streams the raw file bytes.

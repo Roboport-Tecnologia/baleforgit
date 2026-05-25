@@ -25,8 +25,9 @@ use xet_server_core::{ChunkHash, FileHash, Hash32, Scope, XorbHash};
 use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_shard::{
-    serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader,
-    FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
+    build_uncompressed_xorb_body, parse_xorb_frames, serialize, CasChunkEntry, FileTermEntry,
+    ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION,
+    MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_storage_mem::MemBlobStore;
 use xet_server_wire::{encode_hash, QueryReconstructionResponse, XetTokenResponse};
@@ -165,7 +166,8 @@ async fn end_to_end_against_alternate_impls() {
 
     // ---- Upload xorb + shard with the write token --------------------------
     let xorb = XorbHash(h(0x20));
-    let body: Vec<u8> = (0..512u32).map(|i| (i as u8).wrapping_mul(3)).collect();
+    let payload: Vec<u8> = (0..512u32).map(|i| (i as u8).wrapping_mul(3)).collect();
+    let body = build_uncompressed_xorb_body(&[&payload]);
     let req = Request::builder()
         .method("POST")
         .uri(format!("/v1/xorbs/default/{}", encode_hash(&xorb.0)))
@@ -270,7 +272,17 @@ async fn end_to_end_against_alternate_impls() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     let slice = body_to_bytes(resp.into_body()).await;
-    assert_eq!(slice, body, "MemBlobStore round-trip mismatch");
+    // The returned slice is the on-disk byte range covering the term's frame(s);
+    // walk the single uncompressed frame to recover the original payload.
+    let frames = parse_xorb_frames(&slice).expect("term slice parses");
+    assert_eq!(frames.len(), 1);
+    let payload_start = frames[0].on_disk_start as usize + 8;
+    let payload_end = frames[0].on_disk_start as usize + frames[0].on_disk_len as usize;
+    assert_eq!(
+        &slice[payload_start..payload_end],
+        payload.as_slice(),
+        "MemBlobStore round-trip mismatch"
+    );
 }
 
 fn strip_base(url: &str) -> String {

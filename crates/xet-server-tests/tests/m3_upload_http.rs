@@ -13,8 +13,9 @@ use xet_server_core::{ChunkHash, FileHash, Hash32, MetadataStore, XorbHash};
 use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_shard::{
-    serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader,
-    FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
+    build_uncompressed_xorb_body, serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock,
+    ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_TAG,
+    MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_storage_fs::FsBlobStore;
 use xet_server_wire::{encode_hash, UploadShardResponse, UploadXorbResponse};
@@ -48,8 +49,12 @@ async fn upload_xorb_then_shard_indexes_metadata() {
 
     // Build a synthetic xorb body. The server doesn't currently re-verify the
     // xorb hash against the body (see TODO in handler) so any 32-byte hash works.
+    // It DOES parse the body to extract the on-disk frame layout, so we have
+    // to wrap our two 256-byte "chunks" in valid xorb frames.
     let xorb_hash = XorbHash(h(0x10));
-    let xorb_body: Vec<u8> = (0..512u32).map(|i| i as u8).collect();
+    let chunk0_payload: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+    let chunk1_payload: Vec<u8> = (0..256u32).map(|i| (i as u8).wrapping_add(0x80)).collect();
+    let xorb_body = build_uncompressed_xorb_body(&[&chunk0_payload, &chunk1_payload]);
 
     // 1) Upload the xorb.
     let req = Request::builder()

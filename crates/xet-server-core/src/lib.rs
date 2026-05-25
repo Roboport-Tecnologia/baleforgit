@@ -145,15 +145,29 @@ pub struct ChunkLocation {
     pub unpacked_segment_bytes: u32,
 }
 
-/// Per-chunk byte offsets inside one xorb. Used to translate chunk-index ranges
-/// into byte ranges when building `fetch_info`, and to enumerate a xorb's
-/// chunks (with their hashes) when building global-dedup responses.
+/// Per-chunk byte offsets inside one xorb. Used to enumerate a xorb's chunks
+/// (with their hashes) when building global-dedup responses. `byte_start` and
+/// `unpacked_segment_bytes` come from the shard's CAS Info and live in
+/// *uncompressed* coordinate space — they are NOT on-disk byte offsets and
+/// must NOT be used to build HTTP byte ranges. Use [`XorbFrameRow`] for that.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkOffsetRow {
     pub chunk_hash: ChunkHash,
     pub chunk_index: u32,
     pub byte_start: u32,
     pub unpacked_segment_bytes: u32,
+}
+
+/// One chunk frame's actual on-disk layout inside a xorb body. Recorded at
+/// xorb-upload time by walking the chunk frames (`xet_server_shard::xorb`).
+/// `on_disk_start` is the byte offset of the frame's 8-byte header within the
+/// xorb body; `on_disk_len` covers the header plus the compressed payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XorbFrameRow {
+    pub frame_index: u32,
+    pub on_disk_start: u32,
+    pub on_disk_len: u32,
+    pub uncompressed_len: u32,
 }
 
 // ---- Errors ---------------------------------------------------------------
@@ -216,8 +230,26 @@ pub trait MetadataStore: Send + Sync {
         terms: &[FileTerm],
     ) -> CoreResult<()>;
 
+    /// Record the on-disk frame layout of a xorb. Called after a successful
+    /// `BlobStore::put_xorb` and required for [`Self::xorb_frame_layout`] to
+    /// return anything.
+    async fn register_xorb_layout(
+        &self,
+        xorb: &XorbHash,
+        frames: &[XorbFrameRow],
+    ) -> CoreResult<()>;
+    /// Return the xorb's on-disk frame layout, ordered by `frame_index`. Empty
+    /// if no layout was registered (e.g. legacy data or a test fixture that
+    /// only populated chunk-level metadata).
+    async fn xorb_frame_layout(&self, xorb: &XorbHash) -> CoreResult<Vec<XorbFrameRow>>;
+
     async fn xorb_exists(&self, xorb: &XorbHash) -> CoreResult<bool>;
     async fn lookup_file(&self, file_hash: &FileHash) -> CoreResult<Option<Vec<FileTerm>>>;
+    /// Resolve a file by its LFS-style sha256 OID. Returns the Xet `FileHash`
+    /// the OID was registered under, or `None` if no shard has uploaded a file
+    /// carrying that sha256 yet. The sha256 is the standard 32-byte hash —
+    /// not the Xet merkle file hash.
+    async fn lookup_file_by_sha256(&self, sha256: &Hash32) -> CoreResult<Option<FileHash>>;
     async fn lookup_chunk(&self, chunk_hash: &ChunkHash) -> CoreResult<Option<ChunkLocation>>;
     async fn xorbs_near_chunk(
         &self,

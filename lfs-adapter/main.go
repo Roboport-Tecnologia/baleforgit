@@ -84,6 +84,10 @@ type xetTokenResponse struct {
 
 type adapter struct {
 	xetServerBase string
+	// publicBaseURL is the adapter's own externally-visible base, e.g.
+	// "http://127.0.0.1:9090". Embedded in LFS download action hrefs so
+	// git-lfs knows where to GET object bytes.
+	publicBaseURL string
 	client        *http.Client
 }
 
@@ -132,34 +136,54 @@ func (a *adapter) handleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := batchResponse{
-		Transfer: "xet",
-		Objects:  make([]batchResponseItem, 0, len(req.Objects)),
-	}
-	for _, obj := range req.Objects {
-		actionName := "upload"
-		if req.Operation == "download" {
-			actionName = "download"
-		}
-		// `href` must be non-empty per the LFS spec; git-xet doesn't care what
-		// the value is (it reads X-Xet-Cas-Url from the header), but we set it
-		// to the CAS URL for clarity.
-		item := batchResponseItem{
-			OID:           obj.OID,
-			Size:          obj.Size,
-			Authenticated: true,
-			Actions: map[string]batchActionDoc{
-				actionName: {
-					Href: tok.CasURL,
-					Header: map[string]string{
-						"X-Xet-Cas-Url":          tok.CasURL,
-						"X-Xet-Access-Token":     tok.AccessToken,
-						"X-Xet-Token-Expiration": fmt.Sprintf("%d", tok.Exp),
+	// Uploads use the "xet" custom transfer (git-xet binary handles bytes).
+	// Downloads use plain "basic" because git-xet's custom-transfer agent is
+	// upload-only — git-lfs falls back to a vanilla HTTPS GET against the
+	// download.href, which we serve ourselves via handleDownload.
+	var resp batchResponse
+	if req.Operation == "upload" {
+		resp.Transfer = "xet"
+		for _, obj := range req.Objects {
+			resp.Objects = append(resp.Objects, batchResponseItem{
+				OID:           obj.OID,
+				Size:          obj.Size,
+				Authenticated: true,
+				Actions: map[string]batchActionDoc{
+					"upload": {
+						// Href must be non-empty per LFS spec; git-xet reads
+						// X-Xet-Cas-Url from the header, not Href.
+						Href: tok.CasURL,
+						Header: map[string]string{
+							"X-Xet-Cas-Url":          tok.CasURL,
+							"X-Xet-Access-Token":     tok.AccessToken,
+							"X-Xet-Token-Expiration": fmt.Sprintf("%d", tok.Exp),
+						},
 					},
 				},
-			},
+			})
 		}
-		resp.Objects = append(resp.Objects, item)
+	} else {
+		// Download: each object gets its own URL on the adapter, which will
+		// resolve sha256 → xet file_hash → reconstruction → raw bytes when
+		// git-lfs hits it. Echo the caller's bearer back as an Authorization
+		// header so the download GET can re-do the same PAT verification.
+		resp.Transfer = "basic"
+		for _, obj := range req.Objects {
+			resp.Objects = append(resp.Objects, batchResponseItem{
+				OID:           obj.OID,
+				Size:          obj.Size,
+				Authenticated: true,
+				Actions: map[string]batchActionDoc{
+					"download": {
+						Href: fmt.Sprintf("%s/repos/%s/%s/objects/%s",
+							a.publicBaseURL, owner, name, obj.OID),
+						Header: map[string]string{
+							"Authorization": bearer,
+						},
+					},
+				},
+			})
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
@@ -240,26 +264,47 @@ func main() {
 		return
 	}
 
-	a := &adapter{
-		xetServerBase: strings.TrimRight(*xetServer, "/"),
-		client:        &http.Client{Timeout: 30 * time.Second},
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", a.handleBatch)
-
-	srv := &http.Server{
-		Addr:         *listen,
-		Handler:      mux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-	}
-
 	// Open the listener up-front so we can print the bound port (useful when
-	// invoked with :0). Then hand it off to Serve.
-	ln, err := newListener(srv.Addr)
+	// invoked with :0) and capture the real address for download hrefs.
+	ln, err := newListener(*listen)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	fmt.Printf("xet-lfs-adapter listening on http://%s\n", ln.Addr())
+
+	a := &adapter{
+		xetServerBase: strings.TrimRight(*xetServer, "/"),
+		publicBaseURL: "http://" + ln.Addr().String(),
+		// Long timeout for the download path — reconstructing a multi-GB file
+		// can take minutes on slow networks. ReadTimeout/WriteTimeout below
+		// stay generous for the same reason.
+		client: &http.Client{Timeout: 10 * time.Minute},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", a.dispatch)
+
+	srv := &http.Server{
+		Handler:      mux,
+		ReadTimeout:  10 * time.Minute,
+		WriteTimeout: 10 * time.Minute,
+	}
+
+	fmt.Printf("xet-lfs-adapter listening on %s\n", a.publicBaseURL)
 	log.Fatal(srv.Serve(ln))
+}
+
+// dispatch routes by path shape:
+//
+//	POST /repos/{owner}/{name}/objects/batch  → handleBatch
+//	GET  /repos/{owner}/{name}/objects/{oid}  → handleDownload
+func (a *adapter) dispatch(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
+	if len(parts) == 5 && parts[0] == "repos" && parts[3] == "objects" {
+		if parts[4] == "batch" {
+			a.handleBatch(w, r)
+			return
+		}
+		a.handleDownload(w, r)
+		return
+	}
+	http.NotFound(w, r)
 }

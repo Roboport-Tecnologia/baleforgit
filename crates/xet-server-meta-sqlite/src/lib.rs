@@ -11,7 +11,7 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xet_server_core::{
     ChunkHash, ChunkLocation, ChunkOffsetRow, ChunkRow, CoreError, CoreResult, FileHash, FileTerm,
-    Hash32, MetadataStore, RepoRef, XorbHash, XorbInfo, HASH_LEN,
+    Hash32, MetadataStore, RepoRef, XorbFrameRow, XorbHash, XorbInfo, HASH_LEN,
 };
 
 const SCHEMA_SQL: &str = r#"
@@ -33,6 +33,15 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS chunks_by_xorb ON chunks(xorb_hash, chunk_index);
 
+CREATE TABLE IF NOT EXISTS xorb_frames (
+    xorb_hash        BLOB    NOT NULL,
+    frame_index      INTEGER NOT NULL,
+    on_disk_start    INTEGER NOT NULL,
+    on_disk_len      INTEGER NOT NULL,
+    uncompressed_len INTEGER NOT NULL,
+    PRIMARY KEY (xorb_hash, frame_index)
+);
+
 CREATE TABLE IF NOT EXISTS files (
     file_hash    BLOB    PRIMARY KEY,
     repo_type    TEXT    NOT NULL,
@@ -42,6 +51,7 @@ CREATE TABLE IF NOT EXISTS files (
     total_bytes  INTEGER NOT NULL,
     created_at   INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS files_by_sha256 ON files(sha256) WHERE sha256 IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS file_terms (
     file_hash       BLOB    NOT NULL,
@@ -291,6 +301,77 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(Some(terms))
     }
 
+    async fn register_xorb_layout(
+        &self,
+        xorb: &XorbHash,
+        frames: &[XorbFrameRow],
+    ) -> CoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Internal(format!("begin: {e}")))?;
+        for f in frames {
+            sqlx::query(
+                "INSERT OR IGNORE INTO xorb_frames
+                 (xorb_hash, frame_index, on_disk_start, on_disk_len, uncompressed_len)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(hash_to_blob(&xorb.0))
+            .bind(f.frame_index as i64)
+            .bind(f.on_disk_start as i64)
+            .bind(f.on_disk_len as i64)
+            .bind(f.uncompressed_len as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CoreError::Internal(format!("insert frame: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Internal(format!("commit frames: {e}")))?;
+        Ok(())
+    }
+
+    async fn xorb_frame_layout(&self, xorb: &XorbHash) -> CoreResult<Vec<XorbFrameRow>> {
+        let rows = sqlx::query(
+            "SELECT frame_index, on_disk_start, on_disk_len, uncompressed_len
+             FROM xorb_frames WHERE xorb_hash = ? ORDER BY frame_index ASC",
+        )
+        .bind(hash_to_blob(&xorb.0))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Internal(format!("select frames: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let fi: i64 = r.try_get("frame_index").map_err(internal)?;
+            let s: i64 = r.try_get("on_disk_start").map_err(internal)?;
+            let l: i64 = r.try_get("on_disk_len").map_err(internal)?;
+            let u: i64 = r.try_get("uncompressed_len").map_err(internal)?;
+            out.push(XorbFrameRow {
+                frame_index: fi as u32,
+                on_disk_start: s as u32,
+                on_disk_len: l as u32,
+                uncompressed_len: u as u32,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn lookup_file_by_sha256(&self, sha256: &Hash32) -> CoreResult<Option<FileHash>> {
+        let row = sqlx::query("SELECT file_hash FROM files WHERE sha256 = ? LIMIT 1")
+            .bind(hash_to_blob(sha256))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| CoreError::Internal(format!("select file by sha256: {e}")))?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let blob: Vec<u8> = r.try_get("file_hash").map_err(internal)?;
+                Ok(Some(FileHash(blob_to_hash(&blob)?)))
+            }
+        }
+    }
+
     async fn lookup_chunk(&self, chunk_hash: &ChunkHash) -> CoreResult<Option<ChunkLocation>> {
         let row = sqlx::query(
             "SELECT xorb_hash, chunk_index, byte_start, unpacked_bytes
@@ -508,6 +589,37 @@ mod tests {
         assert_eq!(back[1].xorb, xorb_b);
         assert_eq!(back[1].unpacked_segment_bytes, 500);
         assert!(back[0].verification.is_some());
+    }
+
+    #[tokio::test]
+    async fn lookup_file_by_sha256_round_trip() {
+        let s = store().await;
+        let file = FileHash(h(0xAA));
+        let repo = RepoRef {
+            repo_type: RepoType::Model,
+            repo_id: "alice/m".into(),
+            revision: "main".into(),
+        };
+        let sha = h(0xC1);
+        let terms = vec![FileTerm {
+            xorb: XorbHash(h(0x33)),
+            chunk_idx_start: 0,
+            chunk_idx_end: 1,
+            unpacked_segment_bytes: 16,
+            verification: None,
+        }];
+        s.register_file(&file, &repo, Some(&sha), &terms)
+            .await
+            .unwrap();
+        let hit = s.lookup_file_by_sha256(&sha).await.unwrap();
+        assert_eq!(hit, Some(file));
+        let miss = s.lookup_file_by_sha256(&h(0xFF)).await.unwrap();
+        assert!(miss.is_none());
+        // Files registered without sha256 must not collide via NULL.
+        let other = FileHash(h(0xBB));
+        s.register_file(&other, &repo, None, &terms).await.unwrap();
+        let still_no_match = s.lookup_file_by_sha256(&h(0)).await.unwrap();
+        assert!(still_no_match.is_none());
     }
 
     #[tokio::test]

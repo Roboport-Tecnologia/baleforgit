@@ -11,6 +11,9 @@ use bytes::Bytes;
 use thiserror::Error;
 use xet_server_core::{ChunkHash, FileHash, Hash32, XorbHash, HASH_LEN};
 
+pub mod xorb;
+pub use xorb::{build_uncompressed_xorb_body, parse_xorb_frames, XorbChunkFrame, XorbParseError};
+
 pub const ENTRY_SIZE: usize = 48;
 pub const HEADER_SIZE: usize = 48;
 pub const FOOTER_SIZE: usize = 200;
@@ -161,6 +164,21 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Reverse the byte order within each 8-byte group of a 32-byte buffer.
+/// This is its own inverse. xet-core serializes a `MerkleHash` (internally
+/// `[u64; 4]`) as 32 little-endian bytes per u64; the same shape is reused
+/// for `FileMetadataExt.sha256`, so to round-trip a sha256 between the LFS
+/// OID byte order and the on-disk layout we apply this swap.
+pub fn swap_u64_groups(input: [u8; HASH_LEN]) -> [u8; HASH_LEN] {
+    let mut out = [0u8; HASH_LEN];
+    for group in 0..4 {
+        for i in 0..8 {
+            out[group * 8 + i] = input[group * 8 + (7 - i)];
+        }
+    }
+    out
+}
+
 fn is_bookend_hash(h: &Hash32) -> bool {
     h.0.iter().all(|b| *b == 0xFF)
 }
@@ -229,9 +247,14 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
         }
 
         let sha256 = if file_flags & FLAG_WITH_METADATA_EXT != 0 {
+            // git-xet serializes the sha256 in the same little-endian-u64-group
+            // order as every other Xet hash on disk, NOT in plain sha256 byte
+            // order. Normalize here so `ParsedFile.sha256` matches the LFS OID
+            // (and the inverse swap happens on serialize). See
+            // `swap_u64_groups` for the byte mapping.
             let h = c.hash()?;
             c.skip(16)?;
-            Some(h)
+            Some(Hash32(swap_u64_groups(h.0)))
         } else {
             None
         };
@@ -357,7 +380,7 @@ pub fn serialize(s: &ParsedShard) -> Vec<u8> {
         }
         if f.file_flags & FLAG_WITH_METADATA_EXT != 0 {
             let sha = f.sha256.expect("metadata flag set without sha256");
-            out.extend_from_slice(&sha.0);
+            out.extend_from_slice(&swap_u64_groups(sha.0));
             out.extend_from_slice(&[0u8; 16]);
         }
     }

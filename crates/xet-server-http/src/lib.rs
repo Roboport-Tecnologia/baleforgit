@@ -4,6 +4,7 @@
 //! - `POST /v1/xorbs/{prefix}/{hash}`           (xorb upload, write scope)
 //! - `POST /shards`                             (shard upload + indexing, write scope)
 //! - `GET  /v1/reconstructions/{file_id}`       (reconstruction metadata, read scope)
+//! - `GET  /v1/reconstructions/by-sha256/{sha256}` (same, but keyed by LFS sha256 OID)
 //! - `GET  /v1/chunks/{prefix}/{hash}`          (global dedup query, read scope)
 //! - `GET  /xorb/default/{hash}` (signed)       (byte-range transfer, no bearer auth)
 //! - `GET  /api/{type}s/{ns}/{name}/xet-{rw}-token/{rev}` (mock HF Hub token endpoint)
@@ -24,11 +25,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xet_server_core::{
     BlobStore, ChunkHash, ChunkRow, CoreError, FileHash, FileTerm, Hash32, MetadataStore,
-    RepoAuthz, RepoRef, RepoType, Scope, ShardHash, TokenClaims, XorbHash, XorbInfo, HASH_LEN,
+    RepoAuthz, RepoRef, RepoType, Scope, ShardHash, TokenClaims, XorbFrameRow, XorbHash, XorbInfo,
+    HASH_LEN,
 };
 use xet_server_shard::{
-    serialize as serialize_shard, CasChunkEntry, ParsedCasBlock, ParsedShard, ShardFooter,
-    ShardHeader, FOOTER_SIZE, MDB_SHARD_FOOTER_VERSION, MDB_SHARD_HEADER_TAG,
+    parse_xorb_frames, serialize as serialize_shard, CasChunkEntry, ParsedCasBlock, ParsedShard,
+    ShardFooter, ShardHeader, FOOTER_SIZE, MDB_SHARD_FOOTER_VERSION, MDB_SHARD_HEADER_TAG,
     MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_wire::{
@@ -76,6 +78,10 @@ where
     let v1 = Router::new()
         .route("/v1/xorbs/{prefix}/{hash}", post(upload_xorb::<B, M, A>))
         .route("/shards", post(upload_shard::<B, M, A>))
+        .route(
+            "/v1/reconstructions/by-sha256/{sha256}",
+            get(get_reconstruction_by_sha256::<B, M, A>),
+        )
         .route(
             "/v1/reconstructions/{file_id}",
             get(get_reconstruction::<B, M, A>),
@@ -236,8 +242,27 @@ where
     if body.len() > MAX_BODY_BYTES {
         return Err(bad_req("xorb exceeds 64 MiB limit"));
     }
+    // Walk the xorb's chunk frames and stash their on-disk byte ranges.
+    // The shard's CAS Info only records uncompressed offsets, so reconstruction
+    // would otherwise have no way to compute correct HTTP byte ranges for
+    // real (compressed) xorbs. We parse before persisting so a malformed body
+    // is rejected up-front rather than half-stored.
+    let frames =
+        parse_xorb_frames(&body).map_err(|e| bad_req(format!("malformed xorb body: {e}")))?;
+    let layout: Vec<XorbFrameRow> = frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| XorbFrameRow {
+            frame_index: i as u32,
+            on_disk_start: f.on_disk_start,
+            on_disk_len: f.on_disk_len,
+            uncompressed_len: f.uncompressed_len,
+        })
+        .collect();
     // TODO: re-verify xorb content hash against `hash`; see plan §"Tricky bits".
-    let was_inserted = svc.blobs.put_xorb(&XorbHash(hash), body).await?;
+    let xorb = XorbHash(hash);
+    let was_inserted = svc.blobs.put_xorb(&xorb, body).await?;
+    svc.meta.register_xorb_layout(&xorb, &layout).await?;
     Ok(Json(UploadXorbResponse { was_inserted }))
 }
 
@@ -355,43 +380,88 @@ where
     // to a cross-repo dedup policy).
     let file_hash =
         FileHash(decode_hash(&file_hex).map_err(|e| bad_req(format!("malformed file id: {e}")))?);
+    let resp = build_reconstruction_response(&svc, &file_hash).await?;
+    Ok(Json(resp))
+}
+
+/// LFS-keyed entry point into the same reconstruction response. The sha256 here
+/// is the standard LFS OID — a plain 64-char lowercase hex of the 32-byte hash,
+/// not the Xet weird-LE-u64 encoding used everywhere else.
+async fn get_reconstruction_by_sha256<B, M, A>(
+    State(svc): State<Service<B, M, A>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(sha256_hex): Path<String>,
+) -> Result<Json<QueryReconstructionResponse>, ApiError>
+where
+    B: BlobStore,
+    M: MetadataStore,
+    A: RepoAuthz,
+{
+    let sha256 = decode_lfs_sha256(&sha256_hex)
+        .map_err(|e| bad_req(format!("malformed sha256 oid: {e}")))?;
+    let file_hash = svc
+        .meta
+        .lookup_file_by_sha256(&sha256)
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "file not found".into()))?;
+    let resp = build_reconstruction_response(&svc, &file_hash).await?;
+    Ok(Json(resp))
+}
+
+async fn build_reconstruction_response<B, M, A>(
+    svc: &Service<B, M, A>,
+    file_hash: &FileHash,
+) -> Result<QueryReconstructionResponse, ApiError>
+where
+    B: BlobStore,
+    M: MetadataStore,
+    A: RepoAuthz,
+{
     let terms = svc
         .meta
-        .lookup_file(&file_hash)
+        .lookup_file(file_hash)
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "file not found".into()))?;
 
-    let mut offsets_by_xorb: BTreeMap<[u8; HASH_LEN], Vec<xet_server_core::ChunkOffsetRow>> =
-        BTreeMap::new();
+    // Use the xorb's *on-disk* frame layout (recorded at xorb-upload time) —
+    // NOT the chunks table, whose byte_start/unpacked_segment_bytes come from
+    // the shard's CAS Info and live in uncompressed coordinate space.
+    let mut layout_by_xorb: BTreeMap<[u8; HASH_LEN], Vec<XorbFrameRow>> = BTreeMap::new();
     for t in &terms {
-        offsets_by_xorb.entry(*t.xorb.as_bytes()).or_default();
+        layout_by_xorb.entry(*t.xorb.as_bytes()).or_default();
     }
-    for key in offsets_by_xorb.keys().cloned().collect::<Vec<_>>() {
-        let rows = svc.meta.xorb_chunk_offsets(&XorbHash(Hash32(key))).await?;
-        offsets_by_xorb.insert(key, rows);
+    for key in layout_by_xorb.keys().cloned().collect::<Vec<_>>() {
+        let rows = svc.meta.xorb_frame_layout(&XorbHash(Hash32(key))).await?;
+        if rows.is_empty() {
+            return Err(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "xorb on-disk layout missing — upload predates layout indexing".into(),
+            ));
+        }
+        layout_by_xorb.insert(key, rows);
     }
 
     let mut wire_terms = Vec::with_capacity(terms.len());
     let mut fetch_info: BTreeMap<String, Vec<CASReconstructionFetchInfo>> = BTreeMap::new();
     for t in &terms {
         let xorb_hex = encode_hash(&t.xorb.0);
-        let offsets = offsets_by_xorb.get(t.xorb.as_bytes()).ok_or_else(|| {
+        let layout = layout_by_xorb.get(t.xorb.as_bytes()).ok_or_else(|| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "missing offsets for known xorb".into(),
+                "missing layout for known xorb".into(),
             )
         })?;
-        if (t.chunk_idx_end as usize) > offsets.len() {
+        if (t.chunk_idx_end as usize) > layout.len() {
             return Err(ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "term chunk range exceeds xorb's known chunks".into(),
+                "term chunk range exceeds xorb's known frames".into(),
             ));
         }
-        let start_row = &offsets[t.chunk_idx_start as usize];
-        let last_row = &offsets[(t.chunk_idx_end - 1) as usize];
-        let byte_start = start_row.byte_start as u64;
+        let start_frame = &layout[t.chunk_idx_start as usize];
+        let last_frame = &layout[(t.chunk_idx_end - 1) as usize];
+        let byte_start = start_frame.on_disk_start as u64;
         let byte_end_inclusive =
-            (last_row.byte_start as u64) + (last_row.unpacked_segment_bytes as u64) - 1;
+            (last_frame.on_disk_start as u64) + (last_frame.on_disk_len as u64) - 1;
 
         wire_terms.push(CASReconstructionTerm {
             hash: xorb_hex.clone(),
@@ -425,11 +495,26 @@ where
             });
     }
 
-    Ok(Json(QueryReconstructionResponse {
+    Ok(QueryReconstructionResponse {
         offset_into_first_range: 0,
         terms: wire_terms,
         fetch_info,
-    }))
+    })
+}
+
+/// Decode a 64-char lowercase hex string into a 32-byte hash. Standard hex
+/// (NOT the Xet LE-u64 encoding) — this is what LFS clients send as the `oid`.
+fn decode_lfs_sha256(s: &str) -> Result<Hash32, String> {
+    if s.len() != HASH_LEN * 2 {
+        return Err(format!("must be {} chars", HASH_LEN * 2));
+    }
+    let bytes = hex::decode(s).map_err(|e| format!("not hex: {e}"))?;
+    if bytes.len() != HASH_LEN {
+        return Err("decoded length mismatch".into());
+    }
+    let mut out = [0u8; HASH_LEN];
+    out.copy_from_slice(&bytes);
+    Ok(Hash32(out))
 }
 
 // ---- Handlers: global dedup ------------------------------------------------

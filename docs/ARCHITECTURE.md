@@ -145,6 +145,7 @@ CAS API (all behind `RepoAuthz::verify_xet_token`):
 | Method | Path | Scope | Purpose |
 |--------|------|-------|---------|
 | GET | `/v1/reconstructions/{file_id}` | read | File reconstruction metadata |
+| GET | `/v1/reconstructions/by-sha256/{sha256}` | read | Same, but keyed by LFS sha256 OID |
 | GET | `/v1/chunks/{prefix}/{chunk_hash}` | read | Global dedup query |
 | POST | `/v1/xorbs/default/{xorb_hash}` | write | Xorb upload |
 | POST | `/shards` | write | Shard upload + indexing |
@@ -194,12 +195,32 @@ git lfs push ─▶ POST /repos/{o}/{n}/objects/batch (Basic auth, URL-embedded 
                 git-xet transfer ─▶ POST /v1/xorbs/..., POST /shards (to xet-server, with Xet token)
 ```
 
+The **download** path is asymmetric. git-xet's custom-transfer agent is upload-only — it errors out on `download` with "Operation not supported". For pulls the adapter advertises `transfer="basic"` (standard LFS Batch transfer) and serves bytes itself:
+
+```
+git lfs pull ─▶ POST /repos/{o}/{n}/objects/batch  (operation=download)
+                       │
+                       ▼  transfer="basic", action.download.href = adapter's own URL
+                git-lfs GET /repos/{o}/{n}/objects/{sha256}  ─▶ lfs-adapter
+                                                                  │ mint read token
+                                                                  ▼
+                                                       xet-server: GET /v1/reconstructions/by-sha256/{sha256}
+                                                                  │
+                                                       ◀── {terms, fetch_info (signed xorb URLs)}
+                                                                  │ per term
+                                                                  ▼  GET signed URL with Range
+                                                       streams xorb frames, decodes 8-byte header,
+                                                       LZ4/BG4-LZ4/raw decompress per scheme,
+                                                       writes raw bytes to the LFS response.
+```
+
 Key properties:
 
 - The adapter is **stateless and credential-free**. It holds no JWT secret. It doesn't decode the user's PAT — it just forwards it to xet-server, where `RepoAuthz` is authoritative. This is the property that makes it cheap to drop in front of an existing GitLab/Gitea (no shared secrets to manage).
 - The adapter is intentionally written in **Go** so engineers maintaining the existing LFS code in those projects can read it without learning Rust.
 - For GitLab/Gitea integration: replace xet-server's `xet-server-authz-http` with a thin `/check_access` shim that hits `/api/v4/user` (or Gitea equivalent) and project-member lookups. Adapter and xet-server are unchanged.
-- The remote URL **must** be http(s)/ssh — git-xet rejects `file://` during credential helper setup. `lfs.url` only redirects LFS traffic; the remote URL still has to parse. The integration test (`m9_real_lfs_push`) uses `git lfs push` directly so the unreachable `origin` doesn't actually need to accept a ref push.
+- The remote URL **must** be http(s)/ssh — git-xet rejects `file://` during credential helper setup. `lfs.url` only redirects LFS traffic; the remote URL still has to parse. The push integration test (`m9_real_lfs_push`) uses `git lfs push` directly so the unreachable `origin` doesn't actually need to accept a ref push. The pull test (`m10_real_lfs_pull`) wipes `.git/lfs/objects/` and the worktree file after the push, then runs `git lfs pull` so the bytes have to come from the server.
+- Download streaming in the adapter is **per-chunk** — schemes 0 (raw) and 1 (LZ4 frame) flow through `io.Copy`; scheme 2 (BG4-LZ4) needs the full uncompressed chunk in memory before the byte-group regroup, but chunks are ≤16 MiB by the xorb header's u24 length and typically ~64 KiB. No full-file buffering anywhere.
 
 ## Storage layout
 
@@ -266,6 +287,9 @@ These are the easy-to-get-wrong parts of the protocol. Calling them out explicit
 - **`url_range.end` is inclusive** in the wire format (matches HTTP `Range:` semantics). The chunk-index `range.end` is **exclusive**. We translate carefully in `get_reconstruction`.
 - **Idempotency** — `POST /v1/xorbs/{prefix}/{hash}` and `POST /shards` are content-addressed; re-uploading the same content MUST return 200, not error. `was_inserted: false` on the xorb side; `result: 0` on the shard side (we currently always return `1`; both are spec-defined "success — value is informational").
 - **The server never compresses or decompresses chunks.** Xorbs are opaque bytes on the wire. We verify the URL hash is well-formed on upload; the *content* hash of the xorb is part of the future hardening pass — it requires walking the chunk-hash merkle structure which is reconstructable from the shard CAS Info section, so the server *can* eventually re-verify, but the prototype doesn't.
+- **Shard `byte_start` / `unpacked_segment_bytes` live in *uncompressed* coordinate space**, NOT on-disk bytes. The CAS Info section in an MDB shard records each chunk's offset within a *conceptual* uncompressed xorb (xet-core's `XorbChunkSequenceEntry::chunk_byte_range_start` accumulates `c.data.len()` pre-compression). On-disk byte ranges live separately in the `xorb_frames` table, populated by walking the chunk frame headers when a xorb is POSTed (`xet_server_shard::xorb::parse_xorb_frames`). Reconstruction MUST build `url_range` from `xorb_frames`, not from the shard-derived `chunks` table — using shard offsets gives wrong byte ranges for any real LZ4-compressed xorb.
+- **`FileMetadataExt.sha256` is stored in xet-core's byte-reversed-within-u64-groups order**, not natural sha256 byte order. xet-core treats every `Hash32`-shaped field uniformly as `[u64; 4]` and writes LE u64s, even for sha256 (which has no semantic reason to be reordered). The shard parser un-swaps with `swap_u64_groups` so that downstream code — and the `/v1/reconstructions/by-sha256/{oid}` endpoint, which accepts standard hex LFS OIDs — sees natural bytes.
+- **Chunk frame format** (8-byte `XorbChunkHeader`): `version(u8) | compressed_length(u24 LE) | compression_scheme(u8) | uncompressed_length(u24 LE)`. Schemes: 0=None, 1=LZ4 frame, 2=BG4-LZ4 (byte-group-of-4 deinterleave then LZ4 frame). Scheme 99 (Auto) is a sentinel and must never appear on the wire. The Go adapter decodes all three for the LFS download path; xet-server only parses the header (for byte-range layout) and never touches payloads.
 - **64 MiB limits** on both xorbs and shards — enforced via `DefaultBodyLimit`.
 - **Shard magic tag** — the 32-byte `MDB_SHARD_HEADER_TAG` is `b"HFRepoMetaData" + [0, 85, 105, 103, 69, 106, 123, 129, 87, 131, 165, 189, 217, 92, 205, 209, 74, 169]`, lifted verbatim from xet-core's `mdb_shard::shard_format::MDB_SHARD_HEADER_TAG` at the `git-xet-v0.2.1` tag. Our parser still accepts any 32-byte tag (so shards from older toolchains round-trip), but the serializer emits this canonical value so xet-core's strict header check accepts what we produce.
 
