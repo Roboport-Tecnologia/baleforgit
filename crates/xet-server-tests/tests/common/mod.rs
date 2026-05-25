@@ -52,7 +52,7 @@ pub fn run_git(repo: &Path, args: &[&str]) {
     );
 }
 
-// ---- Mock PAT verifier (stand-in for GitLab/Gitea repo authority) ----------
+// ---- Mock PAT verifier (stand-in for the upstream repo authority) -----------
 
 #[derive(Clone)]
 struct VerifierState {

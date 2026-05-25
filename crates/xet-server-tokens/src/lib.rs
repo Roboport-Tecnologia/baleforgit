@@ -3,7 +3,8 @@
 //! These are HS256 tokens issued by our mock HF Hub endpoint and accepted by
 //! the CAS API. Symmetric secret because the same process mints and verifies;
 //! moving to RS256 (issuer ≠ verifier) is a future-proofing step we'll take
-//! if/when the GitLab/Gitea `RepoAuthz` impl needs to call us out-of-process.
+//! if/when a `RepoAuthz` impl needs to mint tokens out-of-process and have
+//! xet-server verify them.
 
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};

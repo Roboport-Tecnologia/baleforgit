@@ -5,7 +5,7 @@ This document describes the internals of `xet-server`: how the protocol pieces m
 ## Goals
 
 1. Speak the [Xet protocol](https://huggingface.co/docs/xet/index) well enough that an unmodified `git-xet` client can push and pull through us.
-2. Keep everything that touches storage, persistence, or authorization behind a **trait** so the same server can later run on top of S3 / Postgres / GitLab / Gitea.
+2. Keep everything that touches storage, persistence, or authorization behind a **trait** so the same server can later run on top of S3, Postgres, or any external repo authority.
 3. Don't reimplement what xet-core (the client crates) already does well; reuse hashing/chunking semantics, but write our own server-side state.
 
 ## Component view
@@ -47,7 +47,7 @@ This document describes the internals of `xet-server`: how the protocol pieces m
    │   ┌───────┴───────┐    ┌─────┴─────┐      ┌─────┴───────────────┐  │
    │   │ filesystem    │    │ SQLite    │      │ AlwaysAllow         │  │
    │   │ S3 (later)    │    │ Postgres  │      │ ConfigAuthz         │  │
-   │   │ Azure (later) │    │ (later)   │      │ GitLab/Gitea (later)│  │
+   │   │ Azure (later) │    │ (later)   │      │ HttpAuthz (upstream)│  │
    │   └───────────────┘    └───────────┘      └─────────────────────┘  │
    └────────────────────────────────────────────────────────────────────┘
 ```
@@ -131,13 +131,13 @@ pub trait RepoAuthz: Send + Sync {
 | `BlobStore` | `xet-server-storage-mem` | `MemBlobStore` — `RwLock<HashMap>`, used for tests and the M8 pluggability check |
 | `MetadataStore` | `xet-server-meta-sqlite` | `SqliteMetadataStore` — runtime `sqlx` queries (no compile-time DB) |
 | `RepoAuthz` | `xet-server-authz-mem` | `AlwaysAllow` (tests) and `ConfigAuthz` (static map of hub bearers → users → repo scopes) |
-| `RepoAuthz` | `xet-server-authz-http` | `HttpAuthz` — skeleton that delegates `check_repo_access` to a small `POST /check_access` upstream contract. Validates the GitLab/Gitea seam without committing to either API surface. Xet token mint/verify stays local. |
+| `RepoAuthz` | `xet-server-authz-http` | `HttpAuthz` — delegates `check_repo_access` to a small `POST /check_access` upstream contract. The contract is intentionally generic: any service that knows about users and repos (a git forge, an identity provider, a custom proxy) can implement it. Xet token mint/verify stays local. |
 
 ### Planned implementations
 
 - `BlobStore` on S3-compatible object storage, with real presigned URLs returned from `presign_xorb_range` so the HTTP layer can hand them out directly in `fetch_info`.
 - `MetadataStore` on Postgres (only required when we outgrow SQLite — the schema is portable).
-- `RepoAuthz` proxying to GitLab or Gitea: replace the `/check_access` shim with calls to `/api/v4/user` (or the Gitea equivalent) and project-member lookups. `HttpAuthz` is the trait seam check; the production impls will likely be their own crates that talk directly to the upstream APIs.
+- `RepoAuthz` that talks directly to a specific upstream's APIs (e.g. `/api/v4/user` + project-member lookups for a particular git forge), as an alternative to going through the generic `HttpAuthz` shim. Useful when bringing the access-decision logic in-process saves a hop, or when richer upstream concepts (groups, scopes, OAuth) don't fit cleanly behind the minimal `/check_access` contract.
 
 ## Wire surface
 
@@ -165,7 +165,7 @@ Mock HF Hub token endpoint:
 
 The token endpoint accepts the client's upstream hub bearer in `Authorization: Bearer ...`, calls `RepoAuthz::check_repo_access`, then `RepoAuthz::mint_xet_token`.
 
-## LFS adapter (the GitLab/Gitea integration seam)
+## LFS adapter (the git-forge integration seam)
 
 xet-server speaks the **Hugging Face Hub** flavor of the Xet protocol — token endpoint at `/api/{type}s/.../xet-{rw}-token/{rev}`, CAS API at `/v1/...`. Git-LFS doesn't know about this surface; it speaks the [git-lfs Batch API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md) and dispatches to a custom transfer agent (`git-xet`) when the batch response declares `transfer="xet"`. Something in the middle has to bridge the two protocols.
 
@@ -182,7 +182,7 @@ git lfs push ─▶ POST /repos/{o}/{n}/objects/batch (Basic auth, URL-embedded 
                                                                    │
                                                                    ▼ check_repo_access
                                                             upstream PAT verifier
-                                                            (mock here; GitLab/Gitea in prod)
+                                                            (mock here; real git forge in prod)
                        ◀── {accessToken, exp, casUrl}
                        │
                        ▼ wraps as standard LFS Batch response
@@ -217,9 +217,9 @@ git lfs pull ─▶ POST /repos/{o}/{n}/objects/batch  (operation=download)
 
 Key properties:
 
-- The adapter is **stateless and credential-free**. It holds no JWT secret. It doesn't decode the user's PAT — it just forwards it to xet-server, where `RepoAuthz` is authoritative. This is the property that makes it cheap to drop in front of an existing GitLab/Gitea (no shared secrets to manage).
-- The adapter is intentionally written in **Go** so engineers maintaining the existing LFS code in those projects can read it without learning Rust.
-- For GitLab/Gitea integration: replace xet-server's `xet-server-authz-http` with a thin `/check_access` shim that hits `/api/v4/user` (or Gitea equivalent) and project-member lookups. Adapter and xet-server are unchanged.
+- The adapter is **stateless and credential-free**. It holds no JWT secret. It doesn't decode the user's PAT — it just forwards it to xet-server, where `RepoAuthz` is authoritative. This is the property that makes it cheap to drop in front of an existing git forge (no shared secrets to manage).
+- The adapter is intentionally written in **Go** so engineers maintaining the existing LFS code in upstream forges can read it without learning Rust.
+- For integration into a specific forge: stand up a `/check_access` endpoint that authorizes the user/repo pair against that forge's own data, and point xet-server's `XET_AUTHZ_HTTP_URL` at it. Adapter and xet-server are unchanged.
 - The remote URL **must** be http(s)/ssh — git-xet rejects `file://` during credential helper setup. `lfs.url` only redirects LFS traffic; the remote URL still has to parse. The push integration test (`m9_real_lfs_push`) uses `git lfs push` directly so the unreachable `origin` doesn't actually need to accept a ref push. The pull test (`m10_real_lfs_pull`) wipes `.git/lfs/objects/` and the worktree file after the push, then runs `git lfs pull` so the bytes have to come from the server.
 - Download streaming in the adapter is **per-chunk** — schemes 0 (raw) and 1 (LZ4 frame) flow through `io.Copy`; scheme 2 (BG4-LZ4) needs the full uncompressed chunk in memory before the byte-group regroup, but chunks are ≤16 MiB by the xorb header's u24 length and typically ~64 KiB. No full-file buffering anywhere.
 
@@ -261,7 +261,7 @@ Two layers:
 
 ### Why JWTs (HS256) and not opaque tokens?
 
-The verifier needs the user/repo/scope tuple on every request, and the issuer is the same process today, so a self-contained signed token saves us a DB round-trip per request. If/when the GitLab/Gitea `RepoAuthz` lives out-of-process, switching to RS256 (issuer ≠ verifier) is a one-line change in `xet-server-tokens`.
+The verifier needs the user/repo/scope tuple on every request, and the issuer is the same process today, so a self-contained signed token saves us a DB round-trip per request. If/when a `RepoAuthz` impl needs to mint tokens out-of-process (issuer ≠ verifier), switching to RS256 is a one-line change in `xet-server-tokens`.
 
 ## Signed transfer URLs
 

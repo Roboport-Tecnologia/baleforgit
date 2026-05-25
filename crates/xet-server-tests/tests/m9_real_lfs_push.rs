@@ -1,7 +1,7 @@
 //! M9: full end-to-end `git lfs push` through git-lfs → xet-lfs-adapter (Go) →
-//! xet-server. Demonstrates the integration path a real GitLab/Gitea Xet
-//! deployment would follow: the adapter speaks the standard LFS Batch API,
-//! the xet-server is unchanged.
+//! xet-server. Demonstrates the integration path a real Xet deployment behind
+//! a self-hosted git forge would follow: the adapter speaks the standard LFS
+//! Batch API, the xet-server is unchanged.
 //!
 //! Tools required on PATH (test skips with eprintln if any are missing):
 //!   - `go`        (to build the adapter)

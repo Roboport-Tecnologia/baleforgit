@@ -266,8 +266,9 @@ pub trait MetadataStore: Send + Sync {
     async fn xorb_chunk_offsets(&self, xorb: &XorbHash) -> CoreResult<Vec<ChunkOffsetRow>>;
 }
 
-/// Authorization layer. Pluggable so we can later proxy to GitLab/Gitea instead
-/// of keeping our own user/repo permissions.
+/// Authorization layer. Pluggable so we can later proxy to an external repo
+/// authority (any self-hosted git forge or identity provider) instead of
+/// keeping our own user/repo permissions.
 #[async_trait]
 pub trait RepoAuthz: Send + Sync {
     /// Verify a Xet bearer token. Returns the claims granted by the token.

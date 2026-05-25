@@ -49,7 +49,7 @@ async fn read_json<T: serde::de::DeserializeOwned>(body: Body) -> T {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-// ---- Mock upstream "repo authority" (stand-in for GitLab/Gitea) ------------
+// ---- Mock upstream "repo authority" -----------------------------------------
 
 #[derive(Clone)]
 struct UpstreamState(Arc<Vec<(String, String, String, Scope)>>);

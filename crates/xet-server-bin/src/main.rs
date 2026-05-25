@@ -12,9 +12,10 @@
 //!
 //! Authz selection (one of):
 //! - `XET_AUTHZ_HTTP_URL`   — base URL where the upstream `/check_access`
-//!   handler lives (e.g. `http://localhost:3000/-/dfs` for gitea). When set,
-//!   xet-server delegates repo-access decisions to that upstream via
-//!   `xet-server-authz-http::HttpAuthz`, and `XET_GRANTS` is ignored.
+//!   handler lives (any service speaking the wire contract documented in
+//!   `xet-server-authz-http`). When set, xet-server delegates repo-access
+//!   decisions to that upstream via `xet-server-authz-http::HttpAuthz`, and
+//!   `XET_GRANTS` is ignored.
 //! - `XET_GRANTS`           — comma-separated `hub_token:user:repo_id:read|write`
 //!   tuples for the in-process static authz (dev/test). Used only when
 //!   `XET_AUTHZ_HTTP_URL` is unset.
