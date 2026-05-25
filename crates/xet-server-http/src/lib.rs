@@ -24,9 +24,9 @@ use xet_server_core::{
     HASH_LEN,
 };
 use xet_server_shard::{
-    parse_xorb_frames, serialize as serialize_shard, CasChunkEntry, ParsedCasBlock, ParsedShard,
-    ShardFooter, ShardHeader, FOOTER_SIZE, MDB_SHARD_FOOTER_VERSION, MDB_SHARD_HEADER_TAG,
-    MDB_SHARD_HEADER_VERSION,
+    parse_xorb_frames, serialize as serialize_shard, verify_xorb_body, CasChunkEntry,
+    ParsedCasBlock, ParsedShard, ShardFooter, ShardHeader, XorbVerifyError, FOOTER_SIZE,
+    MDB_SHARD_FOOTER_VERSION, MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_wire::{
     decode_hash, encode_hash, CASReconstructionFetchInfo, CASReconstructionTerm,
@@ -264,8 +264,16 @@ where
             uncompressed_len: f.uncompressed_len,
         })
         .collect();
-    // TODO: re-verify xorb content hash against `hash`; see plan §"Tricky bits".
     let xorb = XorbHash(hash);
+    // Content-hash check: decompress each chunk, recompute the merkle
+    // aggregation, compare to the URL hash. Rejects a writer who'd otherwise
+    // be able to corrupt the CAS by uploading bytes that don't match.
+    if let Err(e) = verify_xorb_body(&body, &xorb) {
+        return Err(match e {
+            XorbVerifyError::HashMismatch => bad_req("xorb body does not match URL hash"),
+            other => bad_req(format!("xorb body verification failed: {other}")),
+        });
+    }
     let was_inserted = svc.blobs.put_xorb(&xorb, body).await?;
     svc.meta.register_xorb_layout(&xorb, &layout).await?;
     Ok(Json(UploadXorbResponse { was_inserted }))

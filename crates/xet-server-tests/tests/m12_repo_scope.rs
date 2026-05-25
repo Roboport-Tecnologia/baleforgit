@@ -14,9 +14,9 @@ use xet_server_core::{ChunkHash, FileHash, Hash32, Scope, XorbHash};
 use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_shard::{
-    build_uncompressed_xorb_body, serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock,
-    ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_TAG,
-    MDB_SHARD_HEADER_VERSION,
+    build_uncompressed_xorb_body, serialize, xorb_hash_for_uncompressed_chunks, CasChunkEntry,
+    FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION,
+    MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_storage_fs::FsBlobStore;
 use xet_server_wire::{encode_hash, XetTokenResponse};
@@ -144,7 +144,10 @@ async fn cross_repo_isolation_and_dedup() {
     let alice_w = issue_token(&app, "hub-alice", "alice/repo", "write").await;
     let bob_w = issue_token(&app, "hub-bob", "bob/repo", "write").await;
 
-    let xorb = XorbHash(h(0x10));
+    // `upload_file` builds the body from this same 512-byte payload — derive
+    // the xorb hash from it so the server's verification accepts the upload.
+    let payload: Vec<u8> = (0..512u32).map(|i| i as u8).collect();
+    let xorb = xorb_hash_for_uncompressed_chunks(&[&payload]);
     let file = FileHash(h(0xF0));
 
     upload_file(&app, &alice_w.access_token, xorb, file).await;

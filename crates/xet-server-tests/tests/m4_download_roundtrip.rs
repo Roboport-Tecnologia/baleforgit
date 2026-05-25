@@ -8,9 +8,9 @@ use xet_server_core::{ChunkHash, FileHash, Hash32, XorbHash};
 use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_shard::{
-    build_uncompressed_xorb_body, parse_xorb_frames, serialize, CasChunkEntry, FileTermEntry,
-    ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION,
-    MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
+    build_uncompressed_xorb_body, parse_xorb_frames, serialize, xorb_hash_for_uncompressed_chunks,
+    CasChunkEntry, FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader,
+    FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_storage_fs::FsBlobStore;
 use xet_server_wire::{encode_hash, QueryReconstructionResponse};
@@ -46,9 +46,6 @@ async fn upload_then_reconstruct_byte_for_byte() {
     // and consumes a[0..2) + b[1..3) = 1150 bytes. Each xorb is a real container
     // (one frame per chunk, compression scheme 0); reconstruction returns frame
     // bytes (header + payload), walked below to extract payloads.
-    let xorb_a = XorbHash(h(0x10));
-    let xorb_b = XorbHash(h(0x20));
-
     let a_c0: Vec<u8> = (0..300u32).map(|i| (i as u8).wrapping_add(0x10)).collect();
     let a_c1: Vec<u8> = (0..400u32).map(|i| (i as u8).wrapping_add(0x40)).collect();
     let b_c0: Vec<u8> = (0..250u32).map(|i| (i as u8).wrapping_add(0x80)).collect();
@@ -56,6 +53,8 @@ async fn upload_then_reconstruct_byte_for_byte() {
     let b_c2: Vec<u8> = (0..200u32).map(|i| (i as u8).wrapping_add(0xC0)).collect();
     let body_a = build_uncompressed_xorb_body(&[&a_c0, &a_c1]);
     let body_b = build_uncompressed_xorb_body(&[&b_c0, &b_c1, &b_c2]);
+    let xorb_a = xorb_hash_for_uncompressed_chunks(&[&a_c0, &a_c1]);
+    let xorb_b = xorb_hash_for_uncompressed_chunks(&[&b_c0, &b_c1, &b_c2]);
 
     let post_xorb = |hash: XorbHash, body: Vec<u8>| {
         Request::builder()
@@ -233,9 +232,9 @@ async fn transfer_url_rejects_tampered_range() {
     };
     let app = router(svc);
 
-    let xorb = XorbHash(h(0xCC));
     let payload: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
     let body = build_uncompressed_xorb_body(&[&payload]);
+    let xorb = xorb_hash_for_uncompressed_chunks(&[&payload]);
     let req = Request::builder()
         .method("POST")
         .uri(format!("/v1/xorbs/default/{}", encode_hash(&xorb.0)))

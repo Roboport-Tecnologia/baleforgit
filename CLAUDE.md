@@ -51,10 +51,4 @@ Running the binary needs two hex secrets and either `XET_GRANTS` (static dev aut
 
 ## Don't "fix" these without being asked
 
-The prototype intentionally skips one check documented in `docs/ARCHITECTURE.md`:
-
-- `upload_xorb` does NOT re-hash the body against the URL hash (TODO marker in code).
-
-Tracked as deferred hardening. Don't add as drive-by work.
-
-`Range:`-on-request support on `/v1/reconstructions/*` is also intentionally absent — the prototype always returns the full file's terms. The native `git-dfs` smudge handler passes `0..file_size` (not `FileRange::full()`) when calling `xet-data` to avoid tripping the prefetcher; don't "simplify" that range cap without reading the comment in `crates/git-dfs/src/filter_process.rs`.
+`Range:`-on-request support on `/v1/reconstructions/*` is intentionally absent — the prototype always returns the full file's terms. The native `git-dfs` smudge handler passes `0..file_size` (not `FileRange::full()`) when calling `xet-data` to avoid tripping the prefetcher; don't "simplify" that range cap without reading the comment in `crates/git-dfs/src/filter_process.rs`.

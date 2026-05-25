@@ -23,6 +23,9 @@
 //! ASCII bytes well outside the version-0 range, e.g. `XETBLOB`).
 
 use thiserror::Error;
+use xet_core_structures::merklehash::{compute_data_hash, xorb_hash as compute_xorb_merkle_hash};
+use xet_core_structures::xorb_object::CompressionScheme;
+use xet_server_core::XorbHash;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XorbChunkFrame {
@@ -45,6 +48,24 @@ pub enum XorbParseError {
     },
     #[error("frame {frame_index} has invalid compression scheme {scheme}")]
     BadCompressionScheme { frame_index: usize, scheme: u8 },
+}
+
+#[derive(Debug, Error)]
+pub enum XorbVerifyError {
+    #[error(transparent)]
+    Parse(#[from] XorbParseError),
+    #[error("frame {frame_index} failed to decompress: {message}")]
+    DecompressFailed { frame_index: usize, message: String },
+    #[error(
+        "frame {frame_index} length mismatch: header declared {declared}, decompressed {actual}"
+    )]
+    LengthMismatch {
+        frame_index: usize,
+        declared: usize,
+        actual: usize,
+    },
+    #[error("xorb content hash does not match URL hash")]
+    HashMismatch,
 }
 
 const HEADER_LEN: usize = 8;
@@ -103,6 +124,80 @@ pub fn parse_xorb_frames(body: &[u8]) -> Result<Vec<XorbChunkFrame>, XorbParseEr
         return Err(XorbParseError::Empty);
     }
     Ok(frames)
+}
+
+/// Recompute the xorb content hash from `body` and compare it to `expected`.
+///
+/// Walks every chunk frame, decompresses it via xet-core's `CompressionScheme`
+/// (so BG4-LZ4 / LZ4-frame / None all match the client byte-for-byte),
+/// computes each chunk's `compute_data_hash`, then aggregates with xet-core's
+/// `xorb_hash`. The expected hash arrives in natural-byte order (as decoded
+/// from the URL by `xet_server_wire::decode_hash`), which is exactly the
+/// layout `DataHash::from([u8; 32])` consumes.
+///
+/// Returns `Ok(())` on match; any decompression, length, or hash mismatch is
+/// surfaced so callers can reject the upload before persisting.
+pub fn verify_xorb_body(body: &[u8], expected: &XorbHash) -> Result<(), XorbVerifyError> {
+    let frames = parse_xorb_frames(body)?;
+    let mut entries: Vec<(xet_core_structures::merklehash::MerkleHash, u64)> =
+        Vec::with_capacity(frames.len());
+    for (i, f) in frames.iter().enumerate() {
+        let payload_start = f.on_disk_start as usize + HEADER_LEN;
+        let payload_end = f.on_disk_start as usize + f.on_disk_len as usize;
+        let payload = &body[payload_start..payload_end];
+
+        let scheme = match f.compression_scheme {
+            0 => CompressionScheme::None,
+            1 => CompressionScheme::LZ4,
+            2 => CompressionScheme::ByteGrouping4LZ4,
+            // parse_xorb_frames already rejects anything outside 0..=2.
+            other => {
+                return Err(XorbVerifyError::Parse(
+                    XorbParseError::BadCompressionScheme {
+                        frame_index: i,
+                        scheme: other,
+                    },
+                ));
+            }
+        };
+
+        let decompressed = scheme.decompress_from_slice(payload).map_err(|e| {
+            XorbVerifyError::DecompressFailed {
+                frame_index: i,
+                message: e.to_string(),
+            }
+        })?;
+        if decompressed.len() != f.uncompressed_len as usize {
+            return Err(XorbVerifyError::LengthMismatch {
+                frame_index: i,
+                declared: f.uncompressed_len as usize,
+                actual: decompressed.len(),
+            });
+        }
+
+        let chunk_hash = compute_data_hash(&decompressed);
+        entries.push((chunk_hash, decompressed.len() as u64));
+    }
+
+    let computed = compute_xorb_merkle_hash(&entries);
+    let expected_mh: xet_core_structures::merklehash::MerkleHash = (*expected.as_bytes()).into();
+    if computed != expected_mh {
+        return Err(XorbVerifyError::HashMismatch);
+    }
+    Ok(())
+}
+
+/// Compute the xorb merkle hash for the same chunks `build_uncompressed_xorb_body`
+/// would serialize. Tests that hand-roll xorb uploads use this to produce a URL
+/// hash that passes `verify_xorb_body`.
+pub fn xorb_hash_for_uncompressed_chunks(chunks: &[&[u8]]) -> XorbHash {
+    let entries: Vec<(xet_core_structures::merklehash::MerkleHash, u64)> = chunks
+        .iter()
+        .map(|c| (compute_data_hash(c), c.len() as u64))
+        .collect();
+    let merkle = compute_xorb_merkle_hash(&entries);
+    let bytes: [u8; 32] = merkle.into();
+    XorbHash::from_bytes(bytes)
 }
 
 /// Build a minimal valid xorb body whose chunks are stored uncompressed
@@ -192,5 +287,52 @@ mod tests {
         body.truncate(body.len() - 2);
         let err = parse_xorb_frames(&body).unwrap_err();
         assert!(matches!(err, XorbParseError::Truncated { .. }));
+    }
+
+    #[test]
+    fn verify_accepts_correct_hash() {
+        let c0: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        let c1: Vec<u8> = (0..128u32).map(|i| (i as u8).wrapping_add(7)).collect();
+        let body = build_uncompressed_xorb_body(&[&c0, &c1]);
+        let expected = xorb_hash_for_uncompressed_chunks(&[&c0, &c1]);
+        verify_xorb_body(&body, &expected).expect("hash should match");
+    }
+
+    #[test]
+    fn verify_rejects_mismatched_hash() {
+        let payload: Vec<u8> = (0..64u32).map(|i| i as u8).collect();
+        let body = build_uncompressed_xorb_body(&[&payload]);
+        let wrong = XorbHash::from_bytes([0xAB; 32]);
+        let err = verify_xorb_body(&body, &wrong).unwrap_err();
+        assert!(matches!(err, XorbVerifyError::HashMismatch));
+    }
+
+    #[test]
+    fn verify_rejects_body_whose_chunks_were_swapped() {
+        // Hash is computed over c0 then c1, but the body has c1 then c0.
+        let c0: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let c1: Vec<u8> = (0..200u32).map(|i| (i as u8).wrapping_add(0x33)).collect();
+        let expected = xorb_hash_for_uncompressed_chunks(&[&c0, &c1]);
+        let swapped_body = build_uncompressed_xorb_body(&[&c1, &c0]);
+        let err = verify_xorb_body(&swapped_body, &expected).unwrap_err();
+        assert!(matches!(err, XorbVerifyError::HashMismatch));
+    }
+
+    #[test]
+    fn verify_rejects_empty_body() {
+        let expected = XorbHash::from_bytes([0; 32]);
+        let err = verify_xorb_body(&[], &expected).unwrap_err();
+        assert!(matches!(err, XorbVerifyError::Parse(XorbParseError::Empty)));
+    }
+
+    #[test]
+    fn verify_rejects_corrupted_chunk_bytes() {
+        let payload: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        let expected = xorb_hash_for_uncompressed_chunks(&[&payload]);
+        let mut body = build_uncompressed_xorb_body(&[&payload]);
+        // Flip a payload byte after the 8-byte header.
+        body[HEADER_LEN + 5] ^= 0xFF;
+        let err = verify_xorb_body(&body, &expected).unwrap_err();
+        assert!(matches!(err, XorbVerifyError::HashMismatch));
     }
 }

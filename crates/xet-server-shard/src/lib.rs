@@ -12,7 +12,10 @@ use thiserror::Error;
 use xet_server_core::{ChunkHash, FileHash, Hash32, XorbHash, HASH_LEN};
 
 pub mod xorb;
-pub use xorb::{build_uncompressed_xorb_body, parse_xorb_frames, XorbChunkFrame, XorbParseError};
+pub use xorb::{
+    build_uncompressed_xorb_body, parse_xorb_frames, verify_xorb_body,
+    xorb_hash_for_uncompressed_chunks, XorbChunkFrame, XorbParseError, XorbVerifyError,
+};
 
 pub const ENTRY_SIZE: usize = 48;
 pub const HEADER_SIZE: usize = 48;

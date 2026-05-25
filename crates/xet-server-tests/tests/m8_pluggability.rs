@@ -11,13 +11,13 @@ use http_body_util::BodyExt;
 use std::sync::Arc;
 use tower::ServiceExt;
 use xet_server_authz_http::HttpAuthz;
-use xet_server_core::{ChunkHash, FileHash, Hash32, Scope, XorbHash};
+use xet_server_core::{ChunkHash, FileHash, Hash32, Scope};
 use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_shard::{
-    build_uncompressed_xorb_body, parse_xorb_frames, serialize, CasChunkEntry, FileTermEntry,
-    ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION,
-    MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
+    build_uncompressed_xorb_body, parse_xorb_frames, serialize, xorb_hash_for_uncompressed_chunks,
+    CasChunkEntry, FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader,
+    FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_storage_mem::MemBlobStore;
 use xet_server_wire::{encode_hash, QueryReconstructionResponse, XetTokenResponse};
@@ -146,9 +146,9 @@ async fn end_to_end_against_alternate_impls() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    let xorb = XorbHash(h(0x20));
     let payload: Vec<u8> = (0..512u32).map(|i| (i as u8).wrapping_mul(3)).collect();
     let body = build_uncompressed_xorb_body(&[&payload]);
+    let xorb = xorb_hash_for_uncompressed_chunks(&[&payload]);
     let req = Request::builder()
         .method("POST")
         .uri(format!("/v1/xorbs/default/{}", encode_hash(&xorb.0)))

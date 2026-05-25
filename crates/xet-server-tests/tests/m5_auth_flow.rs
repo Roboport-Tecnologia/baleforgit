@@ -8,9 +8,9 @@ use xet_server_core::{ChunkHash, FileHash, Hash32, Scope, XorbHash};
 use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_shard::{
-    build_uncompressed_xorb_body, serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock,
-    ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_TAG,
-    MDB_SHARD_HEADER_VERSION,
+    build_uncompressed_xorb_body, serialize, xorb_hash_for_uncompressed_chunks, CasChunkEntry,
+    FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION,
+    MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_storage_fs::FsBlobStore;
 use xet_server_wire::{encode_hash, XetTokenResponse};
@@ -70,9 +70,9 @@ async fn write_token_unlocks_upload_then_download() {
     assert_eq!(tok.cas_url, "http://test.invalid");
     assert!(!tok.access_token.is_empty());
 
-    let xorb = XorbHash(h(0x10));
     let payload: Vec<u8> = (0..512u32).map(|i| i as u8).collect();
     let body = build_uncompressed_xorb_body(&[&payload]);
+    let xorb = xorb_hash_for_uncompressed_chunks(&[&payload]);
     let req = Request::builder()
         .method("POST")
         .uri(format!("/v1/xorbs/default/{}", encode_hash(&xorb.0)))

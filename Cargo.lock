@@ -4397,6 +4397,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "thiserror",
+ "xet-core-structures",
  "xet-server-core",
 ]
 

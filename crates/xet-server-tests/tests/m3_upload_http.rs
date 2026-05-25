@@ -5,13 +5,13 @@ use http_body_util::BodyExt;
 use std::sync::Arc;
 use tower::ServiceExt;
 use xet_server_authz_mem::AlwaysAllow;
-use xet_server_core::{ChunkHash, FileHash, Hash32, MetadataStore, XorbHash};
+use xet_server_core::{BlobStore, ChunkHash, FileHash, Hash32, MetadataStore, XorbHash};
 use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_shard::{
-    build_uncompressed_xorb_body, serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock,
-    ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION, MDB_SHARD_HEADER_TAG,
-    MDB_SHARD_HEADER_VERSION,
+    build_uncompressed_xorb_body, serialize, xorb_hash_for_uncompressed_chunks, CasChunkEntry,
+    FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION,
+    MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
 };
 use xet_server_storage_fs::FsBlobStore;
 use xet_server_wire::{encode_hash, UploadShardResponse, UploadXorbResponse};
@@ -43,13 +43,13 @@ async fn upload_xorb_then_shard_indexes_metadata() {
     };
     let app = router(svc);
 
-    // Server parses the body to extract on-disk frame layout, so the two
-    // "chunks" must be wrapped in valid xorb frames. The hash is not re-verified
-    // against the body (see TODO in handler).
-    let xorb_hash = XorbHash(h(0x10));
+    // Server parses the body to extract on-disk frame layout, and verifies the
+    // URL hash matches the body's merkle aggregation, so we compute the real
+    // xorb hash from the same chunks rather than using a synthetic one.
     let chunk0_payload: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
     let chunk1_payload: Vec<u8> = (0..256u32).map(|i| (i as u8).wrapping_add(0x80)).collect();
     let xorb_body = build_uncompressed_xorb_body(&[&chunk0_payload, &chunk1_payload]);
+    let xorb_hash = xorb_hash_for_uncompressed_chunks(&[&chunk0_payload, &chunk1_payload]);
 
     let req = Request::builder()
         .method("POST")
@@ -230,4 +230,48 @@ async fn xorb_upload_rejects_malformed_hash() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn xorb_upload_rejects_body_whose_hash_doesnt_match_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Arc::new(FsBlobStore::open(dir.path().join("blobs")).await.unwrap());
+    let meta = Arc::new(SqliteMetadataStore::open_path(":memory:").await.unwrap());
+    let svc = Service {
+        blobs: blobs.clone(),
+        meta: meta.clone(),
+        authz: Arc::new(AlwaysAllow),
+        transfer_secret: [0u8; 32],
+        public_base_url: "http://test.invalid".into(),
+    };
+    let app = router(svc);
+
+    // Compute the correct hash for one body but POST under a different,
+    // attacker-controlled hash. The server must reject the upload AND not
+    // record any metadata for either hash.
+    let payload: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+    let body = build_uncompressed_xorb_body(&[&payload]);
+    let wrong_hash = XorbHash(h(0xAB));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/xorbs/default/{}", encode_hash(&wrong_hash.0)))
+        .header("Authorization", "Bearer test")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let s = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        s.contains("URL hash"),
+        "expected hash-mismatch error, got: {s}"
+    );
+
+    // Neither the storage nor the metadata layer should have remembered it.
+    assert!(!blobs.xorb_exists(&wrong_hash).await.unwrap());
+    assert!(!meta.xorb_exists(&wrong_hash).await.unwrap());
+    let real_hash = xorb_hash_for_uncompressed_chunks(&[&payload]);
+    assert!(!blobs.xorb_exists(&real_hash).await.unwrap());
+    assert!(!meta.xorb_exists(&real_hash).await.unwrap());
 }
