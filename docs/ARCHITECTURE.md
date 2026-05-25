@@ -2,11 +2,14 @@
 
 This document describes the internals of `xet-server`: how the protocol pieces map to code, what each pluggable trait is for, and the gotchas of the Xet wire format.
 
+The repo also ships two client paths that sit *in front of* xet-server: the legacy `lfs-adapter/` Go bridge (drives `git-lfs` users into xet-server) and the native `git-dfs` filter in `crates/git-dfs/` (replaces `git-lfs` entirely with a long-running Git filter that talks xet-core directly). Both are covered below.
+
 ## Goals
 
 1. Speak the [Xet protocol](https://huggingface.co/docs/xet/index) well enough that an unmodified `git-xet` client can push and pull through us.
 2. Keep everything that touches storage, persistence, or authorization behind a **trait** so the same server can later run on top of S3, Postgres, or any external repo authority.
 3. Don't reimplement what xet-core (the client crates) already does well; reuse hashing/chunking semantics, but write our own server-side state.
+4. Make it possible to drop the server in front of an existing git forge without sharing secrets: the forge owns the user model, mints short-lived JWTs, and answers a single `/check_access` callback (see [`DFS_FORGE_PROTOCOL.md`](DFS_FORGE_PROTOCOL.md)).
 
 ## Component view
 
@@ -68,13 +71,15 @@ This document describes the internals of `xet-server`: how the protocol pieces m
 
 ### Download (read-token scope sufficient)
 
-1. Client calls `GET /v1/reconstructions/{file_id}` (optionally with `Range: bytes=..`).
+1. Client calls one of:
+   - `GET /v1/reconstructions/{file_id}` — file_id is the Xet merkle file hash (in Xet hex encoding).
+   - `GET /v1/reconstructions/by-sha256/{oid}` — `oid` is a standard 64-char lowercase-hex LFS sha256 OID; the server first resolves it to a file_id via the `files.sha256` index.
 2. Server **scope-checks the file against the caller's repo**: there must be a row in `files` matching `(file_hash, repo_id = claims.repo.repo_id)`. If not, returns **404** (not 403 — so an attacker can't probe for existence in other repos). The `files` table uses `(file_hash, repo_id)` as a composite primary key, so the same content can be registered in multiple repos and each registration independently grants read access (cross-repo dedup at the chunk layer is unchanged).
-3. Server looks up the file's terms; for each term it joins against the chunk-offset index to compute the xorb byte range covering `[chunk_idx_start, chunk_idx_end)`. It builds `fetch_info` with one **signed transfer URL** per term and the `url_range` bytes covered.
+3. Server looks up the file's terms. For each term it reads the xorb's on-disk frame layout from `xorb_frames` (NOT the `chunks` table — that one stores uncompressed offsets) and computes the on-disk byte range covering `[chunk_idx_start, chunk_idx_end)`. It builds `fetch_info` with one **signed transfer URL** per term and the `url_range` bytes covered.
 4. Server returns JSON `QueryReconstructionResponse`.
 5. Client fetches each `url` with the prescribed `Range` header. The server (transfer layer) verifies the HMAC signature, verifies the Range header matches the signed range (otherwise 401), and streams the bytes from `BlobStore::get_xorb_range`. Client deserializes chunks, strips `offset_into_first_range` from the first one, concatenates.
 
-`Range:` request-side support on `/v1/reconstructions/*` is **not yet implemented** — the prototype always returns the full file's terms. Range support on the transfer URL itself is fully implemented (and mandatory, since signatures cover the byte range).
+`Range:` request-side support on `/v1/reconstructions/*` is **not yet implemented** — the prototype always returns the full file's terms. Range support on the transfer URL itself is fully implemented (and mandatory, since signatures cover the byte range). The native `git-dfs` smudge handler works around the missing range support by passing `0..file_size` to `xet-data` (see "Native filter" below); the LFS-adapter download path doesn't need it because it streams term-by-term itself.
 
 ### Global dedup
 
@@ -86,7 +91,7 @@ This document describes the internals of `xet-server`: how the protocol pieces m
 
 ## Pluggable traits
 
-All three live in `xet-server-core`. No HTTP handler accesses storage or auth directly — handlers go through these traits via the `Service` struct, which holds `Arc<dyn ...>` (well, `Arc<B>` etc. — kept generic so the binary picks a concrete impl at link time).
+All three live in `xet-server-core`. No HTTP handler accesses storage or auth directly — handlers go through these traits via the `Service<B, M, A>` struct, which holds `Arc<B>` / `Arc<M>` / `Arc<A>` (monomorphised on the chosen impls — see "Auth flow" for why the binary builds two separate `Service`s).
 
 ```rust
 #[async_trait]
@@ -97,7 +102,7 @@ pub trait BlobStore: Send + Sync {
     async fn put_shard(&self, hash: &ShardHash, body: Bytes) -> CoreResult<()>;
     async fn get_shard(&self, hash: &ShardHash) -> CoreResult<Bytes>;
     async fn presign_xorb_range(&self, hash: &XorbHash, byte_range: Range<u64>, ttl: Duration)
-        -> CoreResult<Option<String>>;
+        -> CoreResult<Option<String>> { Ok(None) }
 }
 
 #[async_trait]
@@ -105,8 +110,19 @@ pub trait MetadataStore: Send + Sync {
     async fn register_xorb(&self, xorb: &XorbInfo, chunks: &[ChunkRow]) -> CoreResult<()>;
     async fn register_file(&self, file_hash: &FileHash, repo: &RepoRef,
                            sha256: Option<&Hash32>, terms: &[FileTerm]) -> CoreResult<()>;
+
+    // On-disk frame layout — populated at xorb upload time by parsing the
+    // chunk frame headers; required to translate shard chunk-index ranges
+    // into HTTP byte ranges (the chunks table only has uncompressed offsets).
+    async fn register_xorb_layout(&self, xorb: &XorbHash, frames: &[XorbFrameRow]) -> CoreResult<()>;
+    async fn xorb_frame_layout(&self, xorb: &XorbHash) -> CoreResult<Vec<XorbFrameRow>>;
+
     async fn xorb_exists(&self, xorb: &XorbHash) -> CoreResult<bool>;
     async fn lookup_file(&self, file_hash: &FileHash) -> CoreResult<Option<Vec<FileTerm>>>;
+    // M12 scope check: true iff `file_hash` is registered in `repo_id`.
+    async fn file_in_repo(&self, file_hash: &FileHash, repo_id: &str) -> CoreResult<bool>;
+    // LFS-keyed lookup for the by-sha256 reconstruction endpoint.
+    async fn lookup_file_by_sha256(&self, sha256: &Hash32) -> CoreResult<Option<FileHash>>;
     async fn lookup_chunk(&self, chunk_hash: &ChunkHash) -> CoreResult<Option<ChunkLocation>>;
     async fn xorbs_near_chunk(&self, chunk_hash: &ChunkHash, limit: usize)
         -> CoreResult<Vec<XorbInfo>>;
@@ -223,6 +239,50 @@ Key properties:
 - The remote URL **must** be http(s)/ssh — git-xet rejects `file://` during credential helper setup. `lfs.url` only redirects LFS traffic; the remote URL still has to parse. The push integration test (`m9_real_lfs_push`) uses `git lfs push` directly so the unreachable `origin` doesn't actually need to accept a ref push. The pull test (`m10_real_lfs_pull`) wipes `.git/lfs/objects/` and the worktree file after the push, then runs `git lfs pull` so the bytes have to come from the server.
 - Download streaming in the adapter is **per-chunk** — schemes 0 (raw) and 1 (LZ4 frame) flow through `io.Copy`; scheme 2 (BG4-LZ4) needs the full uncompressed chunk in memory before the byte-group regroup, but chunks are ≤16 MiB by the xorb header's u24 length and typically ~64 KiB. No full-file buffering anywhere.
 
+## Native filter: `git-dfs` (the LFS-bypass path)
+
+`crates/git-dfs/` is a native Rust replacement for the LFS adapter, installed as a `filter.dfs.process` driver in git config. It speaks Git's long-running filter protocol directly, and calls into `xet-core`'s `FileUploadSession` / `FileDownloadSession` for chunking and reconstruction — bypassing `git-lfs` entirely. The forge protocol it speaks to authenticate is documented in [`DFS_FORGE_PROTOCOL.md`](DFS_FORGE_PROTOCOL.md).
+
+Why a second client path?
+
+- **No `.git/lfs/objects/`**: git-lfs's design keeps a whole-file copy of every tracked blob in the per-repo store *in addition to* the worktree. That defeats Xet's chunk-level dedup locally and roughly doubles disk usage. git-dfs keeps only the worktree file plus a deduplicated per-user chunk cache.
+- **Pretty-printed JSON pointer** with stable key order (`hash`, `file_size`, `sha256`) instead of the git-lfs `version/oid/size` line format. Tracked as a normal blob, parseable without xet-core.
+- **Long-running process**: one filter-process subprocess per `git add` / `git checkout` fan-out, not one subprocess per file.
+
+Layout on disk:
+
+```
+<repo>/big.bin                          # worktree (one copy)
+<repo>/.git/dfs/manifests/<file_id>.json # per-file reconstruction terms
+~/.cache/dfs/chunks/                     # shared chunk pool across repos
+```
+
+### Hot vs cold smudge
+
+On `command=smudge` (filter sees a pointer, must reconstruct), git-dfs first tries a **cache-only** path:
+
+1. Load `.git/dfs/manifests/<file_id>.json`. Returns `None` for missing / malformed / unknown-version manifests — all three trigger the cold path.
+2. For each cached term, ask the local chunk cache (`xet-client::chunk_cache`) for the chunk range. Any miss → fall back to the cold path.
+3. Concatenate the chunk bytes into a temp file. Length checks guard against stale manifests corrupting the worktree.
+
+If the cache path fails or doesn't run, git-dfs falls back to the standard `FileDownloadSession::download_to_writer` — same code path xet-core uses for HF-Hub-hosted Xet content. It additionally writes the manifest to `.git/dfs/manifests/` as a side effect so subsequent checkouts go through the hot path. The manifest stores only content-addressed `terms` (xorb hash + chunk-index range), **not** `fetch_info` URLs — those signed URLs expire after `SIGNATURE_TTL_SECS` (10 min) and aren't safe to persist.
+
+Critical detail: the cold path passes `0..file_size` (not `FileRange::full()`, which xet-core defaults to) to `download_to_writer`. xet-server has no Range support on `/v1/reconstructions/*`, and xet-data's prefetcher fans out to up to 256 MiB beyond EOF when given an unbounded range — every prefetched block then re-fetches the full file terms and trips xet-data's `SequentialWriter` contiguity check. The cap keeps the prefetcher quiet. Drives `m11_native_filter`.
+
+### Auth resolution
+
+`git-dfs` deliberately holds no xet-server secret of its own. Auth is resolved on first-use per scope (one resolution for write/clean, one for read/smudge, cached in the filter-process lifetime). The resolver lives in `crates/git-dfs/src/resolver.rs`:
+
+1. **Fast path**: if both `dfs.serverUrl` and `dfs.token` are set in local git config (or `DFS_SERVER_URL` / `DFS_TOKEN` env), use them as-is. This is the `m11` test path and the "I'm running my own forge and just want a static service token" mode.
+2. **Remote parse**: `git remote get-url origin` → HTTP(S) or SSH `RemoteUrl` (scp-style `git@host:owner/repo.git` also supported).
+3. **Forge authenticate**:
+   - HTTPS → `POST {forge}/<owner>/<repo>.git/info/dfs/authenticate?op=<download|upload>` with HTTPS Basic auth pulled from `git credential fill`. The user's password / PAT is verified inside the forge and never travels beyond it.
+   - SSH → `ssh git@host git-dfs-authenticate <owner>/<repo> <op>`. Identity-based; the SSH key already proved who the user is.
+   - Both return `{href: <xet-server URL>, header.Authorization: "Bearer <forge-minted JWT>"}`.
+4. **Token exchange**: `GET <xet-server>/api/models/<owner>/<repo>/xet-{rw}-token/<rev>` with `Authorization: Bearer <forge-jwt>` → final xet token via the existing HF-Hub-shaped endpoint.
+
+Step 3's forge protocol is the only piece a forge integrator has to implement — see [`DFS_FORGE_PROTOCOL.md`](DFS_FORGE_PROTOCOL.md) for the wire shape. Combined with the existing `POST /check_access` callback that `xet-server-authz-http` already needs, that's the entire surface for "drop xet-server in front of an existing git forge with no shared secrets".
+
 ## Storage layout
 
 ### Filesystem `BlobStore`
@@ -243,11 +303,20 @@ xorbs       (hash BLOB PK, num_chunks, num_bytes_in_cas, num_bytes_on_disk, crea
 chunks      (chunk_hash, xorb_hash, chunk_index, byte_start, unpacked_bytes)
               PK (chunk_hash, xorb_hash)
               INDEX (xorb_hash, chunk_index)
-files       (file_hash PK, repo_type, repo_id, revision, sha256, total_bytes, created_at)
+xorb_frames (xorb_hash, frame_index, on_disk_start, on_disk_len, uncompressed_len)
+              PK (xorb_hash, frame_index)
+files       (file_hash, repo_type, repo_id, revision, sha256, total_bytes, created_at)
+              PK (file_hash, repo_id)   -- composite: same content in N repos
+              INDEX (sha256) WHERE sha256 IS NOT NULL
+              INDEX (repo_id)
 file_terms  (file_hash, term_index, xorb_hash, chunk_idx_start, chunk_idx_end,
              unpacked_bytes, verification)
               PK (file_hash, term_index)
 ```
+
+`xorb_frames` is populated at upload time by `parse_xorb_frames` in `xet-server-shard`. It is the *only* source of truth for HTTP byte ranges — the `chunks` table records uncompressed offsets from the shard's CAS Info section, which don't match on-disk positions for any real LZ4-compressed xorb. See the "Tricky bits" note below.
+
+`files` has a composite primary key on `(file_hash, repo_id)`. The same content can be registered in multiple repos (cross-repo dedup at the file level), and each registration independently grants read access via the M12 scope check.
 
 This is the minimum needed to answer reconstruction queries and global-dedup queries. Migrations run automatically on connection open (idempotent `CREATE TABLE IF NOT EXISTS ...`).
 
@@ -255,9 +324,16 @@ This is the minimum needed to answer reconstruction queries and global-dedup que
 
 Two layers:
 
-1. **Mock HF Hub token endpoint** — accepts a hub-style bearer, calls `RepoAuthz::check_repo_access` + `RepoAuthz::mint_xet_token`, returns `{accessToken, exp, casUrl}`. The `casUrl` is the server's own `public_base_url`, so the client sends subsequent CAS calls right back to us.
+1. **HF-Hub-shaped token endpoint** — accepts a hub-style bearer, calls `RepoAuthz::check_repo_access` + `RepoAuthz::mint_xet_token`, returns `{accessToken, exp, casUrl}`. The `casUrl` is the server's own `public_base_url`, so the client sends subsequent CAS calls right back to us.
 
 2. **Xet token middleware** — wraps every `/v1/*` route. Verifies the `Authorization: Bearer <jwt>` via `RepoAuthz::verify_xet_token`, attaches `TokenClaims` to request extensions, and enforces scope by HTTP method (POST requires write; GET tolerates read). The transfer route `/xorb/default/...` and the token-issuance route `/api/...` are explicitly **outside** the middleware — the former uses signed URLs, the latter uses the hub bearer.
+
+The binary (`xet-server-bin`) picks which `RepoAuthz` impl to wire in at startup:
+
+- `XET_AUTHZ_HTTP_URL` set → `HttpAuthz` from `xet-server-authz-http`. Token mint/verify stays local; only `check_repo_access` is delegated.
+- Otherwise → `ConfigAuthz` from `xet-server-authz-mem`, populated from the `XET_GRANTS` env var. Intended for dev and integration tests only — `AlwaysAllow` is the test-only variant.
+
+The `Service` struct is generic over the trait impls (`Arc<B>`/`Arc<M>`/`Arc<A>`, not `Arc<dyn ...>`) so the chosen impls get monomorphised at link time. The binary builds a separate `Service` per branch for that reason.
 
 ### Why JWTs (HS256) and not opaque tokens?
 
@@ -296,15 +372,37 @@ These are the easy-to-get-wrong parts of the protocol. Calling them out explicit
 
 ## Where to look in the code
 
+Server side:
+
 | Concern | File |
 |---------|------|
 | Trait definitions | `crates/xet-server-core/src/lib.rs` |
 | Hex encoding + JSON wire types | `crates/xet-server-wire/src/lib.rs` |
 | MDB shard binary parser/serializer | `crates/xet-server-shard/src/lib.rs` |
+| Xorb chunk-frame parser (on-disk layout) | `crates/xet-server-shard/src/xorb.rs` |
 | Filesystem blob store | `crates/xet-server-storage-fs/src/lib.rs` |
+| In-memory blob store (M8 pluggability) | `crates/xet-server-storage-mem/src/lib.rs` |
 | SQLite metadata store | `crates/xet-server-meta-sqlite/src/lib.rs` |
-| Static authz + JWT verify wiring | `crates/xet-server-authz-mem/src/lib.rs` |
+| Static authz (`AlwaysAllow`, `ConfigAuthz`) | `crates/xet-server-authz-mem/src/lib.rs` |
+| HTTP-delegating authz (`HttpAuthz`) | `crates/xet-server-authz-http/src/lib.rs` |
 | JWT mint/verify | `crates/xet-server-tokens/src/lib.rs` |
 | Router, handlers, middleware, signed URLs | `crates/xet-server-http/src/lib.rs` |
 | Binary launcher | `crates/xet-server-bin/src/main.rs` |
-| Cross-crate integration tests | `crates/xet-server-tests/tests/*.rs` |
+| Cross-crate integration tests | `crates/xet-server-tests/tests/m*.rs` |
+
+Client side (`crates/git-dfs/`):
+
+| Concern | File |
+|---------|------|
+| `git-dfs` CLI entry point | `crates/git-dfs/src/main.rs` |
+| Long-running filter-process loop | `crates/git-dfs/src/filter_process.rs` |
+| Pkt-line framing | `crates/git-dfs/src/pktline.rs` |
+| JSON pointer encode/decode | `crates/git-dfs/src/pointer.rs` |
+| Per-repo manifest cache (`.git/dfs/manifests/`) | `crates/git-dfs/src/manifest_cache.rs` |
+| Cache-only smudge fast path | `crates/git-dfs/src/local_reconstruct.rs` |
+| Cold-path manifest fetch | `crates/git-dfs/src/remote_manifest.rs` |
+| Config loader (env + `git config`) | `crates/git-dfs/src/config.rs` |
+| Remote URL parsing (http/https/ssh) | `crates/git-dfs/src/remote.rs` |
+| Forge auth resolver | `crates/git-dfs/src/resolver.rs` |
+| `git-dfs install` / `git-dfs uninstall` | `crates/git-dfs/src/install.rs` |
+| `git-dfs track` (`.gitattributes` writer) | `crates/git-dfs/src/track.rs` |

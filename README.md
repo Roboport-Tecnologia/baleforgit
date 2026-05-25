@@ -6,7 +6,9 @@ A self-hosted, Xet-protocol-compatible Content-Addressable Storage server.
 
 [Xet](https://huggingface.co/docs/xet/index) is Hugging Face's storage backend: a Git-LFS-style large-file system that does **content-defined chunking + chunk-level deduplication**. The official client (`git-xet`, `hf-xet`) is open source — the server is not, and Hugging Face only operates it as a hosted SaaS.
 
-This repo is a from-scratch Rust implementation of the **server side** of the Xet protocol, so that an unmodified `git-xet` client can push to and pull from your own infrastructure. Everything is pluggable behind three traits (`BlobStore`, `MetadataStore`, `RepoAuthz`) so the same server can later sit on top of S3, Postgres, GitLab/Gitea, etc.
+This repo is a from-scratch Rust implementation of the **server side** of the Xet protocol, so that an unmodified `git-xet` client can push to and pull from your own infrastructure. Everything is pluggable behind three traits (`BlobStore`, `MetadataStore`, `RepoAuthz`) so the same server can later sit on top of S3, Postgres, or any git forge — the forge integration contract lives in [`docs/DFS_FORGE_PROTOCOL.md`](docs/DFS_FORGE_PROTOCOL.md).
+
+It also ships a native client (`crates/git-dfs/`) that installs as a Git filter driver and replaces `git-lfs` entirely — it speaks Git's long-running filter protocol and calls into `xet-core` directly, so there's no `.git/lfs/objects/` whole-file cache. A legacy Go bridge (`lfs-adapter/`) is retained for repos that need to keep using `git-lfs`.
 
 ## Status
 
@@ -59,7 +61,8 @@ Environment variables understood by the binary:
 | `XET_PUBLIC_URL` | `http://<XET_LISTEN>` | absolute base URL written into signed download URLs |
 | `XET_JWT_SECRET_HEX` | **required** | HS256 secret for Xet JWTs (≥ 32 bytes hex) |
 | `XET_TRANSFER_SECRET_HEX` | **required** | HMAC secret for signed download URLs (exactly 32 bytes hex / 64 chars) |
-| `XET_GRANTS` | none | comma-separated `hub_token:user:repo_id:read\|write` tuples |
+| `XET_AUTHZ_HTTP_URL` | none | If set, delegate `check_repo_access` to this URL (see [`xet-server-authz-http`](crates/xet-server-authz-http/src/lib.rs)). |
+| `XET_GRANTS` | none | Used only when `XET_AUTHZ_HTTP_URL` is unset. Comma-separated `hub_token:user:repo_id:read\|write` tuples for the in-process static authz (dev/test). |
 
 ## Repo layout
 
@@ -67,33 +70,36 @@ Environment variables understood by the binary:
 crates/
 ├── xet-server-core/         # Trait definitions + domain types
 ├── xet-server-wire/         # JSON shapes + Xet hash hex encoding
-├── xet-server-shard/        # MDB shard binary parser + serializer
+├── xet-server-shard/        # MDB shard binary parser + xorb chunk-frame parser
 ├── xet-server-storage-fs/   # BlobStore on the local filesystem
 ├── xet-server-storage-mem/  # BlobStore in memory (test / pluggability check)
 ├── xet-server-meta-sqlite/  # MetadataStore on SQLite
 ├── xet-server-authz-mem/    # In-memory RepoAuthz (AlwaysAllow, ConfigAuthz)
-├── xet-server-authz-http/   # RepoAuthz skeleton that proxies to an upstream HTTP service
+├── xet-server-authz-http/   # RepoAuthz that delegates check_repo_access to an HTTP upstream
 ├── xet-server-tokens/       # HS256 Xet JWT mint/verify
 ├── xet-server-http/         # Axum router, handlers, middleware
 ├── xet-server-bin/          # The `xet-server` binary
-└── xet-server-tests/        # Cross-crate integration tests
+├── xet-server-tests/        # Cross-crate integration tests (m2..m12)
+└── git-dfs/                 # Native Git filter — bypasses LFS entirely.
+                             #   `git-dfs install` registers `filter.dfs.process`.
+                             #   `git-dfs track '*.bin'` enables it for matching paths.
+                             #   Auto-resolves server URL + token from the
+                             #   `origin` remote via the forge's
+                             #   /info/dfs/authenticate endpoint (or SSH
+                             #   `git-dfs-authenticate`); pointers are pretty
+                             #   JSON; chunks live in a shared user-global
+                             #   cache (`~/.cache/dfs/chunks` by default,
+                             #   overridable via `dfs.cacheDir` or `DFS_CACHE_DIR`).
 
-crates/
-└── git-dfs/                  # Native Git filter — bypasses LFS entirely.
-                              #   `git-dfs install` registers the `dfs` filter
-                              #   driver; `git-dfs track '*.bin'` enables it
-                              #   for matching paths. Pointers are pretty-
-                              #   printed JSON; chunks live in a shared
-                              #   user-global cache (`~/.cache/dfs/chunks` by
-                              #   default, overridable via `dfs.cacheDir` or
-                              #   `DFS_CACHE_DIR`).
-
-lfs-adapter/                 # Go: standalone git-lfs Batch API → xet-server bridge
-                             # (legacy path; retained for users on git-lfs)
+lfs-adapter/                 # Go: standalone git-lfs Batch API → xet-server bridge.
+                             # Legacy path; retained for users on git-lfs.
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for request flows, trait surface, storage layout, and protocol notes.
-See [lfs-adapter/README.md](lfs-adapter/README.md) for the legacy LFS bridge.
+The workspace `Cargo.toml` `exclude`s sibling clones of `xet-core/`, `git-lfs/`, and `lfs-adapter/` from `cargo build --workspace`. `git-dfs` depends on `xet-core/` via path deps; the legacy LFS bridge is built by its own `go build` from inside `lfs-adapter/`.
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — request flows, trait surface, storage layout, and protocol notes.
+- [`docs/DFS_FORGE_PROTOCOL.md`](docs/DFS_FORGE_PROTOCOL.md) — what a git forge has to implement to support `git-dfs`.
+- [`lfs-adapter/README.md`](lfs-adapter/README.md) — the legacy LFS bridge.
 
 ## Using the native filter (`git-dfs`)
 
@@ -106,22 +112,38 @@ path:
 cargo build -p git-dfs
 # put target/debug on PATH, or use absolute paths below
 
-git init my-repo && cd my-repo
-git config --local dfs.serverUrl http://127.0.0.1:8080
-git config --local dfs.token "<a Xet JWT>"
-git-dfs install --local
-git-dfs track '*.bin'
+# Inside an existing repo cloned from a DFS-enabled forge:
+git-dfs install --local        # writes filter.dfs.process to .git/config
+git-dfs track '*.bin'          # appends '*.bin filter=dfs -text' to .gitattributes
 git add .gitattributes && git commit -m 'enable dfs'
-# now any *.bin you add is chunked, uploaded, and replaced with a JSON pointer
+
+cp ~/some-big-model.safetensors models/big.bin
+git add models/big.bin && git commit -m 'add model'
+# git-dfs auto-resolves auth from `origin` on first use:
+#  - HTTPS remotes → git credential fill → forge's /info/dfs/authenticate
+#  - SSH remotes   → ssh git@host git-dfs-authenticate <owner>/<repo> upload
+# The forge mints a short-lived JWT, git-dfs exchanges it for a Xet token,
+# uploads chunks, and replaces the worktree blob with a JSON pointer.
+```
+
+For a self-hosted dev loop without a forge (m11-style), skip the auth resolver
+by pinning the server URL and a static token in local git config:
+
+```bash
+git config --local dfs.serverUrl http://127.0.0.1:8080
+git config --local dfs.token "<a Xet JWT minted out-of-band>"
 ```
 
 Local layout after a `git add` + `git checkout`:
 
 ```
-my-repo/big.bin              # worktree (one copy)
-~/.cache/dfs/chunks/         # shared chunk pool (deduped across files & repos)
-                             # No .git/lfs/objects/. No second whole-file copy.
+my-repo/big.bin                              # worktree (one copy)
+my-repo/.git/dfs/manifests/<file_id>.json    # per-file reconstruction terms (cached)
+~/.cache/dfs/chunks/                         # shared chunk pool (deduped across files & repos)
+                                             # No .git/lfs/objects/. No second whole-file copy.
 ```
+
+Want to integrate a forge with `git-dfs`? See [`docs/DFS_FORGE_PROTOCOL.md`](docs/DFS_FORGE_PROTOCOL.md) — the surface is one HTTPS endpoint (`/info/dfs/authenticate`), an SSH command (`git-dfs-authenticate`), and the existing `/check_access` callback on the xet-server side.
 
 ## Development
 
