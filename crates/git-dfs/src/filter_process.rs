@@ -25,12 +25,17 @@ use anyhow::{anyhow, Context, Result};
 use tempfile::NamedTempFile;
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
-use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy};
+use xet_data::processing::{
+    get_cache, CacheConfig, FileDownloadSession, FileUploadSession, Sha256Policy,
+};
 use xet_runtime::core::XetContext;
 
 use crate::config::DfsConfig;
+use crate::local_reconstruct::{try_reconstruct_from_cache, CacheReconstructOutcome};
+use crate::manifest_cache;
 use crate::pktline::{PktReader, PktWriter, MAX_PKT_PAYLOAD};
 use crate::pointer;
+use crate::remote_manifest::fetch_manifest;
 
 const VERSION: &str = "version=2";
 
@@ -182,35 +187,142 @@ fn handle_smudge<R: Read, W: Write>(
     let info =
         pointer::parse_pointer(&pointer_buf).context("smudge: input is not a dfs pointer")?;
 
-    // Reconstruct into a temp file then stream that file's bytes through
-    // pkt-line. We must pass an explicit `0..file_size` range here:
-    // xet-data's `download_file` calls into `FileReconstructor` with
-    // `FileRange::full()` (0..u64::MAX), and `ReconstructionTermManager`
-    // prefetches up to `min_reconstruction_fetch_size` (default 256 MiB)
-    // ahead of EOF. Our xet-server does not implement Range support on
-    // `/v1/reconstructions/*` (see docs/ARCHITECTURE.md), so every prefetched
-    // block re-receives the full-file terms — and xet-data accumulates them,
-    // shifting `cur_file_byte_offset` forward by 256 MiB each round and
-    // tripping the SequentialWriter's contiguity check. Capping the range
-    // by the known file size avoids the speculative prefetch entirely.
     let file_size = info
         .file_size()
         .ok_or_else(|| anyhow!("dfs pointer missing file_size"))?;
-    let translator = build_translator_config(ctx, cfg)?;
-    let tmp = NamedTempFile::new()?;
-    let dest_file = tmp.reopen()?;
-    ctx.runtime
-        .bridge_sync(async move {
-            let session = FileDownloadSession::new(Arc::new(translator), None).await?;
-            let (_id, _n) = session
-                .download_to_writer(&info, 0..file_size, dest_file)
-                .await?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+    let file_id_hex = info.hash().to_string();
 
+    // Shared chunk cache, used by both the hot (cache-only) path and the
+    // fallback path (which lets xet-data populate it).
+    let cache_cfg = CacheConfig {
+        cache_directory: cfg.cache_dir.clone(),
+        cache_size: ctx.config.chunk_cache.size_bytes,
+    };
+    let chunk_cache = get_cache(&ctx.config, &cache_cfg)
+        .map_err(|e| anyhow!("init chunk cache at {}: {e}", cfg.cache_dir.display()))?;
+
+    // ---- Hot path: cache-only reconstruction -----------------------------
+    // If we have a cached manifest *and* every chunk it references is in the
+    // local chunk cache, assemble the file without touching the network.
+    let tmp = NamedTempFile::new()?;
+    let cache_hit = if let Some(git_dir) = cfg.git_dir.as_deref() {
+        match manifest_cache::load(git_dir, &file_id_hex) {
+            Ok(Some(manifest)) => {
+                // Reopen via the path so the async block owns its own File
+                // handle without moving `tmp` — `tmp` is still used below to
+                // stream bytes back to git after we're done.
+                let dest_file = tmp.reopen()?;
+                let ctx_for_cache = ctx.clone();
+                let cache_for_cache = chunk_cache.clone();
+                let outcome = ctx
+                    .runtime
+                    .bridge_sync(async move {
+                        let mut dest = dest_file;
+                        try_reconstruct_from_cache(
+                            &ctx_for_cache,
+                            &cache_for_cache,
+                            &manifest,
+                            file_size,
+                            &mut dest,
+                        )
+                        .await
+                    })
+                    .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+                matches!(outcome, CacheReconstructOutcome::Wrote(_))
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    "reading cached manifest for {file_id_hex}: {e}; falling back to network"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // ---- Cold / lukewarm path: delegate to xet-data ----------------------
+    // Either we had no cached manifest, or a chunk was missing. Reset the
+    // temp file (a partial cache-only write may be in it) and let
+    // FileDownloadSession do the full thing, populating the chunk cache as
+    // a side effect.
+    if !cache_hit {
+        // Truncate any partial bytes from a failed cache-only attempt. We
+        // reopen via the path so we don't have to thread `&mut tmp` around.
+        let mut trunc = tmp.reopen()?;
+        trunc.set_len(0)?;
+        std::io::Seek::seek(&mut trunc, std::io::SeekFrom::Start(0))?;
+        drop(trunc);
+
+        // We must pass an explicit `0..file_size` range here. xet-data's
+        // `download_file` calls into `FileReconstructor` with
+        // `FileRange::full()` (0..u64::MAX), and `ReconstructionTermManager`
+        // prefetches up to `min_reconstruction_fetch_size` (default 256 MiB)
+        // ahead of EOF. Our xet-server does not implement Range support on
+        // `/v1/reconstructions/*` (see docs/ARCHITECTURE.md), so every
+        // prefetched block re-receives the full-file terms — and xet-data
+        // accumulates them, shifting `cur_file_byte_offset` forward by 256
+        // MiB each round and tripping the SequentialWriter's contiguity
+        // check. Capping the range by the known file size avoids the
+        // speculative prefetch entirely.
+        let translator = build_translator_config(ctx, cfg)?;
+        let dest_file = tmp.reopen()?;
+        let info_for_dl = info.clone();
+        let cache_for_dl = chunk_cache.clone();
+        ctx.runtime
+            .bridge_sync(async move {
+                let session =
+                    FileDownloadSession::new(Arc::new(translator), Some(cache_for_dl)).await?;
+                let (_id, _n) = session
+                    .download_to_writer(&info_for_dl, 0..file_size, dest_file)
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+
+        // Cold path only: refresh `.git/dfs/manifests/<file_id>.json` so the
+        // next checkout can take the hot path. This is one extra small HTTP
+        // request per file on first encounter; subsequent checkouts pay
+        // nothing. Best-effort — a failure here only means the cache stays
+        // cold, not that the smudge fails.
+        if let Some(git_dir) = cfg.git_dir.as_deref() {
+            let merkle = match info.merkle_hash() {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("can't parse merkle hash from pointer ({file_id_hex}): {e}");
+                    return finish_smudge(writer, tmp.path());
+                }
+            };
+            let ctx_for_fetch = ctx.clone();
+            let cfg_for_fetch = cfg.clone();
+            let fetched = ctx.runtime.bridge_sync(async move {
+                fetch_manifest(&ctx_for_fetch, &cfg_for_fetch, &merkle).await
+            });
+            match fetched {
+                Ok(Ok(manifest)) => {
+                    if let Err(e) = manifest_cache::save(git_dir, &file_id_hex, &manifest) {
+                        tracing::warn!("saving manifest for {file_id_hex}: {e}");
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("fetching manifest for {file_id_hex}: {e:?}");
+                }
+                Err(e) => {
+                    tracing::warn!("xet runtime error fetching manifest: {e:?}");
+                }
+            }
+        }
+    }
+
+    finish_smudge(writer, tmp.path())
+}
+
+/// Streams the temp file's bytes back through pkt-line and writes the
+/// terminating `status=success` packets.
+fn finish_smudge<W: Write>(writer: &mut PktWriter<W>, tmp_path: &std::path::Path) -> Result<()> {
     writer.write_text_list(&["status=success"])?;
-    let mut f = std::fs::File::open(tmp.path())?;
+    let mut f = std::fs::File::open(tmp_path)?;
     let mut buf = vec![0u8; MAX_PKT_PAYLOAD];
     loop {
         let n = f.read(&mut buf)?;

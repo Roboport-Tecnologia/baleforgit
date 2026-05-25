@@ -25,6 +25,11 @@ pub struct DfsConfig {
     pub token_expiration: u64,
     /// Directory holding cached chunks. Shared across repos by default.
     pub cache_dir: PathBuf,
+    /// Resolved git directory (the path `.git` points at). `None` when we
+    /// couldn't determine it — e.g. the filter is being driven from a unit
+    /// test or a non-git context. Per-repo caches like the manifest cache
+    /// are disabled in that case.
+    pub git_dir: Option<PathBuf>,
 }
 
 impl DfsConfig {
@@ -48,13 +53,46 @@ impl DfsConfig {
         };
 
         let cache_dir = resolve_cache_dir(repo)?;
+        let git_dir = resolve_git_dir(repo);
 
         Ok(Self {
             server_url,
             token,
             token_expiration,
             cache_dir,
+            git_dir,
         })
+    }
+}
+
+/// Resolves the path that `.git` refers to (top-level repo, linked worktree,
+/// submodule, ...) by shelling out to `git rev-parse --git-dir`. The path is
+/// canonicalized to an absolute one when possible so subsequent IO doesn't
+/// depend on the filter's process-level cwd.
+fn resolve_git_dir(repo: Option<&Path>) -> Option<PathBuf> {
+    let mut cmd = Command::new("git");
+    if let Some(p) = repo {
+        cmd.current_dir(p);
+    }
+    cmd.arg("rev-parse").arg("--git-dir");
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(s);
+    // `git rev-parse --git-dir` returns either an absolute path or a relative
+    // path from the cwd it was invoked in (`.git` for the common case).
+    if p.is_absolute() {
+        Some(p)
+    } else {
+        let base = repo
+            .map(|r| r.to_path_buf())
+            .or_else(|| env::current_dir().ok())?;
+        Some(base.join(p))
     }
 }
 

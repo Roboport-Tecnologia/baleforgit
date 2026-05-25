@@ -20,13 +20,31 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::{Request, State};
+use axum::middleware::{from_fn_with_state, Next};
+use axum::response::Response;
 use xet_server_authz_mem::AlwaysAllow;
 use xet_server_http::{router as xet_router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_storage_fs::FsBlobStore;
+
+/// Increments `recon_hits` for every request whose path starts with
+/// `/v1/reconstructions/`. The hot smudge path is asserted to be a no-op
+/// against this counter.
+async fn count_recon_hits(
+    State(recon_hits): State<Arc<AtomicUsize>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if req.uri().path().starts_with("/v1/reconstructions/") {
+        recon_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    next.run(req).await
+}
 
 fn tool_on_path(name: &str) -> bool {
     Command::new("sh")
@@ -113,7 +131,11 @@ async fn native_filter_push_then_pull() {
         transfer_secret: [0x55u8; 32],
         public_base_url: xet_url.clone(),
     };
-    let app = xet_router(svc);
+    // Counter so the test can assert that the hot path (after a manifest is
+    // cached in `.git/dfs/manifests/` *and* every chunk is in the local
+    // chunk cache) makes zero requests to `/v1/reconstructions/`.
+    let recon_hits = Arc::new(AtomicUsize::new(0));
+    let app = xet_router(svc).layer(from_fn_with_state(recon_hits.clone(), count_recon_hits));
     let xet_handle = tokio::spawn(async move { axum::serve(xet_listener, app).await });
 
     // ---- Working repo + git-dfs install ----------------------------------
@@ -196,7 +218,19 @@ async fn native_filter_push_then_pull() {
         std::fs::remove_dir_all(&cache_root).unwrap();
         std::fs::create_dir_all(&cache_root).unwrap();
     }
+    // Also wipe `.git/dfs/manifests/` so the first smudge truly cold-paths
+    // through xet-data and exercises the manifest-save side effect.
+    let manifests_dir = work.join(".git").join("dfs").join("manifests");
+    if manifests_dir.exists() {
+        std::fs::remove_dir_all(&manifests_dir).unwrap();
+    }
+    let cold_recon_before = recon_hits.load(Ordering::Relaxed);
     run_git(&work, &["checkout", "--", "big.bin"]);
+    let cold_recon_after = recon_hits.load(Ordering::Relaxed);
+    assert!(
+        cold_recon_after > cold_recon_before,
+        "expected the cold smudge to hit /v1/reconstructions/ at least once"
+    );
 
     let recovered = std::fs::read(&big_path).expect("worktree file reconstructed");
     assert_eq!(
@@ -205,6 +239,43 @@ async fn native_filter_push_then_pull() {
         "size mismatch on reconstruct"
     );
     assert_eq!(recovered, payload, "content mismatch on reconstruct");
+
+    // ---- Cold path must have saved a manifest under `.git/dfs/manifests/`.
+    let manifest_files: Vec<_> = std::fs::read_dir(&manifests_dir)
+        .expect("manifests dir should exist after cold smudge")
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(
+        manifest_files.len(),
+        1,
+        "expected exactly one cached manifest, found: {manifest_files:?}"
+    );
+    let manifest_blob = std::fs::read(&manifest_files[0]).unwrap();
+    let manifest_json: serde_json::Value =
+        serde_json::from_slice(&manifest_blob).expect("manifest is JSON");
+    assert!(
+        manifest_json
+            .get("terms")
+            .and_then(|t| t.as_array())
+            .is_some(),
+        "manifest should contain a non-null `terms` array: {manifest_json}"
+    );
+
+    // ---- Hot path: chunks already cached, manifest cached. Second smudge
+    // ---- must reconstruct without calling `/v1/reconstructions/` at all.
+    std::fs::remove_file(&big_path).unwrap();
+    let hot_recon_before = recon_hits.load(Ordering::Relaxed);
+    run_git(&work, &["checkout", "--", "big.bin"]);
+    let hot_recon_after = recon_hits.load(Ordering::Relaxed);
+    assert_eq!(
+        hot_recon_before, hot_recon_after,
+        "hot smudge should not hit /v1/reconstructions/ (before={hot_recon_before}, after={hot_recon_after})"
+    );
+    let recovered_hot = std::fs::read(&big_path).expect("worktree file reconstructed (hot)");
+    assert_eq!(
+        recovered_hot, payload,
+        "content mismatch on hot-path reconstruct"
+    );
 
     // ---- And verify there is NO `.git/lfs/` directory anywhere -----------
     let lfs_dir = work.join(".git").join("lfs");
