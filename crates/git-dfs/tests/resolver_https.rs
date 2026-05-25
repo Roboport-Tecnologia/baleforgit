@@ -1,17 +1,16 @@
 //! End-to-end test for the HTTPS auto-resolution flow:
 //!
-//!   git remote (origin) ──┬── (discovery)    GET /<owner>/<repo>.git/info/dfs
-//!                         ├── (credential)   git credential fill → fake PAT
-//!                         └── (exchange)     GET <xet>/api/.../xet-write-token/main
+//!   git remote (origin) ──┬── POST /<owner>/<repo>.git/info/dfs/authenticate
+//!                         │   (HTTPS Basic auth from `git credential fill`)
+//!                         │   → {href, header.Authorization=Bearer <jwt>, expires_at}
+//!                         │   The password is verified by gitea and never
+//!                         │   leaves it — only the JWT travels onward.
+//!                         └── GET <xet>/api/.../xet-{rw}-token/main
+//!                             (Bearer the JWT from above)
+//!                             → {accessToken, exp, casUrl}
 //!
-//! Both gitea and xet-server are mocked by a single axum router on a
-//! tempfile port — the resolver doesn't care that the same URL serves both
-//! roles, since the discovery response and token-exchange response set their
-//! own URLs. Skipped (with eprintln) when `git` isn't on PATH.
-//!
-//! The credential helper is exercised by writing a tiny shell script that
-//! echoes a fixed password, and wiring it via `git config credential.helper`
-//! on the temp repo.
+//! Both gitea and xet-server are mocked by a single axum router on a temp
+//! port. Skipped (with eprintln) when `git` isn't on PATH.
 
 use std::path::Path;
 use std::process::Command;
@@ -19,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use git_dfs::config::RawConfig;
 use git_dfs::resolver::{resolve, Scope};
@@ -39,24 +38,60 @@ fn tool_on_path(name: &str) -> bool {
 
 #[derive(Clone, Default)]
 struct MockState {
-    /// Echoed back as `server_url` (discovery) and `casUrl` (exchange).
-    /// Per-instance so parallel tests don't race on a shared env var.
+    /// Echoed back as `href` from authenticate and as `casUrl` from exchange.
+    /// Per-instance so parallel tests don't share state.
     base_url: String,
-    /// PAT that the mock will accept on the token-exchange endpoint.
-    expected_pat: String,
-    /// Token string the mock will mint on a valid exchange.
-    minted_token: String,
-    /// Records that the discovery and exchange endpoints were both hit.
-    discovery_called: Arc<Mutex<bool>>,
+    /// The Basic-auth password the authenticate endpoint will accept.
+    expected_password: String,
+    /// The JWT the authenticate endpoint mints; also what the exchange
+    /// endpoint accepts as a Bearer. Contains a `.` so resolver doesn't
+    /// confuse it with a PAT or empty string.
+    minted_jwt: String,
+    /// Final xet access token the exchange endpoint hands back.
+    minted_xet_token: String,
+    /// Tracks that both endpoints were hit.
+    authenticate_called: Arc<Mutex<bool>>,
     exchange_called: Arc<Mutex<bool>>,
 }
 
-async fn discovery_handler(
+async fn authenticate_handler(
     State(state): State<MockState>,
     AxumPath((_owner, _repo)): AxumPath<(String, String)>,
-) -> Json<serde_json::Value> {
-    *state.discovery_called.lock().unwrap() = true;
-    Json(json!({ "server_url": state.base_url }))
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    *state.authenticate_called.lock().unwrap() = true;
+    // Decode Basic auth from the Authorization header.
+    let authz = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Some(b64) = authz.strip_prefix("Basic ") else {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"no basic"})));
+    };
+    use base64::Engine;
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::UNAUTHORIZED, Json(json!({"error":"bad b64"}))),
+    };
+    let creds = String::from_utf8_lossy(&decoded).to_string();
+    let (_user, pass) = match creds.split_once(':') {
+        Some(p) => p,
+        None => return (StatusCode::UNAUTHORIZED, Json(json!({"error":"no colon"}))),
+    };
+    if pass != state.expected_password {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"bad password"})),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "href": state.base_url,
+            "header": { "Authorization": format!("Bearer {}", state.minted_jwt) },
+            "expires_at": "2030-01-01T00:00:00Z",
+        })),
+    )
 }
 
 async fn exchange_handler(
@@ -69,30 +104,29 @@ async fn exchange_handler(
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let expected = format!("Bearer {}", state.expected_pat);
+    let expected = format!("Bearer {}", state.minted_jwt);
     if authz != expected {
         return (
             StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad pat" })),
+            Json(json!({ "error": "bad bearer", "got": authz, "expected": expected })),
         );
     }
     (
         StatusCode::OK,
         Json(json!({
-            "accessToken": state.minted_token,
+            "accessToken": state.minted_xet_token,
             "exp": 4_000_000_000u64,
             "casUrl": state.base_url,
         })),
     )
 }
 
-fn write_credential_helper_script(dir: &Path, pat: &str) -> std::path::PathBuf {
+fn write_credential_helper_script(dir: &Path, password: &str) -> std::path::PathBuf {
     let path = dir.join("creds.sh");
     let body = format!(
         "#!/usr/bin/env sh\n\
-         # Only respond to the 'get' command.\n\
          if [ \"$1\" = \"get\" ]; then\n\
-         \tcat <<EOF\nusername=user2\npassword={pat}\nEOF\n\
+         \tcat <<EOF\nusername=user2\npassword={password}\nEOF\n\
          fi\n"
     );
     std::fs::write(&path, body).unwrap();
@@ -100,6 +134,22 @@ fn write_credential_helper_script(dir: &Path, pat: &str) -> std::path::PathBuf {
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
     std::fs::set_permissions(&path, perms).unwrap();
     path
+}
+
+fn build_router(state: MockState) -> Router {
+    Router::new()
+        // axum 0.8 disallows literal segments next to a param within one
+        // segment, so the literal `.git` is captured as part of `{repo}` and
+        // ignored — gitea strips it the same way server-side.
+        .route(
+            "/{owner}/{repo}/info/dfs/authenticate",
+            post(authenticate_handler),
+        )
+        .route(
+            "/api/models/{owner}/{repo}/{scope}/{rev}",
+            get(exchange_handler),
+        )
+        .with_state(state)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -115,24 +165,14 @@ async fn https_resolve_end_to_end() {
 
     let state = MockState {
         base_url: base_url.clone(),
-        expected_pat: "0123456789abcdef0123456789abcdef01234567".into(),
-        minted_token: "xet-jwt-minted-by-mock".into(),
+        expected_password: "user-password".into(),
+        minted_jwt: "fake.jwt.token".into(),
+        minted_xet_token: "xet-jwt-minted-by-mock".into(),
         ..Default::default()
     };
 
-    let app = Router::new()
-        // axum 0.8 disallows literal segments next to a param within one
-        // segment, so we match the whole "repo.git" piece as the parameter
-        // and ignore the value — `.git` is part of the URL the resolver
-        // emits, and the gitea server strips it the same way.
-        .route("/{owner}/{repo}/info/dfs", get(discovery_handler))
-        .route(
-            "/api/models/{owner}/{repo}/{scope}/{rev}",
-            get(exchange_handler),
-        )
-        .with_state(state.clone());
-
-    let server_handle = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server_handle =
+        tokio::spawn(axum::serve(listener, build_router(state.clone())).into_future());
 
     // Build a temp git repo whose `origin` points at the mock.
     let tmp = TempDir::new().unwrap();
@@ -157,10 +197,8 @@ async fn https_resolve_end_to_end() {
         &format!("{base_url}/user2/repo1.git"),
     ]);
 
-    let helper = write_credential_helper_script(tmp.path(), &state.expected_pat);
-    // Clear any inherited helpers (the macOS keychain, libsecret on Linux,
-    // etc.) so the test's helper is the only one git consults. Per
-    // git-credential docs, an empty-string entry resets the inherited list.
+    let helper = write_credential_helper_script(tmp.path(), &state.expected_password);
+    // Clear inherited helpers so our test helper is the only one consulted.
     run_git(&["config", "--local", "--add", "credential.helper", ""]);
     run_git(&[
         "config",
@@ -170,8 +208,6 @@ async fn https_resolve_end_to_end() {
         &format!("!{}", helper.display()),
     ]);
 
-    // Auto-resolution path: both server_url and token absent. cache_dir is
-    // required but unused by the resolver itself.
     let raw = RawConfig {
         server_url: None,
         token: None,
@@ -188,8 +224,8 @@ async fn https_resolve_end_to_end() {
     assert_eq!(resolved.token_expiration, 4_000_000_000);
 
     assert!(
-        *state.discovery_called.lock().unwrap(),
-        "discovery endpoint was hit"
+        *state.authenticate_called.lock().unwrap(),
+        "authenticate endpoint was hit"
     );
     assert!(
         *state.exchange_called.lock().unwrap(),
@@ -200,7 +236,10 @@ async fn https_resolve_end_to_end() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manual_server_url_skips_discovery() {
+async fn manual_server_url_still_calls_authenticate() {
+    // Even with a manually-configured `dfs.serverUrl`, the HTTPS flow must
+    // still hit gitea's authenticate endpoint to obtain a JWT — that's the
+    // whole password-stays-in-gitea property.
     if !tool_on_path("git") {
         eprintln!("skipping: `git` not on PATH");
         return;
@@ -212,18 +251,13 @@ async fn manual_server_url_skips_discovery() {
 
     let state = MockState {
         base_url: base_url.clone(),
-        expected_pat: "abababababababababababababababababababab".into(),
-        minted_token: "xet-jwt-via-manual-url".into(),
+        expected_password: "user-password".into(),
+        minted_jwt: "fake.jwt.token".into(),
+        minted_xet_token: "xet-jwt-via-manual-url".into(),
         ..Default::default()
     };
-    let app = Router::new()
-        .route("/{owner}/{repo}/info/dfs", get(discovery_handler))
-        .route(
-            "/api/models/{owner}/{repo}/{scope}/{rev}",
-            get(exchange_handler),
-        )
-        .with_state(state.clone());
-    let server_handle = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server_handle =
+        tokio::spawn(axum::serve(listener, build_router(state.clone())).into_future());
 
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path().to_path_buf();
@@ -242,10 +276,7 @@ async fn manual_server_url_skips_discovery() {
         "origin",
         &format!("{base_url}/user2/repo1.git"),
     ]);
-    let helper = write_credential_helper_script(tmp.path(), &state.expected_pat);
-    // Clear any inherited helpers (the macOS keychain, libsecret on Linux,
-    // etc.) so the test's helper is the only one git consults. Per
-    // git-credential docs, an empty-string entry resets the inherited list.
+    let helper = write_credential_helper_script(tmp.path(), &state.expected_password);
     run_git(&["config", "--local", "--add", "credential.helper", ""]);
     run_git(&[
         "config",
@@ -255,7 +286,6 @@ async fn manual_server_url_skips_discovery() {
         &format!("!{}", helper.display()),
     ]);
 
-    // User has manually pinned dfs.serverUrl. Discovery must be skipped.
     let raw = RawConfig {
         server_url: Some(base_url.clone()),
         token: None,
@@ -266,12 +296,13 @@ async fn manual_server_url_skips_discovery() {
 
     let resolved = resolve(&raw, Scope::Read).await.unwrap();
     assert_eq!(resolved.token, "xet-jwt-via-manual-url");
-
-    assert!(
-        !*state.discovery_called.lock().unwrap(),
-        "discovery must be skipped when dfs.serverUrl is set"
-    );
+    assert!(*state.authenticate_called.lock().unwrap());
     assert!(*state.exchange_called.lock().unwrap());
 
     server_handle.abort();
 }
+
+// `axum::serve(...).into_future()` lets us hand the serve future to a spawn
+// without binding `axum` directly to the tokio task signature. Without this
+// extension trait we'd need a wrapper async block.
+use std::future::IntoFuture;

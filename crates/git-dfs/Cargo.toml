@@ -34,5 +34,6 @@ xet-runtime = { path = "../../xet-core/xet_runtime" }
 
 [dev-dependencies]
 axum.workspace = true
+base64 = "0.22"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

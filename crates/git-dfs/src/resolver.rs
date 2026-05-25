@@ -1,22 +1,24 @@
 //! Auto-resolve the `(server_url, token)` pair that the xet-core client
 //! needs, when one or both are absent from local config.
 //!
-//! The resolution chains together four steps; each is skipped when its
+//! The resolution chains together three steps; each is skipped when its
 //! output is already known:
 //!
 //! 1. **Remote parse** — `git remote get-url origin` → HTTPS or SSH URL.
-//! 2. **Discover xet-server URL** — HTTPS: `GET <gitea>/<owner>/<repo>.git/info/dfs`.
-//!    SSH: piggy-backs on step 3 (the `git-dfs-authenticate` response carries
-//!    the URL as `href`).
-//! 3. **Obtain a gitea-side bearer**:
-//!    - HTTPS: `git credential fill` → user's gitea PAT.
-//!    - SSH: `ssh git@host git-dfs-authenticate <repo> <op>` → ephemeral JWT.
-//! 4. **Token exchange** — `GET <xet-server>/api/models/<owner>/<repo>/xet-{rw}-token/<rev>`
-//!    with `Authorization: Bearer <gitea-bearer>` → final xet token.
+//! 2. **Obtain a gitea-minted JWT** (also yields the xet-server URL):
+//!    - HTTPS: `git credential fill` → username + password (or PAT). POST
+//!      `<gitea>/<owner>/<repo>.git/info/dfs/authenticate?op=<op>` with HTTPS
+//!      Basic auth. Gitea verifies the credentials locally and returns
+//!      `{href, header.Authorization=Bearer <jwt>}`. The user's password
+//!      never leaves gitea.
+//!    - SSH: `ssh git@host git-dfs-authenticate <repo> <op>` returns the
+//!      same shape over the existing SSH session.
+//! 3. **Token exchange** — `GET <xet-server>/api/models/<owner>/<repo>/xet-{rw}-token/<rev>`
+//!    with `Authorization: Bearer <gitea-jwt>` → final xet token.
 //!
-//! Steps 3 and 4 are skipped when the caller's local config already holds a
-//! literal xet token (the m11 test path). Step 2 is skipped when local
-//! config already holds a `dfs.serverUrl`.
+//! Step 3 is skipped when the caller's local config already holds a literal
+//! xet token (the m11 test path; manual `git config dfs.token` setups).
+//! Step 2's URL output is overridden when local config sets `dfs.serverUrl`.
 
 use std::io::Write;
 use std::path::Path;
@@ -86,13 +88,19 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
             (url, bearer)
         }
         RemoteScheme::Http | RemoteScheme::Https => {
-            let url = if let Some(u) = raw.server_url.clone() {
-                u
-            } else {
-                discover_server_url(&remote, owner, repo_name).await?
-            };
-            let bearer = git_credential_fill(&remote, repo_cwd)?;
-            (url, bearer)
+            // POST gitea's /info/dfs/authenticate with HTTPS Basic auth from
+            // git-credential. Gitea verifies the password locally and returns
+            // a short-lived JWT plus the xet-server URL. The password never
+            // leaves gitea — that's the whole point of going through this
+            // endpoint instead of forwarding the password to xet-server.
+            let (username, password) = git_credential_fill(&remote, repo_cwd)?;
+            let auth =
+                authenticate_http(&remote, owner, repo_name, scope, &username, &password).await?;
+            let bearer = strip_bearer(&auth.authorization).ok_or_else(|| {
+                anyhow!("/info/dfs/authenticate returned non-Bearer Authorization")
+            })?;
+            let url = raw.server_url.clone().unwrap_or(auth.href);
+            (url, bearer.to_string())
         }
     };
 
@@ -117,32 +125,63 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
 }
 
 #[derive(Deserialize)]
-struct DiscoveryResponse {
-    server_url: String,
+struct AuthenticateHTTPResponse {
+    href: String,
+    #[serde(default)]
+    header: std::collections::HashMap<String, String>,
 }
 
-async fn discover_server_url(remote: &RemoteUrl, owner: &str, repo: &str) -> Result<String> {
-    let url = format!("{}/{}/{}.git/info/dfs", remote.https_base(), owner, repo);
+/// POST gitea's `/<owner>/<repo>.git/info/dfs/authenticate?op=...` with
+/// HTTPS Basic auth. Returns the gitea-minted JWT plus the xet-server URL.
+/// The user's password is verified inside gitea and never forwarded to
+/// xet-server.
+async fn authenticate_http(
+    remote: &RemoteUrl,
+    owner: &str,
+    repo: &str,
+    scope: Scope,
+    username: &str,
+    password: &str,
+) -> Result<SshAuthOutcome> {
+    let op = match scope {
+        Scope::Read => "download",
+        Scope::Write => "upload",
+    };
+    let url = format!(
+        "{}/{}/{}.git/info/dfs/authenticate?op={}",
+        remote.https_base(),
+        owner,
+        repo,
+        op,
+    );
     let client = http_client()?;
     let resp = client
-        .get(&url)
+        .post(&url)
+        .basic_auth(username, Some(password))
         .send()
         .await
-        .with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
         return Err(anyhow!(
-            "discovery {url} returned HTTP {}",
-            resp.status().as_u16()
+            "/info/dfs/authenticate {url} returned HTTP {} ({})",
+            status.as_u16(),
+            body.trim()
         ));
     }
-    let body: DiscoveryResponse = resp
+    let parsed: AuthenticateHTTPResponse = resp
         .json()
         .await
-        .with_context(|| "decoding /info/dfs body")?;
-    if body.server_url.is_empty() {
-        return Err(anyhow!("discovery returned empty server_url"));
-    }
-    Ok(body.server_url.trim_end_matches('/').to_string())
+        .with_context(|| "decoding /info/dfs/authenticate body")?;
+    let authz =
+        parsed.header.get("Authorization").cloned().ok_or_else(|| {
+            anyhow!("/info/dfs/authenticate response has no Authorization header")
+        })?;
+    Ok(SshAuthOutcome {
+        href: parsed.href.trim_end_matches('/').to_string(),
+        authorization: authz,
+    })
 }
 
 #[derive(Deserialize, Debug)]
@@ -225,10 +264,13 @@ async fn ssh_authenticate(
 }
 
 /// Run `git credential fill` to pull the user's stored credential for the
-/// remote's host. Returns the password field, which for gitea is the PAT.
+/// remote's host. Returns `(username, password)`. The password is held
+/// briefly in memory by this process and then handed to gitea's HTTPS
+/// authenticate endpoint via standard Basic auth — it never travels beyond
+/// gitea (xet-server only ever sees the JWT gitea mints in response).
 /// `cwd` is the repo path so the repo's local `credential.helper` setting
 /// is honored (otherwise only `--global` / system helpers apply).
-fn git_credential_fill(remote: &RemoteUrl, cwd: Option<&Path>) -> Result<String> {
+fn git_credential_fill(remote: &RemoteUrl, cwd: Option<&Path>) -> Result<(String, String)> {
     let protocol = match remote.scheme {
         RemoteScheme::Http => "http",
         RemoteScheme::Https => "https",
@@ -269,13 +311,21 @@ fn git_credential_fill(remote: &RemoteUrl, cwd: Option<&Path>) -> Result<String>
         ));
     }
 
+    let mut username = None;
     let mut password = None;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some(rest) = line.strip_prefix("password=") {
+        if let Some(rest) = line.strip_prefix("username=") {
+            username = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("password=") {
             password = Some(rest.to_string());
         }
     }
-    password.ok_or_else(|| anyhow!("git credential fill returned no password field"))
+    let password =
+        password.ok_or_else(|| anyhow!("git credential fill returned no password field"))?;
+    // Username may be absent if the credential helper only stored a PAT; gitea
+    // accepts "<any>:PAT" via its PAT-fallback path, so we default to "git".
+    let username = username.unwrap_or_else(|| "git".to_string());
+    Ok((username, password))
 }
 
 #[derive(Deserialize)]
