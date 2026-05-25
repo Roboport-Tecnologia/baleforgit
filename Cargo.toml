@@ -1,5 +1,10 @@
 [workspace]
 resolver = "2"
+exclude = [
+    "xet-core",
+    "git-lfs",
+    "lfs-adapter",
+]
 members = [
     "crates/xet-server-core",
     "crates/xet-server-wire",
@@ -13,6 +18,7 @@ members = [
     "crates/xet-server-http",
     "crates/xet-server-bin",
     "crates/xet-server-tests",
+    "crates/git-dfs",
 ]
 
 [workspace.package]

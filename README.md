@@ -22,6 +22,7 @@ This repo is a from-scratch Rust implementation of the **server side** of the Xe
 | M8 — Pluggability sanity (alternate impls) | done | `xet-server-storage-mem` (in-memory `BlobStore`) + `xet-server-authz-http` (HTTP-backed `RepoAuthz` skeleton), exercised end-to-end by `m8_pluggability` |
 | M9 — Real LFS push via Go adapter | done | `lfs-adapter/` (Go) bridges the standard git-lfs Batch API to xet-server; `m9_real_lfs_push` drives a real `git lfs push --all` through the full chain (git-lfs → adapter → xet-server → git-xet → CAS upload). Skips when `{go, git, git-lfs, git-xet}` aren't all on PATH. |
 | M10 — Real LFS pull via Go adapter | done | Symmetric `git lfs pull` path: adapter advertises `transfer="basic"` for downloads, serves bytes itself by querying xet-server's new `/v1/reconstructions/by-sha256/{oid}` endpoint, then streams xorb frames (LZ4 / raw / BG4-LZ4) chunk-by-chunk back to git-lfs. `m10_real_lfs_pull` round-trips a 300 KiB payload through push then pull and byte-compares. |
+| M11 — Native filter (`git-dfs`) | done | New `crates/git-dfs` binary implements Git's long-running filter protocol directly. No `.git/lfs/objects/` whole-file cache — content lives only as the worktree file plus a shared chunk cache (`~/.cache/dfs/chunks` by default). `m11_native_filter` drives `git add` + a `git checkout` round-trip with the chunk cache wiped in between, so the smudge path is forced through the server. |
 
 
 ## Quick start
@@ -76,12 +77,50 @@ crates/
 ├── xet-server-bin/          # The `xet-server` binary
 └── xet-server-tests/        # Cross-crate integration tests
 
+crates/
+└── git-dfs/                  # Native Git filter — bypasses LFS entirely.
+                              #   `git-dfs install` registers the `dfs` filter
+                              #   driver; `git-dfs track '*.bin'` enables it
+                              #   for matching paths. Pointers are pretty-
+                              #   printed JSON; chunks live in a shared
+                              #   user-global cache (`~/.cache/dfs/chunks` by
+                              #   default, overridable via `dfs.cacheDir` or
+                              #   `DFS_CACHE_DIR`).
+
 lfs-adapter/                 # Go: standalone git-lfs Batch API → xet-server bridge
-                             # (the reference shape for GitLab/Gitea integration)
+                             # (legacy path; retained for users on git-lfs)
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for request flows, trait surface, storage layout, and protocol notes.
-See [lfs-adapter/README.md](lfs-adapter/README.md) for the LFS bridge.
+See [lfs-adapter/README.md](lfs-adapter/README.md) for the legacy LFS bridge.
+
+## Using the native filter (`git-dfs`)
+
+The LFS path (M9 / M10 above) stores a whole-file copy of every tracked blob in
+`.git/lfs/objects/` — git-lfs's design forces this and it defeats Xet's
+chunk-level dedup locally. The `git-dfs` filter is the newer, dedup-preserving
+path:
+
+```bash
+cargo build -p git-dfs
+# put target/debug on PATH, or use absolute paths below
+
+git init my-repo && cd my-repo
+git config --local dfs.serverUrl http://127.0.0.1:8080
+git config --local dfs.token "<a Xet JWT>"
+git-dfs install --local
+git-dfs track '*.bin'
+git add .gitattributes && git commit -m 'enable dfs'
+# now any *.bin you add is chunked, uploaded, and replaced with a JSON pointer
+```
+
+Local layout after a `git add` + `git checkout`:
+
+```
+my-repo/big.bin              # worktree (one copy)
+~/.cache/dfs/chunks/         # shared chunk pool (deduped across files & repos)
+                             # No .git/lfs/objects/. No second whole-file copy.
+```
 
 ## Development
 

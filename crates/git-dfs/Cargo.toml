@@ -1,0 +1,35 @@
+[package]
+name = "git-dfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "git-dfs"
+path = "src/main.rs"
+
+[lib]
+name = "git_dfs"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "=4.5.50", features = ["derive"] }
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# xet-core library crates (path deps to the sibling clone)
+xet-data = { path = "../../xet-core/xet_data" }
+xet-core-structures = { path = "../../xet-core/xet_core_structures" }
+xet-client = { path = "../../xet-core/xet_client" }
+xet-runtime = { path = "../../xet-core/xet_runtime" }
+
+[dev-dependencies]
+tempfile.workspace = true
