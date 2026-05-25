@@ -158,9 +158,14 @@ async fn https_resolve_end_to_end() {
     ]);
 
     let helper = write_credential_helper_script(tmp.path(), &state.expected_pat);
+    // Clear any inherited helpers (the macOS keychain, libsecret on Linux,
+    // etc.) so the test's helper is the only one git consults. Per
+    // git-credential docs, an empty-string entry resets the inherited list.
+    run_git(&["config", "--local", "--add", "credential.helper", ""]);
     run_git(&[
         "config",
         "--local",
+        "--add",
         "credential.helper",
         &format!("!{}", helper.display()),
     ]);
@@ -238,9 +243,14 @@ async fn manual_server_url_skips_discovery() {
         &format!("{base_url}/user2/repo1.git"),
     ]);
     let helper = write_credential_helper_script(tmp.path(), &state.expected_pat);
+    // Clear any inherited helpers (the macOS keychain, libsecret on Linux,
+    // etc.) so the test's helper is the only one git consults. Per
+    // git-credential docs, an empty-string entry resets the inherited list.
+    run_git(&["config", "--local", "--add", "credential.helper", ""]);
     run_git(&[
         "config",
         "--local",
+        "--add",
         "credential.helper",
         &format!("!{}", helper.display()),
     ]);

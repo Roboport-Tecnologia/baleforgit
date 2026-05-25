@@ -84,12 +84,22 @@ pub fn run() -> Result<()> {
 
         match command {
             "clean" => {
+                // Clean always needs the network — no local-only fallback.
                 let cfg = resolve_cached(&mut clean_cfg, &raw, &ctx, resolver::Scope::Write)?;
                 handle_clean(&ctx, cfg, &mut reader, &mut writer, pathname)?;
             }
             "smudge" => {
-                let cfg = resolve_cached(&mut smudge_cfg, &raw, &ctx, resolver::Scope::Read)?;
-                handle_smudge(&ctx, cfg, &mut reader, &mut writer, pathname)?;
+                // Smudge can short-circuit via the manifest + chunk caches.
+                // Pass the raw config + an empty auth slot so resolution only
+                // runs when the hot path misses.
+                handle_smudge(
+                    &ctx,
+                    &raw,
+                    &mut smudge_cfg,
+                    &mut reader,
+                    &mut writer,
+                    pathname,
+                )?;
             }
             other => {
                 // Drain payload before responding so the stream stays in sync.
@@ -216,7 +226,8 @@ fn handle_clean<R: Read, W: Write>(
 
 fn handle_smudge<R: Read, W: Write>(
     ctx: &XetContext,
-    cfg: &DfsConfig,
+    raw: &crate::config::RawConfig,
+    auth_slot: &mut Option<DfsConfig>,
     reader: &mut PktReader<R>,
     writer: &mut PktWriter<W>,
     _pathname: &str,
@@ -232,19 +243,21 @@ fn handle_smudge<R: Read, W: Write>(
     let file_id_hex = info.hash().to_string();
 
     // Shared chunk cache, used by both the hot (cache-only) path and the
-    // fallback path (which lets xet-data populate it).
+    // fallback path (which lets xet-data populate it). Driven from raw
+    // config so building the cache never triggers auth resolution.
     let cache_cfg = CacheConfig {
-        cache_directory: cfg.cache_dir.clone(),
+        cache_directory: raw.cache_dir.clone(),
         cache_size: ctx.config.chunk_cache.size_bytes,
     };
     let chunk_cache = get_cache(&ctx.config, &cache_cfg)
-        .map_err(|e| anyhow!("init chunk cache at {}: {e}", cfg.cache_dir.display()))?;
+        .map_err(|e| anyhow!("init chunk cache at {}: {e}", raw.cache_dir.display()))?;
 
     // ---- Hot path: cache-only reconstruction -----------------------------
     // If we have a cached manifest *and* every chunk it references is in the
-    // local chunk cache, assemble the file without touching the network.
+    // local chunk cache, assemble the file without touching the network —
+    // and crucially, without resolving auth (no token-exchange round trip).
     let tmp = NamedTempFile::new()?;
-    let cache_hit = if let Some(git_dir) = cfg.git_dir.as_deref() {
+    let cache_hit = if let Some(git_dir) = raw.git_dir.as_deref() {
         match manifest_cache::load(git_dir, &file_id_hex) {
             Ok(Some(manifest)) => {
                 // Reopen via the path so the async block owns its own File
@@ -282,10 +295,8 @@ fn handle_smudge<R: Read, W: Write>(
     };
 
     // ---- Cold / lukewarm path: delegate to xet-data ----------------------
-    // Either we had no cached manifest, or a chunk was missing. Reset the
-    // temp file (a partial cache-only write may be in it) and let
-    // FileDownloadSession do the full thing, populating the chunk cache as
-    // a side effect.
+    // Either we had no cached manifest, or a chunk was missing. This is the
+    // first point where we know we'll hit the network, so resolve auth now.
     if !cache_hit {
         // Truncate any partial bytes from a failed cache-only attempt. We
         // reopen via the path so we don't have to thread `&mut tmp` around.
@@ -293,6 +304,8 @@ fn handle_smudge<R: Read, W: Write>(
         trunc.set_len(0)?;
         std::io::Seek::seek(&mut trunc, std::io::SeekFrom::Start(0))?;
         drop(trunc);
+
+        let cfg = resolve_cached(auth_slot, raw, ctx, resolver::Scope::Read)?;
 
         // We must pass an explicit `0..file_size` range here. xet-data's
         // `download_file` calls into `FileReconstructor` with
@@ -325,7 +338,7 @@ fn handle_smudge<R: Read, W: Write>(
         // request per file on first encounter; subsequent checkouts pay
         // nothing. Best-effort — a failure here only means the cache stays
         // cold, not that the smudge fails.
-        if let Some(git_dir) = cfg.git_dir.as_deref() {
+        if let Some(git_dir) = raw.git_dir.as_deref() {
             let merkle = match info.merkle_hash() {
                 Ok(h) => h,
                 Err(e) => {
