@@ -24,16 +24,12 @@
 
 use thiserror::Error;
 
-/// One chunk frame's on-disk layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XorbChunkFrame {
-    /// Byte offset of this frame's header within the xorb body.
     pub on_disk_start: u32,
-    /// Total on-disk frame size: 8 (header) + compressed_length.
+    /// 8-byte header + compressed_length payload.
     pub on_disk_len: u32,
-    /// Payload size after decompression.
     pub uncompressed_len: u32,
-    /// Raw compression-scheme byte (0=none, 1=LZ4 frame, 2=BG4-LZ4).
     pub compression_scheme: u8,
 }
 

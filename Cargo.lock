@@ -4457,7 +4457,6 @@ dependencies = [
 name = "xet-server-tokens"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "jsonwebtoken",
  "serde",
  "xet-server-core",

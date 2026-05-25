@@ -339,8 +339,6 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
     })
 }
 
-/// Serialize a `ParsedShard`. The server only *receives* shards for upload
-/// (no footer); footer serialization is exercised by round-trip tests.
 pub fn serialize(s: &ParsedShard) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_SIZE + ENTRY_SIZE * 16);
     // Header
@@ -371,7 +369,9 @@ pub fn serialize(s: &ParsedShard) -> Vec<u8> {
             }
         }
         if f.file_flags & FLAG_WITH_METADATA_EXT != 0 {
-            let sha = f.sha256.expect("metadata flag set without sha256");
+            // Caller invariant: flag implies Some(sha256). Defensive fallback to
+            // zeros keeps the layout valid rather than panicking server-wide.
+            let sha = f.sha256.unwrap_or(Hash32([0u8; HASH_LEN]));
             out.extend_from_slice(&swap_u64_groups(sha.0));
             out.extend_from_slice(&[0u8; 16]);
         }

@@ -1,8 +1,4 @@
-//! Single-binary launcher for the Xet CAS server. See `README.md` for env vars.
-//!
-//! Authz: `XET_AUTHZ_HTTP_URL` delegates to an HTTP upstream (`xet-server-authz-http`);
-//! otherwise `XET_GRANTS` (`hub_token:user:repo_id:read|write`, comma-separated)
-//! configures the in-process static authz used for dev/test.
+// `XET_AUTHZ_HTTP_URL` wins over `XET_GRANTS` when both are set. See README for env vars.
 
 use anyhow::{bail, Context, Result};
 use std::env;
@@ -83,17 +79,19 @@ async fn main() -> Result<()> {
     } else {
         let mut authz = ConfigAuthz::new(jwt_secret);
         if let Ok(raw) = env::var("XET_GRANTS") {
-            for tuple in raw.split(',').filter(|s| !s.is_empty()) {
+            for (idx, tuple) in raw.split(',').filter(|s| !s.is_empty()).enumerate() {
                 let parts: Vec<&str> = tuple.split(':').collect();
+                // Never interpolate the tuple itself — parts[0] is a hub bearer token.
                 if parts.len() != 4 {
                     bail!(
-                        "XET_GRANTS tuple must be 'hub_token:user:repo_id:scope' (got '{tuple}')"
+                        "XET_GRANTS tuple #{idx} malformed: expected 'hub_token:user:repo_id:scope' with 4 fields, got {}",
+                        parts.len()
                     );
                 }
                 let scope = match parts[3] {
                     "read" => Scope::Read,
                     "write" => Scope::Write,
-                    other => bail!("invalid scope '{other}' in XET_GRANTS"),
+                    other => bail!("invalid scope '{other}' in XET_GRANTS tuple #{idx}"),
                 };
                 authz = authz.grant(parts[0], parts[1], parts[2], scope);
             }

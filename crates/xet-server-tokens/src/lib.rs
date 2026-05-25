@@ -1,5 +1,3 @@
-//! Xet JWT mint / verify (HS256, symmetric secret).
-
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,7 +27,7 @@ pub fn mint(
     scope: Scope,
     ttl_secs: u64,
 ) -> CoreResult<(String, u64)> {
-    let exp = now_unix() + ttl_secs;
+    let exp = now_unix().saturating_add(ttl_secs);
     let claims = XetClaims {
         sub: user.0.clone(),
         repo_type: repo_type_str(repo.repo_type).into(),

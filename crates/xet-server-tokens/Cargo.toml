@@ -6,7 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 jsonwebtoken.workspace = true
 serde.workspace = true
 xet-server-core.workspace = true

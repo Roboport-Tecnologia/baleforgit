@@ -695,14 +695,16 @@ where
 
     let len = bytes.len();
     let mut resp = (StatusCode::PARTIAL_CONTENT, bytes).into_response();
-    resp.headers_mut().insert(
-        "content-length",
-        HeaderValue::from_str(&len.to_string()).unwrap(),
-    );
-    resp.headers_mut().insert(
-        "content-range",
-        HeaderValue::from_str(&format!("bytes {}-{}/*", q.s, q.e)).unwrap(),
-    );
+    resp.headers_mut()
+        .insert("content-length", HeaderValue::from(len));
+    // u64 Display is ASCII digits; HeaderValue accepts any visible ASCII.
+    let content_range = HeaderValue::try_from(format!("bytes {}-{}/*", q.s, q.e)).map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("content-range: {e}"),
+        )
+    })?;
+    resp.headers_mut().insert("content-range", content_range);
     Ok(resp)
 }
 

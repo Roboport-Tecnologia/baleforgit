@@ -68,25 +68,35 @@ pub fn run() -> Result<()> {
             .map(|(_, v)| v.as_str())
             .unwrap_or("<unknown>");
 
+        // A panic or `?`-propagated error here would tank the whole git
+        // operation. Report per-request failures as `status=error` pktlines so
+        // Git can surface them and continue with the next entry.
         match command {
             "clean" => {
-                // Clean always needs the network.
-                let cfg = resolve_cached(&mut clean_cfg, &raw, &ctx, resolver::Scope::Write)?;
-                handle_clean(&ctx, cfg, &mut reader, &mut writer, pathname)?;
+                if let Err(e) = do_clean(
+                    &ctx,
+                    &raw,
+                    &mut clean_cfg,
+                    &mut reader,
+                    &mut writer,
+                    pathname,
+                ) {
+                    report_request_error(&mut reader, &mut writer, "clean", pathname, &e)?;
+                }
             }
             "smudge" => {
-                // Smudge defers auth resolution until the hot path misses.
-                handle_smudge(
+                if let Err(e) = handle_smudge(
                     &ctx,
                     &raw,
                     &mut smudge_cfg,
                     &mut reader,
                     &mut writer,
                     pathname,
-                )?;
+                ) {
+                    report_request_error(&mut reader, &mut writer, "smudge", pathname, &e)?;
+                }
             }
             other => {
-                // Drain payload so the stream stays in sync.
                 drain_payload(&mut reader)?;
                 let err_line = format!("error=unknown command \"{other}\"");
                 writer.write_text_list(&["status=error", err_line.as_str()])?;
@@ -169,19 +179,54 @@ fn drain_payload<R: Read>(reader: &mut PktReader<R>) -> Result<()> {
     Ok(())
 }
 
-fn handle_clean<R: Read, W: Write>(
+/// Report a per-request failure as a trailing `status=error` so Git rejects
+/// this entry without us tearing down the whole filter-process. The error
+/// chain is sent verbatim via `{e:#}`; callers must not put secrets in the
+/// `anyhow::Error` chain (passwords, JWTs, the xet token).
+///
+/// `_reader` is held to make it clear at the call sites that the input
+/// payload has already been consumed by the failing handler — re-draining
+/// here would either block (input already at flush) or desync the stream.
+fn report_request_error<R: Read, W: Write>(
+    _reader: &mut PktReader<R>,
+    writer: &mut PktWriter<W>,
+    op: &str,
+    pathname: &str,
+    e: &anyhow::Error,
+) -> Result<()> {
+    tracing::warn!("{op} failed for {pathname}: {e:#}");
+    let err_line = format!("error={op} failed: {e:#}");
+    writer.write_text_list(&["status=error", err_line.as_str()])?;
+    writer.flush_packet()?;
+    Ok(())
+}
+
+fn do_clean<R: Read, W: Write>(
+    ctx: &XetContext,
+    raw: &crate::config::RawConfig,
+    auth_slot: &mut Option<DfsConfig>,
+    reader: &mut PktReader<R>,
+    writer: &mut PktWriter<W>,
+    pathname: &str,
+) -> Result<()> {
+    // Read the payload first so a later auth failure doesn't leave the
+    // pkt-line stream desynced.
+    let mut tmp = NamedTempFile::new()?;
+    reader.read_binary_to(&mut tmp)?;
+    tmp.flush()?;
+    let cfg = resolve_cached(auth_slot, raw, ctx, resolver::Scope::Write)?;
+    handle_clean(ctx, cfg, tmp, writer, pathname)
+}
+
+fn handle_clean<W: Write>(
     ctx: &XetContext,
     cfg: &DfsConfig,
-    reader: &mut PktReader<R>,
+    tmp: NamedTempFile,
     writer: &mut PktWriter<W>,
     _pathname: &str,
 ) -> Result<()> {
     // Spooling to a temp file lets us reuse the path-based `clean_file` API
     // and keeps `FileUploadSession::new` off the hot pkt-line loop.
-    let mut tmp = NamedTempFile::new()?;
-    reader.read_binary_to(&mut tmp)?;
-    tmp.flush()?;
-
     let translator = build_translator_config(ctx, cfg)?;
     let pointer_bytes = ctx
         .runtime
@@ -220,7 +265,19 @@ fn handle_smudge<R: Read, W: Write>(
     let file_size = info
         .file_size()
         .ok_or_else(|| anyhow!("dfs pointer missing file_size"))?;
+    // The pointer's `hash` field is a free-form String in xet-data with no
+    // deserialization-time validation. Constraining it to lowercase hex here
+    // keeps it safe to interpolate into the manifest cache path
+    // (`<git-dir>/dfs/manifests/<file_id_hex>.json`) — otherwise a crafted
+    // pointer like `{"hash":"../../etc/passwd"}` would read/write outside the
+    // git dir.
     let file_id_hex = info.hash().to_string();
+    if !is_safe_file_id(&file_id_hex) {
+        return Err(anyhow!(
+            "dfs pointer hash is not lowercase hex (got {} chars)",
+            file_id_hex.len()
+        ));
+    }
 
     // Built from raw config so cache initialization never triggers auth
     // resolution (the hot path stays purely local).
@@ -355,6 +412,14 @@ fn finish_smudge<W: Write>(writer: &mut PktWriter<W>, tmp_path: &std::path::Path
     Ok(())
 }
 
+/// MerkleHash is 32 bytes → 64 hex chars. We accept the canonical length only;
+/// anything else is treated as a malformed/hostile pointer.
+fn is_safe_file_id(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn build_translator_config(ctx: &XetContext, cfg: &DfsConfig) -> Result<TranslatorConfig> {
     Ok(default_config(
         ctx,
@@ -363,4 +428,40 @@ fn build_translator_config(ctx: &XetContext, cfg: &DfsConfig) -> Result<Translat
         None,
         None,
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_file_id;
+
+    #[test]
+    fn is_safe_file_id_accepts_canonical_hex() {
+        assert!(is_safe_file_id(&"0".repeat(64)));
+        assert!(is_safe_file_id(&"f".repeat(64)));
+        assert!(is_safe_file_id(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+    }
+
+    #[test]
+    fn is_safe_file_id_rejects_traversal() {
+        assert!(!is_safe_file_id("../../etc/passwd"));
+        assert!(!is_safe_file_id("/etc/passwd"));
+        assert!(!is_safe_file_id("..\\..\\windows"));
+    }
+
+    #[test]
+    fn is_safe_file_id_rejects_wrong_length() {
+        assert!(!is_safe_file_id(""));
+        assert!(!is_safe_file_id(&"a".repeat(63)));
+        assert!(!is_safe_file_id(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn is_safe_file_id_rejects_uppercase_and_separators() {
+        assert!(!is_safe_file_id(&"A".repeat(64)));
+        let mut with_dot = "a".repeat(63);
+        with_dot.push('.');
+        assert!(!is_safe_file_id(&with_dot));
+    }
 }

@@ -18,6 +18,7 @@
 //! by the upstream so no long-lived credential reaches xet-server.
 
 use async_trait::async_trait;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use xet_server_core::{CoreError, CoreResult, RepoAuthz, RepoRef, Scope, TokenClaims, UserId};
@@ -26,34 +27,55 @@ use xet_server_tokens as tokens;
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 3600;
 
 pub struct HttpAuthz {
-    base_url: String,
+    check_access_url: Url,
     client: reqwest::Client,
     jwt_secret: Vec<u8>,
 }
 
+// Parsing the base URL up front rejects misconfiguration (relative URLs, junk
+// schemes) before any request fires, and `Url::join` composes the path safely
+// regardless of query/fragment in the base.
+fn build_check_access_url(base_url: &str) -> CoreResult<Url> {
+    let trimmed = base_url.trim_end_matches('/');
+    let mut base = Url::parse(trimmed)
+        .map_err(|e| CoreError::Internal(format!("invalid authz base_url: {e}")))?;
+    if !matches!(base.scheme(), "http" | "https") {
+        return Err(CoreError::Internal(format!(
+            "invalid authz base_url scheme: {}",
+            base.scheme()
+        )));
+    }
+    if !base.path().ends_with('/') {
+        base.set_path(&format!("{}/", base.path()));
+    }
+    base.join("check_access")
+        .map_err(|e| CoreError::Internal(format!("invalid authz base_url: {e}")))
+}
+
 impl HttpAuthz {
-    pub fn new(base_url: impl Into<String>, jwt_secret: impl Into<Vec<u8>>) -> CoreResult<Self> {
+    pub fn new(base_url: impl AsRef<str>, jwt_secret: impl Into<Vec<u8>>) -> CoreResult<Self> {
         let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| CoreError::Internal(format!("http client init: {e}")))?;
         Ok(Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            check_access_url: build_check_access_url(base_url.as_ref())?,
             client,
             jwt_secret: jwt_secret.into(),
         })
     }
 
     pub fn with_client(
-        base_url: impl Into<String>,
+        base_url: impl AsRef<str>,
         jwt_secret: impl Into<Vec<u8>>,
         client: reqwest::Client,
-    ) -> Self {
-        Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+    ) -> CoreResult<Self> {
+        Ok(Self {
+            check_access_url: build_check_access_url(base_url.as_ref())?,
             client,
             jwt_secret: jwt_secret.into(),
-        }
+        })
     }
 }
 
@@ -81,10 +103,9 @@ impl RepoAuthz for HttpAuthz {
         repo: &RepoRef,
         scope: Scope,
     ) -> CoreResult<UserId> {
-        let url = format!("{}/check_access", self.base_url);
         let resp = self
             .client
-            .post(&url)
+            .post(self.check_access_url.clone())
             .json(&CheckAccessRequest {
                 hub_bearer,
                 repo,
@@ -95,16 +116,20 @@ impl RepoAuthz for HttpAuthz {
             .map_err(|e| CoreError::Internal(format!("upstream call: {e}")))?;
         match resp.status() {
             s if s.is_success() => {
+                // Discard the body on decode error rather than `format!("{e}")` it:
+                // reqwest's JSON-decode error can echo a body snippet, which is risky
+                // if a misbehaving upstream ever reflects the bearer back to us.
                 let parsed: CheckAccessResponse = resp
                     .json()
                     .await
-                    .map_err(|e| CoreError::Internal(format!("upstream body: {e}")))?;
+                    .map_err(|_| CoreError::Internal("upstream body decode failed".into()))?;
                 Ok(UserId(parsed.user_id))
             }
             s if s == reqwest::StatusCode::UNAUTHORIZED => Err(CoreError::Unauthorized),
             s if s == reqwest::StatusCode::FORBIDDEN => Err(CoreError::Forbidden),
             other => Err(CoreError::Internal(format!(
-                "upstream status {other} for check_access"
+                "upstream status {} for check_access",
+                other.as_u16()
             ))),
         }
     }

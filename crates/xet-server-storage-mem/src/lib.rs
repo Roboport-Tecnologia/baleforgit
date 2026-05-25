@@ -1,7 +1,5 @@
-//! In-memory `BlobStore`. Exists to validate the trait seam: the full HTTP
-//! stack should run against this with zero handler changes.
-//!
-//! Not intended for production use — no eviction, no persistence.
+//! In-memory `BlobStore`. Validates the trait seam: the full HTTP stack runs
+//! against this with zero handler changes. Tests only.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -26,7 +24,7 @@ impl MemBlobStore {
 impl BlobStore for MemBlobStore {
     async fn put_xorb(&self, hash: &XorbHash, body: Bytes) -> CoreResult<bool> {
         let mut g = self.xorbs.write().await;
-        // Content-addressed: a second put with the same hash is a no-op.
+        // Idempotent: don't overwrite an existing entry under the same hash.
         if g.contains_key(hash.as_bytes()) {
             return Ok(false);
         }
@@ -95,14 +93,50 @@ mod tests {
         let body = Bytes::from_static(b"hello xorb");
         assert!(store.put_xorb(&hash, body.clone()).await.unwrap());
         assert!(store.xorb_exists(&hash).await.unwrap());
-        assert!(!store.put_xorb(&hash, body).await.unwrap());
+        // A second put under the same hash must not overwrite the original
+        // bytes, even if the caller hands us a different body.
+        assert!(!store
+            .put_xorb(&hash, Bytes::from_static(b"different"))
+            .await
+            .unwrap());
+        let got = store
+            .get_xorb_range(&hash, 0..body.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(&*got, &body[..]);
+    }
+
+    #[tokio::test]
+    async fn inverted_range_is_bad_request() {
+        let store = MemBlobStore::new();
+        let hash = h(0x55);
+        store
+            .put_xorb(&hash, Bytes::from_static(b"abcdef"))
+            .await
+            .unwrap();
+        let start = 5u64;
+        let end = 2u64;
+        let err = store.get_xorb_range(&hash, start..end).await.unwrap_err();
+        assert!(matches!(err, CoreError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn range_start_past_end_is_bad_request() {
+        let store = MemBlobStore::new();
+        let hash = h(0x56);
+        store
+            .put_xorb(&hash, Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        let err = store.get_xorb_range(&hash, 10..20).await.unwrap_err();
+        assert!(matches!(err, CoreError::BadRequest(_)));
     }
 
     #[tokio::test]
     async fn missing_xorb_get_range_returns_not_found() {
         let store = MemBlobStore::new();
         let err = store.get_xorb_range(&h(0x01), 0..10).await.unwrap_err();
-        matches!(err, CoreError::NotFound);
+        assert!(matches!(err, CoreError::NotFound));
     }
 
     #[tokio::test]

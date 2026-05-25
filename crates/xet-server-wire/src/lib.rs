@@ -20,21 +20,19 @@ pub enum HexError {
     BadHex,
 }
 
-/// Encode a 32-byte hash into its 64-char lowercase Xet hex form.
 pub fn encode_hash(h: &Hash32) -> String {
     let mut out = String::with_capacity(HASH_LEN * 2);
     for group in 0..4 {
         let start = group * 8;
         for i in (0..8).rev() {
             use std::fmt::Write;
-            // Writing to String never fails.
+            // write! into String is infallible.
             let _ = write!(out, "{:02x}", h.0[start + i]);
         }
     }
     out
 }
 
-/// Decode a 64-char lowercase Xet hex string back to a 32-byte hash.
 pub fn decode_hash(s: &str) -> Result<Hash32, HexError> {
     if s.len() != HASH_LEN * 2 {
         return Err(HexError::BadLength);
@@ -63,46 +61,43 @@ fn hex_nibble(c: u8) -> Result<u8, HexError> {
     }
 }
 
-/// Half-open `[start, end)` range used for chunk indices and byte ranges.
-/// Matches the spec's JSON shape `{"start": N, "end": N}`.
+/// Half-open `[start, end)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RangeJson {
     pub start: u64,
     pub end: u64,
 }
 
-/// One term in a file reconstruction: a chunk-index range inside a xorb.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CASReconstructionTerm {
-    pub hash: String, // xorb hash, Xet hex encoding
+    pub hash: String,
     pub unpacked_length: u64,
-    pub range: RangeJson, // chunk indices, end-exclusive
+    /// Chunk indices, end-exclusive.
+    pub range: RangeJson,
 }
 
-/// Where to fetch the bytes for a chunk-index range inside a xorb.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CASReconstructionFetchInfo {
-    pub range: RangeJson,     // chunk indices this URL covers, end-exclusive
-    pub url: String,          // signed URL to GET (xorb byte slice)
-    pub url_range: RangeJson, // bytes range; end-INCLUSIVE per spec
+    /// Chunk indices this URL covers, end-exclusive.
+    pub range: RangeJson,
+    pub url: String,
+    /// Byte range; end-INCLUSIVE per spec, and the signed URL enforces a
+    /// matching Range header on GET.
+    pub url_range: RangeJson,
 }
 
-/// Top-level reconstruction response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueryReconstructionResponse {
     pub offset_into_first_range: u64,
     pub terms: Vec<CASReconstructionTerm>,
-    /// xorb hash (Xet hex) -> ordered fetch info entries
     pub fetch_info: BTreeMap<String, Vec<CASReconstructionFetchInfo>>,
 }
 
-/// Response body for `POST /v1/xorbs/default/{hash}`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UploadXorbResponse {
     pub was_inserted: bool,
 }
 
-/// Response body for `POST /v1/shards`.
 /// `0` = shard already existed, `1` = `SyncPerformed`. Per spec the value is
 /// not meaningful beyond "200 means success".
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,7 +105,7 @@ pub struct UploadShardResponse {
     pub result: u32,
 }
 
-/// Response body for the mock HF Hub token endpoint.
+/// Mock HF Hub token endpoint response shape.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct XetTokenResponse {
     #[serde(rename = "accessToken")]

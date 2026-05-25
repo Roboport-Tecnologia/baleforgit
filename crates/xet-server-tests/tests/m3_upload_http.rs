@@ -62,7 +62,6 @@ async fn upload_xorb_then_shard_indexes_metadata() {
     let body: UploadXorbResponse = read_body_json(resp.into_body()).await;
     assert!(body.was_inserted, "first xorb upload should insert");
 
-    // Re-upload is idempotent.
     let req = Request::builder()
         .method("POST")
         .uri(format!("/v1/xorbs/default/{}", encode_hash(&xorb_hash.0)))

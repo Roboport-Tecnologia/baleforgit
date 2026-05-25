@@ -100,7 +100,9 @@ pub fn parse_remote(s: &str) -> Result<RemoteUrl> {
         return Err(anyhow!("unrecognized remote URL: {s}"));
     }
 
-    let (scheme_str, rest) = s.split_once("://").unwrap();
+    let (scheme_str, rest) = s
+        .split_once("://")
+        .ok_or_else(|| anyhow!("unrecognized remote URL: {s}"))?;
     let scheme = match scheme_str {
         "http" => RemoteScheme::Http,
         "https" => RemoteScheme::Https,

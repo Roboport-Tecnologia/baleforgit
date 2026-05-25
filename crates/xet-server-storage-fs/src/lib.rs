@@ -16,7 +16,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 use xet_server_core::{BlobStore, CoreError, CoreResult, Hash32, ShardHash, XorbHash};
 
@@ -64,9 +64,21 @@ impl FsBlobStore {
                 .map_err(|e| CoreError::Internal(format!("mkdir {}: {e}", parent.display())))?;
         }
         let tmp = self.tmp_path();
-        fs::write(&tmp, body.as_ref())
+        // fsync the temp file before rename so a crash can't leave a
+        // zero/short blob at the final content-addressed path.
+        let mut f = fs::File::create(&tmp)
             .await
-            .map_err(|e| CoreError::Internal(format!("write tmp: {e}")))?;
+            .map_err(|e| CoreError::Internal(format!("create tmp: {e}")))?;
+        if let Err(e) = async {
+            f.write_all(body.as_ref()).await?;
+            f.sync_all().await
+        }
+        .await
+        {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(CoreError::Internal(format!("write tmp: {e}")));
+        }
+        drop(f);
         match fs::rename(&tmp, dst).await {
             Ok(()) => Ok(true),
             Err(_) if fs::metadata(dst).await.is_ok() => {

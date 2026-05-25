@@ -89,8 +89,18 @@ impl ConfigAuthz {
     }
 }
 
-/// One hour.
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 3600;
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut x = 0u8;
+    for (x_a, x_b) in a.iter().zip(b.iter()) {
+        x |= x_a ^ x_b;
+    }
+    x == 0
+}
 
 #[async_trait]
 impl RepoAuthz for ConfigAuthz {
@@ -104,7 +114,15 @@ impl RepoAuthz for ConfigAuthz {
         repo: &RepoRef,
         requested: Scope,
     ) -> CoreResult<UserId> {
-        let u = self.users.get(hub_bearer).ok_or(CoreError::Unauthorized)?;
+        // Trust boundary: avoid a HashMap-keyed lookup so the hub bearer
+        // comparison doesn't leak length/prefix via timing.
+        let mut found: Option<&ConfigUser> = None;
+        for (k, v) in &self.users {
+            if ct_eq(k.as_bytes(), hub_bearer.as_bytes()) {
+                found = Some(v);
+            }
+        }
+        let u = found.ok_or(CoreError::Unauthorized)?;
         let granted = u
             .repos
             .get(&repo.repo_id)

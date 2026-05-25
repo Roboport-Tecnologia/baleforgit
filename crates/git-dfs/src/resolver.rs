@@ -50,8 +50,6 @@ impl Scope {
     }
 }
 
-/// Output of a complete resolution. Same shape the existing `DfsConfig`
-/// has held; produced from a [`RawDfsConfig`] + [`Scope`].
 #[derive(Clone, Debug)]
 pub struct ResolvedAuth {
     pub server_url: String,
@@ -246,11 +244,14 @@ async fn ssh_authenticate(
         ));
     }
 
+    // Don't include the raw body — on success it contains the forge-minted
+    // bearer token, and we don't get to know whether a parse failure is
+    // structural (safe to dump) or partial (still includes the bearer).
     let parsed: SshAuthenticateResponse =
         serde_json::from_slice(&out.stdout).with_context(|| {
             format!(
-                "decoding git-dfs-authenticate output: {:?}",
-                String::from_utf8_lossy(&out.stdout)
+                "decoding git-dfs-authenticate output ({} bytes)",
+                out.stdout.len()
             )
         })?;
     let authz = parsed
