@@ -10,12 +10,11 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use tempfile::NamedTempFile;
+use xet_client::chunk_cache::{get_cache, CacheConfig};
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
-use xet_data::processing::{
-    get_cache, CacheConfig, FileDownloadSession, FileUploadSession, Sha256Policy,
-};
-use xet_runtime::core::XetContext;
+use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy};
+use xet_runtime::core::XetRuntime;
 
 use crate::config::DfsConfig;
 use crate::local_reconstruct::{try_reconstruct_from_cache, CacheReconstructOutcome};
@@ -30,7 +29,7 @@ const VERSION: &str = "version=2";
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let raw = crate::config::RawConfig::load(Some(cwd.as_path()))?;
-    let ctx = XetContext::default().context("starting xet runtime")?;
+    let rt = XetRuntime::new().context("starting xet runtime")?;
 
     let stdin_lock = stdin().lock();
     let stdout_lock = stdout().lock();
@@ -74,7 +73,7 @@ pub fn run() -> Result<()> {
         match command {
             "clean" => {
                 if let Err(e) = do_clean(
-                    &ctx,
+                    &rt,
                     &raw,
                     &mut clean_cfg,
                     &mut reader,
@@ -86,7 +85,7 @@ pub fn run() -> Result<()> {
             }
             "smudge" => {
                 if let Err(e) = handle_smudge(
-                    &ctx,
+                    &rt,
                     &raw,
                     &mut smudge_cfg,
                     &mut reader,
@@ -109,13 +108,12 @@ pub fn run() -> Result<()> {
 fn resolve_cached<'a>(
     slot: &'a mut Option<DfsConfig>,
     raw: &crate::config::RawConfig,
-    ctx: &XetContext,
+    rt: &Arc<XetRuntime>,
     scope: resolver::Scope,
 ) -> Result<&'a DfsConfig> {
     if slot.is_none() {
         let raw_clone = raw.clone();
-        let resolved = ctx
-            .runtime
+        let resolved = rt
             .bridge_sync(async move { resolver::resolve(&raw_clone, scope).await })
             .map_err(|e| anyhow!("xet runtime error during DFS auth resolution: {e:?}"))??;
         *slot = Some(DfsConfig {
@@ -202,7 +200,7 @@ fn report_request_error<R: Read, W: Write>(
 }
 
 fn do_clean<R: Read, W: Write>(
-    ctx: &XetContext,
+    rt: &Arc<XetRuntime>,
     raw: &crate::config::RawConfig,
     auth_slot: &mut Option<DfsConfig>,
     reader: &mut PktReader<R>,
@@ -214,12 +212,12 @@ fn do_clean<R: Read, W: Write>(
     let mut tmp = NamedTempFile::new()?;
     reader.read_binary_to(&mut tmp)?;
     tmp.flush()?;
-    let cfg = resolve_cached(auth_slot, raw, ctx, resolver::Scope::Write)?;
-    handle_clean(ctx, cfg, tmp, writer, pathname)
+    let cfg = resolve_cached(auth_slot, raw, rt, resolver::Scope::Write)?;
+    handle_clean(rt, cfg, tmp, writer, pathname)
 }
 
 fn handle_clean<W: Write>(
-    ctx: &XetContext,
+    rt: &Arc<XetRuntime>,
     cfg: &DfsConfig,
     tmp: NamedTempFile,
     writer: &mut PktWriter<W>,
@@ -227,9 +225,8 @@ fn handle_clean<W: Write>(
 ) -> Result<()> {
     // Spooling to a temp file lets us reuse the path-based `clean_file` API
     // and keeps `FileUploadSession::new` off the hot pkt-line loop.
-    let translator = build_translator_config(ctx, cfg)?;
-    let pointer_bytes = ctx
-        .runtime
+    let translator = build_translator_config(cfg)?;
+    let pointer_bytes = rt
         .bridge_sync(async move {
             let session = FileUploadSession::new(Arc::new(translator)).await?;
             let (info, _metrics) = xet_data::processing::data_client::clean_file(
@@ -250,7 +247,7 @@ fn handle_clean<W: Write>(
 }
 
 fn handle_smudge<R: Read, W: Write>(
-    ctx: &XetContext,
+    rt: &Arc<XetRuntime>,
     raw: &crate::config::RawConfig,
     auth_slot: &mut Option<DfsConfig>,
     reader: &mut PktReader<R>,
@@ -283,9 +280,9 @@ fn handle_smudge<R: Read, W: Write>(
     // resolution (the hot path stays purely local).
     let cache_cfg = CacheConfig {
         cache_directory: raw.cache_dir.clone(),
-        cache_size: ctx.config.chunk_cache.size_bytes,
+        cache_size: rt.config().chunk_cache.size_bytes,
     };
-    let chunk_cache = get_cache(&ctx.config, &cache_cfg)
+    let chunk_cache = get_cache(&cache_cfg)
         .map_err(|e| anyhow!("init chunk cache at {}: {e}", raw.cache_dir.display()))?;
 
     // ---- Hot path: cache-only reconstruction ----------------------------
@@ -296,14 +293,13 @@ fn handle_smudge<R: Read, W: Write>(
                 // Reopen by path so the async block owns its own File handle
                 // and `tmp` stays usable for the byte-streaming below.
                 let dest_file = tmp.reopen()?;
-                let ctx_for_cache = ctx.clone();
+                let rt_for_cache = rt.clone();
                 let cache_for_cache = chunk_cache.clone();
-                let outcome = ctx
-                    .runtime
+                let outcome = rt
                     .bridge_sync(async move {
                         let mut dest = dest_file;
                         try_reconstruct_from_cache(
-                            &ctx_for_cache,
+                            &rt_for_cache,
                             &cache_for_cache,
                             &manifest,
                             file_size,
@@ -334,7 +330,7 @@ fn handle_smudge<R: Read, W: Write>(
         std::io::Seek::seek(&mut trunc, std::io::SeekFrom::Start(0))?;
         drop(trunc);
 
-        let cfg = resolve_cached(auth_slot, raw, ctx, resolver::Scope::Read)?;
+        let cfg = resolve_cached(auth_slot, raw, rt, resolver::Scope::Read)?;
 
         // The `0..file_size` range cap is load-bearing. xet-data's
         // `download_file` passes `FileRange::full()` (0..u64::MAX) into
@@ -346,20 +342,19 @@ fn handle_smudge<R: Read, W: Write>(
         // `cur_file_byte_offset` forward by 256 MiB each round and tripping
         // the SequentialWriter's contiguity check. Capping the range at
         // `file_size` skips the speculative prefetch entirely.
-        let translator = build_translator_config(ctx, cfg)?;
+        let translator = build_translator_config(cfg)?;
         let dest_file = tmp.reopen()?;
         let info_for_dl = info.clone();
         let cache_for_dl = chunk_cache.clone();
-        ctx.runtime
-            .bridge_sync(async move {
-                let session =
-                    FileDownloadSession::new(Arc::new(translator), Some(cache_for_dl)).await?;
-                let (_id, _n) = session
-                    .download_to_writer(&info_for_dl, 0..file_size, dest_file)
-                    .await?;
-                Ok::<(), anyhow::Error>(())
-            })
-            .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+        rt.bridge_sync(async move {
+            let session =
+                FileDownloadSession::new(Arc::new(translator), Some(cache_for_dl)).await?;
+            let (_id, _n) = session
+                .download_to_writer(&info_for_dl, 0..file_size, dest_file)
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 
         // One extra small request per cold-path file; subsequent checkouts
         // hit the hot path. Best-effort — failure here only keeps the cache
@@ -372,11 +367,9 @@ fn handle_smudge<R: Read, W: Write>(
                     return finish_smudge(writer, tmp.path());
                 }
             };
-            let ctx_for_fetch = ctx.clone();
             let cfg_for_fetch = cfg.clone();
-            let fetched = ctx.runtime.bridge_sync(async move {
-                fetch_manifest(&ctx_for_fetch, &cfg_for_fetch, &merkle).await
-            });
+            let fetched =
+                rt.bridge_sync(async move { fetch_manifest(&cfg_for_fetch, &merkle).await });
             match fetched {
                 Ok(Ok(manifest)) => {
                     if let Err(e) = manifest_cache::save(git_dir, &file_id_hex, &manifest) {
@@ -420,9 +413,8 @@ fn is_safe_file_id(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn build_translator_config(ctx: &XetContext, cfg: &DfsConfig) -> Result<TranslatorConfig> {
+fn build_translator_config(cfg: &DfsConfig) -> Result<TranslatorConfig> {
     Ok(default_config(
-        ctx,
         cfg.server_url.clone(),
         Some((cfg.token.clone(), cfg.token_expiration)),
         None,

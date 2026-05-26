@@ -8,20 +8,15 @@ use anyhow::{anyhow, Context, Result};
 use xet_client::cas_client::auth::AuthConfig;
 use xet_client::cas_client::RemoteClient;
 use xet_core_structures::merklehash::MerkleHash;
-use xet_runtime::core::XetContext;
 
 use crate::config::DfsConfig;
 use crate::manifest_cache::{CachedManifest, CachedTerm, CURRENT_VERSION};
 
 /// Returns the content-addressed parts only. `fetch_info` is discarded —
 /// signed URLs expire (`SIGNATURE_TTL_SECS` = 600s) and aren't safe to persist.
-pub async fn fetch_manifest(
-    ctx: &XetContext,
-    cfg: &DfsConfig,
-    file_id: &MerkleHash,
-) -> Result<CachedManifest> {
+pub async fn fetch_manifest(cfg: &DfsConfig, file_id: &MerkleHash) -> Result<CachedManifest> {
     let auth = AuthConfig::maybe_new(Some(cfg.token.clone()), Some(cfg.token_expiration), None);
-    let client = RemoteClient::new(ctx.clone(), &cfg.server_url, &auth, "git-dfs", false, None);
+    let client = RemoteClient::new(&cfg.server_url, &auth, "git-dfs", false, None);
 
     let response = client
         .get_reconstruction_v1(file_id, None)

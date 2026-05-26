@@ -25,12 +25,10 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-
-# xet-core library crates (path deps to the sibling clone)
-xet-data = { path = "../../xet-core/xet_data" }
-xet-core-structures = { path = "../../xet-core/xet_core_structures" }
-xet-client = { path = "../../xet-core/xet_client" }
-xet-runtime = { path = "../../xet-core/xet_runtime" }
+xet-data = "=1.5.2"
+xet-core-structures = "=1.5.2"
+xet-client = "=1.5.2"
+xet-runtime = "=1.5.2"
 
 [dev-dependencies]
 axum.workspace = true

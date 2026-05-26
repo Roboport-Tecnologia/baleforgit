@@ -167,6 +167,26 @@ pre-commit install
 
 That wires up `.pre-commit-config.yaml`, which on every commit runs `cargo fmt --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 
+## CI and release artifacts
+
+GitHub Actions workflows live under `.github/workflows/`:
+
+- **`ci.yml`** — on every push to `main` and every PR, runs `cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test --workspace`. m7/m9/m10 skip silently when their external tools (`git-xet`, `git-lfs`, `go`) aren't on PATH; m11 builds `git-dfs` from its crates.io deps and runs end-to-end.
+- **`release.yml`** — on a `v*` tag push, builds release binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`, then creates a GitHub release with the tarballs and SHA-256 sums attached.
+- **`docker.yml`** — on a push to `main` or a `v*` tag, builds a multi-arch (`linux/amd64`, `linux/arm64`) image from `Dockerfile` and pushes it to `ghcr.io/<owner>/<repo>` with `branch`, `sha-<short>`, semver, and `latest` tags as appropriate.
+
+To run the container locally:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e XET_JWT_SECRET_HEX=$(printf '%064x' 1) \
+  -e XET_TRANSFER_SECRET_HEX=$(printf '%064x' 2) \
+  -e XET_GRANTS=hub-alice:alice:alice/my-model:write \
+  ghcr.io/davidrios/git-xet-server:latest
+```
+
+Point an orchestrator's readiness probe at `GET /healthz`.
+
 ## License
 
 Apache-2.0.

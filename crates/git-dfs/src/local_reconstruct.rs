@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use xet_client::cas_types::{ChunkRange, Key};
 use xet_client::chunk_cache::ChunkCache;
 use xet_core_structures::merklehash::MerkleHash;
-use xet_runtime::core::XetContext;
+use xet_runtime::core::XetRuntime;
 
 use crate::manifest_cache::CachedManifest;
 
@@ -25,14 +25,14 @@ pub enum CacheReconstructOutcome {
 }
 
 pub async fn try_reconstruct_from_cache<W: Write>(
-    ctx: &XetContext,
+    rt: &Arc<XetRuntime>,
     chunk_cache: &Arc<dyn ChunkCache>,
     manifest: &CachedManifest,
     expected_size: u64,
     out: &mut W,
 ) -> Result<CacheReconstructOutcome> {
     // Must match xet-data's `XorbBlock::retrieve_data` key construction.
-    let prefix = ctx.config.data.default_prefix.clone();
+    let prefix = rt.config().data.default_prefix.clone();
 
     let mut written: u64 = 0;
     for term in &manifest.terms {

@@ -1,0 +1,17 @@
+target/
+**/target/
+
+# Sibling clones — see CLAUDE.md.
+xet-core/
+git-lfs/
+lfs-adapter/
+
+# Local-only.
+.git/
+.github/
+gitea/
+docs/
+*.md
+.pre-commit-config.yaml
+.gitignore
+.editorconfig
