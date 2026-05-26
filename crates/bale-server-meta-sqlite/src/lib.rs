@@ -225,16 +225,12 @@ impl MetadataStore for SqliteMetadataStore {
         .await
         .map_err(|e| CoreError::Internal(format!("insert file: {e}")))?;
 
-        // Rewrite the term list so a re-register with fewer terms can't leave stragglers.
-        sqlx::query("DELETE FROM file_terms WHERE file_hash = ?")
-            .bind(hash_to_blob(&file_hash.0))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CoreError::Internal(format!("clear terms: {e}")))?;
-
+        // Terms are content-addressed by file_hash, so a re-register carries
+        // identical terms — IGNORE the duplicate rather than DELETE+INSERT,
+        // which would briefly expose an empty term list to a concurrent reader.
         for (idx, t) in terms.iter().enumerate() {
             sqlx::query(
-                "INSERT INTO file_terms
+                "INSERT OR IGNORE INTO file_terms
                  (file_hash, term_index, xorb_hash, chunk_idx_start, chunk_idx_end, unpacked_bytes, verification)
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
