@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Extra image tag to push for this manual run (e.g. test, my-feature). The sha-<short> tag is always pushed too.'
+        required: false
+        default: 'test'
 
 concurrency:
   group: docker-${{ github.workflow }}-${{ github.ref }}
@@ -16,6 +22,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Required by actions/attest-build-provenance to mint a Sigstore-backed
+      # SLSA Build Provenance attestation referencing the pushed image digest.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -40,8 +50,10 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - uses: docker/build-push-action@v5
+      - id: push
+        uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -50,3 +62,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Attest image provenance
+        # `push-to-registry: true` writes a Sigstore-backed attestation as an
+        # OCI referrer alongside the image, so `gh attestation verify
+        # oci://…@<digest>` and `cosign verify-attestation` both work.
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

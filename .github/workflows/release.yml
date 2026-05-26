@@ -3,15 +3,30 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name for the test release (e.g. v0.0.0-test). Will be published as a draft prerelease — the git tag is NOT created until you publish the draft.'
+        required: true
+        default: 'v0.0.0-test'
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
+  # Tag-push event: github.ref_name is the pushed tag.
+  # workflow_dispatch event: take it from the form input instead.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      # Required by actions/attest-build-provenance to mint a Sigstore-backed
+      # SLSA Build Provenance attestation for each tarball.
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -42,10 +57,20 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           for bin in xet-server git-dfs; do
-            tarball="${bin}-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+            tarball="${bin}-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
             tar -C "target/${{ matrix.target }}/release" -czf "dist/${tarball}" "$bin"
             (cd dist && shasum -a 256 -- "$tarball" > "${tarball}.sha256")
           done
+      - name: Attest build provenance
+        # One attestation per matrix entry, covering both tarballs for this
+        # target. The .sigstore.json bundles end up referenced from GitHub's
+        # attestations API and verifiable with `gh attestation verify`.
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/xet-server-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+            dist/git-dfs-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.target }}
@@ -63,11 +88,28 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Create release
+
+      - name: Create release (tag push)
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
+          gh release create "${RELEASE_TAG}" \
+            --title "${RELEASE_TAG}" \
+            --generate-notes \
+            dist/*
+
+      - name: Create draft prerelease (manual dispatch)
+        # --draft means the git tag is NOT created in the repo until the
+        # release is published. Delete-then-create lets a re-dispatch on the
+        # same tag name overwrite a stale draft from a prior test run.
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${RELEASE_TAG}" --yes 2>/dev/null || true
+          gh release create "${RELEASE_TAG}" \
+            --title "${RELEASE_TAG} (manual test build)" \
+            --draft --prerelease \
             --generate-notes \
             dist/*

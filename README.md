@@ -172,8 +172,30 @@ That wires up `.pre-commit-config.yaml`, which on every commit runs `cargo fmt -
 GitHub Actions workflows live under `.github/workflows/`:
 
 - **`ci.yml`** — on every push to `main` and every PR, runs `cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test --workspace`, then the `#[ignore]`d MinIO integration test (`cargo test -p xet-server-storage-s3 --test minio -- --ignored`). The test job installs `git-xet` from upstream releases (`GIT_XET_VERSION` env at the top of the job) and relies on `git`, `git-lfs`, `go`, and `podman` being preinstalled on `ubuntu-latest`, so m7/m9/m10/m11 and the S3 path all run end-to-end rather than skipping.
-- **`release.yml`** — on a `v*` tag push, builds the `xet-server` and `git-dfs` binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`, then creates a GitHub release with one `.tar.gz` per binary per target (each paired with its own `.sha256`) attached.
-- **`docker.yml`** — on a push to `main` or a `v*` tag, builds a multi-arch (`linux/amd64`, `linux/arm64`) image from `Dockerfile` and pushes it to `ghcr.io/<owner>/<repo>` with `branch`, `sha-<short>`, semver, and `latest` tags as appropriate.
+- **`release.yml`** — on a `v*` tag push, builds the `xet-server` and `git-dfs` binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`, then creates a GitHub release with one `.tar.gz` per binary per target (each paired with its own `.sha256`) attached. Each tarball is also signed via [GitHub artifact attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) — `actions/attest-build-provenance` mints an unforgeable [SLSA Build Provenance v1](https://slsa.dev/spec/v1.0/provenance) statement, signed by Sigstore, recorded in the public transparency log, and reachable from the GitHub Attestations API.
+- **`docker.yml`** — on a push to `main` or a `v*` tag, builds a multi-arch (`linux/amd64`, `linux/arm64`) image from `Dockerfile` and pushes it to `ghcr.io/<owner>/<repo>` with `branch`, `sha-<short>`, semver, and `latest` tags as appropriate. Same SLSA Build Provenance is generated and pushed alongside the image as an OCI referrer, so `gh attestation verify oci://…` and `cosign verify-attestation` both find it.
+
+All three workflows are also runnable manually from the Actions tab via **Run workflow** (`workflow_dispatch`):
+
+- `ci.yml` takes no inputs — useful for re-running the test matrix on demand.
+- `release.yml` takes a `tag` input (default `v0.0.0-test`); the release is created as a **draft prerelease**, which means the git tag is *not* materialized in the repo until you click Publish on the resulting draft. Re-dispatching with the same tag overwrites the prior draft so you don't accumulate test releases. Delete the draft when done and nothing is left behind. Attestations are still minted normally.
+- `docker.yml` takes a `tag` input (default `test`); the image is pushed with that tag *and* the usual `sha-<short>` tag, so you can pull `ghcr.io/<owner>/<repo>:test` to try a manual build without touching the `:latest` tag.
+
+### Verifying release artifacts
+
+Each release tarball and container digest is covered by a SLSA Build Provenance attestation tying it back to the exact workflow run, commit SHA, and repository that produced it. Verify with the GitHub CLI (no extra signing keys to manage):
+
+```bash
+# Tarball — works on the file you just downloaded from the release page.
+gh attestation verify xet-server-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+  --repo davidrios/git-xet-server
+
+# Container image — pin to a digest, not a mutable tag.
+gh attestation verify oci://ghcr.io/davidrios/git-xet-server@sha256:<digest> \
+  --repo davidrios/git-xet-server
+```
+
+A passing verify means: the artifact was produced by this repo's GitHub Actions workflow at a specific commit, and nothing in transit has tampered with it. Pin to a digest (not `:latest`) when you care about reproducibility.
 
 To run the container locally:
 
