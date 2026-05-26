@@ -172,7 +172,7 @@ That wires up `.pre-commit-config.yaml`, which on every commit runs `cargo fmt -
 GitHub Actions workflows live under `.github/workflows/`:
 
 - **`ci.yml`** — on every push to `main` and every PR, runs `cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test --workspace`, then the `#[ignore]`d MinIO integration test (`cargo test -p xet-server-storage-s3 --test minio -- --ignored`). The test job installs `git-xet` from upstream releases (`GIT_XET_VERSION` env at the top of the job) and relies on `git`, `git-lfs`, `go`, and `podman` being preinstalled on `ubuntu-latest`, so m7/m9/m10/m11 and the S3 path all run end-to-end rather than skipping.
-- **`release.yml`** — on a `v*` tag push, builds release binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`, then creates a GitHub release with the tarballs and SHA-256 sums attached.
+- **`release.yml`** — on a `v*` tag push, builds the `xet-server` and `git-dfs` binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`, then creates a GitHub release with one `.tar.gz` per binary per target (each paired with its own `.sha256`) attached.
 - **`docker.yml`** — on a push to `main` or a `v*` tag, builds a multi-arch (`linux/amd64`, `linux/arm64`) image from `Dockerfile` and pushes it to `ghcr.io/<owner>/<repo>` with `branch`, `sha-<short>`, semver, and `latest` tags as appropriate.
 
 To run the container locally:

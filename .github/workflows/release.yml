@@ -33,18 +33,22 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release -p xet-server-bin --target ${{ matrix.target }}
+        # One cargo invocation so xet-server and git-dfs share the dep build.
+        run: cargo build --release -p xet-server-bin -p git-dfs --target ${{ matrix.target }}
       - name: Package
+        # One tarball per binary, each paired with its own .sha256. Keeps
+        # downloads small for users who only want one of the two.
         run: |
           set -euo pipefail
           mkdir -p dist
-          tar -C target/${{ matrix.target }}/release \
-              -czf "dist/xet-server-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
-              xet-server
-          (cd dist && shasum -a 256 -- *.tar.gz > "xet-server-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz.sha256")
+          for bin in xet-server git-dfs; do
+            tarball="${bin}-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+            tar -C "target/${{ matrix.target }}/release" -czf "dist/${tarball}" "$bin"
+            (cd dist && shasum -a 256 -- "$tarball" > "${tarball}.sha256")
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: xet-server-${{ matrix.target }}
+          name: binaries-${{ matrix.target }}
           path: dist/*
 
   release:
