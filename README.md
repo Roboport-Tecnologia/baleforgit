@@ -63,6 +63,12 @@ Environment variables understood by the binary:
 | `XET_TRANSFER_SECRET_HEX` | **required** | HMAC secret for signed download URLs (exactly 32 bytes hex / 64 chars) |
 | `XET_AUTHZ_HTTP_URL` | none | If set, delegate `check_repo_access` to this URL (see [`xet-server-authz-http`](crates/xet-server-authz-http/src/lib.rs)). |
 | `XET_GRANTS` | none | Used only when `XET_AUTHZ_HTTP_URL` is unset. Comma-separated `hub_token:user:repo_id:read\|write` tuples for the in-process static authz (dev/test). |
+| `XET_S3_BUCKET` | none | If set, switch blob storage from the local filesystem to an S3-compatible bucket. Picks up credentials from the standard AWS provider chain. |
+| `XET_S3_REGION` | SDK default | Region for the S3 client. |
+| `XET_S3_ENDPOINT_URL` | none | Override the API endpoint (e.g. `https://minio.example:9000` for MinIO, R2's endpoint for Cloudflare). |
+| `XET_S3_FORCE_PATH_STYLE` | `false` | Set to `true` for MinIO and other backends that expect `https://host/{bucket}/{key}` rather than virtual-host addressing. |
+| `XET_S3_PREFIX` | empty | Optional key prefix inside the bucket (include a trailing `/` if you want one). |
+| `XET_S3_ACCESS_KEY_ID` / `XET_S3_SECRET_ACCESS_KEY` / `XET_S3_SESSION_TOKEN` | none | Explicit credentials. When unset, the SDK uses env vars, `~/.aws/credentials`, and IMDS as usual. |
 
 ## Repo layout
 
@@ -73,6 +79,7 @@ crates/
 ├── xet-server-shard/        # MDB shard binary parser + xorb chunk-frame parser
 ├── xet-server-storage-fs/   # BlobStore on the local filesystem
 ├── xet-server-storage-mem/  # BlobStore in memory (test / pluggability check)
+├── xet-server-storage-s3/   # BlobStore on any S3-compatible API (real presigned URLs)
 ├── xet-server-meta-sqlite/  # MetadataStore on SQLite
 ├── xet-server-authz-mem/    # In-memory RepoAuthz (AlwaysAllow, ConfigAuthz)
 ├── xet-server-authz-http/   # RepoAuthz that delegates check_repo_access to an HTTP upstream

@@ -1,4 +1,6 @@
-// `XET_AUTHZ_HTTP_URL` wins over `XET_GRANTS` when both are set. See README for env vars.
+// `XET_AUTHZ_HTTP_URL` wins over `XET_GRANTS` when both are set.
+// `XET_S3_BUCKET` switches the blob backend from filesystem to S3-compatible.
+// See README for full env-var table.
 
 use anyhow::{bail, Context, Result};
 use std::env;
@@ -6,10 +8,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use xet_server_authz_http::HttpAuthz;
 use xet_server_authz_mem::ConfigAuthz;
-use xet_server_core::Scope;
+use xet_server_core::{BlobStore, Scope};
 use xet_server_http::{router, Service};
 use xet_server_meta_sqlite::SqliteMetadataStore;
 use xet_server_storage_fs::FsBlobStore;
+use xet_server_storage_s3::{S3BlobStore, S3Config};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,11 +50,6 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("creating data root {}", data_root.display()))?;
 
-    let blobs = Arc::new(
-        FsBlobStore::open(&data_root)
-            .await
-            .map_err(anyhow_from_core)?,
-    );
     let meta = Arc::new(
         SqliteMetadataStore::open_path(&db_path)
             .await
@@ -59,8 +57,80 @@ async fn main() -> Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
-    tracing::info!(%listen, data_root = %data_root.display(), %public_url, "xet-server up");
 
+    // S3 backend opts in via XET_S3_BUCKET; otherwise the local-filesystem
+    // store is used. Logging both branches makes the active backend obvious
+    // in production logs.
+    if let Ok(bucket) = env::var("XET_S3_BUCKET") {
+        if bucket.is_empty() {
+            bail!("XET_S3_BUCKET is set but empty");
+        }
+        let s3_cfg = S3Config {
+            bucket: bucket.clone(),
+            region: env::var("XET_S3_REGION").ok(),
+            endpoint_url: env::var("XET_S3_ENDPOINT_URL").ok(),
+            force_path_style: env_truthy("XET_S3_FORCE_PATH_STYLE"),
+            prefix: env::var("XET_S3_PREFIX").unwrap_or_default(),
+            access_key_id: env::var("XET_S3_ACCESS_KEY_ID").ok(),
+            secret_access_key: env::var("XET_S3_SECRET_ACCESS_KEY").ok(),
+            session_token: env::var("XET_S3_SESSION_TOKEN").ok(),
+        };
+        let endpoint_for_log = s3_cfg.endpoint_url.clone();
+        let blobs = Arc::new(S3BlobStore::open(s3_cfg).await.map_err(anyhow_from_core)?);
+        tracing::info!(
+            %listen,
+            backend = "s3",
+            bucket = %bucket,
+            endpoint = ?endpoint_for_log,
+            %public_url,
+            "xet-server up"
+        );
+        serve(
+            listener,
+            blobs,
+            meta,
+            jwt_secret,
+            transfer_secret,
+            public_url,
+        )
+        .await?;
+    } else {
+        let blobs = Arc::new(
+            FsBlobStore::open(&data_root)
+                .await
+                .map_err(anyhow_from_core)?,
+        );
+        tracing::info!(
+            %listen,
+            backend = "fs",
+            data_root = %data_root.display(),
+            %public_url,
+            "xet-server up"
+        );
+        serve(
+            listener,
+            blobs,
+            meta,
+            jwt_secret,
+            transfer_secret,
+            public_url,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn serve<B>(
+    listener: tokio::net::TcpListener,
+    blobs: Arc<B>,
+    meta: Arc<SqliteMetadataStore>,
+    jwt_secret: Vec<u8>,
+    transfer_secret: [u8; 32],
+    public_url: String,
+) -> Result<()>
+where
+    B: BlobStore + 'static,
+{
     // Service is generic over the authz impl, so each branch builds its own.
     if let Ok(authz_url) = env::var("XET_AUTHZ_HTTP_URL") {
         if authz_url.is_empty() {
@@ -73,7 +143,7 @@ async fn main() -> Result<()> {
             meta,
             authz: Arc::new(authz),
             transfer_secret,
-            public_base_url: public_url.clone(),
+            public_base_url: public_url,
         };
         axum::serve(listener, router(svc)).await?;
     } else {
@@ -105,11 +175,18 @@ async fn main() -> Result<()> {
             meta,
             authz: Arc::new(authz),
             transfer_secret,
-            public_base_url: public_url.clone(),
+            public_base_url: public_url,
         };
         axum::serve(listener, router(svc)).await?;
     }
     Ok(())
+}
+
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        env::var(name).ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
 }
 
 fn decode_hex_env(name: &str) -> Result<Vec<u8>> {

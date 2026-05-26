@@ -15,7 +15,7 @@ use serde::Deserialize;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use xet_server_core::{
@@ -495,13 +495,28 @@ where
             },
         });
 
-        let url = build_signed_url(
-            &svc.public_base_url,
-            &svc.transfer_secret,
-            &xorb_hex,
-            byte_start,
-            byte_end_inclusive,
-        );
+        // If the BlobStore can offload the GET (e.g. S3 presign), use that URL
+        // directly so bytes never flow through us. The presigned URL must be
+        // signed over the same byte range the client will request — its TTL
+        // matches the self-signed URL's so client retry windows stay aligned.
+        let presigned = svc
+            .blobs
+            .presign_xorb_range(
+                &t.xorb,
+                byte_start..byte_end_inclusive + 1,
+                Duration::from_secs(SIGNATURE_TTL_SECS),
+            )
+            .await?;
+        let url = match presigned {
+            Some(u) => u,
+            None => build_signed_url(
+                &svc.public_base_url,
+                &svc.transfer_secret,
+                &xorb_hex,
+                byte_start,
+                byte_end_inclusive,
+            ),
+        };
         fetch_info
             .entry(xorb_hex)
             .or_default()

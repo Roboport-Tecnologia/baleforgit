@@ -145,13 +145,13 @@ pub trait RepoAuthz: Send + Sync {
 |-------|-------|------|
 | `BlobStore` | `xet-server-storage-fs` | `FsBlobStore` — atomic temp→rename writes, byte-range reads |
 | `BlobStore` | `xet-server-storage-mem` | `MemBlobStore` — `RwLock<HashMap>`, used for tests and the M8 pluggability check |
+| `BlobStore` | `xet-server-storage-s3` | `S3BlobStore` — AWS SDK against any S3-compatible API (AWS S3, MinIO, R2, B2); real presigned `GET` URLs returned from `presign_xorb_range`, so reconstruction bytes never flow through the server's HTTP layer |
 | `MetadataStore` | `xet-server-meta-sqlite` | `SqliteMetadataStore` — runtime `sqlx` queries (no compile-time DB) |
 | `RepoAuthz` | `xet-server-authz-mem` | `AlwaysAllow` (tests) and `ConfigAuthz` (static map of hub bearers → users → repo scopes) |
 | `RepoAuthz` | `xet-server-authz-http` | `HttpAuthz` — delegates `check_repo_access` to a small `POST /check_access` upstream contract. The contract is intentionally generic: any service that knows about users and repos (a git forge, an identity provider, a custom proxy) can implement it. Xet token mint/verify stays local. |
 
 ### Planned implementations
 
-- `BlobStore` on S3-compatible object storage, with real presigned URLs returned from `presign_xorb_range` so the HTTP layer can hand them out directly in `fetch_info`.
 - `MetadataStore` on Postgres (only required when we outgrow SQLite — the schema is portable).
 - `RepoAuthz` that talks directly to a specific upstream's APIs (e.g. `/api/v4/user` + project-member lookups for a particular git forge), as an alternative to going through the generic `HttpAuthz` shim. Useful when bringing the access-decision logic in-process saves a hop, or when richer upstream concepts (groups, scopes, OAuth) don't fit cleanly behind the minimal `/check_access` contract.
 
@@ -296,6 +296,17 @@ Step 3's forge protocol is the only piece a forge integrator has to implement �
 
 `<aa>` / `<bb>` are bytes 0 / 1 of the hash in plain (not Xet) lowercase hex — just for sane directory fan-out, not exposed on the wire. Writes go through `tmp/<uuid>` then `rename(2)` for atomicity.
 
+### S3 `BlobStore`
+
+Same key layout under an optional bucket-relative prefix:
+
+```
+<prefix>xorbs/<aa>/<bb>/<full-hex>
+<prefix>shards/<aa>/<bb>/<full-hex>
+```
+
+Idempotency uses `HEAD`-before-`PUT` (a concurrent racer writing the same content-addressed bytes is benign). Reconstruction handlers call `presign_xorb_range` first — when `Some(url)` comes back the URL goes straight into `fetch_info` and the server is no longer in the data path. The S3 presigned URL signs the `Range:` header, so the client must send the exact range advertised in `url_range`.
+
 ### SQLite `MetadataStore` schema
 
 ```sql
@@ -382,6 +393,7 @@ Server side:
 | Xorb chunk-frame parser (on-disk layout) | `crates/xet-server-shard/src/xorb.rs` |
 | Filesystem blob store | `crates/xet-server-storage-fs/src/lib.rs` |
 | In-memory blob store (M8 pluggability) | `crates/xet-server-storage-mem/src/lib.rs` |
+| S3-compatible blob store | `crates/xet-server-storage-s3/src/lib.rs` |
 | SQLite metadata store | `crates/xet-server-meta-sqlite/src/lib.rs` |
 | Static authz (`AlwaysAllow`, `ConfigAuthz`) | `crates/xet-server-authz-mem/src/lib.rs` |
 | HTTP-delegating authz (`HttpAuthz`) | `crates/xet-server-authz-http/src/lib.rs` |

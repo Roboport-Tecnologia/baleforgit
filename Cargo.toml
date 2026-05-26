@@ -11,6 +11,7 @@ members = [
     "crates/xet-server-shard",
     "crates/xet-server-storage-fs",
     "crates/xet-server-storage-mem",
+    "crates/xet-server-storage-s3",
     "crates/xet-server-meta-sqlite",
     "crates/xet-server-authz-mem",
     "crates/xet-server-authz-http",
@@ -57,6 +58,7 @@ xet-server-wire = { path = "crates/xet-server-wire" }
 xet-server-shard = { path = "crates/xet-server-shard" }
 xet-server-storage-fs = { path = "crates/xet-server-storage-fs" }
 xet-server-storage-mem = { path = "crates/xet-server-storage-mem" }
+xet-server-storage-s3 = { path = "crates/xet-server-storage-s3" }
 xet-server-meta-sqlite = { path = "crates/xet-server-meta-sqlite" }
 xet-server-authz-mem = { path = "crates/xet-server-authz-mem" }
 xet-server-authz-http = { path = "crates/xet-server-authz-http" }
