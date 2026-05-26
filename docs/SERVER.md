@@ -4,7 +4,7 @@ This document covers operating the server side. For the user-facing client (`git
 
 ## Install
 
-Download the `bale-server-<version>-<target>.tar.gz` tarball for your platform from the [releases page](https://github.com/davidrios/git-baleforgit-server/releases), or pull the container image from `ghcr.io/davidrios/git-baleforgit-server`. Verify the artifact before running it — see "Verifying release artifacts" below.
+Download the `baleforgit-server-<version>-<target>.tar.gz` tarball for your platform from the [releases page](https://github.com/davidrios/baleforgit/releases), or pull the container image from `ghcr.io/davidrios/baleforgit-server`. Verify the artifact before running it — see "Verifying release artifacts" below.
 
 ## Quick start
 
@@ -33,7 +33,7 @@ docker run --rm -p 8080:8080 \
   -e BALE_JWT_SECRET_HEX=$(printf '%064x' 1) \
   -e BALE_TRANSFER_SECRET_HEX=$(printf '%064x' 2) \
   -e BALE_GRANTS=token-alice:alice:alice/my-model:write \
-  ghcr.io/davidrios/git-baleforgit-server:latest
+  ghcr.io/davidrios/baleforgit-server:latest
 ```
 
 ## Configuration
@@ -61,12 +61,12 @@ Each release tarball and container digest is covered by a [SLSA Build Provenance
 
 ```bash
 # Tarball — works on the file you just downloaded from the release page.
-gh attestation verify bale-server-<version>-<target>.tar.gz \
-  --repo davidrios/git-baleforgit-server
+gh attestation verify baleforgit-server-<version>-<target>.tar.gz \
+  --repo davidrios/baleforgit
 
 # Container image — pin to a digest, not a mutable tag.
-gh attestation verify oci://ghcr.io/davidrios/git-baleforgit-server@sha256:<digest> \
-  --repo davidrios/git-baleforgit-server
+gh attestation verify oci://ghcr.io/davidrios/baleforgit-server@sha256:<digest> \
+  --repo davidrios/baleforgit
 ```
 
 A passing verify means: the artifact was produced by this repo's GitHub Actions workflow at a specific commit, and nothing in transit has tampered with it. Pin to a digest (not `:latest`) when you care about reproducibility.
