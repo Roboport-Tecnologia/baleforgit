@@ -8,12 +8,12 @@ The protocol is deliberately shaped to mirror git-lfs's authentication flow, so 
 
 ```
    ┌──────────────┐   1. authenticate (HTTPS Basic / SSH)
-   │  git-dfs     │ ────────────────────────────▶ ┌────────────┐
+   │  git-dfs     │ ───────────────────────────▶ ┌────────────┐
    │  (client)    │ ◀────────────────────────────│   forge    │
    └──────┬───────┘   {href, Bearer <jwt>, exp}  └─────┬──────┘
-          │                                             │
-          │ 2. exchange JWT for xet token               │ 3. /check_access
-          ▼                                             ▼  (verify jwt, return user_id)
+          │                                            │
+          │ 2. exchange JWT for xet token              │ 3. /check_access
+          ▼                                            ▼  (verify jwt, return user_id)
    ┌──────────────┐                              ┌────────────┐
    │  xet-server  │ ────────────────────────────▶│   forge    │
    └──────────────┘                              └────────────┘
@@ -93,5 +93,4 @@ The forge then implements `POST /check_access` (see `xet-server-authz-http`) to 
 
 - **Mirrors `git-lfs-authenticate`.** A forge that supports LFS already has SSH `git-lfs-authenticate`, an HTTPS LFS Batch endpoint, and Basic-auth credential handling. The DFS endpoints follow the same patterns under a different name.
 - **No shared secret between forge and xet-server.** The forge mints JWTs against its own key. xet-server verifies them by calling back to the forge (`/check_access`) rather than holding a copy of the signing key.
-- **No long-lived credential reaches xet-server.** The user's password / PAT stays inside the forge. xet-server only sees short-lived JWTs.
 - **Forge owns the user model.** xet-server has no concept of users, organisations, teams, branches, or branch protection. The forge is the single source of truth for "who can read/write this repo".
