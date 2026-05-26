@@ -10,7 +10,4 @@ bytes.workspace = true
 thiserror.workspace = true
 xet-server-core.workspace = true
 
-# Path dep into the sibling xet-core clone (excluded from the workspace).
-# Used for content-hash verification of uploaded xorbs so the merkle
-# aggregation and BG4-LZ4 decoder match the client byte-for-byte.
-xet-core-structures = { path = "../../xet-core/xet_core_structures" }
+xet-core-structures = "=1.5.2"
