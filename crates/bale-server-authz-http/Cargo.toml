@@ -1,0 +1,19 @@
+[package]
+name = "bale-server-authz-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+bale-server-core.workspace = true
+bale-server-tokens.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true

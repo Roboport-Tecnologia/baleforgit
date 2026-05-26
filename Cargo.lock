@@ -611,6 +611,200 @@ dependencies = [
 ]
 
 [[package]]
+name = "bale-server-authz-http"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bale-server-core",
+ "bale-server-tokens",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bale-server-authz-mem"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bale-server-core",
+ "bale-server-tokens",
+ "tokio",
+]
+
+[[package]]
+name = "bale-server-bin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bale-server-authz-http",
+ "bale-server-authz-mem",
+ "bale-server-core",
+ "bale-server-http",
+ "bale-server-meta-sqlite",
+ "bale-server-storage-fs",
+ "bale-server-storage-s3",
+ "bale-server-tokens",
+ "hex",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "bale-server-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "bale-server-http"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bale-server-core",
+ "bale-server-shard",
+ "bale-server-tokens",
+ "bale-server-wire",
+ "blake3",
+ "bytes",
+ "hex",
+ "hmac 0.13.0",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "bale-server-meta-sqlite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bale-server-core",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bale-server-shard"
+version = "0.1.0"
+dependencies = [
+ "bale-server-core",
+ "bytes",
+ "thiserror",
+ "xet-core-structures",
+]
+
+[[package]]
+name = "bale-server-storage-fs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bale-server-core",
+ "bytes",
+ "hex",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bale-server-storage-mem"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bale-server-core",
+ "bytes",
+ "tokio",
+]
+
+[[package]]
+name = "bale-server-storage-s3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "bale-server-core",
+ "bytes",
+ "hex",
+ "reqwest",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bale-server-tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bale-server-authz-http",
+ "bale-server-authz-mem",
+ "bale-server-core",
+ "bale-server-http",
+ "bale-server-meta-sqlite",
+ "bale-server-shard",
+ "bale-server-storage-fs",
+ "bale-server-storage-mem",
+ "bale-server-tokens",
+ "bale-server-wire",
+ "bytes",
+ "hex",
+ "hmac 0.13.0",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "bale-server-tokens"
+version = "0.1.0"
+dependencies = [
+ "bale-server-core",
+ "jsonwebtoken",
+ "serde",
+]
+
+[[package]]
+name = "bale-server-wire"
+version = "0.1.0"
+dependencies = [
+ "bale-server-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1558,7 +1752,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-dfs"
+name = "git-bale"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -4904,200 +5098,6 @@ dependencies = [
  "tracing-subscriber",
  "whoami",
  "winapi",
-]
-
-[[package]]
-name = "xet-server-authz-http"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "xet-server-core",
- "xet-server-tokens",
-]
-
-[[package]]
-name = "xet-server-authz-mem"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "tokio",
- "xet-server-core",
- "xet-server-tokens",
-]
-
-[[package]]
-name = "xet-server-bin"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "hex",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "xet-server-authz-http",
- "xet-server-authz-mem",
- "xet-server-core",
- "xet-server-http",
- "xet-server-meta-sqlite",
- "xet-server-storage-fs",
- "xet-server-storage-s3",
- "xet-server-tokens",
-]
-
-[[package]]
-name = "xet-server-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "xet-server-http"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "blake3",
- "bytes",
- "hex",
- "hmac 0.13.0",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "xet-server-core",
- "xet-server-shard",
- "xet-server-tokens",
- "xet-server-wire",
-]
-
-[[package]]
-name = "xet-server-meta-sqlite"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "sqlx",
- "tempfile",
- "tokio",
- "tracing",
- "xet-server-core",
-]
-
-[[package]]
-name = "xet-server-shard"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "thiserror",
- "xet-core-structures",
- "xet-server-core",
-]
-
-[[package]]
-name = "xet-server-storage-fs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "hex",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
- "xet-server-core",
-]
-
-[[package]]
-name = "xet-server-storage-mem"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "tokio",
- "xet-server-core",
-]
-
-[[package]]
-name = "xet-server-storage-s3"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "bytes",
- "hex",
- "reqwest",
- "tokio",
- "tracing",
- "uuid",
- "xet-server-core",
-]
-
-[[package]]
-name = "xet-server-tests"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "hex",
- "hmac 0.13.0",
- "http-body-util",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "tokio",
- "tower",
- "xet-server-authz-http",
- "xet-server-authz-mem",
- "xet-server-core",
- "xet-server-http",
- "xet-server-meta-sqlite",
- "xet-server-shard",
- "xet-server-storage-fs",
- "xet-server-storage-mem",
- "xet-server-tokens",
- "xet-server-wire",
-]
-
-[[package]]
-name = "xet-server-tokens"
-version = "0.1.0"
-dependencies = [
- "jsonwebtoken",
- "serde",
- "xet-server-core",
-]
-
-[[package]]
-name = "xet-server-wire"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
- "xet-server-core",
 ]
 
 [[package]]

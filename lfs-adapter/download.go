@@ -12,9 +12,9 @@ package main
 //
 //   1. git-lfs GETs /repos/{owner}/{name}/objects/{oid} with the same
 //      Authorization header used for the batch call.
-//   2. We mint a Xet *read* token from xet-server (PAT verification happens
-//      upstream in xet-server's RepoAuthz impl).
-//   3. We ask xet-server for the file's reconstruction keyed by sha256:
+//   2. We mint a Bale *read* token from baleforgit-server (PAT verification happens
+//      upstream in baleforgit-server's RepoAuthz impl).
+//   3. We ask baleforgit-server for the file's reconstruction keyed by sha256:
 //      GET /v1/reconstructions/by-sha256/{oid}.
 //   4. For each term, we GET the signed xorb byte range (which now correctly
 //      covers chunk frames on-disk after the xorb_frames fix), parse 8-byte
@@ -37,7 +37,7 @@ import (
 	"github.com/pierrec/lz4/v4"
 )
 
-// Reconstruction response shapes — match xet-server's QueryReconstructionResponse.
+// Reconstruction response shapes — match baleforgit-server's QueryReconstructionResponse.
 type reconstructionResponse struct {
 	OffsetIntoFirstRange uint64                         `json:"offset_into_first_range"`
 	Terms                []reconstructionTerm           `json:"terms"`
@@ -85,9 +85,9 @@ func (a *adapter) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	bearer := normalizeToBearer(r.Header.Get("Authorization"))
 
-	tok, status, err := a.mintXetToken(owner, name, "read", bearer)
+	tok, status, err := a.mintBaleToken(owner, name, "read", bearer)
 	if err != nil {
-		http.Error(w, "mint xet token: "+err.Error(), status)
+		http.Error(w, "mint bale token: "+err.Error(), status)
 		return
 	}
 
@@ -179,7 +179,7 @@ func (a *adapter) fetchReconstruction(casURL, token, oid string) (*reconstructio
 }
 
 // findEncompassing returns the fetch_info entry whose chunk-index range fully
-// contains [termStart, termEnd). xet-server today emits exactly one entry per
+// contains [termStart, termEnd). baleforgit-server today emits exactly one entry per
 // term, but per protocol multiple are allowed.
 func findEncompassing(entries []reconstructionURL, termStart, termEnd uint64) *reconstructionURL {
 	for i := range entries {

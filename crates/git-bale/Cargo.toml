@@ -1,0 +1,37 @@
+[package]
+name = "git-bale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "git-bale"
+path = "src/main.rs"
+
+[lib]
+name = "git_bale"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "=4.5.50", features = ["derive"] }
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+xet-data = "=1.5.2"
+xet-core-structures = "=1.5.2"
+xet-client = "=1.5.2"
+xet-runtime = "=1.5.2"
+
+[dev-dependencies]
+axum.workspace = true
+base64 = "0.22"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

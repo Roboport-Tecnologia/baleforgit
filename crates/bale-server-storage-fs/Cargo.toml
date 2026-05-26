@@ -1,0 +1,19 @@
+[package]
+name = "bale-server-storage-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+hex.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+bale-server-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

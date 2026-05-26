@@ -1,0 +1,33 @@
+[package]
+name = "bale-server-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+hex.workspace = true
+hmac.workspace = true
+http-body-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tower.workspace = true
+bale-server-core.workspace = true
+bale-server-wire.workspace = true
+bale-server-shard.workspace = true
+bale-server-storage-fs.workspace = true
+bale-server-storage-mem.workspace = true
+bale-server-meta-sqlite.workspace = true
+bale-server-authz-mem.workspace = true
+bale-server-authz-http.workspace = true
+bale-server-http.workspace = true
+bale-server-tokens.workspace = true

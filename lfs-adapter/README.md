@@ -1,11 +1,11 @@
-# xet-lfs-adapter
+# bale-lfs-adapter
 
 A small Go HTTP server that bridges the standard **git-lfs Batch API** to a
-**xet-server** CAS backend by way of the `git-xet` custom transfer agent.
+**baleforgit-server** CAS backend by way of the `git-xet` custom transfer agent.
 
-It exists as a reference shape for what a GitLab/Gitea Xet integration would
+It exists as a reference shape for what a GitLab/Gitea Bale integration would
 look like: a thin protocol adapter that holds no secrets, knows nothing about
-users, and delegates all authorization to the upstream xet-server.
+users, and delegates all authorization to the upstream baleforgit-server.
 
 ## What it does
 
@@ -16,15 +16,15 @@ For every `POST /repos/{owner}/{name}/objects/batch` from git-lfs:
 1. Reads the caller's `Authorization` header (Bearer or Basic — git-lfs uses
    Basic when credentials are URL-embedded; the adapter normalizes Basic to
    Bearer using the password part).
-2. Forwards that bearer to xet-server's HF-Hub-compatible token endpoint:
-   `GET {xet-server}/api/models/{owner}/{name}/xet-write-token/main`
-3. Repackages xet-server's `{accessToken, exp, casUrl}` response into a
+2. Forwards that bearer to baleforgit-server's HF-Hub-compatible token endpoint:
+   `GET {baleforgit-server}/api/models/{owner}/{name}/bale-write-token/main`
+3. Repackages baleforgit-server's `{accessToken, exp, casUrl}` response into a
    standard LFS Batch response with `transfer="xet"` and per-object
    `action.header` carrying `X-Xet-Cas-Url`, `X-Xet-Access-Token`,
    `X-Xet-Token-Expiration`.
 4. Returns the batch response. git-lfs dispatches to the `git-xet` custom
    transfer agent, which reads those headers and uploads bytes directly to
-   xet-server. The adapter never touches blob bytes.
+   baleforgit-server. The adapter never touches blob bytes.
 
 ### Downloads (`operation: download`)
 
@@ -35,8 +35,8 @@ takes over byte serving:
    `action.download.href` pointing back at the adapter
    (`/repos/{owner}/{name}/objects/{sha256}`), `header.Authorization`
    echoing the caller's bearer.
-2. git-lfs follows that URL; the adapter mints a Xet **read** token,
-   queries xet-server's `GET /v1/reconstructions/by-sha256/{sha256}` to
+2. git-lfs follows that URL; the adapter mints a Bale **read** token,
+   queries baleforgit-server's `GET /v1/reconstructions/by-sha256/{sha256}` to
    get the file's terms and signed xorb byte ranges, then **streams**:
    - For each term, GET the signed URL with the prescribed `Range` header.
    - Parse 8-byte chunk frame headers in flight, decompress per scheme
@@ -53,11 +53,11 @@ small lz4 dependency for download decoding.
 ## Where authorization actually happens
 
 The adapter is **stateless and credential-free**. The PAT verification +
-mint-token logic lives in xet-server's `RepoAuthz` impl (typically
-`xet-server-authz-http`, which calls out to the platform). To integrate with
+mint-token logic lives in baleforgit-server's `RepoAuthz` impl (typically
+`bale-server-authz-http`, which calls out to the platform). To integrate with
 GitLab or Gitea, you'd write a small `/check_access` shim in front of their
 API (verify the PAT via `/api/v4/user`, check project access, return
-`{user_id}`) — the adapter and xet-server remain unchanged.
+`{user_id}`) — the adapter and baleforgit-server remain unchanged.
 
 ## Build
 
@@ -69,7 +69,7 @@ go build ./...
 ## Run
 
 ```bash
-./xet-lfs-adapter --listen 127.0.0.1:9090 --xet-server http://127.0.0.1:8080
+./bale-lfs-adapter --listen 127.0.0.1:9090 --bale-server http://127.0.0.1:8080
 ```
 
 ## Configure a git repo to use it
@@ -127,9 +127,9 @@ Response:
     { "oid": "<sha256>", "size": 307200, "authenticated": true,
       "actions": {
         "upload": {
-          "href": "http://xet-server:8080",
+          "href": "http://baleforgit-server:8080",
           "header": {
-            "X-Xet-Cas-Url":          "http://xet-server:8080",
+            "X-Xet-Cas-Url":          "http://baleforgit-server:8080",
             "X-Xet-Access-Token":     "<jwt>",
             "X-Xet-Token-Expiration": "1716580000"
           } } } } ] }

@@ -1,23 +1,23 @@
-// xet-lfs-adapter: a tiny git-lfs Batch API server that bridges incoming
-// LFS uploads/downloads to a Xet CAS server using the "xet" custom transfer
+// bale-lfs-adapter: a tiny git-lfs Batch API server that bridges incoming
+// LFS uploads/downloads to a Bale CAS server using the "xet" custom transfer
 // agent (https://github.com/huggingface/xet-core).
 //
 // Per-request flow:
 //
 //  1. git-lfs POSTs /repos/{owner}/{name}/objects/batch with an Authorization
 //     header carrying a platform credential (a GitLab PAT, a Gitea token, etc.).
-//  2. The adapter forwards that same Authorization to xet-server's HF-Hub-
+//  2. The adapter forwards that same Authorization to baleforgit-server's HF-Hub-
 //     compatible token endpoint
-//     GET /api/models/{owner}/{name}/xet-{read|write}-token/main
-//     to mint a Xet token. xet-server's own authz layer (e.g.
-//     xet-server-authz-http) is what actually verifies the credential against
+//     GET /api/models/{owner}/{name}/bale-{read|write}-token/main
+//     to mint a Bale token. baleforgit-server's own authz layer (e.g.
+//     bale-server-authz-http) is what actually verifies the credential against
 //     the platform — the adapter holds no secrets, knows nothing about users.
 //  3. The adapter repackages the {accessToken, exp, casUrl} response into a
 //     standard LFS Batch response with transfer="xet" and per-object
 //     action.header carrying X-Xet-Cas-Url, X-Xet-Access-Token, and
 //     X-Xet-Token-Expiration. git-lfs sees transfer="xet" and dispatches to
 //     the git-xet binary, which reads those headers and uploads/downloads
-//     bytes directly to/from xet-server.
+//     bytes directly to/from baleforgit-server.
 //
 // This is intended as a reference shape for a real GitLab/Gitea integration:
 // it's small enough to read end-to-end, written in Go so the same engineers
@@ -73,9 +73,9 @@ type batchActionDoc struct {
 	ExpiresAt string            `json:"expires_at,omitempty"`
 }
 
-// xet-server's /api/.../xet-{rw}-token/main response shape, mirrors
+// baleforgit-server's /api/.../bale-{rw}-token/main response shape, mirrors
 // huggingface_hub's XetTokenResponse.
-type xetTokenResponse struct {
+type baleTokenResponse struct {
 	AccessToken     string `json:"accessToken"`
 	Exp             int64  `json:"exp"`
 	CasURL          string `json:"casUrl"`
@@ -83,7 +83,7 @@ type xetTokenResponse struct {
 }
 
 type adapter struct {
-	xetServerBase string
+	baleServerBase string
 	// publicBaseURL is the adapter's own externally-visible base, e.g.
 	// "http://127.0.0.1:9090". Embedded in LFS download action hrefs so
 	// git-lfs knows where to GET object bytes.
@@ -119,7 +119,7 @@ func (a *adapter) handleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// git-lfs presents URL-embedded credentials as Basic auth; xet-server's
+	// git-lfs presents URL-embedded credentials as Basic auth; baleforgit-server's
 	// HF-Hub-compatible token endpoint only knows Bearer. Translate before
 	// forwarding so the chain works regardless of how the LFS client built
 	// its Authorization header.
@@ -130,9 +130,9 @@ func (a *adapter) handleBatch(w http.ResponseWriter, r *http.Request) {
 		scope = "read"
 	}
 
-	tok, status, err := a.mintXetToken(owner, name, scope, bearer)
+	tok, status, err := a.mintBaleToken(owner, name, scope, bearer)
 	if err != nil {
-		http.Error(w, "mint xet token: "+err.Error(), status)
+		http.Error(w, "mint bale token: "+err.Error(), status)
 		return
 	}
 
@@ -192,11 +192,11 @@ func (a *adapter) handleBatch(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// mintXetToken forwards the caller's credential to xet-server's
+// mintBaleToken forwards the caller's credential to baleforgit-server's
 // HF-Hub-compatible token endpoint. Returns the minted token, or the upstream
 // status to relay back to the LFS client.
-func (a *adapter) mintXetToken(owner, name, scope, callerAuth string) (*xetTokenResponse, int, error) {
-	url := fmt.Sprintf("%s/api/models/%s/%s/xet-%s-token/main", a.xetServerBase, owner, name, scope)
+func (a *adapter) mintBaleToken(owner, name, scope, callerAuth string) (*baleTokenResponse, int, error) {
+	url := fmt.Sprintf("%s/api/models/%s/%s/bale-%s-token/main", a.baleServerBase, owner, name, scope)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, http.StatusInternalServerError, err
@@ -213,7 +213,7 @@ func (a *adapter) mintXetToken(owner, name, scope, callerAuth string) (*xetToken
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, resp.StatusCode, fmt.Errorf("upstream %d: %s", resp.StatusCode, bytes.TrimSpace(body))
 	}
-	var out xetTokenResponse
+	var out baleTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, http.StatusBadGateway, fmt.Errorf("decode upstream: %w", err)
 	}
@@ -256,10 +256,10 @@ func parseRepoFromPath(p string) (owner, name string, ok bool) {
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:0", "bind address")
-	xetServer := flag.String("xet-server", "", "base URL of xet-server (required)")
+	baleServer := flag.String("bale-server", "", "base URL of baleforgit-server (required)")
 	flag.Parse()
-	if *xetServer == "" {
-		fmt.Fprintln(flag.CommandLine.Output(), "--xet-server is required")
+	if *baleServer == "" {
+		fmt.Fprintln(flag.CommandLine.Output(), "--bale-server is required")
 		flag.Usage()
 		return
 	}
@@ -272,7 +272,7 @@ func main() {
 	}
 
 	a := &adapter{
-		xetServerBase: strings.TrimRight(*xetServer, "/"),
+		baleServerBase: strings.TrimRight(*baleServer, "/"),
 		publicBaseURL: "http://" + ln.Addr().String(),
 		// Long timeout for the download path — reconstructing a multi-GB file
 		// can take minutes on slow networks. ReadTimeout/WriteTimeout below
@@ -288,7 +288,7 @@ func main() {
 		WriteTimeout: 10 * time.Minute,
 	}
 
-	fmt.Printf("xet-lfs-adapter listening on %s\n", a.publicBaseURL)
+	fmt.Printf("bale-lfs-adapter listening on %s\n", a.publicBaseURL)
 	log.Fatal(srv.Serve(ln))
 }
 

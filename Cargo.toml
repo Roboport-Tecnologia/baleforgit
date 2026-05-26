@@ -6,26 +6,26 @@ exclude = [
     "lfs-adapter",
 ]
 members = [
-    "crates/xet-server-core",
-    "crates/xet-server-wire",
-    "crates/xet-server-shard",
-    "crates/xet-server-storage-fs",
-    "crates/xet-server-storage-mem",
-    "crates/xet-server-storage-s3",
-    "crates/xet-server-meta-sqlite",
-    "crates/xet-server-authz-mem",
-    "crates/xet-server-authz-http",
-    "crates/xet-server-tokens",
-    "crates/xet-server-http",
-    "crates/xet-server-bin",
-    "crates/xet-server-tests",
-    "crates/git-dfs",
+    "crates/bale-server-core",
+    "crates/bale-server-wire",
+    "crates/bale-server-shard",
+    "crates/bale-server-storage-fs",
+    "crates/bale-server-storage-mem",
+    "crates/bale-server-storage-s3",
+    "crates/bale-server-meta-sqlite",
+    "crates/bale-server-authz-mem",
+    "crates/bale-server-authz-http",
+    "crates/bale-server-tokens",
+    "crates/bale-server-http",
+    "crates/bale-server-bin",
+    "crates/bale-server-tests",
+    "crates/git-bale",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "LicenseRef-Proprietary"
 rust-version = "1.94"
 
 [workspace.dependencies]
@@ -53,14 +53,14 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 uuid = { version = "=1.23.1", features = ["v4"] }
 
-xet-server-core = { path = "crates/xet-server-core" }
-xet-server-wire = { path = "crates/xet-server-wire" }
-xet-server-shard = { path = "crates/xet-server-shard" }
-xet-server-storage-fs = { path = "crates/xet-server-storage-fs" }
-xet-server-storage-mem = { path = "crates/xet-server-storage-mem" }
-xet-server-storage-s3 = { path = "crates/xet-server-storage-s3" }
-xet-server-meta-sqlite = { path = "crates/xet-server-meta-sqlite" }
-xet-server-authz-mem = { path = "crates/xet-server-authz-mem" }
-xet-server-authz-http = { path = "crates/xet-server-authz-http" }
-xet-server-tokens = { path = "crates/xet-server-tokens" }
-xet-server-http = { path = "crates/xet-server-http" }
+bale-server-core = { path = "crates/bale-server-core" }
+bale-server-wire = { path = "crates/bale-server-wire" }
+bale-server-shard = { path = "crates/bale-server-shard" }
+bale-server-storage-fs = { path = "crates/bale-server-storage-fs" }
+bale-server-storage-mem = { path = "crates/bale-server-storage-mem" }
+bale-server-storage-s3 = { path = "crates/bale-server-storage-s3" }
+bale-server-meta-sqlite = { path = "crates/bale-server-meta-sqlite" }
+bale-server-authz-mem = { path = "crates/bale-server-authz-mem" }
+bale-server-authz-http = { path = "crates/bale-server-authz-http" }
+bale-server-tokens = { path = "crates/bale-server-tokens" }
+bale-server-http = { path = "crates/bale-server-http" }

@@ -1,0 +1,26 @@
+[package]
+name = "bale-server-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "baleforgit-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+hex.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bale-server-core.workspace = true
+bale-server-http.workspace = true
+bale-server-storage-fs.workspace = true
+bale-server-storage-s3.workspace = true
+bale-server-meta-sqlite.workspace = true
+bale-server-authz-mem.workspace = true
+bale-server-authz-http.workspace = true
+bale-server-tokens.workspace = true

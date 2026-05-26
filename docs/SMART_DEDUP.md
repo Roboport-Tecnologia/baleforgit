@@ -1,7 +1,7 @@
 # Smart dedup wrapper (sketch)
 
 Design notes for an opt-in transform that decompresses well-known
-container formats (gzip first; zstd/xz later) inside `git-dfs
+container formats (gzip first; zstd/xz later) inside `git-bale
 filter-process` — **before** content reaches CDC chunking — so small
 source edits to compressed files like `.blend`, `.fcstd`, `.xcf`
 actually dedup across versions.
@@ -17,19 +17,19 @@ repeated regions and almost nothing dedups. Decompressing before
 chunking restores the dedup signal — the inflated bodies of two
 near-identical `.blend` saves share long runs.
 
-The xet-server is intentionally payload-agnostic past the upload-time
+The baleforgit-server is intentionally payload-agnostic past the upload-time
 chunk integrity check (`docs/ARCHITECTURE.md` — "The server does
 decompress on `POST /v1/xorbs/...`" only to verify chunk hashes, never
 as a transformation). So this layer is **client-side only** and lives
-entirely inside `git-dfs`.
+entirely inside `git-bale`.
 
 ## Insertion points
 
-With LFS removed from the picture (`git-dfs` is a native Git filter
-registered as `filter.dfs.process`), the data path is a single
+With LFS removed from the picture (`git-bale` is a native Git filter
+registered as `filter.bale.process`), the data path is a single
 filter-process subprocess Git invokes on staging (`clean`) and
 checkout (`smudge`). Both directions live in
-`crates/git-dfs/src/filter_process.rs`:
+`crates/git-bale/src/filter_process.rs`:
 
 - **Clean** (`do_clean` → `handle_clean`): we already spool the input
   bytes from Git's pkt-line stream into a `NamedTempFile` so we can
@@ -51,7 +51,7 @@ clean (stage):
                                 |  detect format, transform tmp -> tmp'
                                 v
                             FileUploadSession (chunks tmp' bytes
-                              -> xorbs/shards on xet-server)
+                              -> xorbs/shards on baleforgit-server)
                                 |
                                 v
                             pointer JSON
@@ -228,7 +228,7 @@ sniff happens after it too — no extra plumbing needed.
 The smudge path needs no parameter sweep — the recipe tells it
 exactly which deflate params to use.
 
-## Knock-on effects on git-dfs / Xet invariants
+## Knock-on effects on git-bale / Xet invariants
 
 - **Pointer file metadata describes the SMART_BLOB, not the original
   file.** `XetFileInfo.hash` is the merkle hash of the chunked
@@ -239,19 +239,19 @@ exactly which deflate params to use.
   pointer JSON expecting the working-copy SHA-256 will get the
   SMART_BLOB's SHA-256 instead.
 - **Pointer parsing unchanged.** The pointer JSON's wire format
-  (`crates/git-dfs/src/pointer.rs`) doesn't change. No new fields,
+  (`crates/git-bale/src/pointer.rs`) doesn't change. No new fields,
   no schema bump.
 - **Chunk cache + manifest cache unchanged.** Both key on the
   pointer's merkle hash, which is now the SMART_BLOB's merkle —
-  same code path, same on-disk layout (`~/.cache/dfs/chunks`,
-  `.git/dfs/manifests/`).
+  same code path, same on-disk layout (`~/.cache/bale/chunks`,
+  `.git/bale/manifests/`).
 - **Cross-repo dedup.** A SMART_BLOB and its un-transformed twin
   share no chunks (different first bytes, different inflated
   framing). Don't expect cross-pollination between repos that opt in
   vs. opt out. Within the smart-dedup neighborhood, near-identical
   inputs share most chunks via their INFLATED bodies — that's the
   whole point.
-- **xet-server unchanged.** The server sees only chunks; smart-dedup
+- **baleforgit-server unchanged.** The server sees only chunks; smart-dedup
   is purely client-side. The upload-time chunk integrity check
   (`POST /v1/xorbs/...`, see `docs/ARCHITECTURE.md`) still applies,
   but operates on SMART_BLOB chunks, not original-file chunks.
@@ -259,21 +259,21 @@ exactly which deflate params to use.
 ## Opt-in / rollout
 
 Per-repo opt-in via a git config key, e.g. `dfs.smartDedup = gzip`
-(parallel to the existing `dfs.serverUrl` / `dfs.token` /
-`dfs.cacheDir` set read by `crates/git-dfs/src/config.rs`).
+(parallel to the existing `bale.serverUrl` / `bale.token` /
+`bale.cacheDir` set read by `crates/git-bale/src/config.rs`).
 `filter-process` would read it on startup through the same
 `RawConfig` path; if unset, the filter behaves identically to today.
 This lets a user enable smart dedup for one repo storing `.blend`
-files without affecting any other DFS workflow on the same machine.
+files without affecting any other Bale workflow on the same machine.
 
-`git-dfs install` and `git-dfs track` need no changes — they
+`git-bale install` and `git-bale track` need no changes — they
 configure the filter; the filter reads `dfs.smartDedup` per
 invocation.
 
 ## Open questions
 
 1. **Where does the deflate-param cache live?** A per-user file under
-   `~/.cache/dfs/smart/deflate-params.json` (alongside the existing
+   `~/.cache/bale/smart/deflate-params.json` (alongside the existing
    chunk cache) keyed on file extension + first-N-bytes-of-header
    would avoid re-sweeping for repeated saves from the same app.
    Cache poisoning is a real concern — the self-test must still run
@@ -301,6 +301,6 @@ invocation.
    a format-aware chunker that knows Blender's block structure, which
    is a much bigger lift.
 5. **Should `dfs.smartDedup` ever be auto-set?** E.g. flipped on
-   automatically when `git-dfs track '*.blend'` runs. Probably no —
+   automatically when `git-bale track '*.blend'` runs. Probably no —
    explicit opt-in is safer, especially while the transform is
    experimental.

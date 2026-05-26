@@ -1,0 +1,188 @@
+//! In-memory `RepoAuthz` implementations: [`AlwaysAllow`] for tests,
+//! [`ConfigAuthz`] for static hub-token → repo-scope configs.
+
+use async_trait::async_trait;
+use bale_server_core::{CoreError, CoreResult, RepoAuthz, RepoRef, Scope, TokenClaims, UserId};
+use bale_server_tokens as tokens;
+use std::collections::HashMap;
+
+/// Test-only: accepts any non-empty bearer and grants write scope. Not for production.
+#[derive(Clone, Debug, Default)]
+pub struct AlwaysAllow;
+
+#[async_trait]
+impl RepoAuthz for AlwaysAllow {
+    async fn verify_xet_token(&self, bearer: &str) -> CoreResult<TokenClaims> {
+        if bearer.is_empty() {
+            return Err(CoreError::Unauthorized);
+        }
+        Ok(TokenClaims {
+            user: UserId("anonymous".into()),
+            repo: bale_server_core::RepoRef {
+                repo_type: bale_server_core::RepoType::Model,
+                repo_id: "anonymous/repo".into(),
+                revision: "main".into(),
+            },
+            scope: Scope::Write,
+            expires_at: u64::MAX,
+        })
+    }
+
+    async fn check_repo_access(
+        &self,
+        _hub_bearer: &str,
+        _repo: &RepoRef,
+        _scope: Scope,
+    ) -> CoreResult<UserId> {
+        Ok(UserId("anonymous".into()))
+    }
+
+    async fn mint_xet_token(
+        &self,
+        _user: &UserId,
+        _repo: &RepoRef,
+        _scope: Scope,
+    ) -> CoreResult<(String, u64)> {
+        Err(CoreError::Internal("AlwaysAllow cannot mint tokens".into()))
+    }
+}
+
+/// Static config: hub tokens → user + per-repo scope. `repo_id` matching is exact.
+#[derive(Clone, Debug, Default)]
+pub struct ConfigAuthz {
+    pub jwt_secret: Vec<u8>,
+    pub users: HashMap<String, ConfigUser>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ConfigUser {
+    pub user_id: String,
+    pub repos: HashMap<String, Scope>,
+}
+
+impl ConfigAuthz {
+    pub fn new(jwt_secret: impl Into<Vec<u8>>) -> Self {
+        Self {
+            jwt_secret: jwt_secret.into(),
+            users: HashMap::new(),
+        }
+    }
+
+    pub fn grant(
+        mut self,
+        hub_token: impl Into<String>,
+        user_id: impl Into<String>,
+        repo_id: impl Into<String>,
+        scope: Scope,
+    ) -> Self {
+        let user_id = user_id.into();
+        let entry = self
+            .users
+            .entry(hub_token.into())
+            .or_insert_with(|| ConfigUser {
+                user_id: user_id.clone(),
+                repos: HashMap::new(),
+            });
+        // Conflicting user_id grants for the same hub token: first wins.
+        entry.repos.insert(repo_id.into(), scope);
+        self
+    }
+}
+
+pub const DEFAULT_TOKEN_TTL_SECS: u64 = 3600;
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut x = 0u8;
+    for (x_a, x_b) in a.iter().zip(b.iter()) {
+        x |= x_a ^ x_b;
+    }
+    x == 0
+}
+
+#[async_trait]
+impl RepoAuthz for ConfigAuthz {
+    async fn verify_xet_token(&self, bearer: &str) -> CoreResult<TokenClaims> {
+        tokens::verify(&self.jwt_secret, bearer)
+    }
+
+    async fn check_repo_access(
+        &self,
+        hub_bearer: &str,
+        repo: &RepoRef,
+        requested: Scope,
+    ) -> CoreResult<UserId> {
+        // Trust boundary: avoid a HashMap-keyed lookup so the hub bearer
+        // comparison doesn't leak length/prefix via timing.
+        let mut found: Option<&ConfigUser> = None;
+        for (k, v) in &self.users {
+            if ct_eq(k.as_bytes(), hub_bearer.as_bytes()) {
+                found = Some(v);
+            }
+        }
+        let u = found.ok_or(CoreError::Unauthorized)?;
+        let granted = u
+            .repos
+            .get(&repo.repo_id)
+            .copied()
+            .ok_or(CoreError::Forbidden)?;
+        if matches!(requested, Scope::Write) && matches!(granted, Scope::Read) {
+            return Err(CoreError::Forbidden);
+        }
+        Ok(UserId(u.user_id.clone()))
+    }
+
+    async fn mint_xet_token(
+        &self,
+        user: &UserId,
+        repo: &RepoRef,
+        scope: Scope,
+    ) -> CoreResult<(String, u64)> {
+        tokens::mint(&self.jwt_secret, user, repo, scope, DEFAULT_TOKEN_TTL_SECS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bale_server_core::RepoType;
+
+    fn repo(name: &str) -> RepoRef {
+        RepoRef {
+            repo_type: RepoType::Model,
+            repo_id: name.into(),
+            revision: "main".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_authz_grants_write_when_allowed() {
+        let authz =
+            ConfigAuthz::new(b"k".to_vec()).grant("hub-alice", "alice", "alice/m", Scope::Write);
+        let u = authz
+            .check_repo_access("hub-alice", &repo("alice/m"), Scope::Write)
+            .await
+            .unwrap();
+        assert_eq!(u.0, "alice");
+    }
+
+    #[tokio::test]
+    async fn config_authz_forbids_write_when_only_read() {
+        let authz = ConfigAuthz::new(b"k".to_vec()).grant("hub-bob", "bob", "bob/m", Scope::Read);
+        let r = authz
+            .check_repo_access("hub-bob", &repo("bob/m"), Scope::Write)
+            .await;
+        assert!(matches!(r, Err(CoreError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn config_authz_unknown_hub_token_is_unauthorized() {
+        let authz = ConfigAuthz::new(b"k".to_vec());
+        let r = authz
+            .check_repo_access("nope", &repo("x/y"), Scope::Read)
+            .await;
+        assert!(matches!(r, Err(CoreError::Unauthorized)));
+    }
+}
