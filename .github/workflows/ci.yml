@@ -40,10 +40,43 @@ jobs:
   test:
     name: cargo test
     runs-on: ubuntu-latest
+    env:
+      # Pin to a known git-xet release. Bumping this is safe so long as the
+      # LFS custom-transfer JSON shape m7 drives doesn't change.
+      GIT_XET_VERSION: "0.2.1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # ubuntu-latest already has git, git-lfs, go, and podman preinstalled.
+      # Only git-xet has to be fetched. We pull the upstream release zip and
+      # drop the binary into /usr/local/bin so the m7/m9/m10 tests find it on
+      # PATH.
+      - name: Install git-xet
+        run: |
+          set -euo pipefail
+          url="https://github.com/huggingface/xet-core/releases/download/git-xet-v${GIT_XET_VERSION}/git-xet-linux-x86_64.zip"
+          tmp=$(mktemp -d)
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$tmp/git-xet.zip" "$url"
+          unzip -q "$tmp/git-xet.zip" -d "$tmp"
+          sudo install -m 0755 "$tmp/git-xet" /usr/local/bin/git-xet
+          rm -rf "$tmp"
+
+      - name: Show tool versions
+        # Surfaces the actual toolchain bound to this run so a future failure
+        # in m7/m9/m10/minio can be diagnosed without re-running locally.
+        run: |
+          git --version
+          git lfs version
+          git-xet --version
+          go version
+          podman --version || true
+
       - run: cargo test --workspace --no-fail-fast
-      # m7/m9/m10 skip silently when their external tools (git-xet, git-lfs,
-      # go) aren't on PATH; m11 builds git-dfs from crates.io deps and runs.
+
+      # MinIO test is #[ignore]d so the line above skips it. Run it explicitly;
+      # it pulls a ~100 MiB image and exercises the real S3 BlobStore path.
+      # The test itself probes `podman info` and skips if podman isn't usable.
+      - name: MinIO S3 integration test
+        run: cargo test -p xet-server-storage-s3 --test minio -- --ignored --nocapture
