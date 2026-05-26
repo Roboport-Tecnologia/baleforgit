@@ -210,3 +210,17 @@ async fn hub_endpoint_rejects_unauthorized_write_request() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn healthz_is_unauthenticated() {
+    let app = build_app().await;
+    let req = Request::builder()
+        .method("GET")
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 16).await.unwrap();
+    assert_eq!(&body[..], b"ok");
+}

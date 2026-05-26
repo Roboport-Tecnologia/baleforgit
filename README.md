@@ -49,7 +49,12 @@ cargo run -p xet-server-bin
 curl -i -X GET \
   -H 'Authorization: Bearer hub-alice' \
   http://127.0.0.1:8080/api/models/alice/my-model/xet-write-token/main
+
+# Liveness probe (unauthenticated, not access-logged):
+curl http://127.0.0.1:8080/healthz
 ```
+
+Send `SIGINT` (Ctrl-C) or `SIGTERM` to shut the server down gracefully — it stops accepting new connections and waits for in-flight requests to finish before exiting.
 
 Environment variables understood by the binary:
 

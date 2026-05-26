@@ -145,7 +145,9 @@ where
             transfer_secret,
             public_base_url: public_url,
         };
-        axum::serve(listener, router(svc)).await?;
+        axum::serve(listener, router(svc))
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
     } else {
         let mut authz = ConfigAuthz::new(jwt_secret);
         if let Ok(raw) = env::var("XET_GRANTS") {
@@ -177,9 +179,34 @@ where
             transfer_secret,
             public_base_url: public_url,
         };
-        axum::serve(listener, router(svc)).await?;
+        axum::serve(listener, router(svc))
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
     }
     Ok(())
+}
+
+async fn shutdown_signal() {
+    use tokio::signal;
+    // Both expects fire only if the kernel refuses to install a signal handler
+    // (e.g. SIGTERM is masked) — startup-time invariant, not a network input.
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("install Ctrl+C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("SIGINT received, draining in-flight requests"),
+        _ = terminate => tracing::info!("SIGTERM received, draining in-flight requests"),
+    }
 }
 
 fn env_truthy(name: &str) -> bool {

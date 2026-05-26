@@ -181,6 +181,14 @@ Mock HF Hub token endpoint:
 
 The token endpoint accepts the client's upstream hub bearer in `Authorization: Bearer ...`, calls `RepoAuthz::check_repo_access`, then `RepoAuthz::mint_xet_token`.
 
+Operational endpoints (no bearer, no scope check, no access log):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/healthz` | Liveness probe. Returns `200 ok` while the process is running. Sits outside the auth middleware *and* the `TraceLayer`, so a probe firing every few seconds doesn't drown out real request logs. |
+
+The binary registers a `SIGINT`/`SIGTERM` handler and hands it to `axum::serve(...).with_graceful_shutdown(...)`: on signal the listener stops accepting new connections and the server returns once in-flight handlers complete. Useful for container orchestrators that send `SIGTERM` and a grace period.
+
 ## LFS adapter (the git-forge integration seam)
 
 xet-server speaks the **Hugging Face Hub** flavor of the Xet protocol — token endpoint at `/api/{type}s/.../xet-{rw}-token/{rev}`, CAS API at `/v1/...`. Git-LFS doesn't know about this surface; it speaks the [git-lfs Batch API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md) and dispatches to a custom transfer agent (`git-xet`) when the batch response declares `transfer="xet"`. Something in the middle has to bridge the two protocols.

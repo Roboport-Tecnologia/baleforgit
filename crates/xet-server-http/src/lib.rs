@@ -95,7 +95,7 @@ where
         .on_response(DefaultOnResponse::new().level(Level::INFO))
         .on_failure(DefaultOnFailure::new().level(Level::WARN));
 
-    Router::new()
+    let traced = Router::new()
         .merge(v1)
         .route("/xorb/default/{hash}", get(get_xorb_transfer::<B, M, A>))
         .route(
@@ -104,7 +104,16 @@ where
         )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(trace)
-        .with_state(svc)
+        .with_state(svc);
+
+    // Health probe sits outside auth and outside the access-log trace layer:
+    // k8s/loadbalancer probes fire every few seconds and would otherwise
+    // drown out real request logs.
+    Router::new().route("/healthz", get(healthz)).merge(traced)
+}
+
+async fn healthz() -> &'static str {
+    "ok"
 }
 
 // ---- Errors ----------------------------------------------------------------
