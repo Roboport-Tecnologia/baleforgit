@@ -2,8 +2,6 @@
 resolver = "2"
 exclude = [
     "xet-core",
-    "git-lfs",
-    "lfs-adapter",
 ]
 members = [
     "crates/bale-server-core",

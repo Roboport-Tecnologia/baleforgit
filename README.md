@@ -68,7 +68,6 @@ Bale for Git is a Git large-file system that does content-defined chunking + chu
 - [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md) — what a git forge has to implement to support `git-bale`.
 - [`docs/STATUS.md`](docs/STATUS.md) — milestone breakdown (M1–M12) with what each one provides.
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — building from source, the test matrix, CI workflows, and how releases are cut.
-- [`lfs-adapter/README.md`](lfs-adapter/README.md) — the legacy Go LFS bridge.
 
 ## License
 

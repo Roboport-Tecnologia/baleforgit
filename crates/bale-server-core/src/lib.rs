@@ -212,7 +212,6 @@ pub trait MetadataStore: Send + Sync {
         &self,
         file_hash: &FileHash,
         repo: &RepoRef,
-        sha256: Option<&Hash32>,
         terms: &[FileTerm],
     ) -> CoreResult<()>;
 
@@ -233,10 +232,6 @@ pub trait MetadataStore: Send + Sync {
     /// in `repo_id`. Same `file_hash` may be registered in multiple repos
     /// (cross-repo dedup) and each registration independently grants read.
     async fn file_in_repo(&self, file_hash: &FileHash, repo_id: &str) -> CoreResult<bool>;
-    /// Resolve a file by its LFS-style sha256 OID (the standard 32-byte hash,
-    /// not the Xet merkle file hash). `None` if no shard carrying that sha256
-    /// has been uploaded yet.
-    async fn lookup_file_by_sha256(&self, sha256: &Hash32) -> CoreResult<Option<FileHash>>;
     async fn lookup_chunk(&self, chunk_hash: &ChunkHash) -> CoreResult<Option<ChunkLocation>>;
     async fn xorbs_near_chunk(
         &self,

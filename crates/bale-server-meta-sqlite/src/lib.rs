@@ -44,7 +44,6 @@ CREATE TABLE IF NOT EXISTS files (
     repo_type    TEXT    NOT NULL,
     repo_id      TEXT    NOT NULL,
     revision     TEXT    NOT NULL,
-    sha256       BLOB,
     total_bytes  INTEGER NOT NULL,
     created_at   INTEGER NOT NULL,
     -- Composite PK: same file_hash can live in multiple repos (cross-repo
@@ -52,7 +51,6 @@ CREATE TABLE IF NOT EXISTS files (
     -- (file_hash, repo_id=token.repo) row to exist.
     PRIMARY KEY (file_hash, repo_id)
 );
-CREATE INDEX IF NOT EXISTS files_by_sha256 ON files(sha256) WHERE sha256 IS NOT NULL;
 CREATE INDEX IF NOT EXISTS files_by_repo ON files(repo_id);
 
 CREATE TABLE IF NOT EXISTS file_terms (
@@ -203,7 +201,6 @@ impl MetadataStore for SqliteMetadataStore {
         &self,
         file_hash: &FileHash,
         repo: &RepoRef,
-        sha256: Option<&Hash32>,
         terms: &[FileTerm],
     ) -> CoreResult<()> {
         let total_bytes: u64 = terms.iter().map(|t| t.unpacked_segment_bytes as u64).sum();
@@ -215,14 +212,13 @@ impl MetadataStore for SqliteMetadataStore {
             .map_err(|e| CoreError::Internal(format!("begin: {e}")))?;
 
         sqlx::query(
-            "INSERT OR REPLACE INTO files (file_hash, repo_type, repo_id, revision, sha256, total_bytes, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO files (file_hash, repo_type, repo_id, revision, total_bytes, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(hash_to_blob(&file_hash.0))
         .bind(format!("{:?}", repo.repo_type).to_lowercase())
         .bind(&repo.repo_id)
         .bind(&repo.revision)
-        .bind(sha256.map(hash_to_blob))
         .bind(total_bytes as i64)
         .bind(now_unix())
         .execute(&mut *tx)
@@ -364,21 +360,6 @@ impl MetadataStore for SqliteMetadataStore {
             });
         }
         Ok(out)
-    }
-
-    async fn lookup_file_by_sha256(&self, sha256: &Hash32) -> CoreResult<Option<FileHash>> {
-        let row = sqlx::query("SELECT file_hash FROM files WHERE sha256 = ? LIMIT 1")
-            .bind(hash_to_blob(sha256))
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| CoreError::Internal(format!("select file by sha256: {e}")))?;
-        match row {
-            None => Ok(None),
-            Some(r) => {
-                let blob: Vec<u8> = r.try_get("file_hash").map_err(internal)?;
-                Ok(Some(FileHash(blob_to_hash(&blob)?)))
-            }
-        }
     }
 
     async fn lookup_chunk(&self, chunk_hash: &ChunkHash) -> CoreResult<Option<ChunkLocation>> {
@@ -586,9 +567,7 @@ mod tests {
                 verification: Some(h(0xE2)),
             },
         ];
-        s.register_file(&file, &repo, Some(&h(0xC0)), &terms)
-            .await
-            .unwrap();
+        s.register_file(&file, &repo, &terms).await.unwrap();
 
         let back = s.lookup_file(&file).await.unwrap().unwrap();
         assert_eq!(back.len(), 2);
@@ -624,47 +603,16 @@ mod tests {
         assert!(!s.file_in_repo(&file, "alice/m").await.unwrap());
         assert!(!s.file_in_repo(&file, "bob/m").await.unwrap());
 
-        s.register_file(&file, &alice, None, &terms).await.unwrap();
+        s.register_file(&file, &alice, &terms).await.unwrap();
         assert!(s.file_in_repo(&file, "alice/m").await.unwrap());
         assert!(!s.file_in_repo(&file, "bob/m").await.unwrap());
 
         // Same file_hash in a second repo must NOT displace Alice's row (composite PK).
-        s.register_file(&file, &bob, None, &terms).await.unwrap();
+        s.register_file(&file, &bob, &terms).await.unwrap();
         assert!(s.file_in_repo(&file, "alice/m").await.unwrap());
         assert!(s.file_in_repo(&file, "bob/m").await.unwrap());
 
         assert!(!s.file_in_repo(&file, "carol/m").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn lookup_file_by_sha256_round_trip() {
-        let s = store().await;
-        let file = FileHash(h(0xAA));
-        let repo = RepoRef {
-            repo_type: RepoType::Model,
-            repo_id: "alice/m".into(),
-            revision: "main".into(),
-        };
-        let sha = h(0xC1);
-        let terms = vec![FileTerm {
-            xorb: XorbHash(h(0x33)),
-            chunk_idx_start: 0,
-            chunk_idx_end: 1,
-            unpacked_segment_bytes: 16,
-            verification: None,
-        }];
-        s.register_file(&file, &repo, Some(&sha), &terms)
-            .await
-            .unwrap();
-        let hit = s.lookup_file_by_sha256(&sha).await.unwrap();
-        assert_eq!(hit, Some(file));
-        let miss = s.lookup_file_by_sha256(&h(0xFF)).await.unwrap();
-        assert!(miss.is_none());
-        // NULL sha256 rows must not collide with each other on lookup.
-        let other = FileHash(h(0xBB));
-        s.register_file(&other, &repo, None, &terms).await.unwrap();
-        let still_no_match = s.lookup_file_by_sha256(&h(0)).await.unwrap();
-        assert!(still_no_match.is_none());
     }
 
     #[tokio::test]

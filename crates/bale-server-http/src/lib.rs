@@ -72,10 +72,6 @@ where
         .route("/v1/xorbs/{prefix}/{hash}", post(upload_xorb::<B, M, A>))
         .route("/shards", post(upload_shard::<B, M, A>))
         .route(
-            "/v1/reconstructions/by-sha256/{sha256}",
-            get(get_reconstruction_by_sha256::<B, M, A>),
-        )
-        .route(
             "/v1/reconstructions/{file_id}",
             get(get_reconstruction::<B, M, A>),
         )
@@ -368,7 +364,7 @@ where
             })
             .collect();
         svc.meta
-            .register_file(&f.file_hash, &claims.repo, f.sha256.as_ref(), &terms)
+            .register_file(&f.file_hash, &claims.repo, &terms)
             .await?;
     }
 
@@ -399,37 +395,6 @@ where
     let file_hash =
         FileHash(decode_hash(&file_hex).map_err(|e| bad_req(format!("malformed file id: {e}")))?);
     // 404 (not 403) on miss to avoid probing for files in other repos.
-    if !svc
-        .meta
-        .file_in_repo(&file_hash, &claims.repo.repo_id)
-        .await?
-    {
-        return Err(ApiError(StatusCode::NOT_FOUND, "file not found".into()));
-    }
-    let resp = build_reconstruction_response(&svc, &file_hash).await?;
-    Ok(Json(resp))
-}
-
-/// LFS-keyed reconstruction. `sha256` is a standard LFS OID (plain 64-char
-/// lowercase hex), not the Xet LE-u64 encoding used elsewhere.
-async fn get_reconstruction_by_sha256<B, M, A>(
-    State(svc): State<Service<B, M, A>>,
-    Extension(claims): Extension<TokenClaims>,
-    Path(sha256_hex): Path<String>,
-) -> Result<Json<QueryReconstructionResponse>, ApiError>
-where
-    B: BlobStore,
-    M: MetadataStore,
-    A: RepoAuthz,
-{
-    let sha256 = decode_lfs_sha256(&sha256_hex)
-        .map_err(|e| bad_req(format!("malformed sha256 oid: {e}")))?;
-    let file_hash = svc
-        .meta
-        .lookup_file_by_sha256(&sha256)
-        .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "file not found".into()))?;
-    // Same scope check as get_reconstruction; 404 to avoid cross-repo probes.
     if !svc
         .meta
         .file_in_repo(&file_hash, &claims.repo.repo_id)
@@ -547,20 +512,6 @@ where
         terms: wire_terms,
         fetch_info,
     })
-}
-
-/// Decode a 64-char lowercase hex LFS OID. Standard hex, NOT the Xet LE-u64 encoding.
-fn decode_lfs_sha256(s: &str) -> Result<Hash32, String> {
-    if s.len() != HASH_LEN * 2 {
-        return Err(format!("must be {} chars", HASH_LEN * 2));
-    }
-    let bytes = hex::decode(s).map_err(|e| format!("not hex: {e}"))?;
-    if bytes.len() != HASH_LEN {
-        return Err("decoded length mismatch".into());
-    }
-    let mut out = [0u8; HASH_LEN];
-    out.copy_from_slice(&bytes);
-    Ok(Hash32(out))
 }
 
 // ---- Handlers: global dedup ------------------------------------------------

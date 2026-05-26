@@ -62,7 +62,6 @@ async fn upload_indexes_and_reconstruction_can_be_assembled() {
     meta.register_file(
         &file,
         &repo,
-        None,
         &[FileTerm {
             xorb,
             chunk_idx_start: 1,

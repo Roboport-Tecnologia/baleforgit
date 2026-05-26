@@ -2,7 +2,7 @@
 
 This document describes the internals of `baleforgit-server`: how the protocol pieces map to code, what each pluggable trait is for, and the gotchas of the on-disk format inherited from xet-core.
 
-The repo also ships two client paths that sit *in front of* baleforgit-server: the native `git-bale` filter in `crates/git-bale/` (replaces `git-lfs` entirely with a long-running Git filter, talks to baleforgit-server directly via the Bale wire protocol) and the legacy `lfs-adapter/` Go bridge (drives `git-lfs` users into baleforgit-server). Both are covered below.
+The repo ships one client: the native `git-bale` filter in `crates/git-bale/`, a long-running Git filter that talks to baleforgit-server directly via the Bale wire protocol. Covered below.
 
 ## Goals
 
@@ -15,7 +15,7 @@ The repo also ships two client paths that sit *in front of* baleforgit-server: t
 
 ```
                 ┌──────────────────────────────────────────────────────┐
-                │      git-bale client (or legacy lfs-adapter)         │
+                │                  git-bale client                     │
                 │   (fetches CAS URL + token from token endpoint)      │
                 └────────────────────┬─────────────────────────────────┘
                                      │ HTTPS
@@ -71,15 +71,13 @@ The repo also ships two client paths that sit *in front of* baleforgit-server: t
 
 ### Download (read-token scope sufficient)
 
-1. Client calls one of:
-   - `GET /v1/reconstructions/{file_id}` — file_id is the Xet merkle file hash (in Xet hex encoding).
-   - `GET /v1/reconstructions/by-sha256/{oid}` — `oid` is a standard 64-char lowercase-hex LFS sha256 OID; the server first resolves it to a file_id via the `files.sha256` index.
+1. Client calls `GET /v1/reconstructions/{file_id}` (file_id is the Xet merkle file hash, in Xet hex encoding).
 2. Server **scope-checks the file against the caller's repo**: there must be a row in `files` matching `(file_hash, repo_id = claims.repo.repo_id)`. If not, returns **404** (not 403 — so an attacker can't probe for existence in other repos). The `files` table uses `(file_hash, repo_id)` as a composite primary key, so the same content can be registered in multiple repos and each registration independently grants read access (cross-repo dedup at the chunk layer is unchanged).
 3. Server looks up the file's terms. For each term it reads the xorb's on-disk frame layout from `xorb_frames` (NOT the `chunks` table — that one stores uncompressed offsets) and computes the on-disk byte range covering `[chunk_idx_start, chunk_idx_end)`. It builds `fetch_info` with one **signed transfer URL** per term and the `url_range` bytes covered.
 4. Server returns JSON `QueryReconstructionResponse`.
 5. Client fetches each `url` with the prescribed `Range` header. The server (transfer layer) verifies the HMAC signature, verifies the Range header matches the signed range (otherwise 401), and streams the bytes from `BlobStore::get_xorb_range`. Client deserializes chunks, strips `offset_into_first_range` from the first one, concatenates.
 
-`Range:` request-side support on `/v1/reconstructions/*` is **not yet implemented** — the prototype always returns the full file's terms. Range support on the transfer URL itself is fully implemented (and mandatory, since signatures cover the byte range). The native `git-bale` smudge handler works around the missing range support by passing `0..file_size` to `xet-data` (see "Native filter" below); the LFS-adapter download path doesn't need it because it streams term-by-term itself.
+`Range:` request-side support on `/v1/reconstructions/*` is **not yet implemented** — the prototype always returns the full file's terms. Range support on the transfer URL itself is fully implemented (and mandatory, since signatures cover the byte range). The native `git-bale` smudge handler works around the missing range support by passing `0..file_size` to `xet-data` (see "Native filter" below).
 
 ### Global dedup
 
@@ -109,7 +107,7 @@ pub trait BlobStore: Send + Sync {
 pub trait MetadataStore: Send + Sync {
     async fn register_xorb(&self, xorb: &XorbInfo, chunks: &[ChunkRow]) -> CoreResult<()>;
     async fn register_file(&self, file_hash: &FileHash, repo: &RepoRef,
-                           sha256: Option<&Hash32>, terms: &[FileTerm]) -> CoreResult<()>;
+                           terms: &[FileTerm]) -> CoreResult<()>;
 
     // On-disk frame layout — populated at xorb upload time by parsing the
     // chunk frame headers; required to translate shard chunk-index ranges
@@ -121,8 +119,6 @@ pub trait MetadataStore: Send + Sync {
     async fn lookup_file(&self, file_hash: &FileHash) -> CoreResult<Option<Vec<FileTerm>>>;
     // M12 scope check: true iff `file_hash` is registered in `repo_id`.
     async fn file_in_repo(&self, file_hash: &FileHash, repo_id: &str) -> CoreResult<bool>;
-    // LFS-keyed lookup for the by-sha256 reconstruction endpoint.
-    async fn lookup_file_by_sha256(&self, sha256: &Hash32) -> CoreResult<Option<FileHash>>;
     async fn lookup_chunk(&self, chunk_hash: &ChunkHash) -> CoreResult<Option<ChunkLocation>>;
     async fn xorbs_near_chunk(&self, chunk_hash: &ChunkHash, limit: usize)
         -> CoreResult<Vec<XorbInfo>>;
@@ -162,7 +158,6 @@ CAS API (all behind `RepoAuthz::verify_bale_token`):
 | Method | Path | Scope | Purpose |
 |--------|------|-------|---------|
 | GET | `/v1/reconstructions/{file_id}` | read | File reconstruction metadata |
-| GET | `/v1/reconstructions/by-sha256/{sha256}` | read | Same, but keyed by LFS sha256 OID |
 | GET | `/v1/chunks/{prefix}/{chunk_hash}` | read | Global dedup query |
 | POST | `/v1/xorbs/default/{xorb_hash}` | write | Xorb upload |
 | POST | `/shards` | write | Shard upload + indexing |
@@ -189,73 +184,15 @@ Operational endpoints (no bearer, no scope check, no access log):
 
 The binary registers a `SIGINT`/`SIGTERM` handler and hands it to `axum::serve(...).with_graceful_shutdown(...)`: on signal the listener stops accepting new connections and the server returns once in-flight handlers complete. Useful for container orchestrators that send `SIGTERM` and a grace period.
 
-## LFS adapter (the git-forge integration seam)
+## Native filter: `git-bale`
 
-baleforgit-server speaks the **Hugging Face Hub** flavor of the Bale protocol — token endpoint at `/api/{type}s/.../bale-{rw}-token/{rev}`, CAS API at `/v1/...`. Git-LFS doesn't know about this surface; it speaks the [git-lfs Batch API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md) and dispatches to a custom transfer agent (`git-xet`) when the batch response declares `transfer="xet"`. Something in the middle has to bridge the two protocols.
+`crates/git-bale/` is the client: a native Rust `filter.bale.process` driver installed in git config. It speaks Git's long-running filter protocol directly, and calls into `xet-core`'s `FileUploadSession` / `FileDownloadSession` for chunking and reconstruction. The forge protocol it speaks to authenticate is documented in [`BALE_FORGE_PROTOCOL.md`](BALE_FORGE_PROTOCOL.md).
 
-`lfs-adapter/` (Go) is that bridge:
+Design properties:
 
-```
-git lfs push ─▶ POST /repos/{o}/{n}/objects/batch (Basic auth, URL-embedded PAT)
-                       │
-                       ▼
-                lfs-adapter (Go, stateless)
-                   │ forwards bearer to
-                   ▼
-                GET /api/models/{o}/{n}/bale-{rw}-token/main  ─▶ baleforgit-server
-                                                                   │
-                                                                   ▼ check_repo_access
-                                                            upstream PAT verifier
-                                                            (mock here; real git forge in prod)
-                       ◀── {accessToken, exp, casUrl}
-                       │
-                       ▼ wraps as standard LFS Batch response
-                { "transfer": "xet",
-                  "objects": [ { "actions": { "upload": {
-                      "href": "<casUrl>",
-                      "header": { "X-Xet-Cas-Url", "X-Xet-Access-Token", "X-Xet-Token-Expiration" }
-                  } } } ] }
-                       │
-                       ▼ git-lfs spawns git-xet
-                git-xet transfer ─▶ POST /v1/xorbs/..., POST /shards (to baleforgit-server, with Bale token)
-```
-
-The **download** path is asymmetric. git-xet's custom-transfer agent is upload-only — it errors out on `download` with "Operation not supported". For pulls the adapter advertises `transfer="basic"` (standard LFS Batch transfer) and serves bytes itself:
-
-```
-git lfs pull ─▶ POST /repos/{o}/{n}/objects/batch  (operation=download)
-                       │
-                       ▼  transfer="basic", action.download.href = adapter's own URL
-                git-lfs GET /repos/{o}/{n}/objects/{sha256}  ─▶ lfs-adapter
-                                                                  │ mint read token
-                                                                  ▼
-                                                       baleforgit-server: GET /v1/reconstructions/by-sha256/{sha256}
-                                                                  │
-                                                       ◀── {terms, fetch_info (signed xorb URLs)}
-                                                                  │ per term
-                                                                  ▼  GET signed URL with Range
-                                                       streams xorb frames, decodes 8-byte header,
-                                                       LZ4/BG4-LZ4/raw decompress per scheme,
-                                                       writes raw bytes to the LFS response.
-```
-
-Key properties:
-
-- The adapter is **stateless and credential-free**. It holds no JWT secret. It doesn't decode the user's PAT — it just forwards it to baleforgit-server, where `RepoAuthz` is authoritative. This is the property that makes it cheap to drop in front of an existing git forge (no shared secrets to manage).
-- The adapter is intentionally written in **Go** so engineers maintaining the existing LFS code in upstream forges can read it without learning Rust.
-- For integration into a specific forge: stand up a `/check_access` endpoint that authorizes the user/repo pair against that forge's own data, and point baleforgit-server's `BALE_AUTHZ_HTTP_URL` at it. Adapter and baleforgit-server are unchanged.
-- The remote URL **must** be http(s)/ssh — git-xet rejects `file://` during credential helper setup. `lfs.url` only redirects LFS traffic; the remote URL still has to parse. The push integration test (`m9_real_lfs_push`) uses `git lfs push` directly so the unreachable `origin` doesn't actually need to accept a ref push. The pull test (`m10_real_lfs_pull`) wipes `.git/lfs/objects/` and the worktree file after the push, then runs `git lfs pull` so the bytes have to come from the server.
-- Download streaming in the adapter is **per-chunk** — schemes 0 (raw) and 1 (LZ4 frame) flow through `io.Copy`; scheme 2 (BG4-LZ4) needs the full uncompressed chunk in memory before the byte-group regroup, but chunks are ≤16 MiB by the xorb header's u24 length and typically ~64 KiB. No full-file buffering anywhere.
-
-## Native filter: `git-bale` (the LFS-bypass path)
-
-`crates/git-bale/` is a native Rust replacement for the LFS adapter, installed as a `filter.bale.process` driver in git config. It speaks Git's long-running filter protocol directly, and calls into `xet-core`'s `FileUploadSession` / `FileDownloadSession` for chunking and reconstruction — bypassing `git-lfs` entirely. The forge protocol it speaks to authenticate is documented in [`BALE_FORGE_PROTOCOL.md`](BALE_FORGE_PROTOCOL.md).
-
-Why a second client path?
-
-- **No `.git/lfs/objects/`**: git-lfs's design keeps a whole-file copy of every tracked blob in the per-repo store *in addition to* the worktree. That defeats Xet's chunk-level dedup locally and roughly doubles disk usage. git-bale keeps only the worktree file plus a deduplicated per-user chunk cache.
-- **Pretty-printed JSON pointer** with stable key order (`hash`, `file_size`, `sha256`) instead of the git-lfs `version/oid/size` line format. Tracked as a normal blob, parseable without xet-core.
+- **Pretty-printed JSON pointer** with stable key order (`hash`, `file_size`, `sha256`). Tracked as a normal blob, parseable without xet-core.
 - **Long-running process**: one filter-process subprocess per `git add` / `git checkout` fan-out, not one subprocess per file.
+- **Deduplicated per-user chunk cache** instead of a whole-file local store — the worktree file is the only full copy on disk.
 
 Layout on disk:
 
@@ -324,9 +261,8 @@ chunks      (chunk_hash, xorb_hash, chunk_index, byte_start, unpacked_bytes)
               INDEX (xorb_hash, chunk_index)
 xorb_frames (xorb_hash, frame_index, on_disk_start, on_disk_len, uncompressed_len)
               PK (xorb_hash, frame_index)
-files       (file_hash, repo_type, repo_id, revision, sha256, total_bytes, created_at)
+files       (file_hash, repo_type, repo_id, revision, total_bytes, created_at)
               PK (file_hash, repo_id)   -- composite: same content in N repos
-              INDEX (sha256) WHERE sha256 IS NOT NULL
               INDEX (repo_id)
 file_terms  (file_hash, term_index, xorb_hash, chunk_idx_start, chunk_idx_end,
              unpacked_bytes, verification)
@@ -384,8 +320,8 @@ These are the easy-to-get-wrong parts of the protocol. Calling them out explicit
 - **Idempotency** — `POST /v1/xorbs/{prefix}/{hash}` and `POST /shards` are content-addressed; re-uploading the same content MUST return 200, not error. `was_inserted: false` on the xorb side; `result: 0` on the shard side (we currently always return `1`; both are spec-defined "success — value is informational").
 - **The server does decompress on `POST /v1/xorbs/...` (and only there).** Every chunk frame is decompressed via xet-core's `CompressionScheme` (None / LZ4-frame / BG4-LZ4) so the server can recompute each chunk's `compute_data_hash`, aggregate via `xorb_hash`, and compare to the URL hash. Mismatch → 400 before anything is persisted. This is the load-bearing integrity check that keeps a writer from corrupting the CAS by uploading bytes that don't match the content hash. Implemented in `bale_server_shard::xorb::verify_xorb_body`. Outside of this verification step, payload bytes are still treated as opaque: reconstruction streams raw xorb bytes through signed transfer URLs without touching the compressed payload.
 - **Shard `byte_start` / `unpacked_segment_bytes` live in *uncompressed* coordinate space**, NOT on-disk bytes. The CAS Info section in an MDB shard records each chunk's offset within a *conceptual* uncompressed xorb (xet-core's `XorbChunkSequenceEntry::chunk_byte_range_start` accumulates `c.data.len()` pre-compression). On-disk byte ranges live separately in the `xorb_frames` table, populated by walking the chunk frame headers when a xorb is POSTed (`bale_server_shard::xorb::parse_xorb_frames`). Reconstruction MUST build `url_range` from `xorb_frames`, not from the shard-derived `chunks` table — using shard offsets gives wrong byte ranges for any real LZ4-compressed xorb.
-- **`FileMetadataExt.sha256` is stored in xet-core's byte-reversed-within-u64-groups order**, not natural sha256 byte order. xet-core treats every `Hash32`-shaped field uniformly as `[u64; 4]` and writes LE u64s, even for sha256 (which has no semantic reason to be reordered). The shard parser un-swaps with `swap_u64_groups` so that downstream code — and the `/v1/reconstructions/by-sha256/{oid}` endpoint, which accepts standard hex LFS OIDs — sees natural bytes.
-- **Chunk frame format** (8-byte `XorbChunkHeader`): `version(u8) | compressed_length(u24 LE) | compression_scheme(u8) | uncompressed_length(u24 LE)`. Schemes: 0=None, 1=LZ4 frame, 2=BG4-LZ4 (byte-group-of-4 deinterleave then LZ4 frame). Scheme 99 (Auto) is a sentinel and must never appear on the wire. The Go adapter decodes all three for the LFS download path; baleforgit-server only parses the header (for byte-range layout) and never touches payloads.
+- **`FileMetadataExt.sha256` is stored in xet-core's byte-reversed-within-u64-groups order**, not natural sha256 byte order. xet-core treats every `Hash32`-shaped field uniformly as `[u64; 4]` and writes LE u64s, even for sha256 (which has no semantic reason to be reordered). The shard parser un-swaps with `swap_u64_groups` so `ParsedFile.sha256` matches the standard byte order; the serializer applies the inverse swap on the way out.
+- **Chunk frame format** (8-byte `XorbChunkHeader`): `version(u8) | compressed_length(u24 LE) | compression_scheme(u8) | uncompressed_length(u24 LE)`. Schemes: 0=None, 1=LZ4 frame, 2=BG4-LZ4 (byte-group-of-4 deinterleave then LZ4 frame). Scheme 99 (Auto) is a sentinel and must never appear on the wire. baleforgit-server only parses the header (for byte-range layout) and never touches payloads.
 - **64 MiB limits** on both xorbs and shards — enforced via `DefaultBodyLimit`.
 - **Shard magic tag** — the 32-byte `MDB_SHARD_HEADER_TAG` is `b"HFRepoMetaData" + [0, 85, 105, 103, 69, 106, 123, 129, 87, 131, 165, 189, 217, 92, 205, 209, 74, 169]`, lifted verbatim from xet-core's `mdb_shard::shard_format::MDB_SHARD_HEADER_TAG` at the `git-xet-v0.2.1` tag. Our parser still accepts any 32-byte tag (so shards from older toolchains round-trip), but the serializer emits this canonical value so xet-core's strict header check accepts what we produce.
 

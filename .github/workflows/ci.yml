@@ -43,17 +43,16 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Pin to a known git-xet release. Bumping this is safe so long as the
-      # LFS custom-transfer JSON shape m7 drives doesn't change.
+      # custom-transfer JSON shape m7 drives doesn't change.
       GIT_XET_VERSION: "0.2.1"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # ubuntu-latest already has git, git-lfs, go, and podman preinstalled.
-      # Only git-xet has to be fetched. We pull the upstream release zip and
-      # drop the binary into /usr/local/bin so the m7/m9/m10 tests find it on
-      # PATH.
+      # ubuntu-latest already has git and podman preinstalled. Only git-xet has
+      # to be fetched. We pull the upstream release zip and drop the binary
+      # into /usr/local/bin so m7 finds it on PATH.
       - name: Install git-xet
         run: |
           set -euo pipefail
@@ -66,12 +65,10 @@ jobs:
 
       - name: Show tool versions
         # Surfaces the actual toolchain bound to this run so a future failure
-        # in m7/m9/m10/minio can be diagnosed without re-running locally.
+        # in m7/minio can be diagnosed without re-running locally.
         run: |
           git --version
-          git lfs version
           git-xet --version
-          go version
           podman --version || true
 
       - run: cargo test --workspace --no-fail-fast
