@@ -11,7 +11,8 @@ verified against the on-disk numbers and the `/v1/usage` API.
 **Not run by `cargo test`.** Invoke it directly:
 
 ```bash
-python3 tests/e2e/run.py
+python3 tests/e2e/run.py        # filesystem blob store (the default)
+python3 tests/e2e/run_s3.py     # S3 blob store via a MinIO sidecar
 ```
 
 ## Prereqs
@@ -53,6 +54,26 @@ found" error until that's fixed; the harness logic itself is portable.
 | `failure-conndrop` | A TCP proxy in front of the CAS port is killed mid-upload (server stays up); retry succeeds.        |
 | `failure-dbbusy`   | A sidecar `sqlite3` shell holds an IMMEDIATE write lock on `meta.db`; the user-side push still succeeds because sqlx's busy_timeout waits the lock out. |
 
+### S3 mode (`run_s3.py`)
+
+Brings up a MinIO sidecar (`quay.io/minio/minio`, ~120 MB on first pull)
+on a per-run podman network, then runs four phases against a server that
+uses MinIO as its `BlobStore` instead of the local filesystem.
+
+| Phase                  | What it verifies                                                                                       |
+|------------------------|--------------------------------------------------------------------------------------------------------|
+| `s3-basic`             | Push + cold-clone roundtrip against S3 storage; bucket actually receives xorbs (no silent fs fallback).|
+| `s3-dedup`             | CDC chunk-level dedup against MinIO object counts; a duplicate file adds ≤ 4 KiB of bucket bytes.      |
+| `s3-failure-kill`      | Server is killed while mid-PUT to MinIO; restart + retry converges via content-addressed idempotency.  |
+| `s3-failure-conndrop`  | Server↔MinIO TCP connection dropped mid-PUT via a host-side `TcpProxy`; retry on the recovered link succeeds. |
+
+Each phase writes under its own `BALE_S3_PREFIX` so they share one
+bucket without cross-contamination. The S3-conndrop phase requires
+podman 4+ (or docker with the equivalent) because it relies on
+`host.containers.internal` to make the host-side proxy reachable from
+inside the server container; older runtimes will error out at server
+start.
+
 A timing summary (per-phase wallclock + throughput on the
 bytes-relevant phases) prints at the end of every run.
 
@@ -89,8 +110,11 @@ python3 tests/e2e/run.py [--git-bale PATH] [--image-tag TAG] [--no-build]
 |----------------------------|------------------------------------------------------------------------|
 | `Dockerfile`               | Multi-stage build of the bundled `baleforgit-server` + `sshd` image.   |
 | `entrypoint.sh`            | Generates ssh host keys + authorized_keys + bare repos + the fake     |
-|                            | `git-bale-authenticate` script, starts sshd, execs `baleforgit-server`.|
-| `run.py`                   | The harness itself.                                                    |
+|                            | `git-bale-authenticate` script, starts sshd, execs `baleforgit-server`. Also pass-through for `BALE_S3_*` env vars when set. |
+| `run.py`                   | The fs-mode harness.                                                   |
+| `run_s3.py`                | The S3-mode harness (MinIO sidecar; 4 phases).                         |
+| `s3lib.py`                 | `MinioGuard`, `Network`, `S3StorageView`, and the 4 S3 phase functions.|
+| `run_matrix.py`            | Multi-run driver for `run.py`. Pass `--s3` to invoke `run_s3.py` once. |
 | `README.md`                | This file.                                                             |
 
 ## Reproducibility

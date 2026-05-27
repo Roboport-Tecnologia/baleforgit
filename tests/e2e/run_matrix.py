@@ -48,6 +48,7 @@ from typing import Optional
 
 HERE = Path(__file__).resolve().parent
 RUN_PY = HERE / "run.py"
+RUN_S3_PY = HERE / "run_s3.py"
 
 
 @dataclass
@@ -70,8 +71,9 @@ def _invoke(
     extra_env: Optional[dict] = None,
     output_file: Optional[Path] = None,
     stream: bool = True,
+    runner: Path = RUN_PY,
 ) -> RunResult:
-    cmd = [sys.executable, str(RUN_PY), "--no-build", *extra_args]
+    cmd = [sys.executable, str(runner), "--no-build", *extra_args]
     _info(f">>> {label}")
     _info(f"    $ {' '.join(cmd)}")
     env = os.environ.copy()
@@ -128,7 +130,25 @@ def main() -> int:
              "log files and print only summaries. Failing runs still dump "
              "their tail.",
     )
+    parser.add_argument(
+        "--s3", action="store_true",
+        help="Run the S3 suite (run_s3.py) instead of the fs suite. The "
+             "S3 suite has no concept of ordering or preserved state, so "
+             "the matrix collapses to a single invocation.",
+    )
     args = parser.parse_args()
+
+    if args.s3:
+        # The S3 runner has 4 isolated phases; no --order/--state-dir/
+        # --reuse-from to vary. Run it once and surface the result.
+        _info("S3 mode: running run_s3.py once (no matrix permutations apply)")
+        r = _invoke(
+            label="s3 suite", extra_args=[],
+            runner=RUN_S3_PY,
+            stream=not args.quiet,
+            output_file=None,
+        )
+        return r.exit_code
 
     matrix_root = Path(tempfile.mkdtemp(prefix="bale-e2e-matrix-"))
     _info(f"matrix work dir: {matrix_root}")

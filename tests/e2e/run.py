@@ -399,6 +399,8 @@ def start_container(
     admin_token_hex: Optional[str] = None,
     name_suffix: Optional[str] = None,
     public_host_url_override: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
+    extra_run_args: Optional[list[str]] = None,
 ) -> ServerHandle:
     cas_port = cas_port or pick_free_port()
     ssh_port = ssh_port or pick_free_port()
@@ -429,6 +431,11 @@ def start_container(
         env_kvs.append(f"BALE_DEFAULT_QUOTA_BYTES={quota_bytes}")
     if admin_token_hex is not None:
         env_kvs.append(f"BALE_ADMIN_TOKEN_HEX={admin_token_hex}")
+    # extra_env carries S3 wiring (BALE_S3_*) for run_s3.py. Existing call
+    # sites in this file pass None and behave exactly as before.
+    if extra_env:
+        for k, v in extra_env.items():
+            env_kvs.append(f"{k}={v}")
 
     # Bind-mount `<data_root>/git-home` too so the bare git repos under
     # /home/git survive a container restart. Without this, the restart
@@ -454,6 +461,11 @@ def start_container(
     ]
     for kv in env_kvs:
         cmd.extend(["-e", kv])
+    # extra_run_args lets run_s3.py attach the container to a shared podman
+    # network (for server→MinIO traffic) and inject host.containers.internal
+    # via --add-host so a TcpProxy on the host is reachable from the server.
+    if extra_run_args:
+        cmd.extend(extra_run_args)
     cmd.append(image_tag)
 
     info(
@@ -1116,10 +1128,15 @@ class TcpProxy:
         upstream_port: int,
         *,
         throttle_bytes_per_sec: Optional[int] = None,
+        bind_host: str = "127.0.0.1",
     ) -> None:
         self.listen_port = listen_port
         self.upstream = (upstream_host, upstream_port)
         self.throttle_bytes_per_sec = throttle_bytes_per_sec
+        # bind_host is "127.0.0.1" for the existing client↔server drop phase,
+        # and "0.0.0.0" for the S3-conndrop phase so the server container can
+        # reach the proxy via host.containers.internal.
+        self.bind_host = bind_host
         self._lock = threading.Lock()
         self._listen_sock: Optional[socket.socket] = None
         self._active: list[socket.socket] = []
@@ -1138,7 +1155,7 @@ class TcpProxy:
                 return
             ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            ls.bind(("127.0.0.1", self.listen_port))
+            ls.bind((self.bind_host, self.listen_port))
             ls.listen(16)
             self._listen_sock = ls
             self._stopped = False

@@ -49,7 +49,7 @@ The repo ships one client: the native `git-bale` filter in `crates/git-bale/`, a
    │    impls: │            impls:│            impls:│                  │
    │   ┌───────┴───────┐    ┌─────┴─────┐      ┌─────┴───────────────┐  │
    │   │ filesystem    │    │ SQLite    │      │ AlwaysAllow         │  │
-   │   │ S3 (later)    │    │ Postgres  │      │ ConfigAuthz         │  │
+   │   │ S3            │    │ Postgres  │      │ ConfigAuthz         │  │
    │   │ Azure (later) │    │ (later)   │      │ HttpAuthz (upstream)│  │
    │   └───────────────┘    └───────────┘      └─────────────────────┘  │
    └────────────────────────────────────────────────────────────────────┘
