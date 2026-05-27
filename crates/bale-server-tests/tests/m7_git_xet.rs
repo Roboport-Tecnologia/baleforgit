@@ -84,6 +84,8 @@ async fn git_xet_upload_round_trip() {
         authz: Arc::new(authz),
         transfer_secret: TRANSFER_SECRET,
         public_base_url: cas_url.clone(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     let app = router(svc);
     let server_handle = tokio::spawn(async move { axum::serve(listener, app).await });

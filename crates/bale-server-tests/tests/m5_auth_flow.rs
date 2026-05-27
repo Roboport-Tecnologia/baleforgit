@@ -44,6 +44,8 @@ async fn build_app() -> axum::Router {
         authz: Arc::new(authz),
         transfer_secret: [0x99u8; 32],
         public_base_url: "http://test.invalid".into(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     router(svc)
 }

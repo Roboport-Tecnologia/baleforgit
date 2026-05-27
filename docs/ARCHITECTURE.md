@@ -123,6 +123,22 @@ pub trait MetadataStore: Send + Sync {
     async fn xorbs_near_chunk(&self, chunk_hash: &ChunkHash, limit: usize)
         -> CoreResult<Vec<XorbInfo>>;
     async fn xorb_chunk_offsets(&self, xorb: &XorbHash) -> CoreResult<Vec<ChunkOffsetRow>>;
+
+    // Per-owner accounting + quotas. Owner = the namespace prefix of repo_id
+    // (everything before '/'), denormalised onto `files` for indexed scans.
+    async fn raw_bytes_for_owner(&self, owner: &str) -> CoreResult<u64>;
+    async fn stored_bytes_for_owner(&self, owner: &str) -> CoreResult<u64>;
+    async fn get_owner_quota(&self, owner: &str) -> CoreResult<Option<u64>>;
+    async fn set_owner_quota(&self, owner: &str, limit_bytes: Option<u64>) -> CoreResult<()>;
+    /// Used at shard upload to project `stored_bytes_for_owner` after a pending
+    /// file registration: sums `num_bytes_on_disk` for the subset of `candidates`
+    /// that `owner` does NOT already reference.
+    async fn unaccounted_xorb_bytes_for_owner(&self, owner: &str, candidates: &[XorbHash])
+        -> CoreResult<u64>;
+    // Per-repo equivalents — same aggregation shape keyed by full `repo_id`
+    // (e.g. "alice/big-model"). Used by the gitea repo settings page.
+    async fn raw_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
+    async fn stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
 }
 
 #[async_trait]
@@ -159,8 +175,10 @@ CAS API (all behind `RepoAuthz::verify_bale_token`):
 |--------|------|-------|---------|
 | GET | `/v1/reconstructions/{file_id}` | read | File reconstruction metadata |
 | GET | `/v1/chunks/{prefix}/{chunk_hash}` | read | Global dedup query |
-| POST | `/v1/xorbs/default/{xorb_hash}` | write | Xorb upload |
-| POST | `/shards` | write | Shard upload + indexing |
+| POST | `/v1/xorbs/default/{xorb_hash}` | write | Xorb upload (rejects with 413 if over the owner's quota) |
+| POST | `/shards` | write | Shard upload + indexing (rejects with 413 if over the owner's quota) |
+| GET | `/v1/usage/{owner}` | read or admin | Per-owner accounting — accepts either a Bale JWT scoped to the owner OR `BALE_ADMIN_TOKEN_HEX`. See "Owner accounting and quotas". |
+| GET | `/v1/usage/repo/{owner}/{repo}` | read or admin | Per-repo accounting — same auth as `/v1/usage/{owner}` (token's `repo.owner()` must match `{owner}`, or admin bearer). Returns `{repo_id, raw_bytes, stored_bytes, dedup_savings_bytes}`. Unknown repos return zeros, not 404. |
 
 Transfer URL (referenced from `fetch_info`, signed query string, no bearer required):
 
@@ -175,6 +193,12 @@ Mock HF Hub token endpoint:
 | GET | `/api/{models\|datasets\|spaces}/{ns}/{name}/bale-{read\|write}-token/{rev}` | Returns `{accessToken, exp, casUrl}` |
 
 The token endpoint accepts the client's upstream hub bearer in `Authorization: Bearer ...`, calls `RepoAuthz::check_repo_access`, then `RepoAuthz::mint_bale_token`.
+
+Admin endpoint (outside the JWT middleware, gated by a separate static bearer):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| PUT | `/v1/quotas/{owner}` | Set or clear the per-owner storage quota. Body: `{"limit_bytes": <u64>}` or `{"limit_bytes": null}` to revert to the default. Auth: `Authorization: Bearer <hex of BALE_ADMIN_TOKEN_HEX>`, constant-time compared. Returns 404 when the admin token isn't configured (endpoint disabled). |
 
 Operational endpoints (no bearer, no scope check, no access log):
 
@@ -228,6 +252,37 @@ Critical detail: the cold path passes `0..file_size` (not `FileRange::full()`, w
 
 Step 3's forge protocol is the only piece a forge integrator has to implement — see [`BALE_FORGE_PROTOCOL.md`](BALE_FORGE_PROTOCOL.md) for the wire shape. Combined with the existing `POST /check_access` callback that `bale-server-authz-http` already needs, that's the entire surface for "drop baleforgit-server in front of an existing git forge with no shared secrets".
 
+### `git-bale mount-diff` and `git-bale mount`
+
+Two read-only FUSE mounts share the same VFS, reader, and backend infrastructure; they differ only in the file set they expose.
+
+`mount-diff` shows both sides of a `git diff` with the revision label folded into each basename (`foo__<revA>.txt`, `foo__<revB>.txt`). `mount` shows the full tree at one revision with original filenames intact — useful for browsing a tag or another branch without `git checkout`.
+
+```
+git-bale mount-diff <revA> <revB> --mount <dir> \
+  [--label-a NAME] [--label-b NAME] [-- <paths>...]
+git-bale mount      <rev>         --mount <dir> [-- <paths>...]
+```
+
+Neither copies bytes to disk: reads stream out of git's object database (for non-Bale blobs) and the chunk cache / network reconstruction (for Bale pointers). The cold-path reconstruction also backfills `.git/bale/manifests/` so the next mount of the same content is purely local.
+
+Layout (`crates/git-bale/src/mount/`):
+
+- `mod.rs` — CLI entry, label sanitisation, lifecycle. Two entry points: `run` for diff mode, `run_rev` for single-rev mode. `run_rev` opens an `Arc<gix::ThreadSafeRepository>`, resolves the rev to a tree OID, and hands both to the lazy VFS — no tree walk at mount time. A single root `readdir` runs eagerly so an empty / mis-targeted mount errors out with a clear message rather than mounting silently empty.
+- `diff.rs` — pure-Rust diff via `gix` (no `git` subprocess): `rev_parse_single` + `tree.changes().for_each_to_obtain_tree`. Rename tracking is enabled by default, matching `git diff`.
+- `vfs.rs` — inode tree, inode 1 = root. Two builders: `build` (diff mode, labels appended, fully populated up front) and `build_single_lazy` (single-rev mode, names verbatim, directories resolved against their gix tree object on first `lookup_child`/`readdir`). Lazy directories carry the unresolved `tree_oid` + repo-relative `path_prefix` so pathspec filters can prune sibling subtrees without reading their tree objects. Inodes are stable for the life of the mount, memoized per `(parent, name)`. Directories are deduplicated; first-write-wins on collision. Internal state lives behind a single `Mutex` — fine while libfuse runs `-s`.
+- `reader.rs` — byte source. Plain blobs are pulled from the ODB via `gix::find_object` and cached fully (capped at 16 MiB per blob). Bale pointers go through the same cache-first / network-fallback reconstruction as the smudge filter, with a bounded in-memory LRU of decompressed file bodies (1 GiB default budget).
+- `backend/mod.rs` — `MountBackend` trait. Today there is one impl; fuse-t (macFUSE-free macOS), WinFsp (Windows), or NFS could slot in without touching the VFS.
+- `backend/libfuse.rs` — hand-rolled FFI to libfuse 3.x's high-level API (`fuse_main_real` + `struct fuse_operations`). libfuse is loaded with `libloading` at runtime, *not* linked at build time — workspaces without libfuse still build. On Linux that's `libfuse3.so.3`; on macOS that's `libfuse-t.dylib` (fuse-t's userspace shim, no kext). Mounts foreground (`-f`), single-threaded (`-s`), read-only (`-o ro`). `fuse_main_real` installs its own SIGINT/SIGTERM handlers, so Ctrl-C cleanly unmounts. The `ensure_available` probe runs first thing in `run`/`run_rev`; if libfuse fails to load the user gets a multi-line install hint and the process exits without doing any other work.
+
+Tricky bits:
+
+- **`getattr` never reconstructs.** Bale pointers carry `file_size` in their JSON, so a `stat` just reads the pointer blob from the ODB and parses the few hundred bytes — no chunks expanded, no network. Plain blobs report ODB blob length. Reconstruction (cache + possibly network) is deferred until the first actual `read`.
+- **Path-based libfuse API.** The high-level API hands callbacks paths, not inodes. We walk slash components against the in-memory dir tree on every call. Fine for diffs in the low-thousands of entries; bigger trees should move to `fuse_lowlevel_ops` (inode-native).
+- **Lazy single-rev mounts hold the repo handle for the life of the mount.** Each first-touch of a directory issues one `find_object(tree_oid)` against the ODB and populates that directory's children. The commit (and therefore every reachable tree) is immutable, so there is no invalidation — the populated children just stay cached until the FUSE process exits. `mount-diff` is still eager because the diff result is already bounded by the changeset.
+- **Active-VFS singleton.** libfuse's path callbacks don't get user-data, so we stash `Arc<DiffVfs>` in a `OnceLock`. One mount per process — a second mount in the same process is rejected.
+- **No working-tree comparisons.** Both modes operate on committed revisions only. Adding worktree support means rebuilding the VFS when the index moves; punted.
+
 ## Storage layout
 
 ### Filesystem `BlobStore`
@@ -261,19 +316,22 @@ chunks      (chunk_hash, xorb_hash, chunk_index, byte_start, unpacked_bytes)
               INDEX (xorb_hash, chunk_index)
 xorb_frames (xorb_hash, frame_index, on_disk_start, on_disk_len, uncompressed_len)
               PK (xorb_hash, frame_index)
-files       (file_hash, repo_type, repo_id, revision, total_bytes, created_at)
+files       (file_hash, repo_type, repo_id, revision, total_bytes, created_at, owner)
               PK (file_hash, repo_id)   -- composite: same content in N repos
-              INDEX (repo_id)
+              INDEX (repo_id), INDEX (owner)
 file_terms  (file_hash, term_index, xorb_hash, chunk_idx_start, chunk_idx_end,
              unpacked_bytes, verification)
               PK (file_hash, term_index)
+owner_quotas (owner TEXT PK, limit_bytes INTEGER NOT NULL)
 ```
 
 `xorb_frames` is populated at upload time by `parse_xorb_frames` in `bale-server-shard`. It is the *only* source of truth for HTTP byte ranges — the `chunks` table records uncompressed offsets from the shard's CAS Info section, which don't match on-disk positions for any real LZ4-compressed xorb. See the "Tricky bits" note below.
 
 `files` has a composite primary key on `(file_hash, repo_id)`. The same content can be registered in multiple repos (cross-repo dedup at the file level), and each registration independently grants read access via the M12 scope check.
 
-This is the minimum needed to answer reconstruction queries and global-dedup queries. Migrations run automatically on connection open (idempotent `CREATE TABLE IF NOT EXISTS ...`).
+`files.owner` is the slice of `repo_id` before the first `/`, denormalised so quota and usage aggregations can hit the `files_by_owner` index instead of `LIKE 'alice/%'`. Populated at `register_file` time from `RepoRef::owner()` — there is no separate backfill or migration path, so existing dev DBs from before owner accounting will fail to open and should be deleted.
+
+This is the minimum needed to answer reconstruction queries, global-dedup queries, and per-owner accounting. Migrations run automatically on connection open (idempotent `CREATE TABLE IF NOT EXISTS ...`).
 
 ## Auth flow
 
@@ -293,6 +351,36 @@ The `Service` struct is generic over the trait impls (`Arc<B>`/`Arc<M>`/`Arc<A>`
 ### Why JWTs (HS256) and not opaque tokens?
 
 The verifier needs the user/repo/scope tuple on every request, and the issuer is the same process today, so a self-contained signed token saves us a DB round-trip per request. If/when a `RepoAuthz` impl needs to mint tokens out-of-process (issuer ≠ verifier), switching to RS256 is a one-line change in `bale-server-tokens`.
+
+## Owner accounting and quotas
+
+The server accounts storage usage per **owner** — the namespace before `/` in a `repo_id` (`alice/big-model` → `alice`). Forges that don't allow user/org name collisions can treat users and orgs uniformly; nothing in the server distinguishes them.
+
+Two numbers, both queryable by `GET /v1/usage/{owner}` (which returns JSON `{owner, raw_bytes, stored_bytes, dedup_savings_bytes, quota_bytes}`):
+
+- **`raw_bytes`** — `SUM(files.total_bytes)` for the owner. Each file's `total_bytes` is the sum of its terms' `unpacked_segment_bytes`, recorded at `register_file` time. This is the "no-dedup baseline" the UI shows when illustrating savings.
+- **`stored_bytes`** — `SUM(num_bytes_on_disk)` over the distinct xorbs that any of the owner's files reference. **No cross-owner accounting**: a xorb that two owners both reference is counted once for each of them, so an owner's stored-bytes never depends on what another owner does or doesn't push. This matches the demo story ("here's what's actually on disk for me") and keeps quota enforcement stable under cross-owner activity.
+
+`dedup_savings_bytes = raw_bytes - stored_bytes`.
+
+`GET /v1/usage/repo/{owner}/{repo}` returns the same shape (minus the quota field) keyed by full `repo_id`. The intended consumer is a per-repo settings page in a forge: `raw_bytes` is the "this repo's total size" to surface to the user, ignoring chunk-level dedup with sibling repos. Stored-bytes is also returned but is generally less useful at the per-repo level — sibling repos under the same owner can share xorbs, so a repo's "stored" cost in isolation is somewhat fictional. Same auth rule as the owner endpoint.
+
+### Quota enforcement
+
+Quotas are **soft** — under concurrent uploads two writers can both pass the check then both succeed, slightly overshooting. That tradeoff buys us no extra locking on the hot path. Two enforcement points:
+
+1. **At `POST /v1/xorbs/{prefix}/{hash}`**: if the xorb already exists in CAS, the call is content-addressed-idempotent and skipped — re-pushes never reject. Otherwise we conservatively check `stored_bytes_for_owner + body.len() ≤ quota` and 413 on miss. This blocks the obvious "upload terabytes" failure mode at the door.
+2. **At `POST /shards`**: after xorb metadata is registered but *before* `register_file`, we compute the projected post-commit stored bytes — current stored plus the on-disk sizes of xorbs the owner doesn't already reference (`unaccounted_xorb_bytes_for_owner`). 413 on miss, and `register_file` never runs, so no file rows are left behind.
+
+The second check is load-bearing because the first one's "skip if exists" shortcut would otherwise let an owner gain attributable bytes by referencing someone else's xorb without paying. Drives `m13_quotas_and_usage::quota_blocks_at_shard_upload_for_cross_owner_dedup`.
+
+### Configuration
+
+`BALE_DEFAULT_QUOTA_BYTES` sets the fallback limit applied when no per-owner override exists. Per-owner overrides (set via `PUT /v1/quotas/{owner}`) take precedence; `null` clears the override and falls back to the default. If neither is set, the owner is unlimited.
+
+The admin endpoint is gated by `BALE_ADMIN_TOKEN_HEX` (a 64-char hex string decoding to 32 bytes). When unset, the route returns 404 — the wire surface advertises that admin is disabled rather than 401-ing. Comparison is constant-time. The admin bearer is **not** a Bale JWT and the endpoint sits outside the JWT middleware.
+
+`GET /v1/usage/{owner}` accepts either a Bale JWT scoped to the owner (the token's `repo.owner()` slice must equal the URL segment, so an `alice/x` token can't enumerate bob's usage) or the admin bearer (which bypasses the scope check so an operator dashboard can read every owner). The handler does this auth inline rather than going through the JWT middleware, so the admin bearer doesn't have to be a valid JWT.
 
 ## Signed transfer URLs
 
@@ -362,3 +450,4 @@ Client side (`crates/git-bale/`):
 | Forge auth resolver | `crates/git-bale/src/resolver.rs` |
 | `git-bale install` / `git-bale uninstall` | `crates/git-bale/src/install.rs` |
 | `git-bale track` (`.gitattributes` writer) | `crates/git-bale/src/track.rs` |
+| `git-bale mount-diff` (read-only FUSE diff view) | `crates/git-bale/src/mount/` |

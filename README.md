@@ -37,6 +37,34 @@ git config --local bale.token "<a Bale JWT minted out-of-band>"
 
 Same env-var equivalents exist for ephemeral overrides: `BALE_SERVER_URL`, `BALE_TOKEN`.
 
+### Mounting a diff or a single rev
+
+`git-bale mount-diff` exposes both sides of `git diff <revA> <revB>` as a read-only filesystem, with the revision label folded into each filename. Useful for piping a diff through external tools (Beyond Compare, Meld, vimdiff over directories, etc.) without checking out either side.
+
+```bash
+mkdir /tmp/diff
+git-bale mount-diff main feature-x --mount /tmp/diff
+# In another shell:
+ls /tmp/diff/src/
+#   foo__main.rs   foo__feature-x.rs   bar__feature-x.rs (added)
+# Ctrl-C the mount-diff process to unmount.
+```
+
+Supports the same arg shape as `git diff`: `<revA> <revB> [-- <paths>...]`. Custom labels via `--label-a` / `--label-b`.
+
+`git-bale mount` does the same for a *single* revision — every file from the tree appears under the mount point with its normal name. Useful for browsing a tag, an older commit, or another branch without `git checkout`.
+
+```bash
+mkdir /tmp/v1
+git-bale mount v1.0.0 --mount /tmp/v1
+# In another shell:
+ls /tmp/v1/        # files at v1.0.0, as they were committed
+```
+
+Both modes: no bytes are copied to disk — each `read` streams from git's object DB or, for Bale-tracked files, the chunk cache (with a network fallback that also repopulates the cache).
+
+Requires libfuse at runtime (not at build time): `libfuse3` on Linux, [fuse-t](https://www.fuse-t.org/) on macOS. Windows is not supported yet.
+
 ## Configuration
 
 | Source     | Key                     | Purpose                                                       |
@@ -63,7 +91,7 @@ Bale for Git is a Git large-file system that does content-defined chunking + chu
 
 ## More docs
 
-- [`docs/SERVER.md`](docs/SERVER.md) — running `baleforgit-server`: install, configuration, container, artifact verification.
+- [`docs/SERVER.md`](docs/SERVER.md) — running `baleforgit-server`: install, configuration (incl. `BALE_DEFAULT_QUOTA_BYTES` and `BALE_ADMIN_TOKEN_HEX` for per-owner quotas), container, artifact verification.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — request flows, trait surface, storage layout, protocol notes, and the "Tricky bits" section.
 - [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md) — what a git forge has to implement to support `git-bale`.
 - [`docs/STATUS.md`](docs/STATUS.md) — milestone breakdown (M1–M12) with what each one provides.

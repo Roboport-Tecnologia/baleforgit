@@ -113,6 +113,8 @@ async fn end_to_end_against_alternate_impls() {
         authz: Arc::new(authz),
         transfer_secret: [0xA1u8; 32],
         public_base_url: "http://test.invalid".into(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     let app = router(svc);
 

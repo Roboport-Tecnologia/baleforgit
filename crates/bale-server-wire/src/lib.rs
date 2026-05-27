@@ -115,6 +115,35 @@ pub struct XetTokenResponse {
     pub cas_url: String,
 }
 
+/// Response for `GET /v1/usage/{owner}`. `quota_bytes` is null when no quota
+/// is configured for the owner (server default or no default).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OwnerUsageResponse {
+    pub owner: String,
+    pub raw_bytes: u64,
+    pub stored_bytes: u64,
+    pub dedup_savings_bytes: u64,
+    pub quota_bytes: Option<u64>,
+}
+
+/// Body for `PUT /v1/quotas/{owner}`. Null `limit_bytes` clears the override.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetOwnerQuotaRequest {
+    pub limit_bytes: Option<u64>,
+}
+
+/// Response for `GET /v1/usage/repo/{owner}/{repo}`. No quota field — quotas
+/// are owner-scoped, not per-repo. `raw_bytes` is what to surface to the user
+/// as "this repo's size" (sum of file totals, ignoring chunk-level dedup
+/// across repos), `stored_bytes` is the actually-attributable on-disk cost.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RepoUsageResponse {
+    pub repo_id: String,
+    pub raw_bytes: u64,
+    pub stored_bytes: u64,
+    pub dedup_savings_bytes: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,7 +6,7 @@ use bale_server_core::{
     Hash32, MetadataStore, RepoRef, XorbFrameRow, XorbHash, XorbInfo, HASH_LEN,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Pool, QueryBuilder, Row, Sqlite};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,12 +46,21 @@ CREATE TABLE IF NOT EXISTS files (
     revision     TEXT    NOT NULL,
     total_bytes  INTEGER NOT NULL,
     created_at   INTEGER NOT NULL,
+    -- Namespace before `/` in repo_id, denormalized so quota aggregation is
+    -- an indexed scan rather than a LIKE prefix match.
+    owner        TEXT    NOT NULL,
     -- Composite PK: same file_hash can live in multiple repos (cross-repo
     -- dedup), and the reconstruction handler authorizes reads by requiring a
     -- (file_hash, repo_id=token.repo) row to exist.
     PRIMARY KEY (file_hash, repo_id)
 );
 CREATE INDEX IF NOT EXISTS files_by_repo ON files(repo_id);
+CREATE INDEX IF NOT EXISTS files_by_owner ON files(owner);
+
+CREATE TABLE IF NOT EXISTS owner_quotas (
+    owner       TEXT    PRIMARY KEY,
+    limit_bytes INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS file_terms (
     file_hash       BLOB    NOT NULL,
@@ -212,8 +221,8 @@ impl MetadataStore for SqliteMetadataStore {
             .map_err(|e| CoreError::Internal(format!("begin: {e}")))?;
 
         sqlx::query(
-            "INSERT OR REPLACE INTO files (file_hash, repo_type, repo_id, revision, total_bytes, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO files (file_hash, repo_type, repo_id, revision, total_bytes, created_at, owner)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(hash_to_blob(&file_hash.0))
         .bind(format!("{:?}", repo.repo_type).to_lowercase())
@@ -221,6 +230,7 @@ impl MetadataStore for SqliteMetadataStore {
         .bind(&repo.revision)
         .bind(total_bytes as i64)
         .bind(now_unix())
+        .bind(repo.owner())
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Internal(format!("insert file: {e}")))?;
@@ -420,6 +430,143 @@ impl MetadataStore for SqliteMetadataStore {
         }];
         out.truncate(limit);
         Ok(out)
+    }
+
+    async fn raw_bytes_for_owner(&self, owner: &str) -> CoreResult<u64> {
+        let row =
+            sqlx::query("SELECT COALESCE(SUM(total_bytes), 0) AS n FROM files WHERE owner = ?")
+                .bind(owner)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| CoreError::Internal(format!("raw_bytes_for_owner: {e}")))?;
+        let n: i64 = row.try_get("n").map_err(internal)?;
+        Ok(n.max(0) as u64)
+    }
+
+    async fn stored_bytes_for_owner(&self, owner: &str) -> CoreResult<u64> {
+        // Distinct xorbs the owner's files reference, summed by on-disk size.
+        // Per the design: each owner is accounted independently — a xorb that's
+        // also referenced by another owner is still counted for this owner.
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(num_bytes_on_disk), 0) AS n
+             FROM xorbs
+             WHERE hash IN (
+                 SELECT DISTINCT ft.xorb_hash
+                 FROM file_terms ft
+                 JOIN files f ON f.file_hash = ft.file_hash
+                 WHERE f.owner = ?
+             )",
+        )
+        .bind(owner)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CoreError::Internal(format!("stored_bytes_for_owner: {e}")))?;
+        let n: i64 = row.try_get("n").map_err(internal)?;
+        Ok(n.max(0) as u64)
+    }
+
+    async fn get_owner_quota(&self, owner: &str) -> CoreResult<Option<u64>> {
+        let row = sqlx::query("SELECT limit_bytes FROM owner_quotas WHERE owner = ?")
+            .bind(owner)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| CoreError::Internal(format!("get_owner_quota: {e}")))?;
+        let Some(r) = row else { return Ok(None) };
+        let n: i64 = r.try_get("limit_bytes").map_err(internal)?;
+        Ok(Some(n.max(0) as u64))
+    }
+
+    async fn set_owner_quota(&self, owner: &str, limit_bytes: Option<u64>) -> CoreResult<()> {
+        match limit_bytes {
+            Some(n) => {
+                sqlx::query(
+                    "INSERT INTO owner_quotas (owner, limit_bytes) VALUES (?, ?)
+                     ON CONFLICT(owner) DO UPDATE SET limit_bytes = excluded.limit_bytes",
+                )
+                .bind(owner)
+                .bind(n as i64)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| CoreError::Internal(format!("set_owner_quota: {e}")))?;
+            }
+            None => {
+                sqlx::query("DELETE FROM owner_quotas WHERE owner = ?")
+                    .bind(owner)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| CoreError::Internal(format!("clear_owner_quota: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn raw_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64> {
+        let row =
+            sqlx::query("SELECT COALESCE(SUM(total_bytes), 0) AS n FROM files WHERE repo_id = ?")
+                .bind(repo_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| CoreError::Internal(format!("raw_bytes_for_repo: {e}")))?;
+        let n: i64 = row.try_get("n").map_err(internal)?;
+        Ok(n.max(0) as u64)
+    }
+
+    async fn stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64> {
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(num_bytes_on_disk), 0) AS n
+             FROM xorbs
+             WHERE hash IN (
+                 SELECT DISTINCT ft.xorb_hash
+                 FROM file_terms ft
+                 JOIN files f ON f.file_hash = ft.file_hash
+                 WHERE f.repo_id = ?
+             )",
+        )
+        .bind(repo_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CoreError::Internal(format!("stored_bytes_for_repo: {e}")))?;
+        let n: i64 = row.try_get("n").map_err(internal)?;
+        Ok(n.max(0) as u64)
+    }
+
+    async fn unaccounted_xorb_bytes_for_owner(
+        &self,
+        owner: &str,
+        candidates: &[XorbHash],
+    ) -> CoreResult<u64> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        // Deduplicate by raw bytes so the IN clause stays compact.
+        let mut uniq: Vec<&XorbHash> = candidates.iter().collect();
+        uniq.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        uniq.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT COALESCE(SUM(num_bytes_on_disk), 0) AS n FROM xorbs WHERE hash IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for x in &uniq {
+            sep.push_bind(hash_to_blob(&x.0));
+        }
+        qb.push(
+            ") AND hash NOT IN (
+                SELECT DISTINCT ft.xorb_hash
+                FROM file_terms ft
+                JOIN files f ON f.file_hash = ft.file_hash
+                WHERE f.owner = ",
+        );
+        qb.push_bind(owner.to_string());
+        qb.push(")");
+
+        let row = qb
+            .build()
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| CoreError::Internal(format!("unaccounted_xorb_bytes: {e}")))?;
+        let n: i64 = row.try_get("n").map_err(internal)?;
+        Ok(n.max(0) as u64)
     }
 
     async fn xorb_chunk_offsets(&self, xorb: &XorbHash) -> CoreResult<Vec<ChunkOffsetRow>> {
@@ -661,5 +808,175 @@ mod tests {
         }
         let s = SqliteMetadataStore::open_path(&path).await.unwrap();
         assert!(s.xorb_exists(&XorbHash(h(0x33))).await.unwrap());
+    }
+
+    /// Helper: register a xorb with one chunk for the aggregation tests.
+    async fn put_xorb(
+        s: &SqliteMetadataStore,
+        xorb_seed: u8,
+        chunk_seed: u8,
+        on_disk: u32,
+        in_cas: u32,
+    ) -> XorbHash {
+        let xorb = XorbHash(h(xorb_seed));
+        s.register_xorb(
+            &XorbInfo {
+                xorb,
+                num_chunks: 1,
+                num_bytes_in_cas: in_cas,
+                num_bytes_on_disk: on_disk,
+            },
+            &[ChunkRow {
+                chunk_hash: ChunkHash(h(chunk_seed)),
+                chunk_index: 0,
+                byte_start: 0,
+                unpacked_segment_bytes: in_cas,
+            }],
+        )
+        .await
+        .unwrap();
+        xorb
+    }
+
+    fn term(xorb: XorbHash, unpacked: u32) -> FileTerm {
+        FileTerm {
+            xorb,
+            chunk_idx_start: 0,
+            chunk_idx_end: 1,
+            unpacked_segment_bytes: unpacked,
+            verification: None,
+        }
+    }
+
+    fn repo(owner: &str, name: &str) -> RepoRef {
+        RepoRef {
+            repo_type: RepoType::Model,
+            repo_id: format!("{owner}/{name}"),
+            revision: "main".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_raw_and_stored_bytes_show_dedup_savings() {
+        let s = store().await;
+        // Two xorbs, both attributed to alice via two separate repos that share
+        // the same underlying content. Raw counts every file once; stored
+        // counts each unique xorb once → savings = raw - stored.
+        let xa = put_xorb(&s, 0x10, 0xA0, 100, 200).await;
+        let xb = put_xorb(&s, 0x20, 0xB0, 50, 100).await;
+        s.register_file(&FileHash(h(0xF1)), &repo("alice", "a"), &[term(xa, 200)])
+            .await
+            .unwrap();
+        s.register_file(&FileHash(h(0xF2)), &repo("alice", "b"), &[term(xa, 200)])
+            .await
+            .unwrap();
+        s.register_file(&FileHash(h(0xF3)), &repo("alice", "b"), &[term(xb, 100)])
+            .await
+            .unwrap();
+
+        let raw = s.raw_bytes_for_owner("alice").await.unwrap();
+        let stored = s.stored_bytes_for_owner("alice").await.unwrap();
+        assert_eq!(raw, 200 + 200 + 100, "raw sums file totals across repos");
+        assert_eq!(stored, 100 + 50, "stored counts xa once + xb once");
+        assert!(raw > stored, "dedup savings visible: {raw} > {stored}");
+    }
+
+    #[tokio::test]
+    async fn owner_accounting_is_independent_per_owner() {
+        let s = store().await;
+        let shared = put_xorb(&s, 0x30, 0xC0, 75, 150).await;
+        // Both alice and bob reference the same xorb in separate repos.
+        s.register_file(
+            &FileHash(h(0xE1)),
+            &repo("alice", "x"),
+            &[term(shared, 150)],
+        )
+        .await
+        .unwrap();
+        s.register_file(&FileHash(h(0xE2)), &repo("bob", "x"), &[term(shared, 150)])
+            .await
+            .unwrap();
+        // No cross-owner accounting: each owner sees the full 75 bytes as
+        // their attributable storage, not a half-share.
+        assert_eq!(s.stored_bytes_for_owner("alice").await.unwrap(), 75);
+        assert_eq!(s.stored_bytes_for_owner("bob").await.unwrap(), 75);
+        assert_eq!(s.stored_bytes_for_owner("carol").await.unwrap(), 0);
+        assert_eq!(s.raw_bytes_for_owner("alice").await.unwrap(), 150);
+        assert_eq!(s.raw_bytes_for_owner("bob").await.unwrap(), 150);
+    }
+
+    #[tokio::test]
+    async fn owner_quota_roundtrip_and_clear() {
+        let s = store().await;
+        assert_eq!(s.get_owner_quota("alice").await.unwrap(), None);
+        s.set_owner_quota("alice", Some(10_000)).await.unwrap();
+        assert_eq!(s.get_owner_quota("alice").await.unwrap(), Some(10_000));
+        s.set_owner_quota("alice", Some(20_000)).await.unwrap();
+        assert_eq!(s.get_owner_quota("alice").await.unwrap(), Some(20_000));
+        s.set_owner_quota("alice", None).await.unwrap();
+        assert_eq!(s.get_owner_quota("alice").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn unaccounted_xorb_bytes_excludes_already_owned() {
+        let s = store().await;
+        let xa = put_xorb(&s, 0x40, 0xD0, 100, 200).await;
+        let xb = put_xorb(&s, 0x50, 0xD1, 50, 100).await;
+        let xc = put_xorb(&s, 0x60, 0xD2, 25, 50).await;
+        // Alice already references xa via repo a.
+        s.register_file(&FileHash(h(0xC1)), &repo("alice", "a"), &[term(xa, 200)])
+            .await
+            .unwrap();
+        // Of the three candidates, only xb + xc would be newly attributable.
+        let delta = s
+            .unaccounted_xorb_bytes_for_owner("alice", &[xa, xb, xc])
+            .await
+            .unwrap();
+        assert_eq!(delta, 50 + 25);
+        // Duplicate candidate is deduped, not double-counted.
+        let delta2 = s
+            .unaccounted_xorb_bytes_for_owner("alice", &[xb, xb, xc])
+            .await
+            .unwrap();
+        assert_eq!(delta2, 50 + 25);
+        // Empty input is 0.
+        assert_eq!(
+            s.unaccounted_xorb_bytes_for_owner("alice", &[])
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn per_repo_aggregations_isolate_repos_within_one_owner() {
+        let s = store().await;
+        let xa = put_xorb(&s, 0x80, 0xE0, 100, 200).await;
+        let xb = put_xorb(&s, 0x81, 0xE1, 50, 100).await;
+        // alice/a: one file referencing xa+xb (raw=300, stored=150).
+        s.register_file(
+            &FileHash(h(0xA1)),
+            &repo("alice", "a"),
+            &[term(xa, 200), term(xb, 100)],
+        )
+        .await
+        .unwrap();
+        // alice/b: one file referencing only xa (raw=200, stored=100).
+        s.register_file(&FileHash(h(0xA2)), &repo("alice", "b"), &[term(xa, 200)])
+            .await
+            .unwrap();
+
+        assert_eq!(s.raw_bytes_for_repo("alice/a").await.unwrap(), 300);
+        assert_eq!(s.raw_bytes_for_repo("alice/b").await.unwrap(), 200);
+        assert_eq!(s.stored_bytes_for_repo("alice/a").await.unwrap(), 150);
+        assert_eq!(s.stored_bytes_for_repo("alice/b").await.unwrap(), 100);
+        // The owner-level total still attributes each xorb once across alice's
+        // repos (xa counted once, xb counted once) — that's the no-cross-owner
+        // accounting rule applied within an owner's repos as well.
+        assert_eq!(s.stored_bytes_for_owner("alice").await.unwrap(), 150);
+        // Unknown repo returns zeros, not an error — the gitea settings page
+        // hits this endpoint even for repos that have never pushed a bale file.
+        assert_eq!(s.raw_bytes_for_repo("alice/nope").await.unwrap(), 0);
+        assert_eq!(s.stored_bytes_for_repo("alice/nope").await.unwrap(), 0);
     }
 }

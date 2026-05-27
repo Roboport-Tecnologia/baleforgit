@@ -47,6 +47,8 @@ async fn build_app() -> (axum::Router, Arc<SqliteMetadataStore>, Arc<FsBlobStore
         authz: Arc::new(AlwaysAllow),
         transfer_secret: [0x42u8; 32],
         public_base_url: "http://test.invalid".into(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     (router(svc), meta, blobs)
 }

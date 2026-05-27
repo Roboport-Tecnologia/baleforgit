@@ -120,6 +120,8 @@ async fn native_filter_push_then_pull() {
         authz: Arc::new(AlwaysAllow),
         transfer_secret: [0x55u8; 32],
         public_base_url: xet_url.clone(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     // The hot path (manifest in .git/bale/manifests/ + chunks in local cache)
     // must make zero requests to /v1/reconstructions/.

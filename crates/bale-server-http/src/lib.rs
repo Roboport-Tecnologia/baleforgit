@@ -21,8 +21,8 @@ use bale_server_shard::{
 };
 use bale_server_wire::{
     decode_hash, encode_hash, CASReconstructionFetchInfo, CASReconstructionTerm,
-    QueryReconstructionResponse, RangeJson, UploadShardResponse, UploadXorbResponse,
-    XetTokenResponse,
+    OwnerUsageResponse, QueryReconstructionResponse, RangeJson, RepoUsageResponse,
+    SetOwnerQuotaRequest, UploadShardResponse, UploadXorbResponse, XetTokenResponse,
 };
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
@@ -47,6 +47,11 @@ pub struct Service<B, M, A> {
     pub authz: Arc<A>,
     pub transfer_secret: [u8; 32],
     pub public_base_url: String,
+    /// Per-owner override beats this; `None` here AND `None` per-owner = unlimited.
+    pub default_quota_bytes: Option<u64>,
+    /// When set, gates `PUT /v1/quotas/{owner}` via a constant-time bearer check.
+    /// `None` disables the admin endpoint entirely (returns 404).
+    pub admin_token: Option<[u8; 32]>,
 }
 
 impl<B, M, A> Clone for Service<B, M, A> {
@@ -57,6 +62,8 @@ impl<B, M, A> Clone for Service<B, M, A> {
             authz: self.authz.clone(),
             transfer_secret: self.transfer_secret,
             public_base_url: self.public_base_url.clone(),
+            default_quota_bytes: self.default_quota_bytes,
+            admin_token: self.admin_token,
         }
     }
 }
@@ -84,6 +91,22 @@ where
             auth_middleware::<B, M, A>,
         ));
 
+    // Admin-or-owner endpoints live outside the JWT middleware: the handlers
+    // accept either a Bale JWT scoped to the owner OR the static admin bearer
+    // (BALE_ADMIN_TOKEN_HEX), so operators can read usage / set quotas without
+    // minting a Bale token. PUT /quotas/{owner} is admin-only and returns 404
+    // when admin is unconfigured.
+    let admin = Router::new()
+        .route("/v1/usage/{owner}", get(get_owner_usage::<B, M, A>))
+        .route(
+            "/v1/usage/repo/{owner}/{repo}",
+            get(get_repo_usage::<B, M, A>),
+        )
+        .route(
+            "/v1/quotas/{owner}",
+            axum::routing::put(put_owner_quota::<B, M, A>),
+        );
+
     // Access logs at INFO; on 4xx/5xx the on_failure line fires at WARN even
     // when ApiError (below) already logged the response body.
     let trace = TraceLayer::new_for_http()
@@ -93,6 +116,7 @@ where
 
     let traced = Router::new()
         .merge(v1)
+        .merge(admin)
         .route("/xorb/default/{hash}", get(get_xorb_transfer::<B, M, A>))
         .route(
             "/api/{type_seg}/{ns}/{name}/{tok_seg}/{rev}",
@@ -237,11 +261,35 @@ fn build_signed_url(
     format!("{base}/xorb/default/{xorb_hex}?s={start}&e={end_inclusive}&x={exp}&sig={sig}")
 }
 
+// ---- Quotas ----------------------------------------------------------------
+
+/// Resolves the quota an owner is subject to: per-owner override beats the
+/// server default. `None` = unlimited.
+async fn effective_quota<M: MetadataStore>(
+    meta: &M,
+    default: Option<u64>,
+    owner: &str,
+) -> Result<Option<u64>, ApiError> {
+    if let Some(n) = meta.get_owner_quota(owner).await? {
+        return Ok(Some(n));
+    }
+    Ok(default)
+}
+
+fn quota_exceeded(owner: &str, used: u64, quota: u64, would_add: u64) -> ApiError {
+    ApiError(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "owner '{owner}' quota exceeded: used {used} + new {would_add} > limit {quota} bytes"
+        ),
+    )
+}
+
 // ---- Handlers: upload ------------------------------------------------------
 
 async fn upload_xorb<B, M, A>(
     State(svc): State<Service<B, M, A>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path((_prefix, hash_hex)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Json<UploadXorbResponse>, ApiError>
@@ -253,6 +301,23 @@ where
     let hash = decode_hash(&hash_hex).map_err(|e| bad_req(format!("malformed xorb hash: {e}")))?;
     if body.len() > MAX_BODY_BYTES {
         return Err(bad_req("xorb exceeds 64 MiB limit"));
+    }
+    // Quota: skip when the xorb already exists in CAS — content-addressed
+    // re-puts don't add disk bytes, so they don't push any owner over.
+    // Charge the upper bound (body.len()) against the owner's already-attributed
+    // stored bytes; the precise attribution lands at /shards when files
+    // referencing this xorb get registered.
+    let owner = claims.repo.owner().to_string();
+    if let Some(quota) = effective_quota(svc.meta.as_ref(), svc.default_quota_bytes, &owner).await?
+    {
+        let xorb_already_exists = svc.blobs.xorb_exists(&XorbHash(hash)).await?;
+        if !xorb_already_exists {
+            let used = svc.meta.stored_bytes_for_owner(&owner).await?;
+            let add = body.len() as u64;
+            if used.saturating_add(add) > quota {
+                return Err(quota_exceeded(&owner, used, quota, add));
+            }
+        }
     }
     // Record on-disk frame ranges: shard CAS Info has only uncompressed
     // offsets, so reconstruction can't compute HTTP byte ranges without this.
@@ -338,6 +403,30 @@ where
             })
             .collect();
         svc.meta.register_xorb(&info, &rows).await?;
+    }
+
+    // Per-owner quota: project the post-commit stored bytes by summing on-disk
+    // sizes for xorbs referenced by the shard's files that the owner doesn't
+    // already reference. Reject BEFORE register_file so an over-quota shard
+    // leaves no file rows behind (xorbs already on disk are still subject to
+    // GC). The xorbs were just registered above, so their sizes are queryable.
+    let owner = claims.repo.owner().to_string();
+    if let Some(quota) = effective_quota(svc.meta.as_ref(), svc.default_quota_bytes, &owner).await?
+    {
+        let mut candidates: Vec<XorbHash> = Vec::new();
+        for f in &parsed.files {
+            for e in &f.entries {
+                candidates.push(e.xorb);
+            }
+        }
+        let used = svc.meta.stored_bytes_for_owner(&owner).await?;
+        let delta = svc
+            .meta
+            .unaccounted_xorb_bytes_for_owner(&owner, &candidates)
+            .await?;
+        if used.saturating_add(delta) > quota {
+            return Err(quota_exceeded(&owner, used, quota, delta));
+        }
     }
 
     for f in &parsed.files {
@@ -757,6 +846,121 @@ where
         exp,
         cas_url: svc.public_base_url.clone(),
     }))
+}
+
+// ---- Handlers: usage + admin quotas ----------------------------------------
+
+/// Accepts either the admin bearer (constant-time compared) or a Bale JWT
+/// whose `repo.owner()` matches `owner`. Used by the read-side usage endpoints
+/// — they live outside the JWT middleware because the admin bearer is not a JWT.
+async fn require_admin_or_owner<B, M, A>(
+    svc: &Service<B, M, A>,
+    headers: &HeaderMap,
+    owner: &str,
+) -> Result<(), ApiError>
+where
+    B: BlobStore,
+    M: MetadataStore,
+    A: RepoAuthz,
+{
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| unauthorized("missing bearer"))?;
+
+    let is_admin = svc
+        .admin_token
+        .and_then(|admin| hex::decode(bearer.trim()).ok().map(|p| (admin, p)))
+        .is_some_and(|(admin, presented)| ct_eq(&presented, &admin));
+    if is_admin {
+        return Ok(());
+    }
+    let claims = svc
+        .authz
+        .verify_xet_token(bearer)
+        .await
+        .map_err(ApiError::from)?;
+    if claims.repo.owner() != owner {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "token not scoped to this owner".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn get_owner_usage<B, M, A>(
+    State(svc): State<Service<B, M, A>>,
+    Path(owner): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<OwnerUsageResponse>, ApiError>
+where
+    B: BlobStore,
+    M: MetadataStore,
+    A: RepoAuthz,
+{
+    require_admin_or_owner(&svc, &headers, &owner).await?;
+
+    let raw = svc.meta.raw_bytes_for_owner(&owner).await?;
+    let stored = svc.meta.stored_bytes_for_owner(&owner).await?;
+    let quota = effective_quota(svc.meta.as_ref(), svc.default_quota_bytes, &owner).await?;
+    Ok(Json(OwnerUsageResponse {
+        owner,
+        raw_bytes: raw,
+        stored_bytes: stored,
+        dedup_savings_bytes: raw.saturating_sub(stored),
+        quota_bytes: quota,
+    }))
+}
+
+async fn get_repo_usage<B, M, A>(
+    State(svc): State<Service<B, M, A>>,
+    Path((owner, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<RepoUsageResponse>, ApiError>
+where
+    B: BlobStore,
+    M: MetadataStore,
+    A: RepoAuthz,
+{
+    require_admin_or_owner(&svc, &headers, &owner).await?;
+    let repo_id = format!("{owner}/{repo}");
+    let raw = svc.meta.raw_bytes_for_repo(&repo_id).await?;
+    let stored = svc.meta.stored_bytes_for_repo(&repo_id).await?;
+    Ok(Json(RepoUsageResponse {
+        repo_id,
+        raw_bytes: raw,
+        stored_bytes: stored,
+        dedup_savings_bytes: raw.saturating_sub(stored),
+    }))
+}
+
+async fn put_owner_quota<B, M, A>(
+    State(svc): State<Service<B, M, A>>,
+    Path(owner): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SetOwnerQuotaRequest>,
+) -> Result<StatusCode, ApiError>
+where
+    B: BlobStore,
+    M: MetadataStore,
+    A: RepoAuthz,
+{
+    let admin = svc
+        .admin_token
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "admin endpoint disabled".into()))?;
+    let raw = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| unauthorized("missing admin bearer"))?;
+    let presented = hex::decode(raw.trim()).map_err(|_| unauthorized("admin token not hex"))?;
+    if !ct_eq(&presented, &admin) {
+        return Err(unauthorized("bad admin token"));
+    }
+    svc.meta.set_owner_quota(&owner, body.limit_bytes).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn parse_hf_repo_type(seg: &str) -> Result<RepoType, ApiError> {

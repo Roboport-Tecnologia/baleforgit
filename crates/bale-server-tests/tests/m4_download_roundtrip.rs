@@ -39,6 +39,8 @@ async fn upload_then_reconstruct_byte_for_byte() {
         authz: Arc::new(AlwaysAllow),
         transfer_secret: secret,
         public_base_url: "http://test.invalid".into(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     let app = router(svc);
 
@@ -229,6 +231,8 @@ async fn transfer_url_rejects_tampered_range() {
         authz: Arc::new(AlwaysAllow),
         transfer_secret: [1u8; 32],
         public_base_url: "http://test.invalid".into(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     let app = router(svc);
 
@@ -280,6 +284,8 @@ async fn reconstruction_404_when_file_unknown() {
         authz: Arc::new(AlwaysAllow),
         transfer_secret: [0u8; 32],
         public_base_url: "http://test.invalid".into(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     let app = router(svc);
 

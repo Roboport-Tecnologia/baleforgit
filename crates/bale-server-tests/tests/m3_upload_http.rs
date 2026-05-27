@@ -40,6 +40,8 @@ async fn upload_xorb_then_shard_indexes_metadata() {
         authz: Arc::new(AlwaysAllow),
         transfer_secret: [0u8; 32],
         public_base_url: "http://test.invalid".into(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     let app = router(svc);
 
@@ -171,6 +173,8 @@ async fn shard_upload_rejects_missing_xorb() {
         authz: Arc::new(AlwaysAllow),
         transfer_secret: [0u8; 32],
         public_base_url: "http://test.invalid".into(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     let app = router(svc);
 
@@ -219,6 +223,8 @@ async fn xorb_upload_rejects_malformed_hash() {
         authz: Arc::new(AlwaysAllow),
         transfer_secret: [0u8; 32],
         public_base_url: "http://test.invalid".into(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     let app = router(svc);
 
@@ -243,6 +249,8 @@ async fn xorb_upload_rejects_body_whose_hash_doesnt_match_url() {
         authz: Arc::new(AlwaysAllow),
         transfer_secret: [0u8; 32],
         public_base_url: "http://test.invalid".into(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     let app = router(svc);
 

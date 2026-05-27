@@ -50,6 +50,8 @@ async fn build_two_repo_app() -> axum::Router {
         authz: Arc::new(authz),
         transfer_secret: [0xAAu8; 32],
         public_base_url: "http://test.invalid".into(),
+        default_quota_bytes: None,
+        admin_token: None,
     };
     router(svc)
 }

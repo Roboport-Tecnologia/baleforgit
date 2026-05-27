@@ -46,6 +46,29 @@ async fn main() -> Result<()> {
         )
     })?;
 
+    // Optional: per-owner storage cap applied when no per-owner override is set.
+    let default_quota_bytes = match env::var("BALE_DEFAULT_QUOTA_BYTES") {
+        Ok(s) => Some(
+            s.trim()
+                .parse::<u64>()
+                .context("BALE_DEFAULT_QUOTA_BYTES must be a non-negative integer")?,
+        ),
+        Err(_) => None,
+    };
+    let admin_token = match env::var("BALE_ADMIN_TOKEN_HEX") {
+        Ok(hex_str) => {
+            let bytes = hex::decode(hex_str.trim()).context("BALE_ADMIN_TOKEN_HEX is not hex")?;
+            let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+                anyhow::anyhow!(
+                    "BALE_ADMIN_TOKEN_HEX must decode to exactly 32 bytes (got {})",
+                    v.len()
+                )
+            })?;
+            Some(arr)
+        }
+        Err(_) => None,
+    };
+
     tokio::fs::create_dir_all(&data_root)
         .await
         .with_context(|| format!("creating data root {}", data_root.display()))?;
@@ -92,6 +115,8 @@ async fn main() -> Result<()> {
             jwt_secret,
             transfer_secret,
             public_url,
+            default_quota_bytes,
+            admin_token,
         )
         .await?;
     } else {
@@ -114,12 +139,15 @@ async fn main() -> Result<()> {
             jwt_secret,
             transfer_secret,
             public_url,
+            default_quota_bytes,
+            admin_token,
         )
         .await?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve<B>(
     listener: tokio::net::TcpListener,
     blobs: Arc<B>,
@@ -127,10 +155,23 @@ async fn serve<B>(
     jwt_secret: Vec<u8>,
     transfer_secret: [u8; 32],
     public_url: String,
+    default_quota_bytes: Option<u64>,
+    admin_token: Option<[u8; 32]>,
 ) -> Result<()>
 where
     B: BlobStore + 'static,
 {
+    if default_quota_bytes.is_some() {
+        tracing::info!(
+            limit = ?default_quota_bytes,
+            "default per-owner quota active (override per-owner via PUT /v1/quotas/{{owner}})"
+        );
+    }
+    if admin_token.is_none() {
+        tracing::info!(
+            "BALE_ADMIN_TOKEN_HEX unset; PUT /v1/quotas/{{owner}} disabled (returns 404)"
+        );
+    }
     // Service is generic over the authz impl, so each branch builds its own.
     if let Ok(authz_url) = env::var("BALE_AUTHZ_HTTP_URL") {
         if authz_url.is_empty() {
@@ -144,6 +185,8 @@ where
             authz: Arc::new(authz),
             transfer_secret,
             public_base_url: public_url,
+            default_quota_bytes,
+            admin_token,
         };
         axum::serve(listener, router(svc))
             .with_graceful_shutdown(shutdown_signal())
@@ -178,6 +221,8 @@ where
             authz: Arc::new(authz),
             transfer_secret,
             public_base_url: public_url,
+            default_quota_bytes,
+            admin_token,
         };
         axum::serve(listener, router(svc))
             .with_graceful_shutdown(shutdown_signal())

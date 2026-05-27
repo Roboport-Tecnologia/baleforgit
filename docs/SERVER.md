@@ -54,6 +54,8 @@ docker run --rm -p 8080:8080 \
 | `BALE_S3_FORCE_PATH_STYLE` | `false` | Set to `true` for MinIO and other backends that expect `https://host/{bucket}/{key}` rather than virtual-host addressing. |
 | `BALE_S3_PREFIX` | empty | Optional key prefix inside the bucket (include a trailing `/` if you want one). |
 | `BALE_S3_ACCESS_KEY_ID` / `BALE_S3_SECRET_ACCESS_KEY` / `BALE_S3_SESSION_TOKEN` | none | Explicit credentials. When unset, the SDK uses env vars, `~/.aws/credentials`, and IMDS as usual. |
+| `BALE_DEFAULT_QUOTA_BYTES` | none (unlimited) | Default per-owner storage cap, applied when no per-owner override is set via `PUT /v1/quotas/{owner}`. See [`ARCHITECTURE.md`](ARCHITECTURE.md#owner-accounting-and-quotas). |
+| `BALE_ADMIN_TOKEN_HEX` | none (admin endpoint disabled, returns 404) | 64-char hex (32 bytes) bearer for `PUT /v1/quotas/{owner}`. Constant-time compared. Keep separate from your JWT secret. |
 
 ## Verifying release artifacts
 

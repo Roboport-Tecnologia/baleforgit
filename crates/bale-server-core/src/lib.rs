@@ -85,6 +85,18 @@ pub struct RepoRef {
     pub revision: String, // default "main"
 }
 
+impl RepoRef {
+    /// Owner slice of `repo_id` — the namespace before `/`. Used as the unit of
+    /// storage accounting and quota enforcement. Falls back to the whole
+    /// `repo_id` if no `/` is present (defensive; forge tokens always include one).
+    pub fn owner(&self) -> &str {
+        match self.repo_id.split_once('/') {
+            Some((owner, _)) => owner,
+            None => &self.repo_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct UserId(pub String);
 
@@ -239,6 +251,39 @@ pub trait MetadataStore: Send + Sync {
         limit: usize,
     ) -> CoreResult<Vec<XorbInfo>>;
     async fn xorb_chunk_offsets(&self, xorb: &XorbHash) -> CoreResult<Vec<ChunkOffsetRow>>;
+
+    /// Total uncompressed bytes the owner's files would occupy without dedup
+    /// (`SUM(files.total_bytes)` for that owner). Used for the
+    /// dedup-savings display, never for quota enforcement.
+    async fn raw_bytes_for_owner(&self, owner: &str) -> CoreResult<u64>;
+
+    /// On-disk bytes attributable to the owner: sum of `num_bytes_on_disk` for
+    /// the distinct xorbs that any of the owner's files reference. Each owner
+    /// is accounted independently — a xorb referenced by two owners is counted
+    /// once per owner ("no cross-owner dedup accounting").
+    async fn stored_bytes_for_owner(&self, owner: &str) -> CoreResult<u64>;
+
+    async fn get_owner_quota(&self, owner: &str) -> CoreResult<Option<u64>>;
+    /// `None` clears the override and falls back to the server default.
+    async fn set_owner_quota(&self, owner: &str, limit_bytes: Option<u64>) -> CoreResult<()>;
+
+    /// Of the input `candidates`, returns the total `num_bytes_on_disk` of the
+    /// xorbs that `owner` does NOT already reference. Used by the shard upload
+    /// quota check to project what `stored_bytes_for_owner` would become *if*
+    /// the pending file registrations were committed — without actually
+    /// committing them. Unknown / not-yet-registered xorbs contribute 0.
+    async fn unaccounted_xorb_bytes_for_owner(
+        &self,
+        owner: &str,
+        candidates: &[XorbHash],
+    ) -> CoreResult<u64>;
+
+    /// Same shape as [`Self::raw_bytes_for_owner`] but keyed by full `repo_id`
+    /// (e.g. `"alice/big-model"`). Powers per-repo size display.
+    async fn raw_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
+    /// Same shape as [`Self::stored_bytes_for_owner`] but per-repo. Cross-repo
+    /// dedup within the same owner can make this smaller than `raw_bytes_for_repo`.
+    async fn stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
 }
 
 /// Authorization layer. Pluggable so it can proxy to an external repo
