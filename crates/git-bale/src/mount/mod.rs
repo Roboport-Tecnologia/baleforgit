@@ -15,12 +15,11 @@ use crate::config::RawConfig;
 use crate::mount::backend::libfuse::LibfuseBackend;
 use crate::mount::backend::MountBackend;
 use crate::mount::diff::DiffEntry;
-use crate::mount::vfs::DiffVfs;
+use crate::mount::vfs::{DiffVfs, ROOT_INODE};
 
 pub mod backend;
 pub mod diff;
 pub mod reader;
-pub mod tree;
 pub mod vfs;
 
 #[derive(Debug, Clone)]
@@ -47,13 +46,31 @@ pub fn run_rev(args: MountRevArgs) -> Result<()> {
     }
 
     let cwd = std::env::current_dir().context("resolving cwd")?;
-    // Resolve the rev so we get a clear "no such ref" error before doing the
-    // full tree walk.
-    diff::rev_parse_commit(&cwd, &args.rev).with_context(|| format!("resolving {}", args.rev))?;
+    let repo = Arc::new(
+        gix::ThreadSafeRepository::open(&cwd)
+            .with_context(|| format!("opening git repo at {}", cwd.display()))?,
+    );
+    let (commit_id, tree_oid) = resolve_commit_and_tree(&repo, &args.rev)
+        .with_context(|| format!("resolving {}", args.rev))?;
 
-    let entries = tree::walk_rev(&cwd, &args.rev, &args.paths)
-        .context("walking tree for single-rev mount")?;
-    if entries.is_empty() {
+    let raw = RawConfig::load(Some(cwd.as_path())).context("loading bale config")?;
+    let reader = Arc::new(reader::Reader::new(repo.clone(), raw).context("starting blob reader")?);
+    let vfs = Arc::new(DiffVfs::build_single_lazy(
+        repo,
+        tree_oid,
+        args.paths.clone(),
+        reader,
+    ));
+
+    // Single eager probe of the root so an empty or mis-targeted mount fails
+    // here with a clear message rather than mounting silently empty. Costs
+    // one tree-object read; the populated children stay cached for the real
+    // readdir later.
+    if vfs
+        .readdir(ROOT_INODE)
+        .map(|e| e.is_empty())
+        .unwrap_or(true)
+    {
         return Err(anyhow!(
             "no files in {}{}",
             args.rev,
@@ -65,19 +82,35 @@ pub fn run_rev(args: MountRevArgs) -> Result<()> {
         ));
     }
 
-    let raw = RawConfig::load(Some(cwd.as_path())).context("loading bale config")?;
-    let reader = Arc::new(reader::Reader::new(cwd.clone(), raw).context("starting blob reader")?);
-    let vfs = Arc::new(DiffVfs::build_single(&entries, reader));
-
     eprintln!(
-        "git-bale: mounting {} ({} files) at {}",
+        "git-bale: mounting {} ({}) at {} (lazy)",
         args.rev,
-        entries.len(),
+        &commit_id.to_string()[..12.min(commit_id.to_string().len())],
         args.mount_point.display(),
     );
 
     let backend = LibfuseBackend::new();
     backend.mount(&args.mount_point, vfs)
+}
+
+fn resolve_commit_and_tree(
+    repo: &gix::ThreadSafeRepository,
+    rev: &str,
+) -> Result<(gix::ObjectId, gix::ObjectId)> {
+    let local = repo.to_thread_local();
+    let resolved = local
+        .rev_parse_single(rev)
+        .with_context(|| format!("git rev-parse {rev}"))?;
+    let obj = resolved
+        .object()
+        .with_context(|| format!("loading object for {rev}"))?;
+    let commit = obj
+        .peel_to_commit()
+        .with_context(|| format!("{rev} does not point to a commit"))?;
+    let tree_id = commit
+        .tree_id()
+        .with_context(|| format!("loading tree for {rev}"))?;
+    Ok((commit.id, tree_id.detach()))
 }
 
 pub fn run(args: MountDiffArgs) -> Result<()> {
@@ -123,7 +156,11 @@ pub fn run(args: MountDiffArgs) -> Result<()> {
     }
 
     let raw = RawConfig::load(Some(cwd.as_path())).context("loading bale config")?;
-    let reader = Arc::new(reader::Reader::new(cwd.clone(), raw).context("starting blob reader")?);
+    let repo = Arc::new(
+        gix::ThreadSafeRepository::open(&cwd)
+            .with_context(|| format!("opening git repo at {}", cwd.display()))?,
+    );
+    let reader = Arc::new(reader::Reader::new(repo, raw).context("starting blob reader")?);
     let vfs = Arc::new(DiffVfs::build(&entries, &label_a, &label_b, reader));
 
     eprintln!(

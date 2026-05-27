@@ -13,7 +13,6 @@
 //!   total bytes (default 1 GiB).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
@@ -52,7 +51,9 @@ struct CachedBlob {
 }
 
 pub struct Reader {
-    repo_path: PathBuf,
+    /// Opened once at mount time, reused for every getattr/read. None only in
+    /// `for_test_only` builds, where any code path that needs git will error.
+    repo: Option<Arc<gix::ThreadSafeRepository>>,
     raw: Option<RawConfig>,
     rt: Option<Arc<XetRuntime>>,
     chunk_cache: Option<Arc<dyn ChunkCache>>,
@@ -118,10 +119,7 @@ impl BaleLru {
 }
 
 impl Reader {
-    pub fn new(repo_path: PathBuf, raw: RawConfig) -> Result<Self> {
-        // Verify the repo opens before we mount — fails fast on a bad cwd.
-        gix::open(&repo_path)
-            .with_context(|| format!("opening git repo at {}", repo_path.display()))?;
+    pub fn new(repo: Arc<gix::ThreadSafeRepository>, raw: RawConfig) -> Result<Self> {
         let rt = XetRuntime::new().context("starting xet runtime")?;
         let cache_cfg = CacheConfig {
             cache_directory: raw.cache_dir.clone(),
@@ -131,7 +129,7 @@ impl Reader {
             .map_err(|e| anyhow!("init chunk cache at {}: {e}", raw.cache_dir.display()))?;
 
         Ok(Self {
-            repo_path,
+            repo: Some(repo),
             raw: Some(raw),
             rt: Some(rt),
             chunk_cache: Some(chunk_cache),
@@ -143,11 +141,11 @@ impl Reader {
     }
 
     /// Test-only constructor that skips xet-runtime + chunk-cache setup.
-    /// `read` will panic via `expect` if a real fetch is attempted.
+    /// Any size_of/read call will error because there's no repo.
     #[cfg(test)]
-    pub fn for_test_only(repo_path: PathBuf) -> Self {
+    pub fn for_test_only() -> Self {
         Self {
-            repo_path,
+            repo: None,
             raw: None,
             rt: None,
             chunk_cache: None,
@@ -158,6 +156,14 @@ impl Reader {
         }
     }
 
+    fn repo_thread_local(&self) -> Result<gix::Repository> {
+        let repo = self
+            .repo
+            .as_ref()
+            .ok_or_else(|| anyhow!("reader was constructed without a repo"))?;
+        Ok(repo.to_thread_local())
+    }
+
     /// Decompressed logical size of the file. Cheap: for a Bale pointer this
     /// just reads the pointer JSON from the ODB and returns `file_size`; for a
     /// plain blob it returns the ODB blob length. Never triggers chunk
@@ -166,8 +172,7 @@ impl Reader {
         if let Some(&s) = self.size_cache.lock().unwrap().get(&source.oid) {
             return Ok(s);
         }
-        let repo = gix::open(&self.repo_path)
-            .with_context(|| format!("opening git repo at {}", self.repo_path.display()))?;
+        let repo = self.repo_thread_local()?;
         let oid = gix::ObjectId::from_hex(source.oid.as_bytes())
             .with_context(|| format!("parsing OID {}", source.oid))?;
         let obj = repo
@@ -222,8 +227,7 @@ impl Reader {
             return Ok(c.data.clone());
         }
 
-        let repo = gix::open(&self.repo_path)
-            .with_context(|| format!("opening git repo at {}", self.repo_path.display()))?;
+        let repo = self.repo_thread_local()?;
         let oid = gix::ObjectId::from_hex(source.oid.as_bytes())
             .with_context(|| format!("parsing OID {}", source.oid))?;
         let obj = repo
