@@ -787,6 +787,123 @@ def force_resmudge_and_verify(
     )
 
 
+def get_bale_cache_dir(repo: Path, env: dict) -> Path:
+    """The chunks cache directory the bale filter writes to (from
+    `bale.cacheDir` in the per-repo git config). The test sets this
+    explicitly in init_repo_for_push / init_repo_for_clone, so missing
+    config here is a harness bug, not a product bug."""
+    out = git(
+        ["config", "--local", "--get", "bale.cacheDir"],
+        cwd=repo, env=env,
+    ).stdout.decode().strip()
+    if not out:
+        raise TestFailure(
+            f"bale.cacheDir not set in {repo}/.git/config — harness bug"
+        )
+    return Path(out)
+
+
+def _has_any_file(root: Path) -> bool:
+    return root.exists() and any(p.is_file() for p in root.rglob("*"))
+
+
+def force_resmudge_cold(
+    repo: Path,
+    env: dict,
+    rel: str,
+    *,
+    expected_sha: str,
+    expected_size: int,
+    label: str,
+) -> None:
+    """Wipe the per-repo manifest cache, the chunk cache pointed to by
+    `bale.cacheDir`, and the worktree file — then force `git checkout --`.
+    With nothing on disk to hit the hot or lukewarm path, the bale filter
+    has to traverse `/v1/reconstructions/` against the server.
+
+    Verifies sha256 + size of the re-materialized file. Also asserts the
+    chunk cache repopulated, which is what proves the round-trip actually
+    went over the wire (an empty cache that stayed empty would mean the
+    smudge silently produced bytes from somewhere this test can't see).
+    """
+    manifests = repo / ".git" / "bale" / "manifests"
+    if manifests.exists():
+        shutil.rmtree(manifests)
+    cache_dir = get_bale_cache_dir(repo, env)
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if _has_any_file(cache_dir):
+        raise TestFailure(
+            f"[{label}] chunk cache {cache_dir} not actually empty after wipe"
+        )
+    (repo / rel).unlink()
+    git(["checkout", "--", rel], cwd=repo, env=env)
+    verify_worktree(
+        repo, rel,
+        expected_sha=expected_sha, expected_size=expected_size,
+        label=label,
+    )
+    if not _has_any_file(cache_dir):
+        raise TestFailure(
+            f"[{label}] cold smudge of {rel} did not repopulate {cache_dir} — "
+            "smudge may not have hit /v1/reconstructions/"
+        )
+
+
+def force_resmudge_lukewarm(
+    repo: Path,
+    env: dict,
+    rel: str,
+    *,
+    expected_sha: str,
+    expected_size: int,
+    label: str,
+) -> None:
+    """Wipe the hot-path caches BEFORE the file has been pushed, then force
+    `git checkout --`. With no chunks on the server yet (`/v1/reconstructions/`
+    would 404), the smudge filter can only succeed by reading from
+    `.git/bale/staging/` — `try_smudge_from_staging` in filter_process.rs.
+
+    Precondition: the file must be staged (xorbs/shards in staging/) but
+    NOT pushed. Caller is responsible for ordering this between `git add`
+    and `git push`.
+
+    Verifies:
+      - staging is populated before the test runs (otherwise lukewarm has
+        nothing to read from and the assertion would be vacuous),
+      - bytes after re-materialization match the expected payload,
+      - staging is still populated after — lukewarm reads but mustn't drain.
+    """
+    if not staging_files(repo):
+        raise TestFailure(
+            f"[{label}] staging dir empty — lukewarm needs a staged file"
+        )
+    manifests = repo / ".git" / "bale" / "manifests"
+    if manifests.exists():
+        shutil.rmtree(manifests)
+    cache_dir = get_bale_cache_dir(repo, env)
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if _has_any_file(cache_dir):
+        raise TestFailure(
+            f"[{label}] chunk cache {cache_dir} not empty after wipe"
+        )
+    (repo / rel).unlink()
+    git(["checkout", "--", rel], cwd=repo, env=env)
+    verify_worktree(
+        repo, rel,
+        expected_sha=expected_sha, expected_size=expected_size,
+        label=label,
+    )
+    if not staging_files(repo):
+        raise TestFailure(
+            f"[{label}] staging dir empty after lukewarm smudge — the filter "
+            "drained the lukewarm input it was supposed to leave alone"
+        )
+
+
 # =============================================================================
 # Storage / cache footprint helpers
 # =============================================================================
@@ -1087,6 +1204,16 @@ def phase_basic_user_ops(
         label="basic:after-commit",
     )
 
+    # Pre-push lukewarm: chunks are in .git/bale/staging/ but not on the
+    # server yet — a successful re-smudge with the local caches wiped
+    # proves the filter is reconstructing from staging, not the wire.
+    with timings.measure("basic: lukewarm resmudge (pre-push)"):
+        force_resmudge_lukewarm(
+            repo, env, "small.bin",
+            expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+            label="basic:lukewarm-pre-push",
+        )
+
     # Pre-push: server must still be empty (defer-uploads contract).
     if server.disk_total_bytes() != 0:
         raise TestFailure(
@@ -1114,11 +1241,20 @@ def phase_basic_user_ops(
     )
     # Force a smudge round-trip through the local cache — the user's own
     # bytes are gone, the filter has to rebuild them from the bale pointer.
-    with timings.measure("basic: resmudge after push"):
+    with timings.measure("basic: hot resmudge after push"):
         force_resmudge_and_verify(
             repo, env, "small.bin",
             expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
-            label="basic:resmudge-after-push",
+            label="basic:hot-resmudge-after-push",
+        )
+    # Wipe local caches so the next checkout must hit /v1/reconstructions/.
+    with timings.measure(
+        "basic: cold resmudge after push", bytes_moved=SMALL_FILE_BYTES
+    ):
+        force_resmudge_cold(
+            repo, env, "small.bin",
+            expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+            label="basic:cold-resmudge-after-push",
         )
 
 
@@ -1182,6 +1318,16 @@ def phase_big_file_dedup(
         expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
         label="bigfile-v1:after-commit",
     )
+    # Lukewarm reconstruction of 35 MB from staging only — the server has
+    # nothing under this repo yet, so the cold path is guaranteed unreachable.
+    with timings.measure(
+        "bigfile v1: lukewarm resmudge (pre-push)", bytes_moved=BIG_FILE_BYTES
+    ):
+        force_resmudge_lukewarm(
+            repo, env, "bigfile.bin",
+            expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+            label="bigfile-v1:lukewarm-pre-push",
+        )
     disk_before = server.disk_total_bytes()
     with timings.measure("bigfile v1: push", bytes_moved=BIG_FILE_BYTES):
         git(["push", "-u", "origin", "main"], cwd=repo, env=env)
@@ -1208,12 +1354,20 @@ def phase_big_file_dedup(
         label="bigfile-v1:after-push",
     )
     with timings.measure(
-        "bigfile v1: resmudge after push", bytes_moved=BIG_FILE_BYTES
+        "bigfile v1: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
         force_resmudge_and_verify(
             repo, env, "bigfile.bin",
             expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
-            label="bigfile-v1:resmudge-after-push",
+            label="bigfile-v1:hot-resmudge-after-push",
+        )
+    with timings.measure(
+        "bigfile v1: cold resmudge after push", bytes_moved=BIG_FILE_BYTES
+    ):
+        force_resmudge_cold(
+            repo, env, "bigfile.bin",
+            expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+            label="bigfile-v1:cold-resmudge-after-push",
         )
     rev_state["commits"].append(
         git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()
@@ -1281,12 +1435,20 @@ def phase_big_file_dedup(
         label="bigfile-v2:after-push",
     )
     with timings.measure(
-        "bigfile v2: resmudge after push", bytes_moved=BIG_FILE_BYTES
+        "bigfile v2: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
         force_resmudge_and_verify(
             repo, env, "bigfile.bin",
             expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
-            label="bigfile-v2:resmudge-after-push",
+            label="bigfile-v2:hot-resmudge-after-push",
+        )
+    with timings.measure(
+        "bigfile v2: cold resmudge after push", bytes_moved=BIG_FILE_BYTES
+    ):
+        force_resmudge_cold(
+            repo, env, "bigfile.bin",
+            expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
+            label="bigfile-v2:cold-resmudge-after-push",
         )
     rev_state["commits"].append(
         git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()
@@ -1364,12 +1526,20 @@ def phase_big_file_dedup(
         label="bigfile-v3:after-push",
     )
     with timings.measure(
-        "bigfile v3: resmudge after push", bytes_moved=BIG_FILE_BYTES
+        "bigfile v3: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
         force_resmudge_and_verify(
             repo, env, "bigfile.bin",
             expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
-            label="bigfile-v3:resmudge-after-push",
+            label="bigfile-v3:hot-resmudge-after-push",
+        )
+    with timings.measure(
+        "bigfile v3: cold resmudge after push", bytes_moved=BIG_FILE_BYTES
+    ):
+        force_resmudge_cold(
+            repo, env, "bigfile.bin",
+            expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
+            label="bigfile-v3:cold-resmudge-after-push",
         )
     rev_state["commits"].append(
         git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()
@@ -1541,17 +1711,38 @@ def phase_dedup_duplicate_file(
     # original bytes for each pointer, even though the dup didn't add any
     # new chunks on the wire.
     with timings.measure(
-        "dedup: resmudge orig + dup", bytes_moved=2 * BIG_FILE_BYTES
+        "dedup: hot resmudge orig + dup", bytes_moved=2 * BIG_FILE_BYTES
     ):
         force_resmudge_and_verify(
             repo, env, "bigfile.bin",
             expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
-            label="dedup:resmudge-orig",
+            label="dedup:hot-resmudge-orig",
         )
         force_resmudge_and_verify(
             repo, env, "bigfile_dup.bin",
             expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
-            label="dedup:resmudge-dup",
+            label="dedup:hot-resmudge-dup",
+        )
+    # The dup's pointer references xorbs the server owes from v3; cold-path
+    # smudge must download them under the *dup* repo's scope check and end
+    # up at the exact same bytes as the original.
+    with timings.measure(
+        "dedup: cold resmudge dup", bytes_moved=BIG_FILE_BYTES
+    ):
+        force_resmudge_cold(
+            repo, env, "bigfile_dup.bin",
+            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            label="dedup:cold-resmudge-dup",
+        )
+    # And the original itself: the prior cold resmudge wiped the cache, so
+    # this one starts from the same empty state and must also re-download.
+    with timings.measure(
+        "dedup: cold resmudge orig", bytes_moved=BIG_FILE_BYTES
+    ):
+        force_resmudge_cold(
+            repo, env, "bigfile.bin",
+            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            label="dedup:cold-resmudge-orig",
         )
 
 
