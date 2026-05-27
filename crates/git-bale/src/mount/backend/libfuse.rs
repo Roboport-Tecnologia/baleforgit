@@ -84,13 +84,14 @@ impl MountBackend for LibfuseBackend {
 
         // Argv we pass to libfuse: it parses these like a CLI tool. `-f`
         // keeps the daemon in the foreground (we want to block until ^C),
-        // `-s` runs single-threaded (simpler concurrency story for the
-        // reader's caches), and `-o ro` enforces read-only at the kernel.
+        // and `-o ro` enforces read-only at the kernel. Multi-threaded —
+        // `Reader` holds its handles / caches behind `Mutex`/`Arc` and the
+        // per-open tempfile path makes parallel reads of the same big file
+        // serve from one reconstruction.
         let argv_strings = [
             CString::new("git-bale-mount").unwrap(),
             CString::new(mount_str).context("CString for mount point")?,
             CString::new("-f").unwrap(),
-            CString::new("-s").unwrap(),
             CString::new("-o").unwrap(),
             CString::new("ro,default_permissions,fsname=git-bale").unwrap(),
         ];
@@ -336,7 +337,7 @@ pub struct fuse_operations {
     pub write: *mut c_void,
     pub statfs: *mut c_void,
     pub flush: *mut c_void,
-    pub release: *mut c_void,
+    pub release: Option<unsafe extern "C" fn(*const c_char, *mut fuse_file_info) -> c_int>,
     pub fsync: *mut c_void,
     pub setxattr: *mut c_void,
     pub getxattr: *mut c_void,
@@ -391,7 +392,7 @@ fn build_operations() -> fuse_operations {
         write: std::ptr::null_mut(),
         statfs: std::ptr::null_mut(),
         flush: std::ptr::null_mut(),
-        release: std::ptr::null_mut(),
+        release: Some(op_release),
         fsync: std::ptr::null_mut(),
         setxattr: std::ptr::null_mut(),
         getxattr: std::ptr::null_mut(),
@@ -512,18 +513,27 @@ unsafe extern "C" fn op_open(path: *const c_char, fi: *mut fuse_file_info) -> c_
     let Some(node) = lookup_path(vfs, &p) else {
         return -libc::ENOENT;
     };
-    if !matches!(node.kind, NodeKind::File { .. }) {
+    let NodeKind::File { ref source, .. } = node.kind else {
         return -libc::EISDIR;
+    };
+    if fi.is_null() {
+        return -libc::EIO;
     }
-    if !fi.is_null() {
-        // Only read flags allowed; libfuse already rejects writes due to
-        // the `-o ro` mount option but a defensive check is cheap.
-        let flags = (*fi).flags;
-        let mode = flags & libc::O_ACCMODE;
-        if mode != libc::O_RDONLY {
-            return -libc::EROFS;
+    // Only read flags allowed; libfuse already rejects writes due to the
+    // `-o ro` mount option but a defensive check is cheap.
+    let mode = (*fi).flags & libc::O_ACCMODE;
+    if mode != libc::O_RDONLY {
+        return -libc::EROFS;
+    }
+    let reader = vfs.reader();
+    let handle = match reader.open(source) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("open({p}): {e:#}");
+            return -libc::EIO;
         }
-    }
+    };
+    (*fi).fh = handle;
     0
 }
 
@@ -532,34 +542,44 @@ unsafe extern "C" fn op_read(
     buf: *mut c_char,
     size: size_t,
     offset: off_t,
-    _fi: *mut fuse_file_info,
+    fi: *mut fuse_file_info,
 ) -> c_int {
     if buf.is_null() {
         return -libc::EFAULT;
     }
-    let Some(p) = cstr_to_path(path) else {
-        return -libc::ENOENT;
-    };
     let Some(vfs) = vfs() else {
         return -libc::EIO;
     };
-    let Some(node) = lookup_path(vfs, &p) else {
-        return -libc::ENOENT;
-    };
-    let NodeKind::File { ref source, .. } = node.kind else {
-        return -libc::EISDIR;
-    };
+    if fi.is_null() || (*fi).fh == 0 {
+        return -libc::EBADF;
+    }
+    let fh = (*fi).fh;
     let reader = vfs.reader();
-    let bytes = match reader.read(source, offset as u64, size) {
+    let bytes = match reader.pread(fh, offset as u64, size) {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!("read({p}, off={offset}, size={size}): {e:#}");
+            let p = cstr_to_path(path).unwrap_or_default();
+            tracing::warn!("read({p}, off={offset}, size={size}, fh={fh}): {e:#}");
             return -libc::EIO;
         }
     };
     let n = bytes.len();
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
     n as c_int
+}
+
+unsafe extern "C" fn op_release(_path: *const c_char, fi: *mut fuse_file_info) -> c_int {
+    if fi.is_null() {
+        return 0;
+    }
+    let fh = (*fi).fh;
+    if fh == 0 {
+        return 0;
+    }
+    if let Some(vfs) = vfs() {
+        vfs.reader().close(fh);
+    }
+    0
 }
 
 unsafe extern "C" fn op_readdir(

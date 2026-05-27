@@ -18,7 +18,6 @@ pub enum DiffStatus {
     Modified,
     /// Mode-only changes etc.
     Other,
-    Renamed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,10 +66,24 @@ pub fn run_diff(
 
     let mut entries: Vec<DiffEntry> = Vec::new();
     let mut platform = tree_a.changes().context("starting tree diff")?;
+    // Disable rename tracking. gix would otherwise run an O(N²) similarity
+    // pass over every Del/Add pair after the walk to pair renames into
+    // `Change::Rewrite`. mount-diff trades that pairing for the speedup —
+    // a renamed file shows up as a Deletion at the old path and an Addition
+    // at the new path, not as a labelled pair at related basenames.
+    platform.options(|opts| {
+        opts.track_rewrites(None);
+    });
     platform
         .for_each_to_obtain_tree(
             &tree_b,
             |change| -> Result<Action, std::convert::Infallible> {
+                // Apply the pathspec on the BStr location before we allocate
+                // OID / path strings — for a wide diff with a narrow filter
+                // that's most of the work.
+                if !change_in_pathspec(&change, paths) {
+                    return Ok(std::ops::ControlFlow::Continue(()));
+                }
                 if let Some(entry) = change_to_entry(change) {
                     entries.push(entry);
                 }
@@ -78,15 +91,7 @@ pub fn run_diff(
             },
         )
         .context("walking tree diff")?;
-
-    if paths.is_empty() {
-        Ok(entries)
-    } else {
-        Ok(entries
-            .into_iter()
-            .filter(|e| path_matches(e, paths))
-            .collect())
-    }
+    Ok(entries)
 }
 
 fn resolve_tree<'r>(repo: &'r gix::Repository, rev: &str) -> Result<gix::Tree<'r>> {
@@ -165,25 +170,9 @@ fn change_to_entry(change: Change<'_, '_, '_>) -> Option<DiffEntry> {
                 status: DiffStatus::Modified,
             })
         }
-        Change::Rewrite {
-            source_location,
-            source_id,
-            location,
-            id,
-            entry_mode,
-            ..
-        } => {
-            if !entry_mode.is_blob() {
-                return None;
-            }
-            Some(DiffEntry {
-                path_a: Some(bstr_string(source_location)),
-                path_b: Some(bstr_string(location)),
-                oid_a: Some(source_id.to_string()),
-                oid_b: Some(id.to_string()),
-                status: DiffStatus::Renamed,
-            })
-        }
+        // Rename tracking is disabled in `run_diff`, so `Rewrite` is never
+        // emitted by the walker. Explicit arm keeps the match exhaustive.
+        Change::Rewrite { .. } => None,
     }
 }
 
@@ -191,20 +180,32 @@ fn bstr_string(b: &gix::bstr::BStr) -> String {
     b.to_str_lossy().into_owned()
 }
 
-/// Literal prefix matching only — no globbing. `src/` matches anything under
-/// src/, `docs/foo.md` matches that exact file.
-fn path_matches(entry: &DiffEntry, filters: &[String]) -> bool {
-    let candidates: [Option<&String>; 2] = [entry.path_a.as_ref(), entry.path_b.as_ref()];
-    for path_opt in candidates {
-        let Some(path) = path_opt else { continue };
-        for f in filters {
-            let f = f.trim_end_matches('/');
-            if path == f || path.starts_with(&format!("{f}/")) {
-                return true;
-            }
-        }
+/// A change passes the pathspec if either side's location matches a filter.
+/// Empty filter list lets everything through.
+fn change_in_pathspec(change: &Change<'_, '_, '_>, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
     }
-    false
+    match change {
+        Change::Addition { location, .. }
+        | Change::Modification { location, .. }
+        | Change::Deletion { location, .. } => bstr_path_matches(location, filters),
+        // Rewrites are disabled at the platform level — see `run_diff`.
+        Change::Rewrite { .. } => false,
+    }
+}
+
+/// Literal prefix matching on raw path bytes — no globbing. `src/` matches
+/// anything under `src/`, `docs/foo.md` matches that exact file.
+fn bstr_path_matches(location: &gix::bstr::BStr, filters: &[String]) -> bool {
+    let bytes: &[u8] = location.as_ref();
+    filters.iter().any(|f| {
+        let f = f.trim_end_matches('/').as_bytes();
+        if f.is_empty() {
+            return true;
+        }
+        bytes == f || (bytes.len() > f.len() && bytes.starts_with(f) && bytes[f.len()] == b'/')
+    })
 }
 
 #[cfg(test)]
@@ -277,7 +278,83 @@ mod tests {
     }
 
     #[test]
-    fn rename_detected() {
+    fn pathspec_directory_filter_matches_subtree() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(p)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "a@b.c"]);
+        run(&["config", "user.name", "Tester"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir_all(p.join("src")).unwrap();
+        std::fs::write(p.join("src/a.rs"), "x\n").unwrap();
+        std::fs::write(p.join("top.txt"), "x\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        std::fs::write(p.join("src/a.rs"), "y\n").unwrap();
+        std::fs::write(p.join("top.txt"), "y\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "edit"]);
+
+        // Trailing slash and bare directory name both match the subtree.
+        for filter in [vec!["src".to_string()], vec!["src/".to_string()]] {
+            let entries = run_diff(p, "HEAD~1", "HEAD", &filter).unwrap();
+            assert_eq!(entries.len(), 1, "filter={filter:?}");
+            assert_eq!(entries[0].path_b.as_deref(), Some("src/a.rs"));
+        }
+    }
+
+    #[test]
+    fn pathspec_filters_each_side_of_a_renamed_file_independently() {
+        // Rename tracking is off, so the rename surfaces as two separate
+        // changes; each respects the pathspec on its own side.
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        let run = |args: &[&str]| {
+            let st = Command::new("git")
+                .args(args)
+                .current_dir(p)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "a@b.c"]);
+        run(&["config", "user.name", "Tester"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir_all(p.join("old")).unwrap();
+        std::fs::write(p.join("old/file.rs"), "content\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        std::fs::create_dir_all(p.join("new")).unwrap();
+        std::fs::rename(p.join("old/file.rs"), p.join("new/file.rs")).unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "rename"]);
+
+        // Filter the deletion side only.
+        let by_source = run_diff(p, "HEAD~1", "HEAD", &["old".to_string()]).unwrap();
+        assert_eq!(by_source.len(), 1);
+        assert_eq!(by_source[0].status, DiffStatus::Deleted);
+        // Filter the addition side only.
+        let by_dest = run_diff(p, "HEAD~1", "HEAD", &["new".to_string()]).unwrap();
+        assert_eq!(by_dest.len(), 1);
+        assert_eq!(by_dest[0].status, DiffStatus::Added);
+        // Unrelated subtree drops both halves.
+        let by_other = run_diff(p, "HEAD~1", "HEAD", &["unrelated".to_string()]).unwrap();
+        assert!(by_other.is_empty());
+    }
+
+    #[test]
+    fn rename_appears_as_unrelated_del_and_add() {
+        // Rename tracking is deliberately disabled to skip gix's O(N²)
+        // similarity pass; a rename shows up as Del(old) + Add(new).
         let dir = tempdir().unwrap();
         let p = dir.path();
         let run = |args: &[&str]| {
@@ -300,9 +377,18 @@ mod tests {
         run(&["commit", "-q", "-m", "rename"]);
 
         let entries = run_diff(p, "HEAD~1", "HEAD", &[]).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].status, DiffStatus::Renamed);
-        assert_eq!(entries[0].path_a.as_deref(), Some("old.txt"));
-        assert_eq!(entries[0].path_b.as_deref(), Some("new.txt"));
+        assert_eq!(entries.len(), 2);
+        let del = entries
+            .iter()
+            .find(|e| e.status == DiffStatus::Deleted)
+            .expect("deletion entry");
+        let add = entries
+            .iter()
+            .find(|e| e.status == DiffStatus::Added)
+            .expect("addition entry");
+        assert_eq!(del.path_a.as_deref(), Some("old.txt"));
+        assert!(del.path_b.is_none());
+        assert!(add.path_a.is_none());
+        assert_eq!(add.path_b.as_deref(), Some("new.txt"));
     }
 }

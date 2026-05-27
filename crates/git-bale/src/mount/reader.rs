@@ -13,6 +13,8 @@
 //!   total bytes (default 1 GiB).
 
 use std::collections::HashMap;
+use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
@@ -60,12 +62,29 @@ pub struct Reader {
     /// Lazily-resolved (server_url, token). Read-scope only.
     bale_cfg: Mutex<Option<BaleConfig>>,
     /// `oid → decompressed file size`. Populated by `size_of` (cheap, no
-    /// reconstruction) and `fetch` (free side effect). Lets `getattr` answer
-    /// `stat` in O(1) after the first call without ever decompressing chunks.
+    /// reconstruction). Lets `getattr` answer `stat` in O(1) after the first
+    /// call without ever decompressing chunks.
     size_cache: Mutex<HashMap<String, u64>>,
     plain_cache: Mutex<HashMap<String, Arc<CachedBlob>>>,
     /// Bale file body cache keyed by xet file id (the pointer's `hash`).
     bale_cache: Mutex<BaleLru>,
+    /// Per-open resources. `op_open` inserts; `op_release` removes. Keys are
+    /// the `fi.fh` values libfuse round-trips for us.
+    handles: Mutex<HashMap<u64, Arc<HandleData>>>,
+    next_handle: AtomicU64,
+}
+
+/// Backing storage behind an open file handle. Bytes for cache hits and
+/// anything small enough to fit the LRU; an on-disk tempfile for Bale files
+/// too large to cache so we don't re-reconstruct on every 128 KiB FUSE read.
+enum HandleData {
+    Bytes(Bytes),
+    Tempfile {
+        /// Owns the path; unlinks on drop after `release`.
+        _tmp: tempfile::NamedTempFile,
+        file: std::fs::File,
+        size: u64,
+    },
 }
 
 struct BaleLru {
@@ -137,11 +156,13 @@ impl Reader {
             size_cache: Mutex::new(HashMap::new()),
             plain_cache: Mutex::new(HashMap::new()),
             bale_cache: Mutex::new(BaleLru::new(BALE_LRU_BUDGET_BYTES)),
+            handles: Mutex::new(HashMap::new()),
+            next_handle: AtomicU64::new(0),
         })
     }
 
     /// Test-only constructor that skips xet-runtime + chunk-cache setup.
-    /// Any size_of/read call will error because there's no repo.
+    /// Any size_of/open call will error because there's no repo.
     #[cfg(test)]
     pub fn for_test_only() -> Self {
         Self {
@@ -153,6 +174,8 @@ impl Reader {
             size_cache: Mutex::new(HashMap::new()),
             plain_cache: Mutex::new(HashMap::new()),
             bale_cache: Mutex::new(BaleLru::new(BALE_LRU_BUDGET_BYTES)),
+            handles: Mutex::new(HashMap::new()),
+            next_handle: AtomicU64::new(0),
         }
     }
 
@@ -204,27 +227,63 @@ impl Reader {
         Ok(size)
     }
 
-    /// Reads `len` bytes starting at `offset`. Returns fewer than `len` only
-    /// at EOF. Backfills `size_cache` as a free side effect.
-    pub fn read(&self, source: &BlobSource, offset: u64, len: usize) -> Result<Bytes> {
-        let bytes = self.fetch(source)?;
-        let total = bytes.len() as u64;
-        self.size_cache
-            .lock()
-            .unwrap()
-            .insert(source.oid.clone(), total);
-        if offset >= total {
-            return Ok(Bytes::new());
-        }
-        let start = offset as usize;
-        let end = (start + len).min(bytes.len());
-        Ok(bytes.slice(start..end))
+    /// Allocates a per-open handle backing the next `pread` calls. Bale files
+    /// that exceed the LRU budget are reconstructed to an on-disk tempfile
+    /// held for the life of the open, so a kernel readahead loop doesn't
+    /// re-run the chunk pipeline for every 128 KiB request.
+    pub fn open(&self, source: &BlobSource) -> Result<u64> {
+        let data = self.materialize(source)?;
+        // 0 is reserved as "uninitialized fh" by the FUSE callbacks.
+        let id = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
+        self.handles.lock().unwrap().insert(id, Arc::new(data));
+        Ok(id)
     }
 
-    fn fetch(&self, source: &BlobSource) -> Result<Bytes> {
-        // Plain blob hit?
+    /// Reads from a handle previously returned by `open`. Returns fewer than
+    /// `len` only at EOF or for an unknown handle (caller maps that to EBADF).
+    pub fn pread(&self, fh: u64, offset: u64, len: usize) -> Result<Bytes> {
+        let handle = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(&fh)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown open handle {fh}"))?;
+        match &*handle {
+            HandleData::Bytes(b) => {
+                let total = b.len() as u64;
+                if offset >= total {
+                    return Ok(Bytes::new());
+                }
+                let start = offset as usize;
+                let end = (start + len).min(b.len());
+                Ok(b.slice(start..end))
+            }
+            HandleData::Tempfile { file, size, .. } => {
+                if offset >= *size {
+                    return Ok(Bytes::new());
+                }
+                let max = (*size - offset) as usize;
+                let want = len.min(max);
+                let mut buf = vec![0u8; want];
+                let n = file
+                    .read_at(&mut buf, offset)
+                    .with_context(|| format!("pread fh={fh} off={offset} len={want}"))?;
+                buf.truncate(n);
+                Ok(Bytes::from(buf))
+            }
+        }
+    }
+
+    /// Drops the handle's resources (closing files / unlinking tempfiles via
+    /// Drop). Returns false if the handle was already absent.
+    pub fn close(&self, fh: u64) -> bool {
+        self.handles.lock().unwrap().remove(&fh).is_some()
+    }
+
+    fn materialize(&self, source: &BlobSource) -> Result<HandleData> {
         if let Some(c) = self.plain_cache.lock().unwrap().get(&source.oid).cloned() {
-            return Ok(c.data.clone());
+            return Ok(HandleData::Bytes(c.data.clone()));
         }
 
         let repo = self.repo_thread_local()?;
@@ -242,17 +301,35 @@ impl Reader {
         }
         let raw = obj.data.clone();
 
-        // Bale pointer? Try to parse — failures just mean "treat as plain blob".
         if pointer::looks_like_pointer(&raw) {
             if let Ok(info) = pointer::parse_pointer(&raw) {
                 let file_id_hex = info.hash().to_string();
                 if let Some(cached) = self.bale_cache.lock().unwrap().get(&file_id_hex) {
-                    return Ok(cached.data.clone());
+                    return Ok(HandleData::Bytes(cached.data.clone()));
                 }
-                let data = self.reconstruct_bale(&info)?;
-                let blob = Arc::new(CachedBlob { data: data.clone() });
-                self.bale_cache.lock().unwrap().put(file_id_hex, blob);
-                return Ok(data);
+                let file_size = info
+                    .file_size()
+                    .ok_or_else(|| anyhow!("bale pointer missing file_size"))?;
+                let tmp = self.reconstruct_bale_to_tempfile(&info)?;
+                if file_size <= BALE_LRU_BUDGET_BYTES {
+                    // Fits the LRU — slurp once, cache, and serve from RAM.
+                    let buf = std::fs::read(tmp.path())?;
+                    let bytes = Bytes::from(buf);
+                    let blob = Arc::new(CachedBlob {
+                        data: bytes.clone(),
+                    });
+                    self.bale_cache.lock().unwrap().put(file_id_hex, blob);
+                    return Ok(HandleData::Bytes(bytes));
+                }
+                // Too large for the LRU: keep the tempfile, pread on demand.
+                let file = tmp
+                    .reopen()
+                    .context("opening reconstruction tempfile for read")?;
+                return Ok(HandleData::Tempfile {
+                    _tmp: tmp,
+                    file,
+                    size: file_size,
+                });
             }
         }
 
@@ -271,10 +348,13 @@ impl Reader {
                 data: bytes.clone(),
             }),
         );
-        Ok(bytes)
+        Ok(HandleData::Bytes(bytes))
     }
 
-    fn reconstruct_bale(&self, info: &xet_data::processing::XetFileInfo) -> Result<Bytes> {
+    fn reconstruct_bale_to_tempfile(
+        &self,
+        info: &xet_data::processing::XetFileInfo,
+    ) -> Result<tempfile::NamedTempFile> {
         let rt = self
             .rt
             .as_ref()
@@ -298,9 +378,9 @@ impl Reader {
             ));
         }
 
-        // Same temp-file dance as the smudge filter: the xet-data download
-        // API takes its writer by value and requires it to be `'static`, so
-        // we spool through a tempfile and slurp it back after.
+        // xet-data's download API takes its writer by value as `'static`, so
+        // we materialize through a tempfile. The caller decides whether to
+        // slurp it into Bytes or keep the on-disk handle for pread.
         let tmp = tempfile::NamedTempFile::new()?;
 
         let cache_hit = if let Some(git_dir) = raw.git_dir.as_deref() {
@@ -367,8 +447,7 @@ impl Reader {
             }
         }
 
-        let buf = std::fs::read(tmp.path())?;
-        Ok(Bytes::from(buf))
+        Ok(tmp)
     }
 
     fn resolved_cfg(&self) -> Result<BaleConfig> {

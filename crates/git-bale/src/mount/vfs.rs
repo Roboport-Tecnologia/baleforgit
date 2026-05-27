@@ -519,22 +519,6 @@ mod tests {
         assert!(vfs.lookup_child(ROOT_INODE, "gone__B.txt").is_none());
     }
 
-    #[test]
-    fn renamed_file_keeps_each_label_at_its_own_path() {
-        let entries = vec![DiffEntry {
-            path_a: Some("old/name.rs".into()),
-            path_b: Some("new/name.rs".into()),
-            oid_a: Some("a".repeat(40)),
-            oid_b: Some("b".repeat(40)),
-            status: DiffStatus::Renamed,
-        }];
-        let vfs = DiffVfs::build(&entries, "A", "B", dummy_reader());
-        let old = vfs.lookup_child(ROOT_INODE, "old").unwrap();
-        let new = vfs.lookup_child(ROOT_INODE, "new").unwrap();
-        assert!(vfs.lookup_child(old.inode, "name__A.rs").is_some());
-        assert!(vfs.lookup_child(new.inode, "name__B.rs").is_some());
-    }
-
     fn make_lazy_repo() -> tempfile::TempDir {
         let dir = tempdir().unwrap();
         let p = dir.path();
