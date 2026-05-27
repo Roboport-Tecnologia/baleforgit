@@ -2,6 +2,8 @@
 // `BALE_S3_BUCKET` switches the blob backend from filesystem to S3-compatible.
 // See README for full env-var table.
 
+mod telemetry;
+
 use anyhow::{bail, Context, Result};
 use bale_server_authz_http::HttpAuthz;
 use bale_server_authz_mem::ConfigAuthz;
@@ -16,15 +18,8 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                // tower_http::trace gives per-request access logs; bale_server_http
-                // logs JSON error bodies on 4xx/5xx so failures are visible by default.
-                "info,sqlx=warn,tower_http::trace=info,bale_server_http=info".into()
-            }),
-        )
-        .init();
+    // Held until end of main so OTLP exporters flush on shutdown.
+    let _telemetry = telemetry::init("baleforgit-server")?;
 
     let listen = env::var("BALE_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let data_root =

@@ -56,6 +56,34 @@ docker run --rm -p 8080:8080 \
 | `BALE_S3_ACCESS_KEY_ID` / `BALE_S3_SECRET_ACCESS_KEY` / `BALE_S3_SESSION_TOKEN` | none | Explicit credentials. When unset, the SDK uses env vars, `~/.aws/credentials`, and IMDS as usual. |
 | `BALE_DEFAULT_QUOTA_BYTES` | none (unlimited) | Default per-owner storage cap, applied when no per-owner override is set via `PUT /v1/quotas/{owner}`. See [`ARCHITECTURE.md`](ARCHITECTURE.md#owner-accounting-and-quotas). |
 | `BALE_ADMIN_TOKEN_HEX` | none (admin endpoint disabled, returns 404) | 64-char hex (32 bytes) bearer for `PUT /v1/quotas/{owner}`. Constant-time compared. Keep separate from your JWT secret. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | none (exporters disabled) | If set, the server exports traces + metrics over OTLP HTTP/protobuf to `<endpoint>/v1/traces` and `<endpoint>/v1/metrics`. Typical local-collector value: `http://localhost:4318`. See [Observability](#observability). |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | none | Per-signal override; used verbatim (no `/v1/...` suffix appended). Either alone is enough to enable just that signal. |
+| `OTEL_SERVICE_NAME` | `baleforgit-server` | Service-name resource attribute attached to all exported telemetry. |
+
+## Observability
+
+The server ships an [OpenTelemetry](https://opentelemetry.io) integration that is **off by default** — if no `OTEL_EXPORTER_OTLP_ENDPOINT` (or per-signal sibling) is set, no provider is installed, no background threads start, and every instrument in the request path is a global no-op. Point the env var at a running [OTel Collector](https://opentelemetry.io/docs/collector/) to turn it on:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+BALE_JWT_SECRET_HEX=$(printf '%064x' 1) \
+BALE_TRANSFER_SECRET_HEX=$(printf '%064x' 2) \
+BALE_GRANTS=token-alice:alice:alice/my-model:write \
+./baleforgit-server
+```
+
+When enabled, the server emits:
+
+- **Traces** — every `tracing` span from the request path (the existing `tower_http::trace` access-log span plus anything inside the handlers) is bridged into OTel and shipped via the OTLP HTTP/protobuf exporter.
+- **Metrics** (instrument names):
+  - `http.server.requests` — counter, labelled by `http.request.method`, `http.route` (axum's matched pattern, *not* the raw URI — keeps cardinality bounded), `http.response.status_code`.
+  - `http.server.duration` — histogram in seconds, labelled by method + matched route.
+  - `bale.xorbs.uploaded` — counter, labelled by `deduplicated=true|false` (a re-upload of existing content is `true`).
+  - `bale.shards.uploaded` — counter.
+  - `bale.reconstructions.served` — counter (only counts 200 responses; misses surface as `http.server.requests{status=404}`).
+  - `bale.upload.bytes` — counter in bytes, labelled by `kind=xorb|shard`.
+
+Standard OTel env vars apply: `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS`, etc. The `/healthz` probe is deliberately not metered or traced — Kubernetes probes would otherwise dominate the volume.
 
 ## Verifying release artifacts
 

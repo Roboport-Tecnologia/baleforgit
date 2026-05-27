@@ -269,11 +269,11 @@ Neither copies bytes to disk: reads stream out of git's object database (for non
 Layout (`crates/git-bale/src/mount/`):
 
 - `mod.rs` — CLI entry, label sanitisation, lifecycle. Two entry points: `run` for diff mode, `run_rev` for single-rev mode. `run_rev` opens an `Arc<gix::ThreadSafeRepository>`, resolves the rev to a tree OID, and hands both to the lazy VFS — no tree walk at mount time. A single root `readdir` runs eagerly so an empty / mis-targeted mount errors out with a clear message rather than mounting silently empty.
-- `diff.rs` — pure-Rust diff via `gix` (no `git` subprocess): `rev_parse_single` + `tree.changes().for_each_to_obtain_tree`. Rename tracking is enabled by default, matching `git diff`.
-- `vfs.rs` — inode tree, inode 1 = root. Two builders: `build` (diff mode, labels appended, fully populated up front) and `build_single_lazy` (single-rev mode, names verbatim, directories resolved against their gix tree object on first `lookup_child`/`readdir`). Lazy directories carry the unresolved `tree_oid` + repo-relative `path_prefix` so pathspec filters can prune sibling subtrees without reading their tree objects. Inodes are stable for the life of the mount, memoized per `(parent, name)`. Directories are deduplicated; first-write-wins on collision. Internal state lives behind a single `Mutex` — fine while libfuse runs `-s`.
+- `diff.rs` — pure-Rust diff via `gix` (no `git` subprocess): `rev_parse_single` + `tree.changes().for_each_to_obtain_tree`. Rename tracking is **disabled** (`options.track_rewrites(None)`) to skip the post-walk O(N²) similarity pass — see the limitation note below. The pathspec is applied inside the callback against the `BStr` location so non-matching changes don't allocate OID / path strings.
+- `vfs.rs` — inode tree, inode 1 = root. Two builders: `build` (diff mode, labels appended, fully populated up front) and `build_single_lazy` (single-rev mode, names verbatim, directories resolved against their gix tree object on first `lookup_child`/`readdir`). Lazy directories carry the unresolved `tree_oid` + repo-relative `path_prefix` so pathspec filters can prune sibling subtrees without reading their tree objects. Inodes are stable for the life of the mount, memoized per `(parent, name)`. Directories are deduplicated; first-write-wins on collision. Internal state lives behind a single `Mutex` — coarse but fine for the parallel FUSE op load; populating a lazy directory is one ODB read while the lock is held.
 - `reader.rs` — byte source. Plain blobs are pulled from the ODB via `gix::find_object` and cached fully (capped at 16 MiB per blob). Bale pointers go through the same cache-first / network-fallback reconstruction as the smudge filter, with a bounded in-memory LRU of decompressed file bodies (1 GiB default budget).
 - `backend/mod.rs` — `MountBackend` trait. Today there is one impl; fuse-t (macFUSE-free macOS), WinFsp (Windows), or NFS could slot in without touching the VFS.
-- `backend/libfuse.rs` — hand-rolled FFI to libfuse 3.x's high-level API (`fuse_main_real` + `struct fuse_operations`). libfuse is loaded with `libloading` at runtime, *not* linked at build time — workspaces without libfuse still build. On Linux that's `libfuse3.so.3`; on macOS that's `libfuse-t.dylib` (fuse-t's userspace shim, no kext). Mounts foreground (`-f`), single-threaded (`-s`), read-only (`-o ro`). `fuse_main_real` installs its own SIGINT/SIGTERM handlers, so Ctrl-C cleanly unmounts. The `ensure_available` probe runs first thing in `run`/`run_rev`; if libfuse fails to load the user gets a multi-line install hint and the process exits without doing any other work.
+- `backend/libfuse.rs` — hand-rolled FFI to libfuse 3.x's high-level API (`fuse_main_real` + `struct fuse_operations`). libfuse is loaded with `libloading` at runtime, *not* linked at build time — workspaces without libfuse still build. On Linux that's `libfuse3.so.3`; on macOS that's `libfuse-t.dylib` (fuse-t's userspace shim, no kext). Mounts foreground (`-f`), read-only (`-o ro`), and lets libfuse run callbacks on multiple threads. `fuse_main_real` installs its own SIGINT/SIGTERM handlers, so Ctrl-C cleanly unmounts. The `ensure_available` probe runs first thing in `run`/`run_rev`; if libfuse fails to load the user gets a multi-line install hint and the process exits without doing any other work.
 
 Tricky bits:
 
@@ -281,7 +281,12 @@ Tricky bits:
 - **Path-based libfuse API.** The high-level API hands callbacks paths, not inodes. We walk slash components against the in-memory dir tree on every call. Fine for diffs in the low-thousands of entries; bigger trees should move to `fuse_lowlevel_ops` (inode-native).
 - **Lazy single-rev mounts hold the repo handle for the life of the mount.** Each first-touch of a directory issues one `find_object(tree_oid)` against the ODB and populates that directory's children. The commit (and therefore every reachable tree) is immutable, so there is no invalidation — the populated children just stay cached until the FUSE process exits. `mount-diff` is still eager because the diff result is already bounded by the changeset.
 - **Active-VFS singleton.** libfuse's path callbacks don't get user-data, so we stash `Arc<DiffVfs>` in a `OnceLock`. One mount per process — a second mount in the same process is rejected.
+- **Per-open file handles.** `op_open` calls `Reader::open(source)`, which reconstructs once into a `NamedTempFile`. If the result fits the LRU budget it is slurped into `Bytes` and cached; otherwise the tempfile stays alive for the open and `op_read` serves bytes via `pread`. The handle id rides in `fi.fh`; `op_release` drops the handle (tempfile unlinks on Drop). Without this, files larger than the 1 GiB LRU budget would re-run the full reconstruction pipeline on every 128 KiB FUSE read.
 - **No working-tree comparisons.** Both modes operate on committed revisions only. Adding worktree support means rebuilding the VFS when the index moves; punted.
+
+Limitation:
+
+- **`mount-diff` does not pair renames.** Rename tracking is turned off at the gix diff platform. A renamed file shows up as a deletion at the old path (visible only on side A as `name__<labelA>.ext`) and an addition at the new path (visible only on side B as `name__<labelB>.ext`), *not* as a single labelled pair under a shared basename. The trade-off is the O(N²) similarity computation gix would otherwise run over every del/add pair after the walk — for diffs with thousands of changes that pass dominates the wall time. If you need rename-aware viewing for a small diff, fall back to `git difftool`.
 
 ## Storage layout
 
@@ -398,6 +403,21 @@ The signature covers `xorb_hex | start | end_inclusive | exp` (concatenated with
 
 Missing or non-matching `Range:` returns 401 — per the spec, this is required ("Not specifying this header will result in an authorization failure") so the URL grants access to a specific byte range, not the whole xorb.
 
+## Observability
+
+The server's instrumentation is OpenTelemetry-based and **gated on `OTEL_EXPORTER_OTLP_ENDPOINT`** (or per-signal sibling). With the env unset, `telemetry::init` skips the SDK entirely — no provider is registered against `opentelemetry::global`, so every `meter(...).u64_counter(...).build().add(...)` in the request path resolves to the global no-op. That's how the "do nothing when no collector is running" contract is honoured: no background threads, no socket open, no per-request cost beyond a function call.
+
+When set, the bin installs:
+
+- An OTLP HTTP/protobuf **`SdkTracerProvider`** with a `BatchSpanProcessor`. The tracing-opentelemetry layer is wired into the `tracing_subscriber` registry, so the existing `tower_http::trace` access-log span (and any `tracing::info_span!` inside handlers) flow through as OTel spans.
+- An OTLP HTTP/protobuf **`SdkMeterProvider`** with a `PeriodicReader`. The HTTP crate defines its instruments lazily via `LazyLock<Counter<_>>` so they're constructed against whichever provider was installed at init time.
+
+Per-request metering lives in `crates/bale-server-http/src/metrics.rs` and is wired via an axum `middleware::from_fn` layer. It reads the matched route pattern out of `MatchedPath` (NOT the raw URI) before labelling — without that bound, a label like `/v1/xorbs/default/{hash}` would explode into one series per xorb hash and bury the metric backend.
+
+A `Guard` returned from `telemetry::init` flushes both providers on drop, so a SIGINT-triggered graceful shutdown still ships the trailing spans/metrics to the collector before the process exits.
+
+See [`SERVER.md` § "Observability"](SERVER.md#observability) for the operator-facing env vars and the instrument-name list.
+
 ## Tricky bits
 
 These are the easy-to-get-wrong parts of the protocol. Calling them out explicitly so they don't get re-broken.
@@ -431,6 +451,8 @@ Server side:
 | HTTP-delegating authz (`HttpAuthz`) | `crates/bale-server-authz-http/src/lib.rs` |
 | JWT mint/verify | `crates/bale-server-tokens/src/lib.rs` |
 | Router, handlers, middleware, signed URLs | `crates/bale-server-http/src/lib.rs` |
+| HTTP metrics middleware + handler counters | `crates/bale-server-http/src/metrics.rs` |
+| OTLP traces + metrics init (gated on env) | `crates/bale-server-bin/src/telemetry.rs` |
 | Binary launcher | `crates/bale-server-bin/src/main.rs` |
 | Cross-crate integration tests | `crates/bale-server-tests/tests/m*.rs` |
 

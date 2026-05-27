@@ -2,6 +2,8 @@
 //! route table, wire formats, and the "Tricky bits" notes that explain *why*
 //! several handlers behave the way they do.
 
+mod metrics;
+
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -26,6 +28,7 @@ use bale_server_wire::{
 };
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
+use opentelemetry::KeyValue;
 use serde::Deserialize;
 use sha2::Sha256;
 use std::collections::BTreeMap;
@@ -124,6 +127,10 @@ where
         )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(trace)
+        // Metrics middleware runs inside the trace layer so each recorded
+        // request also has the access-log span on the stack. No-op when no
+        // OTel meter provider is installed.
+        .layer(middleware::from_fn(metrics::middleware))
         .with_state(svc);
 
     // Health probe sits outside auth and outside the access-log trace layer:
@@ -344,8 +351,17 @@ where
             other => bad_req(format!("xorb body verification failed: {other}")),
         });
     }
+    let body_len = body.len() as u64;
     let was_inserted = svc.blobs.put_xorb(&xorb, body).await?;
     svc.meta.register_xorb_layout(&xorb, &layout).await?;
+    metrics::XORBS_UPLOADED.add(
+        1,
+        &[KeyValue::new(
+            "deduplicated",
+            if was_inserted { "false" } else { "true" },
+        )],
+    );
+    metrics::UPLOAD_BYTES.add(body_len, &[KeyValue::new("kind", "xorb")]);
     Ok(Json(UploadXorbResponse { was_inserted }))
 }
 
@@ -458,7 +474,10 @@ where
     }
 
     let shard_hash = shard_storage_hash(&body);
+    let body_len = body.len() as u64;
     svc.blobs.put_shard(&shard_hash, body).await?;
+    metrics::SHARDS_UPLOADED.add(1, &[]);
+    metrics::UPLOAD_BYTES.add(body_len, &[KeyValue::new("kind", "shard")]);
 
     Ok(Json(UploadShardResponse { result: 1 }))
 }
@@ -492,6 +511,7 @@ where
         return Err(ApiError(StatusCode::NOT_FOUND, "file not found".into()));
     }
     let resp = build_reconstruction_response(&svc, &file_hash).await?;
+    metrics::RECONSTRUCTIONS_SERVED.add(1, &[]);
     Ok(Json(resp))
 }
 
