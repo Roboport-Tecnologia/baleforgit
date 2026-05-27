@@ -39,6 +39,12 @@ use tracing::Level;
 
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const SIGNATURE_TTL_SECS: u64 = 600;
+/// Hard cap on `term.unpacked_segment_bytes` honored during reconstruction.
+/// Set to 2× the 64 MiB xorb cap because a term's *uncompressed* span can be a
+/// little larger than the compressed xorb body (typical compression ratios for
+/// the workloads xet targets are modest, but the headroom keeps us from
+/// rejecting borderline-valid terms while still bounding the per-term Vec).
+const MAX_TERM_UNPACKED_BYTES: u64 = 128 * 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -532,30 +538,19 @@ where
         .ok_or(ApiError(StatusCode::NOT_FOUND, "file not found".into()))?;
 
     // Use the xorb's on-disk frame layout — NOT the chunks table, whose
-    // offsets live in uncompressed coordinate space.
-    let mut layout_by_xorb: BTreeMap<[u8; HASH_LEN], Vec<XorbFrameRow>> = BTreeMap::new();
-    for t in &terms {
-        layout_by_xorb.entry(*t.xorb.as_bytes()).or_default();
-    }
-    for key in layout_by_xorb.keys().cloned().collect::<Vec<_>>() {
-        let rows = svc.meta.xorb_frame_layout(&XorbHash(Hash32(key))).await?;
-        if rows.is_empty() {
-            return Err(ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "xorb on-disk layout missing — upload predates layout indexing".into(),
-            ));
-        }
-        layout_by_xorb.insert(key, rows);
-    }
+    // offsets live in uncompressed coordinate space. One batched query
+    // replaces what used to be N sequential round-trips.
+    let xorbs: Vec<XorbHash> = terms.iter().map(|t| t.xorb).collect();
+    let layouts = svc.meta.xorb_frame_layouts(&xorbs).await?;
 
     let mut wire_terms = Vec::with_capacity(terms.len());
     let mut fetch_info: BTreeMap<String, Vec<CASReconstructionFetchInfo>> = BTreeMap::new();
     for t in &terms {
         let xorb_hex = encode_hash(&t.xorb.0);
-        let layout = layout_by_xorb.get(t.xorb.as_bytes()).ok_or_else(|| {
+        let layout = layouts.get(&t.xorb).ok_or_else(|| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "missing layout for known xorb".into(),
+                "xorb on-disk layout missing — upload predates layout indexing".into(),
             )
         })?;
         if (t.chunk_idx_end as usize) > layout.len() {
@@ -825,6 +820,16 @@ where
     let byte_start = start_frame.on_disk_start as u64;
     let byte_end = (last_frame.on_disk_start as u64) + (last_frame.on_disk_len as u64);
 
+    // Bound the decompression buffer against the xorb cap so a corrupt term
+    // claiming gigabytes of "unpacked" bytes can't trigger an unbounded
+    // Vec::with_capacity. Xorbs are ≤64 MiB compressed, so any single term's
+    // unpacked size legitimately fits well within MAX_TERM_UNPACKED_BYTES.
+    if (term.unpacked_segment_bytes as u64) > MAX_TERM_UNPACKED_BYTES {
+        return Err(ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "term unpacked size exceeds per-term cap".into(),
+        ));
+    }
     let body = svc
         .blobs
         .get_xorb_range(&term.xorb, byte_start..byte_end)
@@ -1045,14 +1050,16 @@ fn parse_byte_range_header(v: &HeaderValue) -> Result<(u64, u64), String> {
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut x = 0u8;
+    // Folds the length difference into the accumulator so a length mismatch
+    // doesn't return early — callers that pass variable-length user input
+    // (e.g. an admin bearer that decoded to the wrong size) would otherwise
+    // leak length via timing. zip() naturally truncates to the shorter side;
+    // the (len ^ len) seed makes any difference visible regardless.
+    let mut acc: u32 = (a.len() ^ b.len()) as u32;
     for (x_a, x_b) in a.iter().zip(b.iter()) {
-        x |= x_a ^ x_b;
+        acc |= (x_a ^ x_b) as u32;
     }
-    x == 0
+    acc == 0
 }
 
 // ---- Mock HF Hub token endpoint --------------------------------------------

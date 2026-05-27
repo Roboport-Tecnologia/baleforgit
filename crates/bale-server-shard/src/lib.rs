@@ -126,6 +126,9 @@ impl<'a> Cursor<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
     fn need(&self, n: usize) -> ShardResult<()> {
         if self.buf.len().saturating_sub(self.pos) < n {
             Err(ShardError::Truncated {
@@ -219,6 +222,17 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
             break;
         }
 
+        // Bound the preallocation against the remaining buffer: each entry is
+        // ENTRY_SIZE bytes, so num_entries items cannot exceed remaining/ENTRY_SIZE
+        // without the parse failing later anyway. Guards against a malicious
+        // num_entries=u32::MAX from triggering a ~200 GiB Vec preallocation.
+        let max_entries = (c.remaining() / ENTRY_SIZE) as u32;
+        if num_entries > max_entries {
+            return Err(ShardError::Truncated {
+                offset: c.pos,
+                needed: (num_entries as usize).saturating_mul(ENTRY_SIZE) - c.remaining(),
+            });
+        }
         let mut entries = Vec::with_capacity(num_entries as usize);
         for _ in 0..num_entries {
             let cas_hash = c.hash()?;
@@ -237,6 +251,15 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
 
         let mut verifications = Vec::new();
         if file_flags & FLAG_WITH_VERIFICATION != 0 {
+            // num_entries is already bounded against remaining above, but the
+            // verification section needs another ENTRY_SIZE bytes per entry on
+            // top of the file-term bytes we just consumed.
+            if num_entries as usize > c.remaining() / ENTRY_SIZE {
+                return Err(ShardError::Truncated {
+                    offset: c.pos,
+                    needed: (num_entries as usize).saturating_mul(ENTRY_SIZE) - c.remaining(),
+                });
+            }
             verifications.reserve(num_entries as usize);
             for _ in 0..num_entries {
                 let range_hash = c.hash()?;
@@ -280,6 +303,13 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
             break;
         }
 
+        // Same allocation guard as the file-info section.
+        if num_entries as usize > c.remaining() / ENTRY_SIZE {
+            return Err(ShardError::Truncated {
+                offset: c.pos,
+                needed: (num_entries as usize).saturating_mul(ENTRY_SIZE) - c.remaining(),
+            });
+        }
         let mut chunks = Vec::with_capacity(num_entries as usize);
         for _ in 0..num_entries {
             let chunk_hash = c.hash()?;
@@ -607,6 +637,24 @@ mod tests {
     fn parse_rejects_short_buffer() {
         let err = parse(&[0u8; 10]).unwrap_err();
         matches!(err, ShardError::Truncated { .. });
+    }
+
+    #[test]
+    fn parse_rejects_oversized_num_entries() {
+        // Build a header + a file-info entry that claims num_entries = u32::MAX.
+        // Without the bound check this would `Vec::with_capacity(u32::MAX as usize)`
+        // and OOM. With the check, it must error as truncated.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MDB_SHARD_HEADER_TAG);
+        bytes.extend_from_slice(&MDB_SHARD_HEADER_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // footer_size
+        bytes.extend_from_slice(&mk_hash(0x01).0); // file_hash (not bookend)
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // file_flags
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // num_entries
+        bytes.extend_from_slice(&[0u8; 8]); // _unused
+                                            // Body intentionally too small to fit u32::MAX entries.
+        let err = parse(&bytes).unwrap_err();
+        assert!(matches!(err, ShardError::Truncated { .. }));
     }
 
     #[test]

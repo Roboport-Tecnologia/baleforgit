@@ -175,6 +175,9 @@ async fn full_roundtrip_against_minio() {
         access_key_id: Some(ACCESS_KEY.into()),
         secret_access_key: Some(SECRET_KEY.into()),
         session_token: None,
+        // MinIO supports SSE-S3 but only after a KMS key is configured;
+        // disable for the throwaway CI bucket.
+        disable_sse: true,
     })
     .await
     .expect("open S3BlobStore against MinIO");

@@ -30,6 +30,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+twox-hash = { version = "=2.1.2", default-features = false, features = ["xxhash3_64", "std"] }
 tracing-subscriber.workspace = true
 xet-data = "=1.5.2"
 xet-core-structures = "=1.5.2"

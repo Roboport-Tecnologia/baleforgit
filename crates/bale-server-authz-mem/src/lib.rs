@@ -92,14 +92,14 @@ impl ConfigAuthz {
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 3600;
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut x = 0u8;
+    // Folds the length difference into the accumulator: hub bearers in the
+    // grants table can be different lengths and we don't want a presented
+    // token's length to be exfiltrated via the timing of the length mismatch.
+    let mut acc: u32 = (a.len() ^ b.len()) as u32;
     for (x_a, x_b) in a.iter().zip(b.iter()) {
-        x |= x_a ^ x_b;
+        acc |= (x_a ^ x_b) as u32;
     }
-    x == 0
+    acc == 0
 }
 
 #[async_trait]

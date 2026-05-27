@@ -1,5 +1,5 @@
 //! Per-clean cache. Keyed by `blake3(pathname)` and verified by
-//! `(size, chunked_hashes)` rather than a single full-file blake3.
+//! `(size, chunked_hashes)` rather than a single full-file hash.
 //!
 //! ### Why chunked?
 //!
@@ -20,8 +20,10 @@
 //!
 //! Net effect: cache *misses* on large modified files now bail out in
 //! ~milliseconds instead of `O(file_size)`; cache *hits* still hash every
-//! chunk for correctness (you can't trust a sample-only positive) but the
-//! parallelism roughly matches blake3's own internal SIMD throughput.
+//! chunk for correctness (you can't trust a sample-only positive).
+//!
+//! Chunk fingerprints use xxh3-64 — change detection, not adversarial
+//! integrity, so the speed (~10× blake3 on modern x86) wins.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -30,18 +32,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use twox_hash::XxHash3_64;
 
 /// Chunk size for the index. 1 MiB chosen so an 1 GiB file still indexes
 /// in ~1024 chunks (~64 KiB serialized) while leaving plenty of room for
 /// early-exit on small files.
 const CHUNK_SIZE: u64 = 1 << 20;
-pub const CURRENT_VERSION: u32 = 2;
+/// Bump when the on-disk schema or the chunk-hash algorithm changes —
+/// old entries become invisible and rebuild on the next clean.
+/// v3: chunk hashes are xxh3-64 hex (was blake3 hex in v2).
+pub const CURRENT_VERSION: u32 = 3;
 /// How many random middle-chunks to check *before* the rest. 3 is enough
 /// to catch most middle edits before the linear sweep.
 const MIDDLE_SAMPLES: usize = 3;
-/// Worker count for parallel chunk hashing. blake3 already uses internal
-/// SIMD parallelism per hash, so this is roughly the sweet spot for
-/// 1 MiB chunks on a 4-8 core box.
+/// Worker count for parallel chunk hashing.
 const VERIFY_PARALLELISM: usize = 3;
 
 pub type PathKey = blake3::Hash;
@@ -64,9 +68,17 @@ pub struct CacheEntry {
 pub struct Chunk {
     pub start: u64,
     pub end: u64,
-    /// blake3 of `[start..end]`, hex-encoded so the cache file stays
-    /// hand-readable for debugging.
+    /// xxh3-64 of `[start..end]`, 16-char lowercase hex (big-endian) so the
+    /// cache file stays hand-readable for debugging.
     pub hash: String,
+}
+
+fn chunk_hash(bytes: &[u8]) -> u64 {
+    XxHash3_64::oneshot(bytes)
+}
+
+fn chunk_hash_hex(bytes: &[u8]) -> String {
+    format!("{:016x}", chunk_hash(bytes))
 }
 
 /// Hash the file pathname (as Git sends it) into the cache directory's
@@ -131,11 +143,10 @@ pub fn compute_chunks(path: &Path, size: u64) -> io::Result<Vec<Chunk>> {
         let remaining = size - pos;
         let to_read = remaining.min(CHUNK_SIZE) as usize;
         file.read_exact(&mut buf[..to_read])?;
-        let hash = blake3::hash(&buf[..to_read]);
         chunks.push(Chunk {
             start: pos,
             end: pos + to_read as u64,
-            hash: hash.to_hex().to_string(),
+            hash: chunk_hash_hex(&buf[..to_read]),
         });
         pos += to_read as u64;
     }
@@ -143,7 +154,7 @@ pub fn compute_chunks(path: &Path, size: u64) -> io::Result<Vec<Chunk>> {
         chunks.push(Chunk {
             start: 0,
             end: 0,
-            hash: blake3::hash(b"").to_hex().to_string(),
+            hash: chunk_hash_hex(b""),
         });
     }
     Ok(chunks)
@@ -161,17 +172,16 @@ pub fn verify_chunks(cached: &[Chunk], path: &Path, file_size: u64) -> io::Resul
     if covered != file_size {
         return Ok(false);
     }
-    // Decode the on-disk hex hashes into raw bytes once, so the hot loop can
-    // compare against blake3::Hash::as_bytes() instead of paying hex on every
-    // chunk. Any malformed hex is treated as a verification failure (the
-    // entry is bogus; we'll rebuild it).
-    let mut decoded = Vec::with_capacity(cached.len());
+    // Parse the on-disk hex hashes into u64 once, so the hot loop can
+    // compare integers instead of paying hex on every chunk. Any malformed
+    // hex is treated as a verification failure (the entry is bogus; we'll
+    // rebuild it).
+    let mut decoded: Vec<u64> = Vec::with_capacity(cached.len());
     for c in cached {
-        let mut bytes = [0u8; 32];
-        if hex::decode_to_slice(&c.hash, &mut bytes).is_err() {
-            return Ok(false);
+        match u64::from_str_radix(&c.hash, 16) {
+            Ok(h) if c.hash.len() == 16 => decoded.push(h),
+            _ => return Ok(false),
         }
-        decoded.push(bytes);
     }
 
     // Share a single File across the worker stripes — verify_chunks runs on
@@ -205,7 +215,7 @@ pub fn verify_chunks(cached: &[Chunk], path: &Path, file_size: u64) -> io::Resul
 fn verify_stripe(
     file: &fs::File,
     cached: &[Chunk],
-    decoded: &[[u8; 32]],
+    decoded: &[u64],
     indices: &[usize],
     mismatch: &AtomicBool,
 ) -> io::Result<()> {
@@ -220,8 +230,7 @@ fn verify_stripe(
             buf.resize(len, 0);
         }
         read_exact_at(file, &mut buf[..len], c.start)?;
-        let actual = blake3::hash(&buf[..len]);
-        if actual.as_bytes() != &decoded[idx] {
+        if chunk_hash(&buf[..len]) != decoded[idx] {
             mismatch.store(true, Ordering::Relaxed);
             return Ok(());
         }
@@ -347,7 +356,7 @@ mod tests {
             vec![Chunk {
                 start: 0,
                 end: 12,
-                hash: blake3::hash(b"hello world!").to_hex().to_string(),
+                hash: chunk_hash_hex(b"hello world!"),
             }],
             "{\"hash\":\"abc\",\"file_size\":12}\n",
         );
@@ -388,7 +397,7 @@ mod tests {
         fs::write(&path, &body).unwrap();
         let mut chunks = compute_chunks(&path, body.len() as u64).unwrap();
         // Corrupt chunk 0's hash.
-        chunks[0].hash = blake3::hash(b"bogus").to_hex().to_string();
+        chunks[0].hash = chunk_hash_hex(b"bogus");
         assert!(!verify_chunks(&chunks, &path, body.len() as u64).unwrap());
     }
 
@@ -400,7 +409,7 @@ mod tests {
         fs::write(&path, &body).unwrap();
         let mut chunks = compute_chunks(&path, body.len() as u64).unwrap();
         let last = chunks.len() - 1;
-        chunks[last].hash = blake3::hash(b"bogus").to_hex().to_string();
+        chunks[last].hash = chunk_hash_hex(b"bogus");
         assert!(!verify_chunks(&chunks, &path, body.len() as u64).unwrap());
     }
 

@@ -48,6 +48,8 @@ pub enum XorbParseError {
     },
     #[error("frame {frame_index} has invalid compression scheme {scheme}")]
     BadCompressionScheme { frame_index: usize, scheme: u8 },
+    #[error("xorb body exceeds {max} bytes ({actual} given)")]
+    TooLarge { actual: usize, max: usize },
 }
 
 #[derive(Debug, Error)]
@@ -77,7 +79,17 @@ fn u24_le(b: &[u8]) -> u32 {
 /// Walk every chunk frame in `body`. Stops at the first header whose version
 /// byte is non-zero (treated as the footer marker) or at EOF, whichever comes
 /// first. Returns at least one frame or an error.
+///
+/// `XorbChunkFrame` stores offsets as u32, so bodies larger than u32::MAX are
+/// rejected up front. Production xorbs are capped at 64 MiB by the upload
+/// handler, so this is a defense-in-depth check.
 pub fn parse_xorb_frames(body: &[u8]) -> Result<Vec<XorbChunkFrame>, XorbParseError> {
+    if body.len() > u32::MAX as usize {
+        return Err(XorbParseError::TooLarge {
+            actual: body.len(),
+            max: u32::MAX as usize,
+        });
+    }
     let mut frames = Vec::new();
     let mut pos: usize = 0;
     while pos + HEADER_LEN <= body.len() {

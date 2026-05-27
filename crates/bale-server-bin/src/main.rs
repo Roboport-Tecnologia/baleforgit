@@ -27,7 +27,25 @@ async fn main() -> Result<()> {
     let db_path = env::var("BALE_DB_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| data_root.join("meta.db"));
-    let public_url = env::var("BALE_PUBLIC_URL").unwrap_or_else(|_| format!("http://{listen}"));
+    let public_url = match env::var("BALE_PUBLIC_URL") {
+        Ok(v) => v,
+        Err(_) => {
+            // Default is only sensible for local dev; warn loudly when the
+            // server binds beyond loopback because clients accessing the
+            // service through a TLS proxy will receive http:// presigned URLs
+            // that no longer resolve.
+            let host = listen.split(':').next().unwrap_or("");
+            if !is_loopback(host) {
+                tracing::warn!(
+                    %listen,
+                    "BALE_PUBLIC_URL is unset and server binds beyond loopback; \
+                     signed URLs will use 'http://{listen}' — set BALE_PUBLIC_URL \
+                     explicitly behind any reverse proxy or TLS terminator"
+                );
+            }
+            format!("http://{listen}")
+        }
+    };
 
     let jwt_secret = decode_hex_env("BALE_JWT_SECRET_HEX")?;
     if jwt_secret.len() < 32 {
@@ -92,6 +110,7 @@ async fn main() -> Result<()> {
             access_key_id: env::var("BALE_S3_ACCESS_KEY_ID").ok(),
             secret_access_key: env::var("BALE_S3_SECRET_ACCESS_KEY").ok(),
             session_token: env::var("BALE_S3_SESSION_TOKEN").ok(),
+            disable_sse: env_truthy("BALE_S3_DISABLE_SSE"),
         };
         let endpoint_for_log = s3_cfg.endpoint_url.clone();
         let blobs = Arc::new(S3BlobStore::open(s3_cfg).await.map_err(anyhow_from_core)?);
@@ -247,6 +266,10 @@ async fn shutdown_signal() {
         _ = ctrl_c => tracing::info!("SIGINT received, draining in-flight requests"),
         _ = terminate => tracing::info!("SIGTERM received, draining in-flight requests"),
     }
+}
+
+fn is_loopback(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
 fn env_truthy(name: &str) -> bool {

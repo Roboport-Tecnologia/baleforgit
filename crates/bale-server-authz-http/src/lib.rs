@@ -26,6 +26,11 @@ use std::time::Duration;
 
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 3600;
 
+/// Cap on the upstream `check_access` response body. The contract returns a
+/// tiny JSON like `{"user_id": "alice"}`; anything materially larger is either
+/// a misconfigured upstream or a hostile one trying to OOM us.
+const MAX_UPSTREAM_RESPONSE_BYTES: u64 = 64 * 1024;
+
 pub struct HttpAuthz {
     check_access_url: Url,
     client: reqwest::Client,
@@ -116,12 +121,28 @@ impl RepoAuthz for HttpAuthz {
             .map_err(|e| CoreError::Internal(format!("upstream call: {e}")))?;
         match resp.status() {
             s if s.is_success() => {
-                // Discard the body on decode error rather than `format!("{e}")` it:
-                // reqwest's JSON-decode error can echo a body snippet, which is risky
-                // if a misbehaving upstream ever reflects the bearer back to us.
-                let parsed: CheckAccessResponse = resp
-                    .json()
+                // Reject obviously-oversized responses up front via content_length;
+                // for a streamed/unknown-length body, the bytes() call below uses
+                // reqwest's internal accumulator which is itself bounded by the
+                // client's response_body_limit setting if configured. The hard
+                // cap here is defense-in-depth against an upstream that lies in
+                // Content-Length and then streams gigabytes.
+                if let Some(len) = resp.content_length() {
+                    if len > MAX_UPSTREAM_RESPONSE_BYTES {
+                        return Err(CoreError::Internal("upstream response too large".into()));
+                    }
+                }
+                let bytes = resp
+                    .bytes()
                     .await
+                    .map_err(|_| CoreError::Internal("upstream body read failed".into()))?;
+                if bytes.len() as u64 > MAX_UPSTREAM_RESPONSE_BYTES {
+                    return Err(CoreError::Internal("upstream response too large".into()));
+                }
+                // Decode-error message intentionally generic: reqwest's JSON-decode
+                // error can echo a body snippet, which is risky if a misbehaving
+                // upstream ever reflects the bearer back to us.
+                let parsed: CheckAccessResponse = serde_json::from_slice(&bytes)
                     .map_err(|_| CoreError::Internal("upstream body decode failed".into()))?;
                 Ok(UserId(parsed.user_id))
             }

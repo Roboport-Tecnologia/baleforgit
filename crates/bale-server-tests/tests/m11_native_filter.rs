@@ -270,8 +270,8 @@ async fn native_filter_push_then_pull() {
         serde_json::from_slice(&cache_blob).expect("cache entry is JSON");
     assert_eq!(
         cache_json.get("v").and_then(|v| v.as_u64()),
-        Some(2),
-        "expected schema v=2"
+        Some(3),
+        "expected schema v=3"
     );
     assert_eq!(
         cache_json.get("size").and_then(|s| s.as_u64()),
@@ -285,7 +285,7 @@ async fn native_filter_push_then_pull() {
     assert!(!chunks.is_empty(), "chunk list must be non-empty");
     for c in chunks {
         let hash = c.get("hash").and_then(|h| h.as_str()).unwrap();
-        assert_eq!(hash.len(), 64, "hash must be 64 hex chars");
+        assert_eq!(hash.len(), 16, "hash must be 16 hex chars (xxh3-64)");
         assert!(c.get("start").and_then(|x| x.as_u64()).is_some());
         assert!(c.get("end").and_then(|x| x.as_u64()).is_some());
     }

@@ -13,11 +13,11 @@ pub struct XetClaims {
     pub exp: u64,
 }
 
-fn now_unix() -> u64 {
+fn now_unix() -> CoreResult<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_err(|e| CoreError::Internal(format!("system clock before unix epoch: {e}")))
 }
 
 pub fn mint(
@@ -27,7 +27,7 @@ pub fn mint(
     scope: Scope,
     ttl_secs: u64,
 ) -> CoreResult<(String, u64)> {
-    let exp = now_unix().saturating_add(ttl_secs);
+    let exp = now_unix()?.saturating_add(ttl_secs);
     let claims = XetClaims {
         sub: user.0.clone(),
         repo_type: repo_type_str(repo.repo_type).into(),
@@ -137,7 +137,7 @@ mod tests {
             repo_id: "a/b".into(),
             revision: "main".into(),
             scope: "read".into(),
-            exp: now_unix().saturating_sub(3600),
+            exp: now_unix().unwrap().saturating_sub(3600),
         };
         let tok = encode(
             &Header::new(Algorithm::HS256),

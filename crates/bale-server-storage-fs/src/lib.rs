@@ -20,6 +20,25 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
+#[cfg(unix)]
+async fn open_private(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .await
+}
+
+#[cfg(not(unix))]
+async fn open_private(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+}
+
 pub struct FsBlobStore {
     root: PathBuf,
 }
@@ -58,7 +77,8 @@ impl FsBlobStore {
         if fs::metadata(dst).await.is_ok() {
             return Ok(false);
         }
-        if let Some(parent) = dst.parent() {
+        let parent = dst.parent();
+        if let Some(parent) = parent {
             fs::create_dir_all(parent)
                 .await
                 .map_err(|e| CoreError::Internal(format!("mkdir {}: {e}", parent.display())))?;
@@ -66,7 +86,7 @@ impl FsBlobStore {
         let tmp = self.tmp_path();
         // fsync the temp file before rename so a crash can't leave a
         // zero/short blob at the final content-addressed path.
-        let mut f = fs::File::create(&tmp)
+        let mut f = open_private(&tmp)
             .await
             .map_err(|e| CoreError::Internal(format!("create tmp: {e}")))?;
         if let Err(e) = async {
@@ -79,8 +99,19 @@ impl FsBlobStore {
             return Err(CoreError::Internal(format!("write tmp: {e}")));
         }
         drop(f);
-        match fs::rename(&tmp, dst).await {
-            Ok(()) => Ok(true),
+        let rename_result = fs::rename(&tmp, dst).await;
+        match rename_result {
+            Ok(()) => {
+                // fsync the parent directory so the rename itself is durable
+                // — without this, a crash after rename can lose the new entry
+                // even though the file's data was synced.
+                if let Some(parent) = parent {
+                    if let Ok(dir) = fs::File::open(parent).await {
+                        let _ = dir.sync_all().await;
+                    }
+                }
+                Ok(true)
+            }
             Err(_) if fs::metadata(dst).await.is_ok() => {
                 // A racing writer beat us to it; tmp is garbage, drop it.
                 let _ = fs::remove_file(&tmp).await;

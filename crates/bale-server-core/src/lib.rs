@@ -237,6 +237,23 @@ pub trait MetadataStore: Send + Sync {
     /// Frame layout ordered by `frame_index`. Empty if no layout was registered
     /// (e.g. test fixture that only populated chunk-level metadata).
     async fn xorb_frame_layout(&self, xorb: &XorbHash) -> CoreResult<Vec<XorbFrameRow>>;
+    /// Batched form of [`Self::xorb_frame_layout`]: looks up layouts for many
+    /// xorbs in one round-trip. Default impl loops over `xorb_frame_layout`
+    /// — backends should override for SQL-like stores. Returned map omits
+    /// xorbs with no recorded layout.
+    async fn xorb_frame_layouts(
+        &self,
+        xorbs: &[XorbHash],
+    ) -> CoreResult<std::collections::HashMap<XorbHash, Vec<XorbFrameRow>>> {
+        let mut out = std::collections::HashMap::new();
+        for x in xorbs {
+            let rows = self.xorb_frame_layout(x).await?;
+            if !rows.is_empty() {
+                out.insert(*x, rows);
+            }
+        }
+        Ok(out)
+    }
 
     async fn xorb_exists(&self, xorb: &XorbHash) -> CoreResult<bool>;
     async fn lookup_file(&self, file_hash: &FileHash) -> CoreResult<Option<Vec<FileTerm>>>;

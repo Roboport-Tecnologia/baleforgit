@@ -127,7 +127,10 @@ pub struct OwnerUsageResponse {
 }
 
 /// Body for `PUT /v1/quotas/{owner}`. Null `limit_bytes` clears the override.
+/// `deny_unknown_fields` so a typo'd / smuggled key on the admin endpoint
+/// fails loudly instead of silently being ignored.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetOwnerQuotaRequest {
     pub limit_bytes: Option<u64>,
 }

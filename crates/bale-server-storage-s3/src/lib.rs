@@ -11,6 +11,7 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::ServerSideEncryption;
 use aws_sdk_s3::Client;
 use bale_server_core::{BlobStore, CoreError, CoreResult, Hash32, ShardHash, XorbHash};
 use bytes::Bytes;
@@ -32,12 +33,16 @@ pub struct S3Config {
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
     pub session_token: Option<String>,
+    /// Disable AES-256 server-side encryption on uploaded objects. Default is
+    /// on; set this for S3-compatible backends that reject the header.
+    pub disable_sse: bool,
 }
 
 pub struct S3BlobStore {
     client: Client,
     bucket: String,
     prefix: String,
+    sse_enabled: bool,
 }
 
 impl S3BlobStore {
@@ -70,6 +75,7 @@ impl S3BlobStore {
             client,
             bucket: cfg.bucket,
             prefix: cfg.prefix,
+            sse_enabled: !cfg.disable_sse,
         };
 
         // Non-fatal startup probe — lets dev loops boot against a bucket the
@@ -128,16 +134,18 @@ impl S3BlobStore {
     }
 
     async fn put_object(&self, key: &str, body: Bytes) -> CoreResult<()> {
-        self.client
+        let mut req = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .body(ByteStream::from(body))
-            .send()
-            .await
-            .map_err(|e| {
-                CoreError::Internal(format!("s3 put_object {key}: {}", display_sdk_error(&e)))
-            })?;
+            .body(ByteStream::from(body));
+        if self.sse_enabled {
+            req = req.server_side_encryption(ServerSideEncryption::Aes256);
+        }
+        req.send().await.map_err(|e| {
+            CoreError::Internal(format!("s3 put_object {key}: {}", display_sdk_error(&e)))
+        })?;
         Ok(())
     }
 }
@@ -282,6 +290,7 @@ mod tests {
             client: stub_client(),
             bucket: "b".into(),
             prefix: "p/".into(),
+            sse_enabled: false,
         };
         let mut bytes = [0u8; 32];
         bytes[0] = 0xab;
@@ -299,6 +308,7 @@ mod tests {
             client: stub_client(),
             bucket: "b".into(),
             prefix: String::new(),
+            sse_enabled: false,
         };
         let mut bytes = [0u8; 32];
         bytes[0] = 0x12;
@@ -313,6 +323,7 @@ mod tests {
             client: stub_client(),
             bucket: "b".into(),
             prefix: String::new(),
+            sse_enabled: false,
         };
         let key = store.xorb_key(&XorbHash(Hash32::ZERO));
         assert!(key.starts_with("xorbs/00/00/"));

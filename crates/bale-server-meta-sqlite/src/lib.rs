@@ -72,7 +72,15 @@ CREATE TABLE IF NOT EXISTS file_terms (
     verification    BLOB,
     PRIMARY KEY (file_hash, term_index)
 );
+-- stored_bytes_for_{owner,repo} and unaccounted_xorb_bytes_for_owner scan
+-- file_terms by xorb_hash. Without this index every quota check is a full
+-- table scan over file_terms.
+CREATE INDEX IF NOT EXISTS file_terms_by_xorb ON file_terms(xorb_hash);
 "#;
+
+/// Rows per batched INSERT — SQLite caps bound parameters at ~32k; biggest
+/// row binds 7 params, so 500 rows = 3500 params, well under the limit.
+const CHUNK_INSERT_BATCH: usize = 500;
 
 pub struct SqliteMetadataStore {
     pool: Pool<Sqlite>,
@@ -149,6 +157,19 @@ fn hash_to_blob(h: &Hash32) -> Vec<u8> {
     h.as_bytes().to_vec()
 }
 
+/// SQLite `SUM(INTEGER)` returns i64. A negative result implies overflow —
+/// `.max(0) as u64` would silently mask that to 0, which is the worst possible
+/// behavior for quota accounting (limits effectively vanish). Surface it as
+/// `CoreError::Internal` instead so an operator notices.
+fn nonneg_i64_to_u64(n: i64, label: &'static str) -> CoreResult<u64> {
+    if n < 0 {
+        return Err(CoreError::Internal(format!(
+            "{label}: aggregate overflowed i64 (got {n}); database is corrupt or owner exceeds 8 EiB"
+        )));
+    }
+    Ok(n as u64)
+}
+
 fn blob_to_hash(b: &[u8]) -> CoreResult<Hash32> {
     if b.len() != HASH_LEN {
         return Err(CoreError::Internal(format!(
@@ -184,20 +205,24 @@ impl MetadataStore for SqliteMetadataStore {
         .await
         .map_err(|e| CoreError::Internal(format!("insert xorb: {e}")))?;
 
-        for c in chunks {
-            sqlx::query(
+        // Batched in chunks of CHUNK_INSERT_BATCH so we don't blow past
+        // SQLite's parameter limit (~32k for stock builds; we keep slack).
+        for batch in chunks.chunks(CHUNK_INSERT_BATCH) {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 "INSERT OR IGNORE INTO chunks
-                 (chunk_hash, xorb_hash, chunk_index, byte_start, unpacked_bytes)
-                 VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(hash_to_blob(&c.chunk_hash.0))
-            .bind(hash_to_blob(&xorb.xorb.0))
-            .bind(c.chunk_index as i64)
-            .bind(c.byte_start as i64)
-            .bind(c.unpacked_segment_bytes as i64)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CoreError::Internal(format!("insert chunk: {e}")))?;
+                 (chunk_hash, xorb_hash, chunk_index, byte_start, unpacked_bytes) ",
+            );
+            qb.push_values(batch, |mut b, c| {
+                b.push_bind(hash_to_blob(&c.chunk_hash.0))
+                    .push_bind(hash_to_blob(&xorb.xorb.0))
+                    .push_bind(c.chunk_index as i64)
+                    .push_bind(c.byte_start as i64)
+                    .push_bind(c.unpacked_segment_bytes as i64);
+            });
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| CoreError::Internal(format!("insert chunks: {e}")))?;
         }
 
         tx.commit()
@@ -238,22 +263,25 @@ impl MetadataStore for SqliteMetadataStore {
         // Terms are content-addressed by file_hash, so a re-register carries
         // identical terms — IGNORE the duplicate rather than DELETE+INSERT,
         // which would briefly expose an empty term list to a concurrent reader.
-        for (idx, t) in terms.iter().enumerate() {
-            sqlx::query(
+        let indexed: Vec<(usize, &FileTerm)> = terms.iter().enumerate().collect();
+        for batch in indexed.chunks(CHUNK_INSERT_BATCH) {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 "INSERT OR IGNORE INTO file_terms
-                 (file_hash, term_index, xorb_hash, chunk_idx_start, chunk_idx_end, unpacked_bytes, verification)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(hash_to_blob(&file_hash.0))
-            .bind(idx as i64)
-            .bind(hash_to_blob(&t.xorb.0))
-            .bind(t.chunk_idx_start as i64)
-            .bind(t.chunk_idx_end as i64)
-            .bind(t.unpacked_segment_bytes as i64)
-            .bind(t.verification.as_ref().map(hash_to_blob))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CoreError::Internal(format!("insert term: {e}")))?;
+                 (file_hash, term_index, xorb_hash, chunk_idx_start, chunk_idx_end, unpacked_bytes, verification) ",
+            );
+            qb.push_values(batch, |mut b, (idx, t)| {
+                b.push_bind(hash_to_blob(&file_hash.0))
+                    .push_bind(*idx as i64)
+                    .push_bind(hash_to_blob(&t.xorb.0))
+                    .push_bind(t.chunk_idx_start as i64)
+                    .push_bind(t.chunk_idx_end as i64)
+                    .push_bind(t.unpacked_segment_bytes as i64)
+                    .push_bind(t.verification.as_ref().map(hash_to_blob));
+            });
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| CoreError::Internal(format!("insert terms: {e}")))?;
         }
 
         tx.commit()
@@ -317,30 +345,82 @@ impl MetadataStore for SqliteMetadataStore {
         xorb: &XorbHash,
         frames: &[XorbFrameRow],
     ) -> CoreResult<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| CoreError::Internal(format!("begin: {e}")))?;
-        for f in frames {
-            sqlx::query(
+        for batch in frames.chunks(CHUNK_INSERT_BATCH) {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 "INSERT OR IGNORE INTO xorb_frames
-                 (xorb_hash, frame_index, on_disk_start, on_disk_len, uncompressed_len)
-                 VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(hash_to_blob(&xorb.0))
-            .bind(f.frame_index as i64)
-            .bind(f.on_disk_start as i64)
-            .bind(f.on_disk_len as i64)
-            .bind(f.uncompressed_len as i64)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CoreError::Internal(format!("insert frame: {e}")))?;
+                 (xorb_hash, frame_index, on_disk_start, on_disk_len, uncompressed_len) ",
+            );
+            qb.push_values(batch, |mut b, f| {
+                b.push_bind(hash_to_blob(&xorb.0))
+                    .push_bind(f.frame_index as i64)
+                    .push_bind(f.on_disk_start as i64)
+                    .push_bind(f.on_disk_len as i64)
+                    .push_bind(f.uncompressed_len as i64);
+            });
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| CoreError::Internal(format!("insert frames: {e}")))?;
         }
         tx.commit()
             .await
             .map_err(|e| CoreError::Internal(format!("commit frames: {e}")))?;
         Ok(())
+    }
+
+    async fn xorb_frame_layouts(
+        &self,
+        xorbs: &[XorbHash],
+    ) -> CoreResult<std::collections::HashMap<XorbHash, Vec<XorbFrameRow>>> {
+        if xorbs.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        // Deduplicate first; one IN query replaces N round-trips.
+        let mut uniq: Vec<XorbHash> = xorbs.to_vec();
+        uniq.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        uniq.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT xorb_hash, frame_index, on_disk_start, on_disk_len, uncompressed_len
+             FROM xorb_frames WHERE xorb_hash IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for x in &uniq {
+            sep.push_bind(hash_to_blob(&x.0));
+        }
+        qb.push(") ORDER BY xorb_hash, frame_index ASC");
+
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| CoreError::Internal(format!("select frame layouts: {e}")))?;
+
+        let mut out: std::collections::HashMap<XorbHash, Vec<XorbFrameRow>> =
+            std::collections::HashMap::new();
+        for r in rows {
+            let xorb_blob: Vec<u8> = r.try_get("xorb_hash").map_err(internal)?;
+            let xorb = XorbHash(blob_to_hash(&xorb_blob)?);
+            let fi: i64 = r.try_get("frame_index").map_err(internal)?;
+            let s: i64 = r.try_get("on_disk_start").map_err(internal)?;
+            let l: i64 = r.try_get("on_disk_len").map_err(internal)?;
+            let u: i64 = r.try_get("uncompressed_len").map_err(internal)?;
+            out.entry(xorb).or_default().push(XorbFrameRow {
+                frame_index: fi as u32,
+                on_disk_start: s as u32,
+                on_disk_len: l as u32,
+                uncompressed_len: u as u32,
+            });
+        }
+        Ok(out)
     }
 
     async fn xorb_frame_layout(&self, xorb: &XorbHash) -> CoreResult<Vec<XorbFrameRow>> {
@@ -440,7 +520,7 @@ impl MetadataStore for SqliteMetadataStore {
                 .await
                 .map_err(|e| CoreError::Internal(format!("raw_bytes_for_owner: {e}")))?;
         let n: i64 = row.try_get("n").map_err(internal)?;
-        Ok(n.max(0) as u64)
+        nonneg_i64_to_u64(n, "raw_bytes_for_owner")
     }
 
     async fn stored_bytes_for_owner(&self, owner: &str) -> CoreResult<u64> {
@@ -462,7 +542,7 @@ impl MetadataStore for SqliteMetadataStore {
         .await
         .map_err(|e| CoreError::Internal(format!("stored_bytes_for_owner: {e}")))?;
         let n: i64 = row.try_get("n").map_err(internal)?;
-        Ok(n.max(0) as u64)
+        nonneg_i64_to_u64(n, "stored_bytes_for_owner")
     }
 
     async fn get_owner_quota(&self, owner: &str) -> CoreResult<Option<u64>> {
@@ -473,7 +553,7 @@ impl MetadataStore for SqliteMetadataStore {
             .map_err(|e| CoreError::Internal(format!("get_owner_quota: {e}")))?;
         let Some(r) = row else { return Ok(None) };
         let n: i64 = r.try_get("limit_bytes").map_err(internal)?;
-        Ok(Some(n.max(0) as u64))
+        Ok(Some(nonneg_i64_to_u64(n, "get_owner_quota")?))
     }
 
     async fn set_owner_quota(&self, owner: &str, limit_bytes: Option<u64>) -> CoreResult<()> {
@@ -508,7 +588,7 @@ impl MetadataStore for SqliteMetadataStore {
                 .await
                 .map_err(|e| CoreError::Internal(format!("raw_bytes_for_repo: {e}")))?;
         let n: i64 = row.try_get("n").map_err(internal)?;
-        Ok(n.max(0) as u64)
+        nonneg_i64_to_u64(n, "raw_bytes_for_repo")
     }
 
     async fn stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64> {
@@ -527,7 +607,7 @@ impl MetadataStore for SqliteMetadataStore {
         .await
         .map_err(|e| CoreError::Internal(format!("stored_bytes_for_repo: {e}")))?;
         let n: i64 = row.try_get("n").map_err(internal)?;
-        Ok(n.max(0) as u64)
+        nonneg_i64_to_u64(n, "stored_bytes_for_repo")
     }
 
     async fn unaccounted_xorb_bytes_for_owner(
@@ -566,7 +646,7 @@ impl MetadataStore for SqliteMetadataStore {
             .await
             .map_err(|e| CoreError::Internal(format!("unaccounted_xorb_bytes: {e}")))?;
         let n: i64 = row.try_get("n").map_err(internal)?;
-        Ok(n.max(0) as u64)
+        nonneg_i64_to_u64(n, "unaccounted_xorb_bytes_for_owner")
     }
 
     async fn xorb_chunk_offsets(&self, xorb: &XorbHash) -> CoreResult<Vec<ChunkOffsetRow>> {
