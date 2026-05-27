@@ -67,8 +67,8 @@ pub fn load(git_dir: &Path, file_id_hex: &str) -> io::Result<Option<CachedManife
 /// `tempfile::NamedTempFile`) keeps the temp file in the target directory,
 /// which is required for `rename` to be atomic on the same fs.
 pub fn save(git_dir: &Path, file_id_hex: &str, manifest: &CachedManifest) -> io::Result<()> {
+    crate::fs_util::create_bale_subdir(git_dir, "manifests")?;
     let dir = manifest_dir(git_dir);
-    fs::create_dir_all(&dir)?;
     let final_path = manifest_path(git_dir, file_id_hex);
 
     let tmp = dir.join(format!("{file_id_hex}.json.tmp.{}", std::process::id()));

@@ -24,9 +24,10 @@
 //! parallelism roughly matches blake3's own internal SIMD throughput.
 
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -102,8 +103,8 @@ pub fn load(git_dir: &Path, key: &PathKey) -> io::Result<Option<CacheEntry>> {
 
 /// Atomic write via temp + rename so a partial flush never poisons lookups.
 pub fn save(git_dir: &Path, key: &PathKey, entry: &CacheEntry) -> io::Result<()> {
+    crate::fs_util::create_bale_subdir(git_dir, "clean-cache")?;
     let dir = cache_dir(git_dir);
-    fs::create_dir_all(&dir)?;
     let hex = key.to_hex();
     let final_path = dir.join(hex.as_str());
     let tmp = dir.join(format!("{hex}.tmp.{}", std::process::id()));
@@ -160,6 +161,24 @@ pub fn verify_chunks(cached: &[Chunk], path: &Path, file_size: u64) -> io::Resul
     if covered != file_size {
         return Ok(false);
     }
+    // Decode the on-disk hex hashes into raw bytes once, so the hot loop can
+    // compare against blake3::Hash::as_bytes() instead of paying hex on every
+    // chunk. Any malformed hex is treated as a verification failure (the
+    // entry is bogus; we'll rebuild it).
+    let mut decoded = Vec::with_capacity(cached.len());
+    for c in cached {
+        let mut bytes = [0u8; 32];
+        if hex::decode_to_slice(&c.hash, &mut bytes).is_err() {
+            return Ok(false);
+        }
+        decoded.push(bytes);
+    }
+
+    // Share a single File across the worker stripes — verify_chunks runs on
+    // every `git status` / `git diff`, so dropping N opens to 1 is the cheap
+    // win. read_at / seek_read are stateless so concurrent workers don't
+    // contend on a shared seek cursor.
+    let file = Arc::new(fs::File::open(path)?);
 
     let order = priority_order(cached.len());
     let mismatch = AtomicBool::new(false);
@@ -169,8 +188,10 @@ pub fn verify_chunks(cached: &[Chunk], path: &Path, file_size: u64) -> io::Resul
         for stripe in order.chunks(stripe_size) {
             let stripe = stripe.to_vec();
             let mismatch_ref = &mismatch;
+            let file = file.clone();
+            let decoded = decoded.as_slice();
             scope.spawn(move || {
-                if let Err(e) = verify_stripe(path, cached, &stripe, mismatch_ref) {
+                if let Err(e) = verify_stripe(&file, cached, decoded, &stripe, mismatch_ref) {
                     tracing::debug!("chunk verify IO error on {}: {e}", path.display());
                     mismatch_ref.store(true, Ordering::Relaxed);
                 }
@@ -182,12 +203,12 @@ pub fn verify_chunks(cached: &[Chunk], path: &Path, file_size: u64) -> io::Resul
 }
 
 fn verify_stripe(
-    path: &Path,
+    file: &fs::File,
     cached: &[Chunk],
+    decoded: &[[u8; 32]],
     indices: &[usize],
     mismatch: &AtomicBool,
 ) -> io::Result<()> {
-    let mut file = fs::File::open(path)?;
     let mut buf = Vec::with_capacity(CHUNK_SIZE as usize);
     for &idx in indices {
         if mismatch.load(Ordering::Relaxed) {
@@ -198,15 +219,55 @@ fn verify_stripe(
         if buf.len() < len {
             buf.resize(len, 0);
         }
-        file.seek(SeekFrom::Start(c.start))?;
-        file.read_exact(&mut buf[..len])?;
+        read_exact_at(file, &mut buf[..len], c.start)?;
         let actual = blake3::hash(&buf[..len]);
-        if actual.to_hex().as_str() != c.hash {
+        if actual.as_bytes() != &decoded[idx] {
             mismatch.store(true, Ordering::Relaxed);
             return Ok(());
         }
     }
     Ok(())
+}
+
+/// Positional read that doesn't move the file's seek cursor, so multiple
+/// workers can share one `File` handle without locking. Loops to retry
+/// short reads (rare on regular files but well-defined to handle).
+fn read_exact_at(file: &fs::File, buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    let mut remaining = buf;
+    while !remaining.is_empty() {
+        let n = pread(file, remaining, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short read during chunk verify",
+            ));
+        }
+        offset += n as u64;
+        remaining = &mut remaining[n..];
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn pread(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pread(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pread(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    // Fallback for exotic targets: emulate via clone + seek. Less efficient
+    // (extra file descriptor + serialized seek), but correct.
+    use std::io::{Read, Seek, SeekFrom};
+    let mut handle = file.try_clone()?;
+    handle.seek(SeekFrom::Start(offset))?;
+    handle.read(buf)
 }
 
 /// Index ordering for verification: first, last, then a small random middle

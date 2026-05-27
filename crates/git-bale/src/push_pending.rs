@@ -89,14 +89,20 @@ fn upload_one_xorb(
     if !is_64_lower_hex(&hash_hex) {
         bail!("xorb filename hash component is not 64 lowercase hex chars: {filename}");
     }
-    let body = std::fs::read(path)?;
     let url = format!("{server_url}/v1/xorbs/default/{hash_hex}");
     let token = auth.token.clone();
     let http = http.clone();
+    let path_owned = path.to_path_buf();
     rt.bridge_sync(async move {
+        let file = tokio::fs::File::open(&path_owned)
+            .await
+            .with_context(|| format!("opening staged xorb {}", path_owned.display()))?;
+        let len = file.metadata().await?.len();
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
         let resp = http
             .post(&url)
             .bearer_auth(&token)
+            .header(reqwest::header::CONTENT_LENGTH, len)
             .body(body)
             .send()
             .await?;

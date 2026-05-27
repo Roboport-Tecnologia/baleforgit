@@ -38,8 +38,7 @@ fn file_marker_path(git_dir: &Path, file_hex: &str) -> PathBuf {
 /// lukewarm smudge knows this file's bytes are stageable locally. Empty file —
 /// the existence check is what matters.
 pub fn mark_file_staged(git_dir: &Path, file_hex: &str) -> std::io::Result<()> {
-    let dir = file_index_dir(git_dir);
-    std::fs::create_dir_all(&dir)?;
+    crate::fs_util::create_bale_subdir(git_dir, "staging/file-index")?;
     let path = file_marker_path(git_dir, file_hex);
     // Truncate+create is fine: marker is content-free, idempotent.
     let mut f = std::fs::File::create(&path)?;

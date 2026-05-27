@@ -146,6 +146,9 @@ impl Reader {
         };
         let chunk_cache = get_cache(&cache_cfg)
             .map_err(|e| anyhow!("init chunk cache at {}: {e}", raw.cache_dir.display()))?;
+        if let Err(e) = crate::fs_util::restrict_user_cache_dir(&raw.cache_dir) {
+            tracing::debug!("tightening perms on {}: {e}", raw.cache_dir.display());
+        }
 
         Ok(Self {
             repo: Some(repo),

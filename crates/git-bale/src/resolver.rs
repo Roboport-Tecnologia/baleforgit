@@ -74,6 +74,11 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
     let remote = parse_origin(repo_cwd)
         .context("auto-resolving Bale auth: failed to read git remote 'origin'")?;
     let (owner, repo_name) = remote.owner_and_repo()?;
+    // `owner` and `repo` get interpolated into a URL and into the ssh remote
+    // command string (which the server re-shell-parses), so reject anything
+    // outside a safe alphabet before we hand them off.
+    validate_segment("owner", owner)?;
+    validate_segment("repo", repo_name)?;
     let revision = "main"; // TODO: derive from HEAD when we want branch-scoped tokens.
 
     let (server_url, forge_bearer) = match remote.scheme {
@@ -400,6 +405,28 @@ fn strip_bearer(authz: &str) -> Option<&str> {
     authz.strip_prefix("Bearer ").map(str::trim)
 }
 
+/// Accept only `[A-Za-z0-9._-]+`, no leading dot, length 1..=100.
+/// Rejects path traversal (`..`, `/`), shell metacharacters, and other
+/// payloads that could survive ssh-argv quoting only to be re-parsed on
+/// the server side.
+fn validate_segment(label: &str, s: &str) -> Result<()> {
+    if s.is_empty() || s.len() > 100 {
+        return Err(anyhow!("{label} {s:?} has invalid length"));
+    }
+    if s.starts_with('.') {
+        return Err(anyhow!("{label} {s:?} starts with a dot"));
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(anyhow!(
+            "{label} {s:?} contains characters outside [A-Za-z0-9._-]"
+        ));
+    }
+    Ok(())
+}
+
 fn far_future_epoch() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -424,6 +451,26 @@ mod tests {
         assert_eq!(strip_bearer("Bearer abc.def.ghi"), Some("abc.def.ghi"));
         assert_eq!(strip_bearer("token foo"), None);
         assert_eq!(strip_bearer("Bearer  spaced  "), Some("spaced"));
+    }
+
+    #[test]
+    fn validate_segment_accepts_typical() {
+        assert!(validate_segment("owner", "alice").is_ok());
+        assert!(validate_segment("repo", "my-repo_2.0").is_ok());
+        assert!(validate_segment("repo", "A1").is_ok());
+    }
+
+    #[test]
+    fn validate_segment_rejects_traversal_and_shell_meta() {
+        assert!(validate_segment("repo", "..").is_err());
+        assert!(validate_segment("repo", ".hidden").is_err());
+        assert!(validate_segment("repo", "a/b").is_err());
+        assert!(validate_segment("repo", "a;b").is_err());
+        assert!(validate_segment("repo", "a b").is_err());
+        assert!(validate_segment("repo", "$(whoami)").is_err());
+        assert!(validate_segment("repo", "`id`").is_err());
+        assert!(validate_segment("repo", "").is_err());
+        assert!(validate_segment("repo", &"a".repeat(101)).is_err());
     }
 
     #[test]

@@ -99,15 +99,28 @@ impl<R: Read> PktReader<R> {
     }
 
     /// Read binary data packets until a flush packet, copying each payload
-    /// into `out`. Returns the total bytes copied.
-    pub fn read_binary_to<W: Write>(&mut self, out: &mut W) -> io::Result<u64> {
+    /// into `out`. Returns the total bytes copied. Errors with `InvalidData`
+    /// if the cumulative payload would exceed `max_total_bytes` — guards
+    /// against a misbehaving peer pushing us into unbounded heap growth.
+    pub fn read_binary_to<W: Write>(
+        &mut self,
+        out: &mut W,
+        max_total_bytes: u64,
+    ) -> io::Result<u64> {
         let mut total = 0u64;
         loop {
             match self.read_packet()? {
                 Packet::Flush => return Ok(total),
                 Packet::Data(bytes) => {
+                    let n = bytes.len() as u64;
+                    if total.saturating_add(n) > max_total_bytes {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("pkt-line payload exceeded cap of {max_total_bytes} bytes"),
+                        ));
+                    }
                     out.write_all(&bytes)?;
-                    total += bytes.len() as u64;
+                    total += n;
                 }
                 other => {
                     return Err(io::Error::new(
@@ -243,7 +256,7 @@ mod tests {
         }
         let mut r = PktReader::new(&buf[..]);
         let mut sink = Vec::new();
-        let n = r.read_binary_to(&mut sink).unwrap();
+        let n = r.read_binary_to(&mut sink, 1024).unwrap();
         assert_eq!(n, 14);
         assert_eq!(sink, b"hello pkt-line");
     }
@@ -258,7 +271,23 @@ mod tests {
         }
         let mut r = PktReader::new(&buf[..]);
         let mut sink = Vec::new();
-        r.read_binary_to(&mut sink).unwrap();
+        r.read_binary_to(&mut sink, data.len() as u64).unwrap();
         assert_eq!(sink, data);
+    }
+
+    #[test]
+    fn binary_cap_rejects_overflow() {
+        let data = vec![0u8; MAX_PKT_PAYLOAD * 2];
+        let mut buf = Vec::new();
+        {
+            let mut w = PktWriter::new(&mut buf);
+            w.write_all_then_flush(&data).unwrap();
+        }
+        let mut r = PktReader::new(&buf[..]);
+        let mut sink = Vec::new();
+        let err = r
+            .read_binary_to(&mut sink, MAX_PKT_PAYLOAD as u64)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

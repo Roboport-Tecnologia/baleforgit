@@ -22,6 +22,13 @@ use crate::config::BaleConfig;
 use crate::local_reconstruct::{try_reconstruct_from_cache, CacheReconstructOutcome};
 use crate::manifest_cache;
 use crate::pktline::{PktReader, PktWriter, MAX_PKT_PAYLOAD};
+
+// Per-callsite caps on `read_binary_to`. Defense-in-depth against a
+// misbehaving peer pushing us into unbounded heap growth. Numbers are
+// well above any real bale workload, not tuned to a protocol limit.
+const SMUDGE_PAYLOAD_CAP: u64 = (pointer::POINTER_MAX_BYTES as u64) + 4096;
+const CLEAN_PAYLOAD_CAP: u64 = 128 * 1024 * 1024 * 1024;
+const DRAIN_PAYLOAD_CAP: u64 = 64 * 1024 * 1024;
 use crate::pointer;
 use crate::remote_manifest::fetch_manifest;
 use crate::resolver;
@@ -175,7 +182,7 @@ fn parse_headers(list: &[String]) -> Vec<(String, String)> {
 
 fn drain_payload<R: Read>(reader: &mut PktReader<R>) -> Result<()> {
     let mut sink = std::io::sink();
-    reader.read_binary_to(&mut sink)?;
+    reader.read_binary_to(&mut sink, DRAIN_PAYLOAD_CAP)?;
     Ok(())
 }
 
@@ -219,7 +226,7 @@ fn do_clean<R: Read, W: Write>(
     // read — the cache is verified by `(size, chunked_hashes)` so we'd just
     // be paying for blake3 we may not need.
     let mut tmp = NamedTempFile::new()?;
-    reader.read_binary_to(&mut tmp)?;
+    reader.read_binary_to(&mut tmp, CLEAN_PAYLOAD_CAP)?;
     tmp.flush()?;
     let file_size = tmp.as_file().metadata()?.len();
 
@@ -273,9 +280,9 @@ fn handle_clean<W: Write>(
     // Stage chunks/xorbs/shards under <git_dir>/bale/staging/ via xet-data's
     // LocalClient instead of uploading. `git-bale push-pending` (driven by a
     // pre-push hook) drains the staging dir at push time.
+    crate::fs_util::create_bale_subdir(git_dir, "staging")
+        .with_context(|| format!("creating staging dir under {}", git_dir.display()))?;
     let staging = staging_root(git_dir);
-    std::fs::create_dir_all(&staging)
-        .with_context(|| format!("creating staging dir {}", staging.display()))?;
     let translator =
         TranslatorConfig::local_config(&staging).context("building local TranslatorConfig")?;
     // Keep `tmp` alive across the bridge_sync — moving it into the async
@@ -283,7 +290,7 @@ fn handle_clean<W: Write>(
     // runs below. Pass only the path into the closure.
     let tmp_path = tmp.path().to_path_buf();
     let tmp_path_for_xet = tmp_path.clone();
-    let (pointer_bytes, file_hex) = rt
+    let (pointer_string, file_hex) = rt
         .bridge_sync(async move {
             let session = FileUploadSession::new(Arc::new(translator)).await?;
             let (info, _metrics) = xet_data::processing::data_client::clean_file(
@@ -294,8 +301,8 @@ fn handle_clean<W: Write>(
             .await?;
             session.finalize().await?;
             let file_hex = info.hash().to_string();
-            let bytes = pointer::encode_pointer(&info)?;
-            Ok::<_, anyhow::Error>((bytes, file_hex))
+            let s = pointer::encode_pointer_string(&info)?;
+            Ok::<_, anyhow::Error>((s, file_hex))
         })
         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 
@@ -310,10 +317,16 @@ fn handle_clean<W: Write>(
         tracing::warn!("failed to mark {file_hex} staged: {e}");
     }
 
+    // Respond to git first so the pipeline keeps moving; cache population
+    // below is best-effort and shouldn't delay the pointer landing in the
+    // index.
+    writer.write_text_list(&["status=success"])?;
+    writer.write_all_then_flush(pointer_string.as_bytes())?;
+    writer.write_text_list(&["status=success"])?;
+
     // Build the chunk index for next time. Failures here only sacrifice
     // future cache hits, not this clean's correctness. `tmp` is still owned
     // here, so the temp file is still on disk.
-    let pointer_string = String::from_utf8_lossy(&pointer_bytes).to_string();
     match clean_cache::compute_chunks(&tmp_path, file_size) {
         Ok(chunks) => {
             let entry = clean_cache::CacheEntry {
@@ -329,9 +342,6 @@ fn handle_clean<W: Write>(
         Err(e) => tracing::warn!("computing chunk index for {pathname}: {e}"),
     }
 
-    writer.write_text_list(&["status=success"])?;
-    writer.write_all_then_flush(&pointer_bytes)?;
-    writer.write_text_list(&["status=success"])?;
     Ok(())
 }
 
@@ -344,7 +354,7 @@ fn handle_smudge<R: Read, W: Write>(
     pathname: &str,
 ) -> Result<()> {
     let mut pointer_buf = Vec::with_capacity(256);
-    reader.read_binary_to(&mut pointer_buf)?;
+    reader.read_binary_to(&mut pointer_buf, SMUDGE_PAYLOAD_CAP)?;
     let info =
         pointer::parse_pointer(&pointer_buf).context("smudge: input is not a bale pointer")?;
 
@@ -373,6 +383,9 @@ fn handle_smudge<R: Read, W: Write>(
     };
     let chunk_cache = get_cache(&cache_cfg)
         .map_err(|e| anyhow!("init chunk cache at {}: {e}", raw.cache_dir.display()))?;
+    if let Err(e) = crate::fs_util::restrict_user_cache_dir(&raw.cache_dir) {
+        tracing::debug!("tightening perms on {}: {e}", raw.cache_dir.display());
+    }
 
     // ---- Hot path: cache-only reconstruction ----------------------------
     let tmp = NamedTempFile::new()?;
@@ -518,6 +531,16 @@ fn populate_clean_cache_from_smudge(
     pointer_bytes: &[u8],
     file_size: u64,
 ) {
+    // `pointer_bytes` was already validated as UTF-8 by `parse_pointer`
+    // upstream, so this clones once into an owned String without
+    // re-allocating for the lossy ASCII path.
+    let pointer = match std::str::from_utf8(pointer_bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            tracing::debug!("smudge: refusing to cache non-utf8 pointer for {pathname}");
+            return;
+        }
+    };
     let chunks = match clean_cache::compute_chunks(content_path, file_size) {
         Ok(c) => c,
         Err(e) => {
@@ -532,7 +555,7 @@ fn populate_clean_cache_from_smudge(
         v: clean_cache::CURRENT_VERSION,
         size: file_size,
         chunks,
-        pointer: String::from_utf8_lossy(pointer_bytes).to_string(),
+        pointer,
     };
     let key = clean_cache::path_key(pathname);
     if let Err(e) = clean_cache::save(git_dir, &key, &entry) {

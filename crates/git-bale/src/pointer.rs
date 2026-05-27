@@ -26,16 +26,22 @@ pub enum PointerError {
 }
 
 pub fn write_pointer<W: Write>(mut w: W, info: &XetFileInfo) -> Result<(), PointerError> {
-    let body = serde_json::to_string_pretty(info)?;
-    w.write_all(body.as_bytes())?;
-    w.write_all(b"\n")?;
+    let s = encode_pointer_string(info)?;
+    w.write_all(s.as_bytes())?;
     Ok(())
 }
 
 pub fn encode_pointer(info: &XetFileInfo) -> Result<Vec<u8>, PointerError> {
-    let mut buf = Vec::with_capacity(256);
-    write_pointer(&mut buf, info)?;
-    Ok(buf)
+    Ok(encode_pointer_string(info)?.into_bytes())
+}
+
+/// Like `encode_pointer` but skips the `String → bytes → String` round-trip
+/// when the caller wants both representations (e.g. to stream over pkt-line
+/// *and* stash in the clean cache without a `from_utf8` revalidation).
+pub fn encode_pointer_string(info: &XetFileInfo) -> Result<String, PointerError> {
+    let mut s = serde_json::to_string_pretty(info)?;
+    s.push('\n');
+    Ok(s)
 }
 
 pub fn parse_pointer(bytes: &[u8]) -> Result<XetFileInfo, PointerError> {
