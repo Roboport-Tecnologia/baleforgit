@@ -772,10 +772,27 @@ def force_resmudge_and_verify(
     expected_size: int,
     label: str,
 ) -> None:
-    """Delete the worktree file and force `git checkout --` to re-materialize
-    it via the bale smudge filter, then check sha256 + size. Exercises the
-    pointer-to-bytes round-trip — a plain stat/read of the worktree file
-    only re-reads whatever the user wrote, never the filter's output."""
+    """Hot-path resmudge: delete the worktree file, run `git checkout --`,
+    and verify sha256 + size. Asserts the chunk cache AND manifest cache
+    are populated as a precondition — otherwise the filter would silently
+    fall through to lukewarm/cold and the test wouldn't actually be
+    measuring the hot path."""
+    manifests = repo / ".git" / "bale" / "manifests"
+    cache_dir = get_bale_cache_dir(repo, env)
+    if not _has_any_file(manifests):
+        raise TestFailure(
+            f"[{label}] hot-path precondition violated: manifest cache "
+            f"{manifests} is empty — `git checkout --` would fall through "
+            "to lukewarm/cold and this test would silently measure the "
+            "wrong path"
+        )
+    if not _has_any_file(cache_dir):
+        raise TestFailure(
+            f"[{label}] hot-path precondition violated: chunk cache "
+            f"{cache_dir} is empty — `git checkout --` would fall through "
+            "to lukewarm/cold and this test would silently measure the "
+            "wrong path"
+        )
     p = repo / rel
     if p.exists():
         p.unlink()
@@ -1239,15 +1256,10 @@ def phase_basic_user_ops(
         expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
         label="basic:after-push",
     )
-    # Force a smudge round-trip through the local cache — the user's own
-    # bytes are gone, the filter has to rebuild them from the bale pointer.
-    with timings.measure("basic: hot resmudge after push"):
-        force_resmudge_and_verify(
-            repo, env, "small.bin",
-            expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
-            label="basic:hot-resmudge-after-push",
-        )
-    # Wipe local caches so the next checkout must hit /v1/reconstructions/.
+    # Cold-then-hot ordering: the lukewarm step above wiped the local caches,
+    # and `git push` doesn't repopulate them, so the only way to genuinely
+    # measure the hot path post-push is to first run a cold smudge (which
+    # repopulates the cache from the server) and only then the hot smudge.
     with timings.measure(
         "basic: cold resmudge after push", bytes_moved=SMALL_FILE_BYTES
     ):
@@ -1255,6 +1267,12 @@ def phase_basic_user_ops(
             repo, env, "small.bin",
             expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
             label="basic:cold-resmudge-after-push",
+        )
+    with timings.measure("basic: hot resmudge after push"):
+        force_resmudge_and_verify(
+            repo, env, "small.bin",
+            expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+            label="basic:hot-resmudge-after-push",
         )
 
 
@@ -1353,14 +1371,9 @@ def phase_big_file_dedup(
         expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
         label="bigfile-v1:after-push",
     )
-    with timings.measure(
-        "bigfile v1: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
-    ):
-        force_resmudge_and_verify(
-            repo, env, "bigfile.bin",
-            expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
-            label="bigfile-v1:hot-resmudge-after-push",
-        )
+    # Cold first to warm the cache via server download, then hot, otherwise
+    # the lukewarm step above would have left the cache empty and hot would
+    # silently fall through. See basic phase for the full rationale.
     with timings.measure(
         "bigfile v1: cold resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
@@ -1368,6 +1381,14 @@ def phase_big_file_dedup(
             repo, env, "bigfile.bin",
             expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
             label="bigfile-v1:cold-resmudge-after-push",
+        )
+    with timings.measure(
+        "bigfile v1: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
+    ):
+        force_resmudge_and_verify(
+            repo, env, "bigfile.bin",
+            expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+            label="bigfile-v1:hot-resmudge-after-push",
         )
     rev_state["commits"].append(
         git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()
@@ -1434,14 +1455,10 @@ def phase_big_file_dedup(
         expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
         label="bigfile-v2:after-push",
     )
-    with timings.measure(
-        "bigfile v2: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
-    ):
-        force_resmudge_and_verify(
-            repo, env, "bigfile.bin",
-            expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
-            label="bigfile-v2:hot-resmudge-after-push",
-        )
+    # v2 has no preceding lukewarm — v1's cold left the cache populated with
+    # v1's chunks, but those won't satisfy v2's smudge (different pointer,
+    # likely different chunks after CDC shift). Cold-then-hot makes the
+    # ordering invariant across all revisions.
     with timings.measure(
         "bigfile v2: cold resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
@@ -1449,6 +1466,14 @@ def phase_big_file_dedup(
             repo, env, "bigfile.bin",
             expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
             label="bigfile-v2:cold-resmudge-after-push",
+        )
+    with timings.measure(
+        "bigfile v2: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
+    ):
+        force_resmudge_and_verify(
+            repo, env, "bigfile.bin",
+            expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
+            label="bigfile-v2:hot-resmudge-after-push",
         )
     rev_state["commits"].append(
         git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()
@@ -1526,20 +1551,20 @@ def phase_big_file_dedup(
         label="bigfile-v3:after-push",
     )
     with timings.measure(
-        "bigfile v3: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
-    ):
-        force_resmudge_and_verify(
-            repo, env, "bigfile.bin",
-            expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
-            label="bigfile-v3:hot-resmudge-after-push",
-        )
-    with timings.measure(
         "bigfile v3: cold resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
         force_resmudge_cold(
             repo, env, "bigfile.bin",
             expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
             label="bigfile-v3:cold-resmudge-after-push",
+        )
+    with timings.measure(
+        "bigfile v3: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
+    ):
+        force_resmudge_and_verify(
+            repo, env, "bigfile.bin",
+            expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
+            label="bigfile-v3:hot-resmudge-after-push",
         )
     rev_state["commits"].append(
         git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()
@@ -1706,23 +1731,6 @@ def phase_dedup_duplicate_file(
         expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
         label="dedup:after-push-dup",
     )
-    # Force the bale filter to materialize both files from the local cache —
-    # dedup is only meaningful if the smudge path can still reconstruct the
-    # original bytes for each pointer, even though the dup didn't add any
-    # new chunks on the wire.
-    with timings.measure(
-        "dedup: hot resmudge orig + dup", bytes_moved=2 * BIG_FILE_BYTES
-    ):
-        force_resmudge_and_verify(
-            repo, env, "bigfile.bin",
-            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
-            label="dedup:hot-resmudge-orig",
-        )
-        force_resmudge_and_verify(
-            repo, env, "bigfile_dup.bin",
-            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
-            label="dedup:hot-resmudge-dup",
-        )
     # The dup's pointer references xorbs the server owes from v3; cold-path
     # smudge must download them under the *dup* repo's scope check and end
     # up at the exact same bytes as the original.
@@ -1743,6 +1751,23 @@ def phase_dedup_duplicate_file(
             repo, env, "bigfile.bin",
             expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
             label="dedup:cold-resmudge-orig",
+        )
+    # Hot path now exercises the cache that the cold resmudges just warmed.
+    # Because orig and dup share chunks (same pointer hash, bit-identical
+    # bytes), the manifests + chunks left over from the orig cold pass also
+    # satisfy a hot smudge of the dup.
+    with timings.measure(
+        "dedup: hot resmudge orig + dup", bytes_moved=2 * BIG_FILE_BYTES
+    ):
+        force_resmudge_and_verify(
+            repo, env, "bigfile.bin",
+            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            label="dedup:hot-resmudge-orig",
+        )
+        force_resmudge_and_verify(
+            repo, env, "bigfile_dup.bin",
+            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            label="dedup:hot-resmudge-dup",
         )
 
 
@@ -2416,19 +2441,11 @@ def main() -> int:
             server.stop()
         if client is not None and client.ssh_agent is not None:
             client.ssh_agent.stop()
-        # Best-effort: also kill any straggler we forgot about.
-        subprocess.run(
-            rt.cmd(
-                "ps",
-                "-a",
-                "--filter",
-                f"name={CONTAINER_NAME_PREFIX}-",
-                "--format",
-                "{{.Names}}",
-            ),
-            capture_output=True,
-            check=False,
-        )
+        # Note: per-phase containers (the offline-restart one and the quota
+        # one) are stopped inside their own phases via try/finally. We
+        # deliberately do NOT do a blanket `rm -f` on every container
+        # matching CONTAINER_NAME_PREFIX — that would clobber concurrent
+        # runs sharing the host (CI matrices, two devs on the same box).
         timings.print_report()
         if args.keep_tmpdir:
             info(f"keeping work dir: {tmpdir}")
