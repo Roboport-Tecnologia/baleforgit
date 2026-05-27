@@ -59,6 +59,19 @@ The workspace `Cargo.toml` `exclude`s the sibling clone of `xet-core/` from `car
 - SQLite tests use `:memory:` via `SqliteMetadataStore::open_path(":memory:")`.
 - Filesystem tests use `tempfile::tempdir().keep()`. Do NOT use `into_path` — it's deprecated and clippy will reject it under `-D warnings`.
 
+## Out-of-band full e2e harness
+
+`tests/e2e/run.py` is a Python harness that exercises the release `git-bale` binary against a podman container bundling `baleforgit-server` + `openssh-server`. It runs end-to-end over real SSH (both git push/clone and the Bale forge-auth handshake), covers the user-facing operations (stage / unstage / stash / pop / commit / push / clone) on a 35 MB binary with two slight modifications, verifies the `/v1/usage/...` API numbers agree with on-disk storage, and includes adversarial cases (wrong token, tampered xorb on disk, quota exceeded). Prints a per-phase timing + throughput summary at the end.
+
+It is **not** invoked by `cargo test --workspace` — run it explicitly, and only after producing a release binary:
+
+```bash
+cargo build --release -p git-bale
+python3 tests/e2e/run.py
+```
+
+The harness exits 77 when the environment can't host it (no podman daemon, no release binary, etc.), so CI can distinguish "skipped" from "failed". See [`tests/e2e/README.md`](../tests/e2e/README.md) for full prereqs, flags, and the phase list.
+
 ## CI and release artifacts
 
 GitHub Actions workflows live under `.github/workflows/`:
