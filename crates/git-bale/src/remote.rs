@@ -13,7 +13,6 @@
 //! The `.git` suffix on the path is optional and stripped if present.
 
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -148,24 +147,23 @@ fn strip_dot_git(p: &str) -> &str {
         .unwrap_or(p.trim_start_matches('/'))
 }
 
-/// Run `git -C <repo> remote get-url origin` and parse the result.
+/// Look up `origin`'s fetch URL via gix and parse it. Replaces a
+/// `git remote get-url origin` subprocess on the smudge cold path / push-pending
+/// auth resolution.
 pub fn parse_origin(repo: Option<&Path>) -> Result<RemoteUrl> {
-    let mut cmd = Command::new("git");
-    if let Some(p) = repo {
-        cmd.current_dir(p);
-    }
-    cmd.args(["remote", "get-url", "origin"]);
-    let out = cmd
-        .output()
-        .with_context(|| "spawning git remote get-url origin")?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "git remote get-url origin failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    parse_remote(&url)
+    let start_dir = repo
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| anyhow!("can't resolve cwd to discover repo"))?;
+    let gix_repo =
+        gix::discover(&start_dir).with_context(|| format!("opening repo at {start_dir:?}"))?;
+    let remote = gix_repo
+        .find_remote("origin")
+        .map_err(|e| anyhow!("git remote get-url origin: {e}"))?;
+    let url = remote
+        .url(gix::remote::Direction::Fetch)
+        .ok_or_else(|| anyhow!("origin has no fetch URL configured"))?;
+    parse_remote(&url.to_bstring().to_string())
 }
 
 #[cfg(test)]

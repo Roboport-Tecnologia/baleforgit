@@ -186,6 +186,12 @@ Transfer URL (referenced from `fetch_info`, signed query string, no bearer requi
 |--------|------|---------|
 | GET | `/xorb/default/{xorb_hash}?s=...&e=...&x=...&sig=...` | Byte-range fetch of a xorb |
 
+Browser file download (outside the JWT middleware — bearer rides in the query string because browsers can't carry `Authorization` on a 302 follow):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/v1/files/{file_id}?token=<forge-jwt>&repo=<owner/name>&filename=<name>` | Streams the reconstructed file. Forge (e.g. gitea) calls `check_repo_access` to validate the JWT against `repo`, then the M12 `file_in_repo` scope check runs locally (404 on miss). `filename` is honored for `Content-Disposition: attachment` only when its SHA-256 matches the `FilenameSHA256` claim in the JWT payload — caller-rewritten filenames on leaked URLs get 400. |
+
 Mock HF Hub token endpoint:
 
 | Method | Path | Purpose |
@@ -225,8 +231,35 @@ Layout on disk:
 <repo>/big.bin                          # worktree (one copy)
 <repo>/.git/bale/manifests/<file_id>.json # per-file reconstruction terms
 <repo>/.git/bale/staging/                 # pending xorbs+shards, drained by push-pending
+<repo>/.git/bale/clean-cache/<blake3(path)> # path-keyed, chunked-verified pointer cache
 ~/.cache/bale/chunks/                     # shared chunk pool across repos
 ```
+
+### Pointer cache (clean short-circuit)
+
+`git status` and `git diff` invalidate git's stat cache for any worktree file whose mtime/size differs from the index entry, then re-run the configured filter to recompute the worktree's hash. For our filter that's full CDC + xorb building + shard write — ~1–2 s for a 30 MiB file. With `git status` invoked routinely by shells, IDEs, and prompts, this gets painful fast.
+
+The clean filter keeps a per-repo pointer cache at `<git_dir>/bale/clean-cache/<blake3(pathname)>`. Each entry is JSON shaped:
+
+```json
+{ "v": 2, "size": 30000000, "chunks": [{ "start": 0, "end": 1048576, "hash": "..." }, ...], "pointer": "{...}\n" }
+```
+
+Verification order on every clean call:
+
+1. **Drain pkt-line into a temp file.** No hashing during the read — the chunk index is the verification mechanism.
+2. **Size check.** If `tmp.metadata().size` ≠ `entry.size`, the cache *can't* match — skip straight to the full clean. This is the cheapest possible negative signal.
+3. **Chunked verify.** A small thread pool hashes file regions in 1 MiB chunks and compares to `entry.chunks`. The order is `[first, last, 3 random middle samples, rest]` — edits cluster at file head/tail in practice (headers, appended log lines), so this catches the majority of mismatches in the first two reads. All workers share an `AtomicBool` and exit early as soon as any chunk diverges.
+4. **All chunks match** → write `entry.pointer` back to git and return.
+
+On miss, the full clean runs as before, then a fresh chunk index is computed from the temp file and saved. Cache hits stay side-effect-free (no staging touch, no marker touch), so a stale cache after `push-pending` drained staging just means future smudges fall to the cold path, which is correct.
+
+Entries are ~70 bytes per chunk; a 30 MiB file is ~30 chunks = ~2 KiB on disk. No eviction; manual reset is `rm -rf .git/bale/clean-cache/`.
+
+Two filter-process startup optimisations matter specifically because `git diff` pays them on every invocation (one filter-process per command):
+
+- `RawConfig::load` issues a single `git config --null --get-regexp '^bale\\.'` to fetch every `bale.*` key in one fork+exec, instead of four `git config --get` calls. Saves ~15–60 ms.
+- `XetRuntime::new()` is lazy. Its worker-thread stack allocations (8 MiB × n threads) aren't needed on a cache hit, so we hold an `Option<Arc<XetRuntime>>` and only fill it when the clean miss path or any smudge actually calls `bridge_sync`. Saves another ~20–50 ms on the cache-hit path.
 
 ### Deferred upload and `push-pending`
 
@@ -482,6 +515,7 @@ Client side (`crates/git-bale/`):
 | Pkt-line framing | `crates/git-bale/src/pktline.rs` |
 | JSON pointer encode/decode | `crates/git-bale/src/pointer.rs` |
 | Per-repo manifest cache (`.git/bale/manifests/`) | `crates/git-bale/src/manifest_cache.rs` |
+| Pointer cache for `clean` (`.git/bale/clean-cache/`) | `crates/git-bale/src/clean_cache.rs` |
 | Cache-only smudge fast path | `crates/git-bale/src/local_reconstruct.rs` |
 | Cold-path manifest fetch | `crates/git-bale/src/remote_manifest.rs` |
 | Config loader (env + `git config`) | `crates/git-bale/src/config.rs` |

@@ -13,7 +13,7 @@ use thiserror::Error;
 
 pub mod xorb;
 pub use xorb::{
-    build_uncompressed_xorb_body, parse_xorb_frames, verify_xorb_body,
+    build_uncompressed_xorb_body, decompress_xorb_chunks_into, parse_xorb_frames, verify_xorb_body,
     xorb_hash_for_uncompressed_chunks, XorbChunkFrame, XorbParseError, XorbVerifyError,
 };
 

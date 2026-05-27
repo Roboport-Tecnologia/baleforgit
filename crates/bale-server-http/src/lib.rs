@@ -4,7 +4,7 @@
 
 mod metrics;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -17,9 +17,9 @@ use bale_server_core::{
     HASH_LEN,
 };
 use bale_server_shard::{
-    parse_xorb_frames, serialize as serialize_shard, verify_xorb_body, CasChunkEntry,
-    ParsedCasBlock, ParsedShard, ShardFooter, ShardHeader, XorbVerifyError, FOOTER_SIZE,
-    MDB_SHARD_FOOTER_VERSION, MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
+    decompress_xorb_chunks_into, parse_xorb_frames, serialize as serialize_shard, verify_xorb_body,
+    CasChunkEntry, ParsedCasBlock, ParsedShard, ShardFooter, ShardHeader, XorbVerifyError,
+    FOOTER_SIZE, MDB_SHARD_FOOTER_VERSION, MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
 };
 use bale_server_wire::{
     decode_hash, encode_hash, CASReconstructionFetchInfo, CASReconstructionTerm,
@@ -121,6 +121,7 @@ where
         .merge(v1)
         .merge(admin)
         .route("/xorb/default/{hash}", get(get_xorb_transfer::<B, M, A>))
+        .route("/v1/files/{file_id}", get(get_file_download::<B, M, A>))
         .route(
             "/api/{type_seg}/{ns}/{name}/{tok_seg}/{rev}",
             get(issue_xet_token::<B, M, A>),
@@ -621,6 +622,233 @@ where
         terms: wire_terms,
         fetch_info,
     })
+}
+
+// ---- Handlers: browser file download ---------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct FileDownloadQuery {
+    /// Forge-issued JWT, mirrors the bearer the m11 client gets back from
+    /// `POST /info/bale/authenticate`. Rides the URL because browsers can't
+    /// attach Authorization on a 302 follow.
+    token: String,
+    /// `owner/name` — bale-server does not decode the forge JWT itself, so the
+    /// caller must name the repo explicitly. The forge's `check_access` then
+    /// verifies the JWT binds to this repo.
+    repo: String,
+    /// Optional. When set, gates the `Content-Disposition: attachment;
+    /// filename=` value: we ignore it unless the JWT carries a matching
+    /// SHA-256 in `FilenameSHA256`.
+    filename: Option<String>,
+}
+
+/// Just enough of the forge JWT body to extract the filename binding. Field
+/// name matches gitea's `services/lfs/server.go` `Claims.FilenameSHA256`
+/// (omitempty). We do NOT verify the JWT signature here — `check_repo_access`
+/// already does that on the forge, so an attacker can't substitute a JWT with
+/// a different filename hash without also passing the forge's signature check.
+#[derive(Debug, Default, Deserialize)]
+struct ForgeJwtPayload {
+    #[serde(rename = "FilenameSHA256", default)]
+    filename_sha256: String,
+}
+
+fn extract_filename_sha256(token: &str) -> Option<String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let mut parts = token.splitn(3, '.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let parsed: ForgeJwtPayload = serde_json::from_slice(&payload).ok()?;
+    if parsed.filename_sha256.is_empty() {
+        None
+    } else {
+        Some(parsed.filename_sha256)
+    }
+}
+
+fn parse_owner_name(repo: &str) -> Result<RepoRef, ApiError> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| bad_req("repo must be 'owner/name'"))?;
+    if owner.is_empty() || name.is_empty() {
+        return Err(bad_req("repo must be 'owner/name'"));
+    }
+    Ok(RepoRef {
+        repo_type: RepoType::Model,
+        repo_id: repo.to_string(),
+        revision: "main".to_string(),
+    })
+}
+
+/// Browser-facing single-URL download. The forge (gitea) 302s here from
+/// `/raw/...`; we stream the reconstructed file bytes so they never round-trip
+/// through the forge.
+///
+/// Lives outside the JWT [`auth_middleware`] because a 302 from the forge to
+/// us can't carry an Authorization header — the bearer rides in `?token=`
+/// instead. The same scope guarantees still apply: [`RepoAuthz::check_repo_access`]
+/// runs against the forge, and the file's per-repo scope check (the M12
+/// invariant) runs locally against `meta.file_in_repo`.
+async fn get_file_download<B, M, A>(
+    State(svc): State<Service<B, M, A>>,
+    Path(file_hex): Path<String>,
+    Query(q): Query<FileDownloadQuery>,
+) -> Result<Response, ApiError>
+where
+    B: BlobStore + 'static,
+    M: MetadataStore + 'static,
+    A: RepoAuthz + 'static,
+{
+    let file_hash =
+        FileHash(decode_hash(&file_hex).map_err(|e| bad_req(format!("malformed file id: {e}")))?);
+    let repo = parse_owner_name(&q.repo)?;
+
+    // Authoritative auth: forge verifies the JWT signature, scope, and binding
+    // to `repo`. We only learn the resolved user (logged for the access trail).
+    let user = svc
+        .authz
+        .check_repo_access(&q.token, &repo, Scope::Read)
+        .await
+        .map_err(ApiError::from)?;
+
+    // M12 scope check: 404 (not 403) so cross-repo probes can't enumerate.
+    if !svc.meta.file_in_repo(&file_hash, &repo.repo_id).await? {
+        return Err(ApiError(StatusCode::NOT_FOUND, "file not found".into()));
+    }
+
+    // Filename binding: only honor a caller-supplied `filename` when its hash
+    // matches the JWT claim minted by the forge. Without this check, anyone
+    // sharing a leaked URL could rewrite the download name (and confuse
+    // browsers about file types). Missing claim ⇒ no Content-Disposition; an
+    // explicit mismatch is a 400 because the URL was tampered with.
+    let validated_filename = match (&q.filename, extract_filename_sha256(&q.token)) {
+        (Some(name), Some(claim)) => {
+            use sha2::Digest;
+            let mut hasher = Sha256::new();
+            hasher.update(name.as_bytes());
+            let got = hex::encode(hasher.finalize());
+            if !ct_eq(got.as_bytes(), claim.as_bytes()) {
+                return Err(bad_req("filename does not match token binding"));
+            }
+            Some(name.clone())
+        }
+        _ => None,
+    };
+
+    let terms = svc
+        .meta
+        .lookup_file(&file_hash)
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "file not found".into()))?;
+
+    let total_bytes: u64 = terms.iter().map(|t| t.unpacked_segment_bytes as u64).sum();
+
+    // Stream term by term so a multi-GiB download never lives in the server's
+    // address space. Each yield is one term's assembled bytes (one xorb range
+    // round-trip + frame decompression); an error mid-stream surfaces as a
+    // transport error to the client because headers are already sent.
+    let svc_for_stream = svc.clone();
+    let file_hex_for_log = file_hex.clone();
+    let user_for_log = user.0.clone();
+    let stream = async_stream::stream! {
+        for term in terms {
+            let item: Result<Bytes, std::io::Error> =
+                match fetch_and_decompress_term(&svc_for_stream, &term).await {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) => {
+                        tracing::error!(
+                            file = %file_hex_for_log,
+                            user = %user_for_log,
+                            status = e.0.as_u16(),
+                            error = %e.1,
+                            "file download: term reconstruction failed; truncating stream",
+                        );
+                        Err(std::io::Error::other(format!(
+                            "term reconstruction failed: {}",
+                            e.1
+                        )))
+                    }
+                };
+            let is_err = item.is_err();
+            yield item;
+            if is_err {
+                break;
+            }
+        }
+    };
+
+    let mut resp = Response::new(Body::from_stream(stream));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    resp.headers_mut()
+        .insert("content-length", HeaderValue::from(total_bytes));
+    if let Some(name) = validated_filename {
+        let value = HeaderValue::try_from(format!(
+            "attachment; filename=\"{}\"",
+            sanitize_filename(&name)
+        ))
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("filename: {e}")))?;
+        resp.headers_mut().insert("content-disposition", value);
+    }
+    Ok(resp)
+}
+
+async fn fetch_and_decompress_term<B, M, A>(
+    svc: &Service<B, M, A>,
+    term: &FileTerm,
+) -> Result<Bytes, ApiError>
+where
+    B: BlobStore,
+    M: MetadataStore,
+    A: RepoAuthz,
+{
+    let layout = svc.meta.xorb_frame_layout(&term.xorb).await?;
+    if layout.is_empty() {
+        return Err(ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "xorb on-disk layout missing — upload predates layout indexing".into(),
+        ));
+    }
+    if (term.chunk_idx_end as usize) > layout.len() {
+        return Err(ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "term chunk range exceeds xorb's known frames".into(),
+        ));
+    }
+    let start_frame = &layout[term.chunk_idx_start as usize];
+    let last_frame = &layout[(term.chunk_idx_end - 1) as usize];
+    let byte_start = start_frame.on_disk_start as u64;
+    let byte_end = (last_frame.on_disk_start as u64) + (last_frame.on_disk_len as u64);
+
+    let body = svc
+        .blobs
+        .get_xorb_range(&term.xorb, byte_start..byte_end)
+        .await?;
+    let mut out = Vec::with_capacity(term.unpacked_segment_bytes as usize);
+    decompress_xorb_chunks_into(&body, &mut out).map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("decompress term: {e}"),
+        )
+    })?;
+    Ok(Bytes::from(out))
+}
+
+/// Strip characters that would break a quoted Content-Disposition header.
+/// The value goes inside double quotes; drop quotes, backslashes, control
+/// bytes, and non-ASCII so the header stays well-formed without escaping.
+/// RFC 5987 (`filename*=`) would preserve unicode, but most browsers also
+/// accept this ASCII-only fallback.
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .filter(|c| !matches!(c, '"' | '\\'))
+        .collect()
 }
 
 // ---- Handlers: global dedup ------------------------------------------------

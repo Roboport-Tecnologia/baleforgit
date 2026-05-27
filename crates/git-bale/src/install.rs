@@ -107,38 +107,28 @@ fn uninstall_pre_push_hook(repo: Option<&Path>) -> Result<()> {
 }
 
 fn resolve_hook_path(repo: Option<&Path>, hook_name: &str) -> Result<PathBuf> {
-    // `git rev-parse --git-path hooks/<name>` handles worktrees and
-    // `core.hooksPath` overrides correctly; constructing `<repo>/.git/hooks/...`
-    // by hand does not.
-    let mut cmd = Command::new("git");
-    if let Some(p) = repo {
-        cmd.current_dir(p);
-    }
-    cmd.arg("rev-parse")
-        .arg("--git-path")
-        .arg(format!("hooks/{hook_name}"));
-    let out = cmd
-        .output()
-        .with_context(|| "spawning git rev-parse --git-path")?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "git rev-parse --git-path hooks/{hook_name} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        return Err(anyhow!("git rev-parse returned an empty path"));
-    }
-    let p = PathBuf::from(&raw);
-    if p.is_absolute() {
-        return Ok(p);
-    }
-    let base = repo
-        .map(|r| r.to_path_buf())
+    // gix gives us the git dir directly, including for worktrees. `core.hooksPath`
+    // is honoured if the config has it set (we read the merged snapshot the same
+    // way git does).
+    let start_dir = repo
+        .map(|p| p.to_path_buf())
         .or_else(|| std::env::current_dir().ok())
-        .ok_or_else(|| anyhow!("can't resolve cwd to anchor relative hook path"))?;
-    Ok(base.join(p))
+        .ok_or_else(|| anyhow!("can't resolve cwd to anchor hook path"))?;
+    let gix_repo =
+        gix::discover(&start_dir).with_context(|| format!("opening repo at {start_dir:?}"))?;
+    let snapshot = gix_repo.config_snapshot();
+    let hooks_root = if let Some(p) = snapshot.string("core.hooksPath") {
+        let s = p.to_string();
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            PathBuf::from(trimmed)
+        } else {
+            gix_repo.git_dir().join("hooks")
+        }
+    } else {
+        gix_repo.git_dir().join("hooks")
+    };
+    Ok(hooks_root.join(hook_name))
 }
 
 fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {

@@ -17,7 +17,7 @@ use xet_data::processing::data_client::default_config;
 use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy};
 use xet_runtime::core::XetRuntime;
 
-use crate::clean_cache::{self, ContentKey, TeeHasher};
+use crate::clean_cache::{self, PathKey};
 use crate::config::BaleConfig;
 use crate::local_reconstruct::{try_reconstruct_from_cache, CacheReconstructOutcome};
 use crate::manifest_cache;
@@ -215,43 +215,50 @@ fn do_clean<R: Read, W: Write>(
     writer: &mut PktWriter<W>,
     pathname: &str,
 ) -> Result<()> {
-    // Tee the pkt-line payload into both a temp file (for xet-data) and a
-    // blake3 hasher (for the pointer cache lookup) — single pass, no extra
-    // disk reads.
+    // Drain the pkt-line payload into a temp file. No hashing during the
+    // read — the cache is verified by `(size, chunked_hashes)` so we'd just
+    // be paying for blake3 we may not need.
     let mut tmp = NamedTempFile::new()?;
-    let content_key = {
-        let mut tee = TeeHasher::new(tmp.as_file_mut());
-        reader.read_binary_to(&mut tee)?;
-        tee.finalize().1
-    };
+    reader.read_binary_to(&mut tmp)?;
     tmp.flush()?;
+    let file_size = tmp.as_file().metadata()?.len();
 
     let git_dir = raw.git_dir.as_deref().ok_or_else(|| {
         anyhow!("clean: cannot stage upload — no git directory resolved from cwd")
     })?;
+    let cache_key = clean_cache::path_key(pathname);
 
     // Pointer cache: `git status` / `git diff` re-invoke clean on every
-    // command for any modified bale-filtered file. The pointer JSON is a
-    // pure function of the input bytes, so a content-keyed cache turns the
-    // second-and-onward calls into a stat + read.
-    match clean_cache::load(git_dir, &content_key) {
-        Ok(Some(cached)) if pointer::parse_pointer(&cached).is_ok() => {
-            writer.write_text_list(&["status=success"])?;
-            writer.write_all_then_flush(&cached)?;
-            writer.write_text_list(&["status=success"])?;
-            return Ok(());
-        }
-        Ok(Some(_)) => {
-            tracing::warn!(
-                "clean-cache entry for {pathname} didn't parse as a pointer; re-cleaning"
-            );
+    // command for any modified bale-filtered file. Look up the per-path
+    // entry, short-circuit on size mismatch, then sample-verify chunks.
+    match clean_cache::load(git_dir, &cache_key) {
+        Ok(Some(entry)) => {
+            if entry.size != file_size {
+                tracing::debug!(
+                    "clean-cache size diverged for {pathname} (cached {} vs actual {file_size}); full clean",
+                    entry.size
+                );
+            } else {
+                match clean_cache::verify_chunks(&entry.chunks, tmp.path(), file_size) {
+                    Ok(true) => {
+                        writer.write_text_list(&["status=success"])?;
+                        writer.write_all_then_flush(entry.pointer.as_bytes())?;
+                        writer.write_text_list(&["status=success"])?;
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        tracing::debug!("clean-cache chunk mismatch for {pathname}; full clean");
+                    }
+                    Err(e) => tracing::debug!("clean-cache verify IO error: {e}; full clean"),
+                }
+            }
         }
         Ok(None) => {}
         Err(e) => tracing::debug!("clean-cache load failed for {pathname}: {e}; full clean"),
     }
 
     let rt = ensure_runtime(rt_slot)?;
-    handle_clean(rt, git_dir, tmp, writer, pathname, &content_key)
+    handle_clean(rt, git_dir, tmp, writer, pathname, &cache_key, file_size)
 }
 
 fn handle_clean<W: Write>(
@@ -260,7 +267,8 @@ fn handle_clean<W: Write>(
     tmp: NamedTempFile,
     writer: &mut PktWriter<W>,
     pathname: &str,
-    content_key: &ContentKey,
+    cache_key: &PathKey,
+    file_size: u64,
 ) -> Result<()> {
     // Stage chunks/xorbs/shards under <git_dir>/bale/staging/ via xet-data's
     // LocalClient instead of uploading. `git-bale push-pending` (driven by a
@@ -270,12 +278,17 @@ fn handle_clean<W: Write>(
         .with_context(|| format!("creating staging dir {}", staging.display()))?;
     let translator =
         TranslatorConfig::local_config(&staging).context("building local TranslatorConfig")?;
+    // Keep `tmp` alive across the bridge_sync — moving it into the async
+    // closure would drop (and unlink) the temp file before `compute_chunks`
+    // runs below. Pass only the path into the closure.
+    let tmp_path = tmp.path().to_path_buf();
+    let tmp_path_for_xet = tmp_path.clone();
     let (pointer_bytes, file_hex) = rt
         .bridge_sync(async move {
             let session = FileUploadSession::new(Arc::new(translator)).await?;
             let (info, _metrics) = xet_data::processing::data_client::clean_file(
                 session.clone(),
-                tmp.path(),
+                &tmp_path_for_xet,
                 Sha256Policy::Compute,
             )
             .await?;
@@ -297,8 +310,23 @@ fn handle_clean<W: Write>(
         tracing::warn!("failed to mark {file_hex} staged: {e}");
     }
 
-    if let Err(e) = clean_cache::save(git_dir, content_key, &pointer_bytes) {
-        tracing::warn!("saving clean-cache entry for {pathname}: {e}");
+    // Build the chunk index for next time. Failures here only sacrifice
+    // future cache hits, not this clean's correctness. `tmp` is still owned
+    // here, so the temp file is still on disk.
+    let pointer_string = String::from_utf8_lossy(&pointer_bytes).to_string();
+    match clean_cache::compute_chunks(&tmp_path, file_size) {
+        Ok(chunks) => {
+            let entry = clean_cache::CacheEntry {
+                v: clean_cache::CURRENT_VERSION,
+                size: file_size,
+                chunks,
+                pointer: pointer_string,
+            };
+            if let Err(e) = clean_cache::save(git_dir, cache_key, &entry) {
+                tracing::warn!("saving clean-cache entry for {pathname}: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("computing chunk index for {pathname}: {e}"),
     }
 
     writer.write_text_list(&["status=success"])?;

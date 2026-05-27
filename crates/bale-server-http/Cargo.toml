@@ -7,8 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-stream.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 hex.workspace = true

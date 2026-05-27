@@ -89,6 +89,12 @@ git-bale treats the JWT as opaque — it just forwards it to baleforgit-server a
 
 The forge then implements `POST /check_access` (see `bale-server-authz-http`) to verify the JWT it issued and return the user identity to baleforgit-server. Because verification and issuance live in the same process, the forge can pick whatever JWT scheme it likes — baleforgit-server never tries to parse the bearer itself.
 
+### Browser file download (`GET /v1/files/{file_id}`)
+
+The forge can also use this JWT to 302 a browser straight into baleforgit-server's `GET /v1/files/{file_id}?token=&repo=&filename=` endpoint, so "view raw" / "download" links don't proxy file bytes through the forge. baleforgit-server delegates the JWT validation back to the forge via `check_access` exactly like the `git-bale` flow does — but with one extra invariant the forge participates in:
+
+- If the JWT is going to be used in a redirect URL, include a `FilenameSHA256` claim — hex SHA-256 of the filename the forge wants the browser to download as. baleforgit-server reads this claim out of the JWT payload (signature is irrelevant — `check_access` is the source of truth) and rejects any `?filename=` query that doesn't hash to it (HTTP 400). Without this binding, anyone with the redirect URL could rewrite the `Content-Disposition` filename and trick a browser into a different file type.
+
 ## Why this shape
 
 - **Mirrors `git-lfs-authenticate`.** A forge that supports LFS already has SSH `git-lfs-authenticate`, an HTTPS LFS Batch endpoint, and Basic-auth credential handling. The Bale endpoints follow the same patterns under a different name.

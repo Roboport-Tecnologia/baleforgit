@@ -243,6 +243,70 @@ async fn native_filter_push_then_pull() {
         "expected staging dir at {} after `git add`",
         staging_dir.display()
     );
+
+    // Pointer cache: the clean filter persists `<git_dir>/bale/clean-cache/
+    // <blake3>` and short-circuits future clean calls for the same content.
+    // After the first `git add` there must be at least one entry.
+    let cache_dir = work.join(".git").join("bale").join("clean-cache");
+    let cache_entries_after_add: Vec<_> = std::fs::read_dir(&cache_dir)
+        .expect("clean-cache dir should exist after `git add`")
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(is_64_lower_hex)
+        })
+        .collect();
+    assert!(
+        !cache_entries_after_add.is_empty(),
+        "expected at least one clean-cache entry after `git add big.bin`"
+    );
+
+    // Cache entries are now path-keyed with a chunked verification index.
+    // The JSON shape must carry: a version field, a size matching `payload`,
+    // and a non-empty `chunks` array with hex hashes.
+    let cache_blob = std::fs::read(&cache_entries_after_add[0]).unwrap();
+    let cache_json: serde_json::Value =
+        serde_json::from_slice(&cache_blob).expect("cache entry is JSON");
+    assert_eq!(
+        cache_json.get("v").and_then(|v| v.as_u64()),
+        Some(2),
+        "expected schema v=2"
+    );
+    assert_eq!(
+        cache_json.get("size").and_then(|s| s.as_u64()),
+        Some(payload.len() as u64),
+        "size field must match the cleaned file"
+    );
+    let chunks = cache_json
+        .get("chunks")
+        .and_then(|c| c.as_array())
+        .expect("chunks array");
+    assert!(!chunks.is_empty(), "chunk list must be non-empty");
+    for c in chunks {
+        let hash = c.get("hash").and_then(|h| h.as_str()).unwrap();
+        assert_eq!(hash.len(), 64, "hash must be 64 hex chars");
+        assert!(c.get("start").and_then(|x| x.as_u64()).is_some());
+        assert!(c.get("end").and_then(|x| x.as_u64()).is_some());
+    }
+
+    // Force a second clean of the same content (via re-add) — should be a
+    // cache hit, so no new staged xorbs or shards land beyond what's already
+    // there. We capture the staging snapshot, re-touch the file's mtime to
+    // make git re-run the filter, and re-add. The post-add staging snapshot
+    // must be identical to the pre-add one.
+    let staging_before_recean = staging_files_remaining(&staging_dir);
+    run_git(&work, &["update-index", "--again"]);
+    // `update-index --again` may or may not re-run the filter depending on
+    // stat caching; the more reliable trigger is to overwrite the worktree
+    // file with the same bytes (which bumps mtime) and `git add` it again.
+    std::fs::write(&big_path, &payload).unwrap();
+    run_git(&work, &["add", "big.bin"]);
+    let staging_after_reclean = staging_files_remaining(&staging_dir);
+    assert_eq!(
+        staging_before_recean, staging_after_reclean,
+        "second clean of identical content should hit the pointer cache and not re-stage"
+    );
     assert!(
         meta.count_xorbs().await.unwrap() == 0,
         "no xorbs should be on the server before push-pending"

@@ -187,6 +187,49 @@ pub fn verify_xorb_body(body: &[u8], expected: &XorbHash) -> Result<(), XorbVeri
     Ok(())
 }
 
+/// Decompress every chunk frame in `body` (which holds the bytes for one
+/// reconstruction term, i.e. the on-disk range covering one or more contiguous
+/// chunks of a single xorb) and append the result to `out` in order. Mirrors
+/// the per-frame loop in [`verify_xorb_body`] but without the hash check —
+/// callers (e.g. the file-download streamer) already know the xorb is intact.
+pub fn decompress_xorb_chunks_into(body: &[u8], out: &mut Vec<u8>) -> Result<(), XorbVerifyError> {
+    let frames = parse_xorb_frames(body)?;
+    for (i, f) in frames.iter().enumerate() {
+        let payload_start = f.on_disk_start as usize + HEADER_LEN;
+        let payload_end = f.on_disk_start as usize + f.on_disk_len as usize;
+        let payload = &body[payload_start..payload_end];
+
+        let scheme = match f.compression_scheme {
+            0 => CompressionScheme::None,
+            1 => CompressionScheme::LZ4,
+            2 => CompressionScheme::ByteGrouping4LZ4,
+            other => {
+                return Err(XorbVerifyError::Parse(
+                    XorbParseError::BadCompressionScheme {
+                        frame_index: i,
+                        scheme: other,
+                    },
+                ));
+            }
+        };
+        let decompressed = scheme.decompress_from_slice(payload).map_err(|e| {
+            XorbVerifyError::DecompressFailed {
+                frame_index: i,
+                message: e.to_string(),
+            }
+        })?;
+        if decompressed.len() != f.uncompressed_len as usize {
+            return Err(XorbVerifyError::LengthMismatch {
+                frame_index: i,
+                declared: f.uncompressed_len as usize,
+                actual: decompressed.len(),
+            });
+        }
+        out.extend_from_slice(&decompressed);
+    }
+    Ok(())
+}
+
 /// Compute the xorb merkle hash for the same chunks `build_uncompressed_xorb_body`
 /// would serialize. Tests that hand-roll xorb uploads use this to produce a URL
 /// hash that passes `verify_xorb_body`.
