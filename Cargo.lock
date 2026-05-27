@@ -800,6 +800,7 @@ name = "bale-server-tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bale-server-authz-http",
  "bale-server-authz-mem",
@@ -812,6 +813,7 @@ dependencies = [
  "bale-server-tokens",
  "bale-server-wire",
  "base64",
+ "blake3",
  "bytes",
  "hex",
  "hmac 0.13.0",

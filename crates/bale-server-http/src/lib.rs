@@ -359,8 +359,13 @@ where
         });
     }
     let body_len = body.len() as u64;
-    let was_inserted = svc.blobs.put_xorb(&xorb, body).await?;
+    // Register layout BEFORE writing the blob: a layout row with no backing
+    // blob is harmless (shard upload's `blobs.xorb_exists` gate rejects, and
+    // m6's ghost-xorb dedup tests cover the read-side handling), but a blob
+    // with no layout permanently wedges every file that references it because
+    // reconstruction can't compute byte ranges.
     svc.meta.register_xorb_layout(&xorb, &layout).await?;
+    let was_inserted = svc.blobs.put_xorb(&xorb, body).await?;
     metrics::XORBS_UPLOADED.add(
         1,
         &[KeyValue::new(
@@ -396,12 +401,22 @@ where
             )));
         }
     }
+    // Reject malformed file terms before any metadata write: chunk_idx_end == 0
+    // (or start >= end) is the trap that underflows `chunk_idx_end - 1` in the
+    // reconstruction handler. Catch it at the trust boundary so bad terms never
+    // reach SQLite.
     for f in &parsed.files {
         for e in &f.entries {
             if !svc.blobs.xorb_exists(&e.xorb).await? {
                 return Err(bad_req(format!(
                     "shard references missing xorb {:?}",
                     e.xorb.0
+                )));
+            }
+            if e.chunk_idx_start >= e.chunk_idx_end {
+                return Err(bad_req(format!(
+                    "shard file term has empty/inverted chunk range [{}, {})",
+                    e.chunk_idx_start, e.chunk_idx_end
                 )));
             }
         }
@@ -452,6 +467,10 @@ where
         }
     }
 
+    // Materialize file terms up front so a per-file shape error (verification
+    // count mismatch) fails the whole upload before any state changes.
+    let mut files_to_register: Vec<(FileHash, Vec<FileTerm>)> =
+        Vec::with_capacity(parsed.files.len());
     for f in &parsed.files {
         let has_verification = !f.verifications.is_empty();
         if has_verification && f.verifications.len() != f.entries.len() {
@@ -475,14 +494,25 @@ where
                 },
             })
             .collect();
-        svc.meta
-            .register_file(&f.file_hash, &claims.repo, &terms)
-            .await?;
+        files_to_register.push((f.file_hash, terms));
     }
 
+    // Persist the shard archive first. It's content-addressed and inert
+    // without a metadata reference, so an orphan blob is cheap (GC-able)
+    // and recoverable on retry. Doing this before the atomic file-registration
+    // means a partial failure can never produce orphan file rows pointing at
+    // a missing shard archive.
     let shard_hash = shard_storage_hash(&body);
     let body_len = body.len() as u64;
     svc.blobs.put_shard(&shard_hash, body).await?;
+
+    // Single-transaction commit of all file registrations: a fault inside the
+    // batch rolls back the whole shard, so the client's "500 = nothing
+    // happened" mental model holds.
+    svc.meta
+        .register_files(&claims.repo, &files_to_register)
+        .await?;
+
     metrics::SHARDS_UPLOADED.add(1, &[]);
     metrics::UPLOAD_BYTES.add(body_len, &[KeyValue::new("kind", "shard")]);
 
@@ -553,10 +583,10 @@ where
                 "xorb on-disk layout missing — upload predates layout indexing".into(),
             )
         })?;
-        if (t.chunk_idx_end as usize) > layout.len() {
+        if t.chunk_idx_start >= t.chunk_idx_end || (t.chunk_idx_end as usize) > layout.len() {
             return Err(ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "term chunk range exceeds xorb's known frames".into(),
+                "term chunk range invalid or exceeds xorb's known frames".into(),
             ));
         }
         let start_frame = &layout[t.chunk_idx_start as usize];
@@ -809,10 +839,10 @@ where
             "xorb on-disk layout missing — upload predates layout indexing".into(),
         ));
     }
-    if (term.chunk_idx_end as usize) > layout.len() {
+    if term.chunk_idx_start >= term.chunk_idx_end || (term.chunk_idx_end as usize) > layout.len() {
         return Err(ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "term chunk range exceeds xorb's known frames".into(),
+            "term chunk range invalid or exceeds xorb's known frames".into(),
         ));
     }
     let start_frame = &layout[term.chunk_idx_start as usize];

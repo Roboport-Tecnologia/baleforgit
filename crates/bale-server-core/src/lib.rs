@@ -227,6 +227,23 @@ pub trait MetadataStore: Send + Sync {
         terms: &[FileTerm],
     ) -> CoreResult<()>;
 
+    /// Atomically register many files in a single commit. The shard upload
+    /// handler uses this so a partial fault doesn't leak an orphan file row
+    /// that the client thinks didn't get uploaded. Default impl loops over
+    /// [`Self::register_file`] (non-atomic — for in-memory test stores where
+    /// no partial state is observable mid-loop anyway); SQL-backed stores
+    /// should override with a single transaction.
+    async fn register_files(
+        &self,
+        repo: &RepoRef,
+        files: &[(FileHash, Vec<FileTerm>)],
+    ) -> CoreResult<()> {
+        for (file_hash, terms) in files {
+            self.register_file(file_hash, repo, terms).await?;
+        }
+        Ok(())
+    }
+
     /// Record a xorb's on-disk frame layout. Required for
     /// [`Self::xorb_frame_layout`] to return anything.
     async fn register_xorb_layout(

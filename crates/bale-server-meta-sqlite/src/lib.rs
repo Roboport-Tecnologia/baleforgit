@@ -157,6 +157,59 @@ fn hash_to_blob(h: &Hash32) -> Vec<u8> {
     h.as_bytes().to_vec()
 }
 
+/// Shared body between [`SqliteMetadataStore::register_file`] and the
+/// batch [`SqliteMetadataStore::register_files`] — both want the same per-file
+/// writes but inside different transaction scopes (one tx per file vs one
+/// tx for the whole shard).
+async fn write_file_in_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    file_hash: &FileHash,
+    repo: &RepoRef,
+    terms: &[FileTerm],
+) -> CoreResult<()> {
+    let total_bytes: u64 = terms.iter().map(|t| t.unpacked_segment_bytes as u64).sum();
+
+    sqlx::query(
+        "INSERT OR REPLACE INTO files (file_hash, repo_type, repo_id, revision, total_bytes, created_at, owner)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(hash_to_blob(&file_hash.0))
+    .bind(format!("{:?}", repo.repo_type).to_lowercase())
+    .bind(&repo.repo_id)
+    .bind(&repo.revision)
+    .bind(total_bytes as i64)
+    .bind(now_unix())
+    .bind(repo.owner())
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| CoreError::Internal(format!("insert file: {e}")))?;
+
+    // Terms are content-addressed by file_hash, so a re-register carries
+    // identical terms — IGNORE the duplicate rather than DELETE+INSERT,
+    // which would briefly expose an empty term list to a concurrent reader.
+    let indexed: Vec<(usize, &FileTerm)> = terms.iter().enumerate().collect();
+    for batch in indexed.chunks(CHUNK_INSERT_BATCH) {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "INSERT OR IGNORE INTO file_terms
+             (file_hash, term_index, xorb_hash, chunk_idx_start, chunk_idx_end, unpacked_bytes, verification) ",
+        );
+        qb.push_values(batch, |mut b, (idx, t)| {
+            b.push_bind(hash_to_blob(&file_hash.0))
+                .push_bind(*idx as i64)
+                .push_bind(hash_to_blob(&t.xorb.0))
+                .push_bind(t.chunk_idx_start as i64)
+                .push_bind(t.chunk_idx_end as i64)
+                .push_bind(t.unpacked_segment_bytes as i64)
+                .push_bind(t.verification.as_ref().map(hash_to_blob));
+        });
+        qb.build()
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| CoreError::Internal(format!("insert terms: {e}")))?;
+    }
+    Ok(())
+}
+
 /// SQLite `SUM(INTEGER)` returns i64. A negative result implies overflow —
 /// `.max(0) as u64` would silently mask that to 0, which is the worst possible
 /// behavior for quota accounting (limits effectively vanish). Surface it as
@@ -237,51 +290,36 @@ impl MetadataStore for SqliteMetadataStore {
         repo: &RepoRef,
         terms: &[FileTerm],
     ) -> CoreResult<()> {
-        let total_bytes: u64 = terms.iter().map(|t| t.unpacked_segment_bytes as u64).sum();
-
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| CoreError::Internal(format!("begin: {e}")))?;
 
-        sqlx::query(
-            "INSERT OR REPLACE INTO files (file_hash, repo_type, repo_id, revision, total_bytes, created_at, owner)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(hash_to_blob(&file_hash.0))
-        .bind(format!("{:?}", repo.repo_type).to_lowercase())
-        .bind(&repo.repo_id)
-        .bind(&repo.revision)
-        .bind(total_bytes as i64)
-        .bind(now_unix())
-        .bind(repo.owner())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| CoreError::Internal(format!("insert file: {e}")))?;
+        write_file_in_tx(&mut tx, file_hash, repo, terms).await?;
 
-        // Terms are content-addressed by file_hash, so a re-register carries
-        // identical terms — IGNORE the duplicate rather than DELETE+INSERT,
-        // which would briefly expose an empty term list to a concurrent reader.
-        let indexed: Vec<(usize, &FileTerm)> = terms.iter().enumerate().collect();
-        for batch in indexed.chunks(CHUNK_INSERT_BATCH) {
-            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-                "INSERT OR IGNORE INTO file_terms
-                 (file_hash, term_index, xorb_hash, chunk_idx_start, chunk_idx_end, unpacked_bytes, verification) ",
-            );
-            qb.push_values(batch, |mut b, (idx, t)| {
-                b.push_bind(hash_to_blob(&file_hash.0))
-                    .push_bind(*idx as i64)
-                    .push_bind(hash_to_blob(&t.xorb.0))
-                    .push_bind(t.chunk_idx_start as i64)
-                    .push_bind(t.chunk_idx_end as i64)
-                    .push_bind(t.unpacked_segment_bytes as i64)
-                    .push_bind(t.verification.as_ref().map(hash_to_blob));
-            });
-            qb.build()
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| CoreError::Internal(format!("insert terms: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Internal(format!("commit: {e}")))?;
+        Ok(())
+    }
+
+    async fn register_files(
+        &self,
+        repo: &RepoRef,
+        files: &[(FileHash, Vec<FileTerm>)],
+    ) -> CoreResult<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Internal(format!("begin: {e}")))?;
+
+        for (file_hash, terms) in files {
+            write_file_in_tx(&mut tx, file_hash, repo, terms).await?;
         }
 
         tx.commit()

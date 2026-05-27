@@ -108,6 +108,11 @@ pub trait MetadataStore: Send + Sync {
     async fn register_xorb(&self, xorb: &XorbInfo, chunks: &[ChunkRow]) -> CoreResult<()>;
     async fn register_file(&self, file_hash: &FileHash, repo: &RepoRef,
                            terms: &[FileTerm]) -> CoreResult<()>;
+    // Atomic batch — `upload_shard` calls this once per shard. SQLite
+    // override wraps every file write in a single transaction so a fault
+    // can't leave half-committed file rows the client thinks didn't upload.
+    async fn register_files(&self, repo: &RepoRef,
+                            files: &[(FileHash, Vec<FileTerm>)]) -> CoreResult<()>;
 
     // On-disk frame layout — populated at xorb upload time by parsing the
     // chunk frame headers; required to translate shard chunk-index ranges
@@ -427,7 +432,7 @@ Two numbers, both queryable by `GET /v1/usage/{owner}` (which returns JSON `{own
 Quotas are **soft** — under concurrent uploads two writers can both pass the check then both succeed, slightly overshooting. That tradeoff buys us no extra locking on the hot path. Two enforcement points:
 
 1. **At `POST /v1/xorbs/{prefix}/{hash}`**: if the xorb already exists in CAS, the call is content-addressed-idempotent and skipped — re-pushes never reject. Otherwise we conservatively check `stored_bytes_for_owner + body.len() ≤ quota` and 413 on miss. This blocks the obvious "upload terabytes" failure mode at the door.
-2. **At `POST /shards`**: after xorb metadata is registered but *before* `register_file`, we compute the projected post-commit stored bytes — current stored plus the on-disk sizes of xorbs the owner doesn't already reference (`unaccounted_xorb_bytes_for_owner`). 413 on miss, and `register_file` never runs, so no file rows are left behind.
+2. **At `POST /shards`**: after xorb metadata is registered but *before* `register_files` (the atomic batch), we compute the projected post-commit stored bytes — current stored plus the on-disk sizes of xorbs the owner doesn't already reference (`unaccounted_xorb_bytes_for_owner`). 413 on miss, and `register_files` never runs, so no file rows are left behind.
 
 The second check is load-bearing because the first one's "skip if exists" shortcut would otherwise let an owner gain attributable bytes by referencing someone else's xorb without paying. Drives `m13_quotas_and_usage::quota_blocks_at_shard_upload_for_cross_owner_dedup`.
 
@@ -475,7 +480,10 @@ See [`SERVER.md` § "Observability"](SERVER.md#observability) for the operator-f
 These are the easy-to-get-wrong parts of the protocol. Calling them out explicitly so they don't get re-broken.
 
 - **Xet hash hex encoding** (spec §"Converting Hashes to Strings"). Not plain hex. Bytes are reordered as four little-endian u64s before stringifying. The spec text shows a doc-typo example missing one byte; the actual algorithm produces 64 hex chars from 32 input bytes. See `bale_server_wire::{encode_hash, decode_hash}` and its `hash_hex_spec_vector` test.
-- **Shard upload validation** — every xorb referenced by an uploaded shard MUST already be in the `xorbs` table (we return 400 otherwise). Per-term `FileVerificationEntry` MUST be present (spec says "MUST be set for shard uploads"). We can additionally re-verify by recomputing the term verification hash against the chunk hashes we already indexed — *not done yet*; tracked as a hardening TODO.
+- **Shard upload validation** — every xorb referenced by an uploaded shard MUST already be in the `xorbs` table (we return 400 otherwise). Per-term `FileVerificationEntry` MUST be present (spec says "MUST be set for shard uploads"). Per-term `chunk_idx_start < chunk_idx_end` is checked at the trust boundary — an empty/inverted range used to underflow `chunk_idx_end - 1` at reconstruction time and crash the request task; now rejected with 400 before any metadata write, plus a defensive `start >= end` guard at both reconstruction sites. We can additionally re-verify by recomputing the term verification hash against the chunk hashes we already indexed — *not done yet*; tracked as a hardening TODO.
+- **Write ordering across the two stores** — both upload handlers commit metadata-first, then blob-store:
+    - **`POST /v1/xorbs/...`** writes `register_xorb_layout` BEFORE `put_xorb`. A layout row with no backing blob is harmless: the next shard upload's `blobs.xorb_exists` check rejects with 400 (`missing xorb`), and the M6 ghost-xorb dedup tests already cover the "metadata says yes, blob says no" shape. The inverse — blob with no layout — used to wedge every file referencing that xorb permanently (reconstruction returns 500 "xorb on-disk layout missing"), so that direction is now explicitly forbidden.
+    - **`POST /shards`** writes `put_shard` first (content-addressed archive, inert without metadata pointing at it — orphan archive is GC-able and recoverable on retry), then registers all xorb metadata, then commits every file in a SINGLE atomic batch via `register_files`. A partial fault inside the batch rolls back the whole shard; the client's "500 ⇒ nothing happened" mental model holds. The earlier per-file loop could leave the first N-1 file rows committed while the client believed the upload failed — those orphans were then reachable to anyone who knew the file hash.
 - **`url_range.end` is inclusive** in the wire format (matches HTTP `Range:` semantics). The chunk-index `range.end` is **exclusive**. We translate carefully in `get_reconstruction`.
 - **Idempotency** — `POST /v1/xorbs/{prefix}/{hash}` and `POST /shards` are content-addressed; re-uploading the same content MUST return 200, not error. `was_inserted: false` on the xorb side; `result: 0` on the shard side (we currently always return `1`; both are spec-defined "success — value is informational").
 - **The server does decompress on `POST /v1/xorbs/...` (and only there).** Every chunk frame is decompressed via xet-core's `CompressionScheme` (None / LZ4-frame / BG4-LZ4) so the server can recompute each chunk's `compute_data_hash`, aggregate via `xorb_hash`, and compare to the URL hash. Mismatch → 400 before anything is persisted. This is the load-bearing integrity check that keeps a writer from corrupting the CAS by uploading bytes that don't match the content hash. Implemented in `bale_server_shard::xorb::verify_xorb_body`. Outside of this verification step, payload bytes are still treated as opaque: reconstruction streams raw xorb bytes through signed transfer URLs without touching the compressed payload.
