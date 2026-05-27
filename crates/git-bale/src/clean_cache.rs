@@ -130,6 +130,32 @@ pub fn save(git_dir: &Path, key: &PathKey, entry: &CacheEntry) -> io::Result<()>
     fs::rename(&tmp, &final_path)
 }
 
+/// Like [`compute_chunks`] but for a byte slice already in memory — saves the
+/// disk round-trip when the clean filter receives the payload via pkt-line and
+/// holds it in RAM instead of spilling to a tmp file.
+pub fn compute_chunks_from_slice(bytes: &[u8]) -> Vec<Chunk> {
+    let size = bytes.len() as u64;
+    let mut chunks = Vec::with_capacity((size.div_ceil(CHUNK_SIZE).max(1)) as usize);
+    let mut pos = 0u64;
+    while pos < size {
+        let end = (pos + CHUNK_SIZE).min(size);
+        chunks.push(Chunk {
+            start: pos,
+            end,
+            hash: chunk_hash_hex(&bytes[pos as usize..end as usize]),
+        });
+        pos = end;
+    }
+    if chunks.is_empty() {
+        chunks.push(Chunk {
+            start: 0,
+            end: 0,
+            hash: chunk_hash_hex(b""),
+        });
+    }
+    chunks
+}
+
 /// Build the chunk index by hashing `path` in 1 MiB blocks. Returns one
 /// zero-length chunk for empty files so verify always has at least one
 /// fingerprint to compare against.
@@ -158,6 +184,35 @@ pub fn compute_chunks(path: &Path, size: u64) -> io::Result<Vec<Chunk>> {
         });
     }
     Ok(chunks)
+}
+
+/// In-memory counterpart of [`verify_chunks`]. No threading: the slice is
+/// already in RAM so memcpy + xxh3 dominate; one pass per chunk on the calling
+/// thread beats fan-out overhead. Bail on the first mismatch.
+pub fn verify_chunks_in_memory(cached: &[Chunk], bytes: &[u8]) -> bool {
+    if cached.is_empty() {
+        return false;
+    }
+    let file_size = bytes.len() as u64;
+    let covered: u64 = cached.iter().map(|c| c.end - c.start).sum();
+    if covered != file_size {
+        return false;
+    }
+    for c in cached {
+        let Ok(expected) = u64::from_str_radix(&c.hash, 16) else {
+            return false;
+        };
+        if c.hash.len() != 16 {
+            return false;
+        }
+        if c.end > file_size {
+            return false;
+        }
+        if chunk_hash(&bytes[c.start as usize..c.end as usize]) != expected {
+            return false;
+        }
+    }
+    true
 }
 
 /// Verify the contents of `path` match every fingerprint in `cached`.
@@ -451,6 +506,47 @@ mod tests {
         let chunks = compute_chunks(&path, 0).unwrap();
         assert_eq!(chunks.len(), 1);
         assert!(verify_chunks(&chunks, &path, 0).unwrap());
+    }
+
+    #[test]
+    fn in_memory_round_trips_and_matches_file_path_variant() {
+        // ~3.5 MiB so we get 4 chunks (3 full + 1 partial), same as the file
+        // variant — guard against the two implementations drifting apart.
+        let body: Vec<u8> = (0..3_500_000u32).map(|i| (i & 0xff) as u8).collect();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        fs::write(&path, &body).unwrap();
+        let file_chunks = compute_chunks(&path, body.len() as u64).unwrap();
+        let mem_chunks = compute_chunks_from_slice(&body);
+        assert_eq!(file_chunks.len(), mem_chunks.len());
+        for (a, b) in file_chunks.iter().zip(&mem_chunks) {
+            assert_eq!((a.start, a.end, &a.hash), (b.start, b.end, &b.hash));
+        }
+        assert!(verify_chunks_in_memory(&mem_chunks, &body));
+    }
+
+    #[test]
+    fn in_memory_verify_detects_mid_chunk_edit() {
+        let mut body: Vec<u8> = (0..2_500_000u32).map(|i| (i & 0xff) as u8).collect();
+        let chunks = compute_chunks_from_slice(&body);
+        body[1_234_567] ^= 0xff;
+        assert!(!verify_chunks_in_memory(&chunks, &body));
+    }
+
+    #[test]
+    fn in_memory_verify_rejects_size_mismatch() {
+        let body = vec![3u8; 1_500_000];
+        let chunks = compute_chunks_from_slice(&body);
+        // Truncate by one byte — the chunk's covered span no longer matches.
+        assert!(!verify_chunks_in_memory(&chunks, &body[..body.len() - 1]));
+    }
+
+    #[test]
+    fn in_memory_empty_file_yields_one_zero_chunk() {
+        let chunks = compute_chunks_from_slice(b"");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!((chunks[0].start, chunks[0].end), (0, 0));
+        assert!(verify_chunks_in_memory(&chunks, b""));
     }
 
     #[test]

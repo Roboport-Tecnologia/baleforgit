@@ -215,6 +215,69 @@ fn ensure_runtime(slot: &mut Option<Arc<XetRuntime>>) -> Result<&Arc<XetRuntime>
     Ok(slot.as_ref().unwrap())
 }
 
+/// Above this size we spill the pkt-line payload to a tmp file instead of
+/// holding the full file in RAM. Picked to keep peak RSS bounded for the
+/// common bale workloads (single-digit GiB binaries) while still being big
+/// enough that essentially every realistic file stays in-memory and avoids
+/// the disk round-trip that previously cost ~250 ms on a 350 MiB file.
+const MAX_INLINE_CLEAN: usize = 4 * 1024 * 1024 * 1024;
+
+/// Holds the clean payload either entirely in memory or spilled to a tmp file.
+/// Whichever branch we take, downstream cache-verify and xet-pipeline calls
+/// pick the matching code path.
+enum CleanPayload {
+    InMemory(Vec<u8>),
+    Spilled(NamedTempFile),
+}
+
+/// Drain the pkt-line clean payload. Stays in `Vec<u8>` until it would exceed
+/// `MAX_INLINE_CLEAN`, at which point we transfer accumulated bytes to a tmp
+/// file and continue spilling there. Bytes received are unchanged either way
+/// — the choice is purely about where they live.
+fn drain_clean_payload<R: Read>(reader: &mut PktReader<R>) -> Result<(CleanPayload, u64)> {
+    use crate::pktline::Packet;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut spilled: Option<NamedTempFile> = None;
+    let mut total: u64 = 0;
+    loop {
+        match reader.read_packet()? {
+            Packet::Flush => break,
+            Packet::Data(bytes) => {
+                let n = bytes.len() as u64;
+                if total.saturating_add(n) > CLEAN_PAYLOAD_CAP {
+                    return Err(anyhow!(
+                        "pkt-line payload exceeded cap of {CLEAN_PAYLOAD_CAP} bytes"
+                    ));
+                }
+                if let Some(f) = spilled.as_mut() {
+                    f.write_all(&bytes)?;
+                } else if buf.len().saturating_add(bytes.len()) > MAX_INLINE_CLEAN {
+                    let mut f = NamedTempFile::new()?;
+                    f.write_all(&buf)?;
+                    f.write_all(&bytes)?;
+                    buf = Vec::new();
+                    spilled = Some(f);
+                } else {
+                    buf.extend_from_slice(&bytes);
+                }
+                total += n;
+            }
+            other => {
+                return Err(anyhow!(
+                    "expected pkt-line data or flush in clean payload, got {other:?}"
+                ));
+            }
+        }
+    }
+    let payload = if let Some(mut f) = spilled {
+        f.flush()?;
+        CleanPayload::Spilled(f)
+    } else {
+        CleanPayload::InMemory(buf)
+    };
+    Ok((payload, total))
+}
+
 fn do_clean<R: Read, W: Write>(
     rt_slot: &mut Option<Arc<XetRuntime>>,
     raw: &crate::config::RawConfig,
@@ -222,13 +285,7 @@ fn do_clean<R: Read, W: Write>(
     writer: &mut PktWriter<W>,
     pathname: &str,
 ) -> Result<()> {
-    // Drain the pkt-line payload into a temp file. No hashing during the
-    // read — the cache is verified by `(size, chunked_hashes)` so we'd just
-    // be paying for blake3 we may not need.
-    let mut tmp = NamedTempFile::new()?;
-    reader.read_binary_to(&mut tmp, CLEAN_PAYLOAD_CAP)?;
-    tmp.flush()?;
-    let file_size = tmp.as_file().metadata()?.len();
+    let (payload, file_size) = drain_clean_payload(reader)?;
 
     let git_dir = raw.git_dir.as_deref().ok_or_else(|| {
         anyhow!("clean: cannot stage upload — no git directory resolved from cwd")
@@ -246,7 +303,15 @@ fn do_clean<R: Read, W: Write>(
                     entry.size
                 );
             } else {
-                match clean_cache::verify_chunks(&entry.chunks, tmp.path(), file_size) {
+                let verified = match &payload {
+                    CleanPayload::InMemory(buf) => {
+                        Ok(clean_cache::verify_chunks_in_memory(&entry.chunks, buf))
+                    }
+                    CleanPayload::Spilled(tmp) => {
+                        clean_cache::verify_chunks(&entry.chunks, tmp.path(), file_size)
+                    }
+                };
+                match verified {
                     Ok(true) => {
                         writer.write_text_list(&["status=success"])?;
                         writer.write_all_then_flush(entry.pointer.as_bytes())?;
@@ -265,7 +330,73 @@ fn do_clean<R: Read, W: Write>(
     }
 
     let rt = ensure_runtime(rt_slot)?;
-    handle_clean(rt, git_dir, tmp, writer, pathname, &cache_key, file_size)
+    match payload {
+        CleanPayload::InMemory(buf) => {
+            handle_clean_in_memory(rt, git_dir, buf, writer, pathname, &cache_key, file_size)
+        }
+        CleanPayload::Spilled(tmp) => {
+            handle_clean(rt, git_dir, tmp, writer, pathname, &cache_key, file_size)
+        }
+    }
+}
+
+/// In-memory variant of [`handle_clean`] used when the pkt-line payload fits
+/// in `MAX_INLINE_CLEAN` and we never spilled to disk. Saves both the tmp-file
+/// write and the second full read that `clean_file` would do, plus the third
+/// read that `compute_chunks` would do — the chunk index is built from the
+/// same buffer that already lives in RAM.
+fn handle_clean_in_memory<W: Write>(
+    rt: &Arc<XetRuntime>,
+    git_dir: &Path,
+    bytes: Vec<u8>,
+    writer: &mut PktWriter<W>,
+    pathname: &str,
+    cache_key: &PathKey,
+    file_size: u64,
+) -> Result<()> {
+    crate::fs_util::create_bale_subdir(git_dir, "staging")
+        .with_context(|| format!("creating staging dir under {}", git_dir.display()))?;
+    let staging = staging_root(git_dir);
+    let translator =
+        TranslatorConfig::local_config(&staging).context("building local TranslatorConfig")?;
+    // Build the cache index from the in-memory buffer BEFORE handing ownership
+    // of the Vec to xet-data — clean_bytes consumes it.
+    let chunks = clean_cache::compute_chunks_from_slice(&bytes);
+    let (pointer_string, file_hex) = rt
+        .bridge_sync(async move {
+            let session = FileUploadSession::new(Arc::new(translator)).await?;
+            let (info, _metrics) = xet_data::processing::data_client::clean_bytes(
+                session.clone(),
+                bytes,
+                Sha256Policy::Compute,
+            )
+            .await?;
+            session.finalize().await?;
+            let file_hex = info.hash().to_string();
+            let s = pointer::encode_pointer_string(&info)?;
+            Ok::<_, anyhow::Error>((s, file_hex))
+        })
+        .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+
+    if let Err(e) = mark_file_staged(git_dir, &file_hex) {
+        tracing::warn!("failed to mark {file_hex} staged: {e}");
+    }
+
+    writer.write_text_list(&["status=success"])?;
+    writer.write_all_then_flush(pointer_string.as_bytes())?;
+    writer.write_text_list(&["status=success"])?;
+
+    let entry = clean_cache::CacheEntry {
+        v: clean_cache::CURRENT_VERSION,
+        size: file_size,
+        chunks,
+        pointer: pointer_string,
+    };
+    if let Err(e) = clean_cache::save(git_dir, cache_key, &entry) {
+        tracing::warn!("saving clean-cache entry for {pathname}: {e}");
+    }
+
+    Ok(())
 }
 
 fn handle_clean<W: Write>(
