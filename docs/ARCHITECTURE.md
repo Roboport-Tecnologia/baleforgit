@@ -217,24 +217,41 @@ Design properties:
 - **Pretty-printed JSON pointer** with stable key order (`hash`, `file_size`, `sha256`). Tracked as a normal blob, parseable without xet-core.
 - **Long-running process**: one filter-process subprocess per `git add` / `git checkout` fan-out, not one subprocess per file.
 - **Deduplicated per-user chunk cache** instead of a whole-file local store — the worktree file is the only full copy on disk.
+- **Deferred upload**: `git add` chunks and stages locally; `git push` (via a pre-push hook) is what actually moves bytes to the server.
 
 Layout on disk:
 
 ```
 <repo>/big.bin                          # worktree (one copy)
 <repo>/.git/bale/manifests/<file_id>.json # per-file reconstruction terms
+<repo>/.git/bale/staging/                 # pending xorbs+shards, drained by push-pending
 ~/.cache/bale/chunks/                     # shared chunk pool across repos
 ```
 
-### Hot vs cold smudge
+### Deferred upload and `push-pending`
 
-On `command=smudge` (filter sees a pointer, must reconstruct), git-bale first tries a **cache-only** path:
+`clean` (driven by `git add` / `git commit`) does not touch the network. It builds a `FileUploadSession` via `TranslatorConfig::local_config(<git_dir>/bale/staging/)`, which routes xet-data through `LocalClient` — xorbs land at `…/xet/xorbs/xorbs/default.<hex>` and shards at `…/xet/xorbs/shards/<hex>.mdb`. The pointer Git stores is identical to the synchronous-upload flow; only the upload is deferred. Authentication is **not** resolved during clean (no `git credential fill`, no forge auth roundtrip), so `git add` works on a fully offline laptop.
 
-1. Load `.git/bale/manifests/<file_id>.json`. Returns `None` for missing / malformed / unknown-version manifests — all three trigger the cold path.
-2. For each cached term, ask the local chunk cache (`xet-client::chunk_cache`) for the chunk range. Any miss → fall back to the cold path.
-3. Concatenate the chunk bytes into a temp file. Length checks guard against stale manifests corrupting the worktree.
+`git-bale push-pending` is the drain step. It:
 
-If the cache path fails or doesn't run, git-bale falls back to the standard `FileDownloadSession::download_to_writer` — same code path xet-core uses for HF-Hub-hosted Xet content. It additionally writes the manifest to `.git/bale/manifests/` as a side effect so subsequent checkouts go through the hot path. The manifest stores only content-addressed `terms` (xorb hash + chunk-index range), **not** `fetch_info` URLs — those signed URLs expire after `SIGNATURE_TTL_SECS` (10 min) and aren't safe to persist.
+1. Walks the staging tree for `default.<hex>` (xorbs) and `<hex>.mdb` (shards).
+2. Resolves write-scoped auth via the standard forge protocol.
+3. POSTs each xorb to `/v1/xorbs/default/{hash}` and each shard to `/shards`. Xorbs go first because `/shards` rejects shards referencing unknown xorbs.
+4. Strips the lookup tables + footer from each shard before upload by truncating to `MDBShardFile.shard.metadata.file_lookup_offset` and rewriting the header's `footer_size` field to 0 — same algorithm as xet-data's private `read_shard_to_bytes_remove_footer`. Without this step the bale shard parser sees lookup bytes where it expects either the cas-info bookend or the footer, and 400s.
+5. Deletes each local file on 2xx and best-effort `rmdir`s now-empty directories. Re-running after a partial failure is safe because both endpoints are content-addressed and idempotent (`was_inserted: false` on a repeat xorb, `result: 0` on a repeat shard).
+
+`git-bale install --local` writes a `.git/hooks/pre-push` that just `exec`s `git-bale push-pending`. The hook carries a `bale-marker:` line so `git-bale uninstall --local` removes it without clobbering a hand-written hook. Global / system-scope installs don't touch the hook — hooks are inherently per-repo. The hook path comes from `git rev-parse --git-path hooks/pre-push` so worktrees and `core.hooksPath` overrides resolve correctly.
+
+### Hot vs lukewarm vs cold smudge
+
+On `command=smudge` (filter sees a pointer, must reconstruct), git-bale tries three paths in order, falling through on failure:
+
+1. **Hot path** — cache-only reconstruction:
+   1. Load `.git/bale/manifests/<file_id>.json`. Returns `None` for missing / malformed / unknown-version manifests — all three trigger the next path.
+   2. For each cached term, ask the local chunk cache (`xet-client::chunk_cache`) for the chunk range. Any miss → fall through.
+   3. Concatenate the chunk bytes into a temp file. Length checks guard against stale manifests corrupting the worktree.
+2. **Lukewarm path** — staging-dir reconstruction. After `git add` but before `git-bale push-pending`, the xorbs/shards are still under `.git/bale/staging/`. We open a `FileDownloadSession` against `TranslatorConfig::local_config(<git_dir>/bale/staging/)` and call `download_to_writer(info, 0..file_size, dest)`. Any error (missing xorb, missing shard, post-push-pending empty tree) is logged at `debug` and we fall through. This keeps `git add big.bin && rm big.bin && git checkout -- big.bin` working before the user has pushed. Gated on a per-file marker `<staging>/file-index/<file_hex>` written by `clean` — without it, smudges for file hashes we never staged (e.g. `git stash`'s HEAD-restore phase) drop into xet-data's `ReconstructionTermManager`, return zero terms, and trip a `debug_assert_eq!` in its progress tracker that calls `update_item_size(0, true)` after a previous `update_item_size(file_size, true)` already finalized the size. Release builds drop the assert; dev builds panic. `push-pending` clears the markers after a successful drain so they don't outlive the staged bytes.
+3. **Cold path** — `FileDownloadSession::download_to_writer` against the remote bale server, same code path xet-core uses for HF-Hub-hosted Xet content. As a side effect, it also writes the manifest to `.git/bale/manifests/` so subsequent checkouts go through the hot path. The manifest stores only content-addressed `terms` (xorb hash + chunk-index range), **not** `fetch_info` URLs — those signed URLs expire after `SIGNATURE_TTL_SECS` (10 min) and aren't safe to persist.
 
 Critical detail: the cold path passes `0..file_size` (not `FileRange::full()`, which xet-core defaults to) to `download_to_writer`. baleforgit-server has no Range support on `/v1/reconstructions/*`, and xet-data's prefetcher fans out to up to 256 MiB beyond EOF when given an unbounded range — every prefetched block then re-fetches the full file terms and trips xet-data's `SequentialWriter` contiguity check. The cap keeps the prefetcher quiet. Drives `m11_native_filter`.
 
@@ -470,6 +487,8 @@ Client side (`crates/git-bale/`):
 | Config loader (env + `git config`) | `crates/git-bale/src/config.rs` |
 | Remote URL parsing (http/https/ssh) | `crates/git-bale/src/remote.rs` |
 | Forge auth resolver | `crates/git-bale/src/resolver.rs` |
-| `git-bale install` / `git-bale uninstall` | `crates/git-bale/src/install.rs` |
+| `git-bale install` / `git-bale uninstall` (+ pre-push hook) | `crates/git-bale/src/install.rs` |
+| `git-bale push-pending` (drain `.git/bale/staging/`) | `crates/git-bale/src/push_pending.rs` |
+| Local staging-dir path helper | `crates/git-bale/src/staging.rs` |
 | `git-bale track` (`.gitattributes` writer) | `crates/git-bale/src/track.rs` |
 | `git-bale mount-diff` (read-only FUSE diff view) | `crates/git-bale/src/mount/` |

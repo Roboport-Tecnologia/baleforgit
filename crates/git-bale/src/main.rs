@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use git_bale::install::{self, Scope};
 use git_bale::mount::{self, MountDiffArgs, MountRevArgs};
-use git_bale::{filter_process, track};
+use git_bale::{filter_process, push_pending, track};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -34,6 +34,9 @@ enum Command {
     Track(TrackArgs),
     /// Run the long-running filter protocol. Invoked by Git, not by users.
     FilterProcess,
+    /// Upload any xorbs/shards staged by `clean` (`git add`) to the configured
+    /// bale server. Invoked from the pre-push hook installed by `git-bale install`.
+    PushPending,
     /// Mount a read-only virtual FS exposing both sides of a `git diff`.
     MountDiff(MountDiffCliArgs),
     /// Mount a read-only virtual FS exposing the files at one revision.
@@ -108,6 +111,7 @@ struct MountCliArgs {
 }
 
 fn main() -> Result<()> {
+    set_default_xet_cache_root();
     let cli = Cli::parse();
 
     let log_level = match cli.verbose {
@@ -149,6 +153,7 @@ fn main() -> Result<()> {
             track::track(&cwd, &a.patterns)
         }
         Command::FilterProcess => filter_process::run(),
+        Command::PushPending => push_pending::run(),
         Command::MountDiff(a) => mount::run(MountDiffArgs {
             rev_a: a.rev_a,
             rev_b: a.rev_b,
@@ -163,6 +168,23 @@ fn main() -> Result<()> {
             paths: a.paths,
         }),
     }
+}
+
+/// Redirect xet-runtime's per-endpoint cache root to a bale-branded path so
+/// the default isn't `~/.cache/huggingface/xet`. Respects an explicit
+/// `HF_XET_CACHE` override. Must run before any threads spawn — Rust's
+/// `set_var` is UB in a multi-threaded process on some platforms.
+fn set_default_xet_cache_root() {
+    if std::env::var_os("HF_XET_CACHE").is_some() {
+        return;
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
+    let Some(base) = base else { return };
+    let path = base.join("bale").join("xet");
+    // SAFETY: called from main() before any threads or async runtime spawn.
+    unsafe { std::env::set_var("HF_XET_CACHE", path) };
 }
 
 fn pick_scope(system: bool, local: bool) -> Scope {

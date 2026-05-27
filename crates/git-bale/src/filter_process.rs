@@ -6,6 +6,7 @@
 //! with the reconstructed file content.
 
 use std::io::{stdin, stdout, Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -23,6 +24,7 @@ use crate::pktline::{PktReader, PktWriter, MAX_PKT_PAYLOAD};
 use crate::pointer;
 use crate::remote_manifest::fetch_manifest;
 use crate::resolver;
+use crate::staging::{file_is_staged, mark_file_staged, staging_root};
 
 const VERSION: &str = "version=2";
 
@@ -40,9 +42,9 @@ pub fn run() -> Result<()> {
     handshake(&mut reader, &mut writer)?;
     negotiate_capabilities(&mut reader, &mut writer)?;
 
-    // Auth is cached per scope. A single filter-process invocation typically
-    // does only push or only fetch/checkout, so usually only one fills in.
-    let mut clean_cfg: Option<BaleConfig> = None;
+    // Smudge auth is cached for the life of this filter-process. Clean no
+    // longer needs auth — it writes to <git_dir>/bale/staging/ and the actual
+    // upload happens later via `git-bale push-pending`.
     let mut smudge_cfg: Option<BaleConfig> = None;
 
     loop {
@@ -72,14 +74,7 @@ pub fn run() -> Result<()> {
         // Git can surface them and continue with the next entry.
         match command {
             "clean" => {
-                if let Err(e) = do_clean(
-                    &rt,
-                    &raw,
-                    &mut clean_cfg,
-                    &mut reader,
-                    &mut writer,
-                    pathname,
-                ) {
+                if let Err(e) = do_clean(&rt, &raw, &mut reader, &mut writer, pathname) {
                     report_request_error(&mut reader, &mut writer, "clean", pathname, &e)?;
                 }
             }
@@ -202,31 +197,37 @@ fn report_request_error<R: Read, W: Write>(
 fn do_clean<R: Read, W: Write>(
     rt: &Arc<XetRuntime>,
     raw: &crate::config::RawConfig,
-    auth_slot: &mut Option<BaleConfig>,
     reader: &mut PktReader<R>,
     writer: &mut PktWriter<W>,
     pathname: &str,
 ) -> Result<()> {
-    // Read the payload first so a later auth failure doesn't leave the
-    // pkt-line stream desynced.
+    // Read the payload first so a later failure doesn't leave the pkt-line
+    // stream desynced.
     let mut tmp = NamedTempFile::new()?;
     reader.read_binary_to(&mut tmp)?;
     tmp.flush()?;
-    let cfg = resolve_cached(auth_slot, raw, rt, resolver::Scope::Write)?;
-    handle_clean(rt, cfg, tmp, writer, pathname)
+    let git_dir = raw.git_dir.as_deref().ok_or_else(|| {
+        anyhow!("clean: cannot stage upload — no git directory resolved from cwd")
+    })?;
+    handle_clean(rt, git_dir, tmp, writer, pathname)
 }
 
 fn handle_clean<W: Write>(
     rt: &Arc<XetRuntime>,
-    cfg: &BaleConfig,
+    git_dir: &Path,
     tmp: NamedTempFile,
     writer: &mut PktWriter<W>,
     _pathname: &str,
 ) -> Result<()> {
-    // Spooling to a temp file lets us reuse the path-based `clean_file` API
-    // and keeps `FileUploadSession::new` off the hot pkt-line loop.
-    let translator = build_translator_config(cfg)?;
-    let pointer_bytes = rt
+    // Stage chunks/xorbs/shards under <git_dir>/bale/staging/ via xet-data's
+    // LocalClient instead of uploading. `git-bale push-pending` (driven by a
+    // pre-push hook) drains the staging dir at push time.
+    let staging = staging_root(git_dir);
+    std::fs::create_dir_all(&staging)
+        .with_context(|| format!("creating staging dir {}", staging.display()))?;
+    let translator =
+        TranslatorConfig::local_config(&staging).context("building local TranslatorConfig")?;
+    let (pointer_bytes, file_hex) = rt
         .bridge_sync(async move {
             let session = FileUploadSession::new(Arc::new(translator)).await?;
             let (info, _metrics) = xet_data::processing::data_client::clean_file(
@@ -236,9 +237,22 @@ fn handle_clean<W: Write>(
             )
             .await?;
             session.finalize().await?;
-            pointer::encode_pointer(&info).map_err(anyhow::Error::from)
+            let file_hex = info.hash().to_string();
+            let bytes = pointer::encode_pointer(&info)?;
+            Ok::<_, anyhow::Error>((bytes, file_hex))
         })
         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+
+    // Marker tells the lukewarm smudge fallback that this file_hash is
+    // reconstructable from staging. Without it, smudges for other file_hashes
+    // (e.g. `git stash`'s HEAD-restore phase, where staging holds the modified
+    // version's chunks but smudge wants the HEAD version) drop into xet-data's
+    // term-prefetch loop, return zero terms, and trip a `debug_assert_eq!` in
+    // its progress tracker. Best-effort: a failed marker write is a perf
+    // regression on the next checkout-after-add, not a correctness issue.
+    if let Err(e) = mark_file_staged(git_dir, &file_hex) {
+        tracing::warn!("failed to mark {file_hex} staged: {e}");
+    }
 
     writer.write_text_list(&["status=success"])?;
     writer.write_all_then_flush(&pointer_bytes)?;
@@ -322,8 +336,31 @@ fn handle_smudge<R: Read, W: Write>(
         false
     };
 
+    // ---- Lukewarm path: bytes still staged locally, not yet pushed ------
+    // Gated on a per-file marker the clean filter wrote when it staged the
+    // file. Without the marker, attempting reconstruction tickles a
+    // `debug_assert_eq!` panic in xet-data's `ReconstructionTermManager` when
+    // the term list is empty (see the comment in `staging::mark_file_staged`).
+    let staging_hit = if !cache_hit
+        && raw
+            .git_dir
+            .as_deref()
+            .is_some_and(|gd| file_is_staged(gd, &file_id_hex))
+    {
+        match try_smudge_from_staging(rt, raw, &info, file_size, &tmp) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(e) => {
+                tracing::debug!("staging reconstruction failed for {file_id_hex}: {e:#}");
+                false
+            }
+        }
+    } else {
+        false
+    };
+
     // ---- Cold / lukewarm path: delegate to xet-data ---------------------
-    if !cache_hit {
+    if !cache_hit && !staging_hit {
         // Discard any partial bytes from a failed hot-path attempt.
         let mut trunc = tmp.reopen()?;
         trunc.set_len(0)?;
@@ -389,7 +426,40 @@ fn handle_smudge<R: Read, W: Write>(
     finish_smudge(writer, tmp.path())
 }
 
-fn finish_smudge<W: Write>(writer: &mut PktWriter<W>, tmp_path: &std::path::Path) -> Result<()> {
+/// Try reconstruct the file from `<git_dir>/bale/staging/`. Returns `Ok(true)`
+/// when bytes were written, `Ok(false)` when there is no usable staging dir
+/// (no git dir, or it's missing). Network and on-disk errors propagate so the
+/// caller logs them and falls through to the normal cold path.
+fn try_smudge_from_staging(
+    rt: &Arc<XetRuntime>,
+    raw: &crate::config::RawConfig,
+    info: &xet_data::processing::XetFileInfo,
+    file_size: u64,
+    tmp: &NamedTempFile,
+) -> Result<bool> {
+    let Some(git_dir) = raw.git_dir.as_deref() else {
+        return Ok(false);
+    };
+    let staging = staging_root(git_dir);
+    if !staging.exists() {
+        return Ok(false);
+    }
+    let translator =
+        TranslatorConfig::local_config(&staging).context("building local TranslatorConfig")?;
+    let dest_file = tmp.reopen()?;
+    let info_for_dl = info.clone();
+    rt.bridge_sync(async move {
+        let session = FileDownloadSession::new(Arc::new(translator), None).await?;
+        let (_id, _n) = session
+            .download_to_writer(&info_for_dl, 0..file_size, dest_file)
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+    Ok(true)
+}
+
+fn finish_smudge<W: Write>(writer: &mut PktWriter<W>, tmp_path: &Path) -> Result<()> {
     writer.write_text_list(&["status=success"])?;
     let mut f = std::fs::File::open(tmp_path)?;
     let mut buf = vec![0u8; MAX_PKT_PAYLOAD];

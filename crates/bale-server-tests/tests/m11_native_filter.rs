@@ -62,6 +62,43 @@ fn workspace_root() -> PathBuf {
     p
 }
 
+/// Recursively walks `staging_dir` and returns any files named like xorbs
+/// (`default.<hex>`) or shards (`<hex>.mdb`) that survived push-pending. A
+/// `Vec<_>` of leftover paths is easier to debug than a bare `is_empty`.
+fn staging_files_remaining(staging_dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                walk(&path, out);
+            } else if ft.is_file() {
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    let is_xorb = name.strip_prefix("default.").is_some_and(is_64_lower_hex);
+                    let is_shard = name.strip_suffix(".mdb").is_some_and(is_64_lower_hex);
+                    if is_xorb || is_shard {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if staging_dir.exists() {
+        walk(staging_dir, &mut out);
+    }
+    out
+}
+
+fn is_64_lower_hex(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn build_git_bale() -> Option<PathBuf> {
     let root = workspace_root();
     let out = Command::new("cargo")
@@ -198,10 +235,72 @@ async fn native_filter_push_then_pull() {
         "expected file_size key:\n{blob}"
     );
 
+    // Defer-uploads contract: `git add` writes to <git_dir>/bale/staging/ and
+    // does NOT touch the server. The actual upload happens at `push-pending`.
+    let staging_dir = work.join(".git").join("bale").join("staging");
+    assert!(
+        staging_dir.exists(),
+        "expected staging dir at {} after `git add`",
+        staging_dir.display()
+    );
+    assert!(
+        meta.count_xorbs().await.unwrap() == 0,
+        "no xorbs should be on the server before push-pending"
+    );
+    assert!(
+        meta.count_files().await.unwrap() == 0,
+        "no files should be on the server before push-pending"
+    );
+
+    // Smudge fallback: before push-pending, wiping the worktree and
+    // `git checkout --` must reconstruct from staging without hitting the
+    // network. The recon counter must not advance.
+    std::fs::remove_file(&big_path).unwrap();
+    let pre_push_recon_before = recon_hits.load(Ordering::Relaxed);
+    run_git(&work, &["checkout", "--", "big.bin"]);
+    let pre_push_recon_after = recon_hits.load(Ordering::Relaxed);
+    assert_eq!(
+        pre_push_recon_before, pre_push_recon_after,
+        "pre-push smudge should reconstruct from staging, not /v1/reconstructions/"
+    );
+    let from_staging = std::fs::read(&big_path).expect("worktree reconstructed from staging");
+    assert_eq!(
+        from_staging, payload,
+        "content mismatch on staging-only reconstruct"
+    );
+
+    // Run push-pending. Server should now have the xorbs/shards, and staging
+    // should be drained.
+    let push_out = Command::new(&git_bale_bin)
+        .arg("push-pending")
+        .current_dir(&work)
+        .output()
+        .expect("git-bale push-pending");
+    assert!(
+        push_out.status.success(),
+        "`git-bale push-pending` failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&push_out.stdout),
+        String::from_utf8_lossy(&push_out.stderr),
+    );
     let n_xorbs = meta.count_xorbs().await.unwrap();
     let n_files = meta.count_files().await.unwrap();
-    assert!(n_xorbs > 0, "expected at least one xorb registered");
-    assert!(n_files > 0, "expected at least one file registered");
+    assert!(
+        n_xorbs > 0,
+        "expected at least one xorb registered after push-pending"
+    );
+    assert!(
+        n_files > 0,
+        "expected at least one file registered after push-pending"
+    );
+    assert!(
+        staging_files_remaining(&staging_dir).is_empty(),
+        "push-pending should have drained staging; leftover: {:?}",
+        staging_files_remaining(&staging_dir)
+    );
+    assert!(
+        !staging_dir.join("file-index").exists(),
+        "push-pending should have removed the file-index/ markers"
+    );
 
     // Force a cold smudge: wipe worktree file, shared chunk cache, and the
     // .git/bale/manifests/ dir (so the manifest-save side effect is exercised).

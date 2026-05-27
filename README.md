@@ -26,6 +26,8 @@ git add some-binary-file.bin && git commit -m 'add binary file'
 git push
 ```
 
+`git add` chunks the file and stages xorbs/shards under `.git/bale/staging/` — no network. The actual upload happens at `git push`, via the pre-push hook installed by `git-bale install --local`. If you want to push the staged content explicitly (e.g. before a clone to verify, or after editing then reverting), run `git-bale push-pending`.
+
 ### Without a forge (manual config)
 
 If you're running your own `baleforgit-server` and don't have a forge integration, pin the server URL and a token in git config:
