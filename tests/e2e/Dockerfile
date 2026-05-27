@@ -66,5 +66,12 @@ RUN { \
 ENV BALE_DATA_ROOT=/data
 RUN mkdir -p /data && chown bale:bale /data
 
+# Bind-mounts (data, git home) come from the host with UIDs mapped through
+# rootless podman's user namespace, so the bare repo dirs can appear to be
+# owned by a UID different from the `git` user that runs git-receive-pack
+# inside the container. Git's "dubious ownership" check would then refuse
+# every push. This is a test-only image; opt out of the check system-wide.
+RUN printf '[safe]\n\tdirectory = *\n' > /etc/gitconfig
+
 EXPOSE 8080 2222
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

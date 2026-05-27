@@ -48,10 +48,14 @@ log "generating ssh host keys"
 ssh-keygen -A >/dev/null
 
 # ---------------------------------------------------------------------------
-# Authorized key for the `git` user (one line).
+# Authorized key for the `git` user (one line). The /home/git tree is
+# bind-mounted from the host so bare repos persist across container
+# restarts — meaning the .ssh dir the Dockerfile baked in is masked, and
+# we have to (re)create it here on every start.
 # ---------------------------------------------------------------------------
+mkdir -p /home/git/.ssh
 printf '%s\n' "$SSH_AUTHORIZED_KEY" > /home/git/.ssh/authorized_keys
-chown -R git:git /home/git/.ssh
+chown -R git:git /home/git
 chmod 700 /home/git/.ssh
 chmod 600 /home/git/.ssh/authorized_keys
 

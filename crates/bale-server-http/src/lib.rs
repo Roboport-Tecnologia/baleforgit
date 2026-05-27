@@ -422,12 +422,29 @@ where
         }
     }
 
+    // Derive `num_bytes_on_disk` from the xorb_frames table (populated by
+    // upload_xorb when the body landed) rather than trusting the shard's
+    // claim: xet-data sets the shard's `num_bytes_on_disk` to 0
+    // unconditionally, so without this the owner accounting would collapse
+    // to 0 for every real client. Fall back to the shard's value when no
+    // frame layout is on file (covers hand-rolled test shards that pre-set
+    // the field — see `m13_quotas_and_usage`).
+    let xorb_hashes: Vec<XorbHash> = parsed.cas_blocks.iter().map(|cb| cb.xorb).collect();
+    let frame_layouts = svc.meta.xorb_frame_layouts(&xorb_hashes).await?;
     for cb in &parsed.cas_blocks {
+        let derived: u32 = frame_layouts
+            .get(&cb.xorb)
+            .map(|frames| frames.iter().map(|f| f.on_disk_len).sum())
+            .unwrap_or(0);
         let info = XorbInfo {
             xorb: cb.xorb,
             num_chunks: cb.chunks.len() as u32,
             num_bytes_in_cas: cb.num_bytes_in_cas,
-            num_bytes_on_disk: cb.num_bytes_on_disk,
+            num_bytes_on_disk: if derived > 0 {
+                derived
+            } else {
+                cb.num_bytes_on_disk
+            },
         };
         let rows: Vec<ChunkRow> = cb
             .chunks

@@ -378,7 +378,7 @@ fn handle_clean_in_memory<W: Write>(
         })
         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 
-    if let Err(e) = mark_file_staged(git_dir, &file_hex) {
+    if let Err(e) = mark_file_staged(git_dir, &file_hex, file_size) {
         tracing::warn!("failed to mark {file_hex} staged: {e}");
     }
 
@@ -444,7 +444,7 @@ fn handle_clean<W: Write>(
     // term-prefetch loop, return zero terms, and trip a `debug_assert_eq!` in
     // its progress tracker. Best-effort: a failed marker write is a perf
     // regression on the next checkout-after-add, not a correctness issue.
-    if let Err(e) = mark_file_staged(git_dir, &file_hex) {
+    if let Err(e) = mark_file_staged(git_dir, &file_hex, file_size) {
         tracing::warn!("failed to mark {file_hex} staged: {e}");
     }
 

@@ -423,6 +423,12 @@ def start_container(
     if admin_token_hex is not None:
         env_kvs.append(f"BALE_ADMIN_TOKEN_HEX={admin_token_hex}")
 
+    # Bind-mount `<data_root>/git-home` too so the bare git repos under
+    # /home/git survive a container restart. Without this, the restart
+    # persistence phase brings up a fresh container with empty repos and the
+    # post-restart clone has no refs to check out.
+    git_home_root = data_root.parent / "git-home"
+    git_home_root.mkdir(exist_ok=True)
     cmd: list[str] = [
         rt.exe,
         "run",
@@ -436,6 +442,8 @@ def start_container(
         f"127.0.0.1:{ssh_port}:2222",
         "-v",
         f"{data_root}:/data",
+        "-v",
+        f"{git_home_root}:/home/git",
     ]
     for kv in env_kvs:
         cmd.extend(["-e", kv])
@@ -1121,32 +1129,45 @@ def phase_usage_api(
                 f"{expected_raw_repo2} (3 × {BIG_FILE_BYTES})"
             )
 
-        # stored_bytes vs xorbs-on-disk: the API counts xorb bytes (not
-        # shards). Within ±SIZE_TOLERANCE the two should match.
+        # Owner stored_bytes vs xorbs-on-disk: every xorb in the data dir is
+        # owned by E2E_OWNER (the basic phase + the bigfile phase both push
+        # under the same owner, separate repos). So the owner-level number
+        # has to match the on-disk xorb total within filesystem rounding.
         disk_xorbs = server.disk_xorb_bytes()
-        delta = abs(int(repo_usage["stored_bytes"]) - disk_xorbs)
+        delta = abs(int(owner_usage["stored_bytes"]) - disk_xorbs)
         if delta > SIZE_TOLERANCE_BYTES:
             raise TestFailure(
-                f"repo usage stored_bytes={repo_usage['stored_bytes']} disagrees "
+                f"owner usage stored_bytes={owner_usage['stored_bytes']} disagrees "
                 f"with on-disk xorbs ({disk_xorbs}) by {delta} bytes "
                 f"(> tolerance {SIZE_TOLERANCE_BYTES})"
             )
 
-        # dedup_savings_bytes is derivable.
-        expected_savings = repo_usage["raw_bytes"] - repo_usage["stored_bytes"]
-        if repo_usage["dedup_savings_bytes"] != expected_savings:
+        # Per-repo stored_bytes must be a subset of (≤) the owner total —
+        # repo2 doesn't own the small-file xorb the basic phase pushed under
+        # repo1, so it can be strictly less.
+        if repo_usage["stored_bytes"] > owner_usage["stored_bytes"]:
             raise TestFailure(
-                f"dedup_savings_bytes mismatch: got {repo_usage['dedup_savings_bytes']}, "
-                f"expected raw - stored = {expected_savings}"
+                f"repo stored_bytes={repo_usage['stored_bytes']} exceeds owner "
+                f"stored_bytes={owner_usage['stored_bytes']} — accounting inverted"
+            )
+        # Repo's stored_bytes must be > 0 (we pushed 3 revisions of a 35 MB
+        # binary into it) and dominate the owner total (the basic phase's
+        # 8 KiB xorb is negligible relative to 35 MiB).
+        if repo_usage["stored_bytes"] == 0:
+            raise TestFailure(
+                "repo stored_bytes is 0 but we pushed 35 MB three times — "
+                "shard's CAS Info isn't reaching `xorbs`/`file_terms`"
             )
 
-        # Owner-level usage must equal repo2 (no other repo has uploaded yet
-        # — phase_basic_user_ops uses a different repo, repo1; if it ran first
-        # owner_usage covers both).
-        if owner_usage["stored_bytes"] < repo_usage["stored_bytes"]:
-            raise TestFailure(
-                "owner stored_bytes < repo stored_bytes — accounting inverted"
-            )
+        # dedup_savings_bytes is derivable from raw - stored at both scopes.
+        for label, blob in [("owner", owner_usage), ("repo", repo_usage)]:
+            expected_savings = blob["raw_bytes"] - blob["stored_bytes"]
+            if blob["dedup_savings_bytes"] != expected_savings:
+                raise TestFailure(
+                    f"{label} dedup_savings_bytes mismatch: got "
+                    f"{blob['dedup_savings_bytes']}, expected raw - stored = "
+                    f"{expected_savings}"
+                )
 
 
 def phase_dedup_duplicate_file(
@@ -1329,7 +1350,7 @@ def phase_offline_and_restart(
             cas_port=cas_port,
             ssh_port=ssh_port,
             admin_token_hex=admin_token_hex,
-            name_suffix="restart",
+            name_suffix=f"restart-{secrets.token_hex(3)}",
         )
     after_path, after_env, _ = init_repo_for_clone(
         work_root=work_root,
