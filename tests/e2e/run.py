@@ -46,6 +46,7 @@ from typing import Callable, Iterator, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_IMAGE_TAG = "baleforgit-server-e2e:latest"
+COVERAGE_IMAGE_TAG = "baleforgit-server-e2e-coverage:latest"
 HEALTHZ_TIMEOUT_S = 60
 SSH_READY_TIMEOUT_S = 60
 CONTAINER_NAME_PREFIX = "baleforgit-e2e"
@@ -149,6 +150,24 @@ def pick_free_port() -> int:
     try:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def host_primary_ip() -> str:
+    """The host's primary outbound IP — the address the kernel would use
+    to send a packet to the public internet. The UDP `connect` is just a
+    routing decision; no packet is sent.
+
+    Used as a stable endpoint for host-bound services that have to be
+    reachable from BOTH the host AND a podman container — the host
+    loopbacks to it for free, and the container's default bridge routes
+    to it via the host's interface. macOS rootless podman's
+    `host-gateway` magic name is flaky, so we side-step it."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 1))
+        return s.getsockname()[0]
     finally:
         s.close()
 
@@ -304,11 +323,17 @@ def detect_runtime() -> Runtime:
     raise AssertionError("unreachable")
 
 
-def build_image(rt: Runtime, tag: str) -> None:
+def build_image(rt: Runtime, tag: str, *, coverage: bool = False) -> None:
     info(f"building image {tag} (this may take a few minutes on first run)")
+    build_args: list[str] = []
+    if coverage:
+        # Flips the Dockerfile to compile with `-C instrument-coverage` and
+        # skips `strip` so debug info survives for llvm-cov.
+        build_args.extend(["--build-arg", "COVERAGE=1"])
     completed = subprocess.run(
         rt.cmd(
             "build",
+            *build_args,
             "-t",
             tag,
             "-f",
@@ -319,6 +344,320 @@ def build_image(rt: Runtime, tag: str) -> None:
     )
     if completed.returncode != 0:
         raise TestFailure(f"image build failed (exit {completed.returncode})")
+
+
+# =============================================================================
+# Coverage mode (--coverage)
+# =============================================================================
+#
+# `--coverage` swaps the release/stripped builds for `-C instrument-coverage`
+# builds and bind-mounts a host dir into every container so both the host-
+# side `git-bale` and the in-container `baleforgit-server` write .profraw
+# files to the same place. At teardown we merge them with llvm-profdata and
+# render an HTML report via llvm-cov. The prod (default) path is unchanged.
+
+
+@dataclass
+class CoverageConfig:
+    profile_dir: Path          # host dir; bind-mounted as /coverage in containers
+    git_bale_bin: Path         # instrumented host-side git-bale
+    server_bin_host: Path      # copy of /usr/local/bin/baleforgit-server, podman-cp'd out
+    html_out: Path             # llvm-cov show -output-dir target
+
+    @property
+    def container_profile_template(self) -> str:
+        # %m is the binary hash; %p is the PID. Both required so the many
+        # short-lived `git-bale filter-process` PIDs and the long-lived
+        # server don't clobber each other.
+        return "/coverage/server-%m-%p.profraw"
+
+    @property
+    def host_profile_template(self) -> str:
+        return str(self.profile_dir / "host-%m-%p.profraw")
+
+
+# Module-level singleton so start_container() (called from many sites,
+# including deep inside phase functions) doesn't need every call site
+# rewritten to thread the config through. None in prod mode.
+_COVERAGE: Optional[CoverageConfig] = None
+
+
+def _find_llvm_tool(name: str) -> Optional[Path]:
+    # llvm-tools-preview ships its binaries under
+    # `<sysroot>/lib/rustlib/<host-triple>/bin/`, not under any path
+    # `rustup which` knows about. Resolve via rustc's --print queries.
+    try:
+        sysroot = subprocess.run(
+            ["rustc", "--print", "sysroot"],
+            capture_output=True, check=False, text=True,
+        )
+        host = subprocess.run(
+            ["rustc", "--print", "host-tuple"],
+            capture_output=True, check=False, text=True,
+        )
+        if sysroot.returncode == 0 and host.returncode == 0:
+            candidate = (
+                Path(sysroot.stdout.strip())
+                / "lib" / "rustlib" / host.stdout.strip() / "bin" / name
+            )
+            if candidate.is_file():
+                return candidate
+    except FileNotFoundError:
+        pass
+    p = shutil.which(name)
+    return Path(p) if p else None
+
+
+def build_instrumented_git_bale() -> Path:
+    """Build `git-bale` with `-C instrument-coverage` into a dedicated
+    target dir so the prod release build isn't clobbered. Returns the
+    binary path."""
+    target_dir = REPO_ROOT / "target" / "coverage-e2e" / "cargo"
+    info("building instrumented git-bale (RUSTFLAGS=-C instrument-coverage)")
+    env = os.environ.copy()
+    env["RUSTFLAGS"] = "-C instrument-coverage"
+    r = subprocess.run(
+        [
+            "cargo", "build", "--release", "-p", "git-bale",
+            "--target-dir", str(target_dir),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
+    )
+    if r.returncode != 0:
+        raise TestFailure(
+            f"instrumented git-bale build failed (exit {r.returncode}). "
+            "Stderr was streamed above."
+        )
+    exe = "git-bale.exe" if os.name == "nt" else "git-bale"
+    bin_path = target_dir / "release" / exe
+    if not bin_path.is_file():
+        raise TestFailure(f"expected instrumented binary at {bin_path}")
+    return bin_path.resolve()
+
+
+def extract_server_bin(rt: Runtime, image_tag: str, dest: Path) -> Path:
+    """Copy /usr/local/bin/baleforgit-server out of the built image so
+    llvm-cov can read its coverage sections at report time. Built id
+    matches the binary the container ran, so .profraw files line up."""
+    info(f"extracting server binary from {image_tag} for llvm-cov")
+    created = subprocess.run(
+        rt.cmd("create", image_tag),
+        capture_output=True, check=False, text=True,
+    )
+    if created.returncode != 0:
+        raise TestFailure(
+            f"`{rt.exe} create` failed: {created.stderr.strip()}"
+        )
+    cid = created.stdout.strip()
+    try:
+        cp = subprocess.run(
+            rt.cmd("cp", f"{cid}:/usr/local/bin/baleforgit-server", str(dest)),
+            capture_output=True, check=False, text=True,
+        )
+        if cp.returncode != 0:
+            raise TestFailure(
+                f"`{rt.exe} cp` failed: {cp.stderr.strip()}"
+            )
+    finally:
+        subprocess.run(
+            rt.cmd("rm", cid), capture_output=True, check=False,
+        )
+    return dest
+
+
+def setup_coverage(
+    rt: Runtime,
+    *,
+    coverage_dir_arg: Optional[str],
+    no_build: bool = False,
+) -> CoverageConfig:
+    """Build instrumented binaries, build instrumented image, extract the
+    server binary, and prepare the host profile dir. The prod image_tag
+    is NOT touched — coverage uses its own tag. `no_build` skips both
+    the instrumented git-bale build and the image build, but only if
+    both artifacts already exist (otherwise we have nothing to run)."""
+    if coverage_dir_arg:
+        cov_root = Path(coverage_dir_arg).resolve()
+    else:
+        cov_root = REPO_ROOT / "target" / "coverage-e2e"
+    cov_root.mkdir(parents=True, exist_ok=True)
+    profile_dir = cov_root / "profiles"
+    # Wipe stale .profraw from previous runs — otherwise the merged
+    # profdata would conflate runs and llvm-cov would complain about
+    # mismatched build ids.
+    if profile_dir.exists():
+        shutil.rmtree(profile_dir)
+    profile_dir.mkdir(parents=True)
+    # World-writable so the container's `bale` user (uid 10001, mapped
+    # through rootless podman) can write profraws to the bind-mount.
+    os.chmod(profile_dir, 0o777)
+    html_out = cov_root / "html"
+    if html_out.exists():
+        shutil.rmtree(html_out)
+
+    exe = "git-bale.exe" if os.name == "nt" else "git-bale"
+    existing_git_bale = (
+        REPO_ROOT / "target" / "coverage-e2e" / "cargo" / "release" / exe
+    )
+    server_bin_host_path = cov_root / "baleforgit-server"
+    if no_build:
+        if not existing_git_bale.is_file():
+            die("--no-build with --coverage: instrumented git-bale missing "
+                f"at {existing_git_bale}")
+        if not image_exists(rt, COVERAGE_IMAGE_TAG):
+            die("--no-build with --coverage: coverage image not built yet")
+        git_bale_bin = existing_git_bale.resolve()
+        if not server_bin_host_path.is_file():
+            # Image is here, just need to re-extract the binary.
+            extract_server_bin(rt, COVERAGE_IMAGE_TAG, server_bin_host_path)
+        server_bin_host = server_bin_host_path
+    else:
+        git_bale_bin = build_instrumented_git_bale()
+        build_image(rt, COVERAGE_IMAGE_TAG, coverage=True)
+        server_bin_host = extract_server_bin(
+            rt, COVERAGE_IMAGE_TAG, server_bin_host_path,
+        )
+    return CoverageConfig(
+        profile_dir=profile_dir,
+        git_bale_bin=git_bale_bin,
+        server_bin_host=server_bin_host,
+        html_out=html_out,
+    )
+
+
+def run_s3_coverage_phases(
+    *,
+    timings: "Timings",
+    rt: "Runtime",
+    image_tag: str,
+    work_root: Path,
+    client: "ClientEnv",
+    ssh_public_key: str,
+    admin_token_hex: str,
+    skip: set,
+) -> None:
+    """Run s3-basic + s3-dedup with the same instrumented image so
+    bale-server-storage-s3 shows up in the coverage report.
+
+    Imported lazily because `s3lib` imports from `run` — putting the
+    import at module top would deadlock the load order.
+
+    s3-failure-kill / s3-failure-conndrop are NOT run in coverage mode
+    for the same reason as the fs failure-* phases: SIGKILL prevents the
+    LLVM atexit hook from flushing .profraw."""
+    from s3lib import (
+        MinioGuard,
+        Network,
+        phase_s3_basic,
+        phase_s3_dedup,
+    )
+    # When run.py is invoked as a script Python loads it as `__main__`.
+    # `s3lib` does `from run import ServerHandle, start_container, ...`,
+    # which triggers a SECOND load of run.py as the module named `run`
+    # — separate globals, `_COVERAGE = None` there. The ServerHandle /
+    # start_container the s3 phases end up using are the `run`-module
+    # copies, so we mirror our coverage state onto that module too.
+    if (
+        "run" in sys.modules
+        and sys.modules["run"] is not sys.modules[__name__]
+    ):
+        sys.modules["run"]._COVERAGE = _COVERAGE
+
+    network: Optional["Network"] = None
+    minio: Optional["MinioGuard"] = None
+    try:
+        with timings.measure("s3-setup: podman network"):
+            network = Network.create(rt)
+        with timings.measure("s3-setup: minio sidecar"):
+            minio = MinioGuard.start(rt, network)
+
+        common = dict(
+            timings=timings,
+            rt=rt,
+            image_tag=image_tag,
+            work_root=work_root,
+            client=client,
+            ssh_public_key=ssh_public_key,
+            admin_token_hex=admin_token_hex,
+            minio=minio,
+            network=network,
+        )
+        phases: list[tuple[str, Callable[[], None]]] = [
+            ("s3-basic", lambda: phase_s3_basic(**common)),
+            ("s3-dedup", lambda: phase_s3_dedup(**common)),
+        ]
+        for name, fn in phases:
+            if name in skip:
+                info(f"-- skipping phase {name!r} (per --skip)")
+                continue
+            fn()
+    finally:
+        if minio is not None:
+            minio.stop()
+        if network is not None:
+            network.destroy()
+
+
+def generate_coverage_report(cov: CoverageConfig) -> None:
+    """Merge profraws + render HTML. Best-effort: any failure here
+    warns but does NOT flip the test exit code, since we want phase
+    results to surface even if the llvm tooling is broken."""
+    profraws = sorted(cov.profile_dir.glob("*.profraw"))
+    if not profraws:
+        warn(
+            "coverage: no .profraw files found — instrumented build broken? "
+            f"({cov.profile_dir})"
+        )
+        return
+    info(f"coverage: merging {len(profraws)} profraw files")
+    llvm_profdata = _find_llvm_tool("llvm-profdata")
+    llvm_cov = _find_llvm_tool("llvm-cov")
+    if llvm_profdata is None or llvm_cov is None:
+        warn(
+            "coverage: llvm-profdata / llvm-cov not found. Install with:\n"
+            "    rustup component add llvm-tools-preview\n"
+            f"  raw profraws kept under: {cov.profile_dir}"
+        )
+        return
+    profdata = cov.profile_dir / "merged.profdata"
+    merge = subprocess.run(
+        [str(llvm_profdata), "merge", "-sparse",
+         *[str(p) for p in profraws],
+         "-o", str(profdata)],
+        capture_output=True, check=False, text=True,
+    )
+    if merge.returncode != 0:
+        warn(
+            f"coverage: llvm-profdata merge failed (exit {merge.returncode}):\n"
+            f"{merge.stderr}"
+        )
+        return
+    cov.html_out.mkdir(parents=True, exist_ok=True)
+    show = subprocess.run(
+        [
+            str(llvm_cov), "show",
+            f"-instr-profile={profdata}",
+            "-format=html",
+            f"-output-dir={cov.html_out}",
+            # /src/* paths come from the Dockerfile build stage's WORKDIR.
+            # Remap to the host repo root so llvm-cov can find sources.
+            f"-path-equivalence=/src,{REPO_ROOT}",
+            "-ignore-filename-regex=(/\\.cargo/|/rustc/|/registry/|/\\.rustup/)",
+            # First positional is the "main" binary; -object adds more.
+            str(cov.git_bale_bin),
+            "-object", str(cov.server_bin_host),
+        ],
+        capture_output=True, check=False, text=True,
+    )
+    if show.returncode != 0:
+        warn(
+            f"coverage: llvm-cov show failed (exit {show.returncode}):\n"
+            f"{show.stderr}"
+        )
+        return
+    info(f"coverage report: {cov.html_out / 'index.html'}")
 
 
 def image_exists(rt: Runtime, tag: str) -> bool:
@@ -361,6 +700,16 @@ class ServerHandle:
         return f"{self.public_host_url}/healthz"
 
     def stop(self) -> None:
+        # In coverage mode SIGKILL (`rm -f`) prevents the server's atexit
+        # hook from flushing .profraw files. Send SIGTERM first so the
+        # axum graceful-shutdown path runs, LLVM atexit writes profiles,
+        # then `--rm` on `podman run` auto-removes the container. Prod
+        # mode skips this for speed.
+        if _COVERAGE is not None:
+            subprocess.run(
+                self.rt.cmd("stop", "-t", "10", self.name),
+                capture_output=True, check=False,
+            )
         subprocess.run(
             self.rt.cmd("rm", "-f", self.name), capture_output=True, check=False
         )
@@ -459,6 +808,12 @@ def start_container(
         "-v",
         f"{git_home_root}:/home/git",
     ]
+    # In --coverage mode every container shares the same host profile dir,
+    # bind-mounted as /coverage. The in-container `bale` user writes
+    # .profraw files there; entrypoint.sh propagates LLVM_PROFILE_FILE.
+    if _COVERAGE is not None:
+        cmd.extend(["-v", f"{_COVERAGE.profile_dir}:/coverage"])
+        env_kvs.append(f"LLVM_PROFILE_FILE={_COVERAGE.container_profile_template}")
     for kv in env_kvs:
         cmd.extend(["-e", kv])
     # extra_run_args lets run_s3.py attach the container to a shared podman
@@ -1251,6 +1606,99 @@ class TcpProxy:
         if self._accept_thread is not None:
             self._accept_thread.join(timeout=2.0)
             self._accept_thread = None
+
+
+class MockAuthzServer:
+    """Stand-in for the upstream `/check_access` endpoint a real forge
+    would expose. Used by the `authz-http` coverage phase to drive
+    `bale-server-authz-http::HttpAuthz`.
+
+    Wire contract (see `crates/bale-server-authz-http/src/lib.rs`):
+        POST /check_access  { "hub_bearer": ..., "repo": {...}, "scope": ... }
+        200 OK { "user_id": "alice" }   — known token + sufficient scope
+        401 Unauthorized                — unknown hub_bearer
+        403 Forbidden                   — known token, insufficient access
+        any other (e.g. 500)            — upstream failure (HttpAuthz maps to Internal)
+
+    Binds 0.0.0.0:port so the server container can reach it via the
+    host's primary IP (the standard cross-bridge route).
+
+    The decision function receives (hub_bearer, repo_id, scope_str) and
+    returns (http_status:int, body_dict:dict). Each phase configures its
+    own decision logic.
+    """
+
+    def __init__(
+        self,
+        decide: Callable[[str, str, str], tuple[int, dict]],
+        *,
+        port: Optional[int] = None,
+    ) -> None:
+        self.decide = decide
+        self.port = port or pick_free_port()
+        self.calls: list[tuple[str, str, str, int]] = []  # (bearer, repo_id, scope, status)
+        self._server: Optional["http.server.ThreadingHTTPServer"] = None
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    @property
+    def url(self) -> str:
+        # The container reaches us via the host's primary IP — the
+        # bridge routes to it for free. 127.0.0.1 wouldn't work because
+        # that's the container's own loopback inside its netns.
+        return f"http://{host_primary_ip()}:{self.port}"
+
+    def start(self) -> None:
+        import http.server
+
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):  # noqa: N802
+                # http.server's default writes one stderr line per request,
+                # which would drown our own info() output. Drop them.
+                pass
+
+            def do_POST(self):  # noqa: N802
+                if self.path != "/check_access":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                    bearer = body.get("hub_bearer", "")
+                    repo_id = body.get("repo", {}).get("repo_id", "")
+                    scope = body.get("scope", "")
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                status, payload = outer.decide(bearer, repo_id, scope)
+                with outer._lock:
+                    outer.calls.append((bearer, repo_id, scope, status))
+                body_bytes = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body_bytes)))
+                self.end_headers()
+                self.wfile.write(body_bytes)
+
+        self._server = http.server.ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True, name="MockAuthzServer"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
 
 
 def wait_for_server_progress(
@@ -2502,6 +2950,138 @@ def _wait_push(proc: subprocess.Popen, timeout_s: float) -> int:
     return proc.returncode
 
 
+AUTHZ_HTTP_REPOS = ["authz-http/allow", "authz-http/denied", "authz-http/error"]
+
+
+def _authz_http_decide(bearer: str, repo_id: str, scope: str) -> tuple[int, dict]:
+    """Decision function the MockAuthzServer uses in the authz-http phase.
+    Drives every branch of `HttpAuthz::check_repo_access`:
+      - 200 success  -> exercise the happy path + JWT mint
+      - 403 denied   -> exercise the Forbidden branch
+      - 500 internal -> exercise the catch-all upstream-error branch
+      - 401 unauth   -> tested via direct curl with an unknown bearer
+    """
+    if bearer != E2E_HUB_TOKEN:
+        return 401, {"error": "unknown bearer"}
+    if repo_id == "authz-http/allow":
+        return 200, {"user_id": "alice"}
+    if repo_id == "authz-http/denied":
+        return 403, {"error": "no write grant"}
+    if repo_id == "authz-http/error":
+        return 500, {"error": "upstream broken"}
+    return 403, {"error": f"unknown repo {repo_id!r}"}
+
+
+def phase_authz_http_coverage(
+    *,
+    timings: Timings,
+    rt: Runtime,
+    image_tag: str,
+    work_root: Path,
+    client: ClientEnv,
+    ssh_public_key: str,
+    admin_token_hex: str,
+) -> None:
+    """Drive `bale-server-authz-http::HttpAuthz` via a Python mock of the
+    upstream /check_access endpoint. The server container is brought up
+    with `BALE_AUTHZ_HTTP_URL` set, which makes the bin choose the HTTP
+    branch in main.rs (winning over `BALE_GRANTS`). One container, three
+    push attempts against three repos so the mock can vary the response.
+    Plus one direct probe with a bogus bearer to hit the 401 branch."""
+    phase_root = work_root / "authz-http"
+    phase_root.mkdir()
+    data_root = phase_root / "data"
+    data_root.mkdir()
+    jwt_secret = secrets.token_bytes(32).hex()
+    transfer_secret = secrets.token_bytes(32).hex()
+
+    mock = MockAuthzServer(_authz_http_decide)
+    mock.start()
+    info(f"authz-http: mock listening at {mock.url}")
+    server: Optional[ServerHandle] = None
+    try:
+        with timings.measure("authz-http: container start"):
+            server = start_container(
+                rt,
+                image_tag=image_tag,
+                data_root=data_root,
+                jwt_secret_hex=jwt_secret,
+                transfer_secret_hex=transfer_secret,
+                ssh_public_key=ssh_public_key,
+                test_repos=AUTHZ_HTTP_REPOS,
+                admin_token_hex=admin_token_hex,
+                name_suffix="authz-http",
+                extra_env={"BALE_AUTHZ_HTTP_URL": mock.url},
+            )
+
+        def _push_small(repo_name: str, *, expect_fail: bool, label: str) -> None:
+            owner, name = repo_name.split("/", 1)
+            repo, env = init_repo_for_push(
+                work_root=work_root, client=client, server=server,
+                owner=owner, repo=name, name=f"authz-http-{name}",
+            )
+            payload = deterministic_payload(SMALL_FILE_BYTES, seed=label.encode())
+            (repo / "f.bin").write_bytes(payload)
+            git(["add", "f.bin"], cwd=repo, env=env)
+            git(["commit", "-m", label], cwd=repo, env=env)
+            with timings.measure(f"authz-http: push {label}"):
+                completed = git(
+                    ["push", "-u", "origin", "main"],
+                    cwd=repo, env=env, expect_fail=True,
+                )
+            if expect_fail and completed.returncode == 0:
+                raise TestFailure(
+                    f"authz-http: push to {repo_name} unexpectedly succeeded "
+                    f"({label})"
+                )
+            if not expect_fail and completed.returncode != 0:
+                raise TestFailure(
+                    f"authz-http: push to {repo_name} failed (exit "
+                    f"{completed.returncode}):\nstdout={completed.stdout!r}\n"
+                    f"stderr={completed.stderr!r}"
+                )
+
+        _push_small("authz-http/allow", expect_fail=False, label="allow")
+        _push_small("authz-http/denied", expect_fail=True, label="denied")
+        _push_small("authz-http/error", expect_fail=True, label="error")
+
+        # 401 branch — direct token-mint probe with an unknown hub bearer.
+        # Going via the git client would require overriding the baked-in
+        # `git-bale-authenticate` script in the image, which isn't worth
+        # the complexity for a single status-code branch.
+        with timings.measure("authz-http: 401 probe (unknown bearer)"):
+            req = urllib.request.Request(
+                f"{server.public_host_url}/api/models/authz-http/allow/"
+                f"bale-write-token/main",
+                headers={"Authorization": "Bearer not-the-right-bearer"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    raise TestFailure(
+                        f"authz-http: 401 probe unexpectedly got "
+                        f"{resp.status}"
+                    )
+            except urllib.error.HTTPError as e:
+                if e.code != 401:
+                    raise TestFailure(
+                        f"authz-http: 401 probe got HTTP {e.code}, "
+                        f"expected 401"
+                    )
+
+        statuses = [s for *_, s in mock.calls]
+        info(f"authz-http: mock recorded {len(mock.calls)} calls, statuses={statuses}")
+        for expected in (200, 401, 403, 500):
+            if expected not in statuses:
+                raise TestFailure(
+                    f"authz-http: mock never returned {expected} — "
+                    f"branch coverage incomplete (saw {statuses})"
+                )
+    finally:
+        if server is not None:
+            server.stop()
+        mock.stop()
+
+
 def phase_failure_server_kill_mid_upload(
     *,
     timings: Timings,
@@ -3082,7 +3662,22 @@ def main() -> int:
              "(must have been launched with --state-dir). Only `read_only` "
              "phases are eligible to run in this mode.",
     )
+    parser.add_argument(
+        "--coverage", action="store_true",
+        help="Build instrumented binaries (-C instrument-coverage) for both "
+             "git-bale and the server, collect .profraw files into the "
+             "coverage dir, and generate an HTML report at teardown. "
+             "Builds use a separate target dir and image tag so the prod "
+             "release/stripped path is left intact.",
+    )
+    parser.add_argument(
+        "--coverage-dir", default=None,
+        help="Where to put coverage profiles + the HTML report. Defaults "
+             "to <repo>/target/coverage-e2e/. Implies --coverage.",
+    )
     args = parser.parse_args()
+    if args.coverage_dir and not args.coverage:
+        args.coverage = True
 
     if args.reuse_from and args.state_dir:
         die("--reuse-from and --state-dir are mutually exclusive")
@@ -3097,13 +3692,51 @@ def main() -> int:
         if not tool_on_path(tool):
             skip(f"`{tool}` not on PATH (required for SSH transport)")
 
-    git_bale_bin = resolve_git_bale(args.git_bale)
     rt = detect_runtime()
 
-    if not args.no_build:
-        build_image(rt, args.image_tag)
-    elif not image_exists(rt, args.image_tag):
-        die(f"--no-build was passed but image {args.image_tag} doesn't exist")
+    # Coverage mode rebuilds both binaries with -C instrument-coverage, uses
+    # a separate image tag, and arms _COVERAGE so start_container bind-mounts
+    # the profile dir into every server container. The prod (default) path
+    # is unchanged.
+    image_tag = args.image_tag
+    global _COVERAGE
+    if args.coverage:
+        if args.image_tag != DEFAULT_IMAGE_TAG:
+            die("--coverage manages its own image tag; --image-tag is ignored. "
+                "Remove one of the two.")
+        if args.git_bale:
+            die("--coverage builds its own instrumented git-bale; "
+                "remove --git-bale.")
+        _COVERAGE = setup_coverage(
+            rt,
+            coverage_dir_arg=args.coverage_dir,
+            no_build=args.no_build,
+        )
+        git_bale_bin = _COVERAGE.git_bale_bin
+        image_tag = COVERAGE_IMAGE_TAG
+        # Host-side processes (git, git-bale spawned by git, the pre-push
+        # hook) inherit os.environ unless a call site builds an explicit
+        # env dict — and the ones that do (`ClientEnv.make_env`) start
+        # from `os.environ.copy()`, so this propagates.
+        os.environ["LLVM_PROFILE_FILE"] = _COVERAGE.host_profile_template
+        info(f"coverage: profile dir = {_COVERAGE.profile_dir}")
+        info(f"coverage: report will be at {_COVERAGE.html_out / 'index.html'}")
+        # The failure-* phases SIGKILL the server (or kill a sidecar
+        # container) — the LLVM atexit hook can't flush profraws on
+        # SIGKILL, and these paths are exercised by other phases anyway.
+        # Skip them unless the user opted in via --no-skip-failure-phases
+        # (not exposed; reorder the if to override).
+        for name in ("failure-kill", "failure-conndrop", "failure-dbbusy"):
+            if name not in args.skip:
+                args.skip.append(name)
+        info("coverage: auto-skipping failure-kill / -conndrop / -dbbusy "
+             "(server SIGKILL drops profraws)")
+    else:
+        git_bale_bin = resolve_git_bale(args.git_bale)
+        if not args.no_build:
+            build_image(rt, image_tag)
+        elif not image_exists(rt, image_tag):
+            die(f"--no-build was passed but image {image_tag} doesn't exist")
 
     # Resolve the on-disk layout. With --reuse-from the data_root + git-home
     # already exist and must be left alone; with --state-dir we own the path
@@ -3187,7 +3820,7 @@ def main() -> int:
         with timings.measure("setup: container start"):
             server = start_container(
                 rt,
-                image_tag=args.image_tag,
+                image_tag=image_tag,
                 data_root=data_root,
                 jwt_secret_hex=jwt_secret_hex,
                 transfer_secret_hex=transfer_secret_hex,
@@ -3247,7 +3880,8 @@ def main() -> int:
             nonlocal server
             server = phase_offline_and_restart(
                 timings=timings, server=server, rt=rt,
-                image_tag=args.image_tag, data_root=data_root,
+                image_tag=image_tag,
+                data_root=data_root,
                 jwt_secret_hex=jwt_secret_hex,
                 transfer_secret_hex=transfer_secret_hex,
                 client=client, ssh_public_key=ssh_public_key,
@@ -3264,7 +3898,7 @@ def main() -> int:
 
         def _phase_quota() -> None:
             phase_adversarial_quota_exceeded(
-                timings=timings, rt=rt, image_tag=args.image_tag,
+                timings=timings, rt=rt, image_tag=image_tag,
                 work_root=work_root, client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
@@ -3272,7 +3906,7 @@ def main() -> int:
 
         def _phase_failure_kill() -> None:
             phase_failure_server_kill_mid_upload(
-                timings=timings, rt=rt, image_tag=args.image_tag,
+                timings=timings, rt=rt, image_tag=image_tag,
                 work_root=work_root, client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
@@ -3280,7 +3914,7 @@ def main() -> int:
 
         def _phase_failure_conndrop() -> None:
             phase_failure_connection_drop_mid_upload(
-                timings=timings, rt=rt, image_tag=args.image_tag,
+                timings=timings, rt=rt, image_tag=image_tag,
                 work_root=work_root, client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
@@ -3288,7 +3922,7 @@ def main() -> int:
 
         def _phase_failure_dbbusy() -> None:
             phase_failure_transient_db(
-                timings=timings, rt=rt, image_tag=args.image_tag,
+                timings=timings, rt=rt, image_tag=image_tag,
                 work_root=work_root, client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
@@ -3348,6 +3982,41 @@ def main() -> int:
                 continue
             fn()
 
+        # Coverage mode also exercises the S3 backend and the HttpAuthz
+        # path so the report includes bale-server-storage-s3 and
+        # bale-server-authz-http. The fs server is stopped first so its
+        # atexit flushes profraws (otherwise the still-running container
+        # would only flush in the outer `finally`, well after the extra
+        # phases have run). Each extra phase stands up its own
+        # containers and tears them down itself.
+        if _COVERAGE is not None and not in_reuse:
+            if server is not None:
+                info("stopping fs server before extra coverage phases")
+                server.stop()
+                server = None
+            run_s3_coverage_phases(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+                skip=set(args.skip),
+            )
+            if "authz-http" not in args.skip:
+                phase_authz_http_coverage(
+                    timings=timings,
+                    rt=rt,
+                    image_tag=image_tag,
+                    work_root=work_root,
+                    client=client,
+                    ssh_public_key=ssh_public_key,
+                    admin_token_hex=admin_token_hex,
+                )
+            else:
+                info("-- skipping phase 'authz-http' (per --skip)")
+
         info("ALL CHECKS PASSED")
     except TestFailure as e:
         print(f"\n[e2e][FAIL]\n{e}\n", file=sys.stderr, flush=True)
@@ -3372,6 +4041,12 @@ def main() -> int:
         # matching CONTAINER_NAME_PREFIX — that would clobber concurrent
         # runs sharing the host (CI matrices, two devs on the same box).
         timings.print_report()
+        if _COVERAGE is not None:
+            # Best-effort: don't let a broken llvm install mask phase results.
+            try:
+                generate_coverage_report(_COVERAGE)
+            except Exception as e:
+                warn(f"coverage report generation raised: {e}")
         # Persist state for a follow-up --reuse-from run (only when we own
         # the path: explicit --state-dir, or --reuse-from itself updating
         # its source. In a plain --reuse-from run we don't write — the

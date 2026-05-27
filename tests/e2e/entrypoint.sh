@@ -39,6 +39,10 @@ export BALE_PUBLIC_URL BALE_GRANTS
 [ -n "${BALE_DEFAULT_QUOTA_BYTES:-}" ] && export BALE_DEFAULT_QUOTA_BYTES
 [ -n "${BALE_ADMIN_TOKEN_HEX:-}" ] && export BALE_ADMIN_TOKEN_HEX
 [ -n "${RUST_LOG:-}" ] && export RUST_LOG
+# Coverage mode: run.py --coverage sets this to a /coverage/... path so
+# the instrumented baleforgit-server writes .profraw files to the
+# bind-mounted host dir. Unset in prod mode — no-op.
+[ -n "${LLVM_PROFILE_FILE:-}" ] && export LLVM_PROFILE_FILE
 # S3 backend pass-through. Setting BALE_S3_BUCKET (non-empty) flips the server
 # from the local-filesystem store to S3. The harness (run_s3.py) sets these.
 for v in BALE_S3_BUCKET BALE_S3_ENDPOINT_URL BALE_S3_FORCE_PATH_STYLE \

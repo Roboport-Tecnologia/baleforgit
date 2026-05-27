@@ -93,6 +93,51 @@ python3 tests/e2e/run.py [--git-bale PATH] [--image-tag TAG] [--no-build]
 - `--skip PHASE` — skip a named phase (repeatable). Phases that depend
   on earlier state (e.g., `usage` depends on `bigfile`) auto-skip when
   their prerequisites were skipped.
+- `--coverage` — see [Coverage mode](#coverage-mode) below.
+- `--coverage-dir PATH` — override the coverage output directory
+  (implies `--coverage`). Defaults to `<repo>/target/coverage-e2e/`.
+
+## Coverage mode
+
+`python3 tests/e2e/run.py --coverage` runs the suite against instrumented
+builds of both binaries and renders a unified HTML coverage report.
+
+- Builds `git-bale` with `RUSTFLAGS=-C instrument-coverage` into
+  `target/coverage-e2e/cargo/` (a separate target dir so it doesn't
+  clobber `target/release/git-bale`).
+- Builds the image with `--build-arg COVERAGE=1` under the tag
+  `baleforgit-server-e2e-coverage:latest`. The Dockerfile compiles the
+  server with `-C instrument-coverage` and skips `strip` so debug info
+  and the `__llvm_prf_*` sections survive.
+- Bind-mounts `target/coverage-e2e/profiles/` into every container at
+  `/coverage` and sets `LLVM_PROFILE_FILE=/coverage/server-%m-%p.profraw`.
+  Host processes write to the same dir via `host-%m-%p.profraw`.
+- At teardown, runs `llvm-profdata merge` + `llvm-cov show -format=html`
+  against both binaries (the server binary is extracted from the image
+  via `podman cp` so the host-side llvm-cov can read its coverage
+  sections). The report lands at `target/coverage-e2e/html/index.html`.
+
+Coverage mode runs **extra phases** beyond the fs set so the report
+covers every pluggable trait impl:
+- `s3-basic` + `s3-dedup` — exercise `bale-server-storage-s3`.
+- `authz-http` — drives `bale-server-authz-http::HttpAuthz` via a Python
+  mock of the upstream `/check_access`. One server container with
+  `BALE_AUTHZ_HTTP_URL` set; three pushes against three test repos so
+  the mock can return 200 / 403 / 500 per repo; one direct token-mint
+  probe with an unknown hub bearer for the 401 branch.
+
+Coverage mode **auto-skips** phases that SIGKILL the server (`failure-
+kill`, `failure-conndrop`, `failure-dbbusy`, and the s3 equivalents) —
+LLVM's atexit hook can't flush profraws on SIGKILL.
+
+Requires `llvm-profdata` and `llvm-cov` from the `llvm-tools-preview`
+component (install with `rustup component add llvm-tools-preview`).
+Resolved via `rustc --print sysroot` + `--print host-tuple` since
+`rustup which` doesn't proxy them.
+
+The prod (default, no `--coverage`) path is unchanged — it keeps using
+the release/stripped binaries and the original image tag, so functional
+testing and coverage measurement stay separate.
 
 ## Exit codes
 

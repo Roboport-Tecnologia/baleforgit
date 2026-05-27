@@ -39,25 +39,6 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
-def _host_ip() -> str:
-    """Return the host's primary outbound IP — the address the kernel
-    would use to send a packet to the public internet. Doesn't actually
-    open a connection (UDP `connect` is just a routing decision).
-
-    This IP is reachable from BOTH the host (it's the host's own
-    interface IP, so the kernel loopbacks) AND from a podman container
-    (it routes to the host via the bridge). MinIO bound on 0.0.0.0 +
-    this IP as the endpoint URL is the only way the presigned URLs the
-    server signs work for the host-side client — the server-only DNS
-    name `bale-e2e-minio-<hex>` won't resolve outside the network.
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 1))
-        return s.getsockname()[0]
-    finally:
-        s.close()
-
 # We deliberately import from run.py rather than re-implementing — keeps the
 # fs and S3 suites in lock-step on container plumbing, JWT minting, git
 # driving, payload generation, and the worktree/pointer verifiers.
@@ -83,6 +64,7 @@ from run import (
     fetch_repo_usage,
     fmt_bytes,
     git,
+    host_primary_ip,
     info,
     init_repo_for_clone,
     init_repo_for_push,
@@ -197,7 +179,7 @@ class MinioGuard:
     @classmethod
     def start(cls, rt: Runtime, network: Network) -> "MinioGuard":
         host_port = pick_free_port()
-        host_ip = _host_ip()
+        host_ip = host_primary_ip()
         container = f"bale-e2e-minio-{secrets.token_hex(4)}"
         info(
             f"launching {MINIO_IMAGE} as {container} on 0.0.0.0:{host_port} "

@@ -5,11 +5,20 @@
 FROM rust:1.94-bookworm AS builder
 WORKDIR /src
 
+# COVERAGE=1 produces an `-C instrument-coverage` build with debug info
+# preserved (no strip). See tests/e2e/run.py --coverage.
+ARG COVERAGE=0
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release -p bale-server-bin \
- && strip target/release/baleforgit-server
+RUN if [ "$COVERAGE" = "1" ]; then \
+        RUSTFLAGS="-C instrument-coverage" \
+        cargo build --release -p bale-server-bin; \
+    else \
+        cargo build --release -p bale-server-bin \
+        && strip target/release/baleforgit-server; \
+    fi
 
 FROM debian:bookworm-slim
 
@@ -69,6 +78,11 @@ RUN { \
 # here so it can walk the data dir from outside the container.
 ENV BALE_DATA_ROOT=/data
 RUN mkdir -p /data && chown bale:bale /data
+
+# /coverage is the bind-mount target for run.py --coverage. Always created
+# (cheap) so the same image works with or without coverage mounted. Owned
+# by `bale` so the instrumented server can write .profraw files to it.
+RUN mkdir -p /coverage && chown bale:bale /coverage
 
 # Bind-mounts (data, git home) come from the host with UIDs mapped through
 # rootless podman's user namespace, so the bare repo dirs can appear to be

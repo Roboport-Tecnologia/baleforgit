@@ -30,3 +30,4 @@ lfs-adapter/lfs-adapter
 git-lfs
 gitea
 xet-core
+*.profraw
