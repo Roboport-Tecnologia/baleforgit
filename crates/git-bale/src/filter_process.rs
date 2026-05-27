@@ -341,7 +341,7 @@ fn handle_smudge<R: Read, W: Write>(
     auth_slot: &mut Option<BaleConfig>,
     reader: &mut PktReader<R>,
     writer: &mut PktWriter<W>,
-    _pathname: &str,
+    pathname: &str,
 ) -> Result<()> {
     let mut pointer_buf = Vec::with_capacity(256);
     reader.read_binary_to(&mut pointer_buf)?;
@@ -498,7 +498,46 @@ fn handle_smudge<R: Read, W: Write>(
         }
     }
 
+    // Populate the clean cache from the smudge result. We have both inputs
+    // to the clean(content)→pointer mapping (the pointer git just gave us,
+    // and the bytes we just reconstructed), so future `git status`/`git diff`
+    // calls on the same path can hit without re-running CDC. This is what
+    // makes `git checkout -- foo` fast on the next status: HEAD's content
+    // gets back to disk and the cache simultaneously learns its fingerprint.
+    if let Some(git_dir) = raw.git_dir.as_deref() {
+        populate_clean_cache_from_smudge(git_dir, pathname, tmp.path(), &pointer_buf, file_size);
+    }
+
     finish_smudge(writer, tmp.path())
+}
+
+fn populate_clean_cache_from_smudge(
+    git_dir: &Path,
+    pathname: &str,
+    content_path: &Path,
+    pointer_bytes: &[u8],
+    file_size: u64,
+) {
+    let chunks = match clean_cache::compute_chunks(content_path, file_size) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(
+                "smudge: compute_chunks failed for {pathname} at {}: {e}",
+                content_path.display()
+            );
+            return;
+        }
+    };
+    let entry = clean_cache::CacheEntry {
+        v: clean_cache::CURRENT_VERSION,
+        size: file_size,
+        chunks,
+        pointer: String::from_utf8_lossy(pointer_bytes).to_string(),
+    };
+    let key = clean_cache::path_key(pathname);
+    if let Err(e) = clean_cache::save(git_dir, &key, &entry) {
+        tracing::debug!("smudge: saving clean-cache entry for {pathname}: {e}");
+    }
 }
 
 /// Try reconstruct the file from `<git_dir>/bale/staging/`. Returns `Ok(true)`

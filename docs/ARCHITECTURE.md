@@ -254,6 +254,8 @@ Verification order on every clean call:
 
 On miss, the full clean runs as before, then a fresh chunk index is computed from the temp file and saved. Cache hits stay side-effect-free (no staging touch, no marker touch), so a stale cache after `push-pending` drained staging just means future smudges fall to the cold path, which is correct.
 
+**Smudge populates the cache too.** Every successful smudge already has both inputs to the `clean(content) → pointer` mapping in hand: the pointer git just sent us as input, and the reconstructed bytes we just wrote to the temp file. We compute a chunk index against the temp file and save it under the smudge's pathname before responding to git. That makes `git checkout -- foo.bin` fast on the *next* `git status`: the worktree gets back to HEAD's content and the clean cache simultaneously learns its fingerprint, so the subsequent stat-cache-invalidated clean call hits instead of full-cleaning HEAD's content from scratch.
+
 Entries are ~70 bytes per chunk; a 30 MiB file is ~30 chunks = ~2 KiB on disk. No eviction; manual reset is `rm -rf .git/bale/clean-cache/`.
 
 Two filter-process startup optimisations matter specifically because `git diff` pays them on every invocation (one filter-process per command):
