@@ -49,6 +49,9 @@ found" error until that's fixed; the harness logic itself is portable.
 | `wrong-token`   | Push with a bogus `bale.token` is rejected and does not corrupt the data dir.                       |
 | `tampered-xorb` | A xorb whose bytes were flipped on disk does NOT produce matching content via cold smudge.          |
 | `quota`         | A server brought up with `BALE_DEFAULT_QUOTA_BYTES=1024` rejects a 35 MB push cleanly.              |
+| `failure-kill`     | Server is SIGKILL'd mid-upload; restart on the same data dir and a retry `git push` recovers cleanly. |
+| `failure-conndrop` | A TCP proxy in front of the CAS port is killed mid-upload (server stays up); retry succeeds.        |
+| `failure-dbbusy`   | A sidecar `sqlite3` shell holds an IMMEDIATE write lock on `meta.db`; the user-side push still succeeds because sqlx's busy_timeout waits the lock out. |
 
 A timing summary (per-phase wallclock + throughput on the
 bytes-relevant phases) prints at the end of every run.

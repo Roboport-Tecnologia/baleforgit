@@ -21,6 +21,9 @@ FROM debian:bookworm-slim
 #   user without forking through `su`/`sudo`.
 # - procps + curl: debugging aid when the test prints `podman exec ... ps`
 #   or `curl`s the healthz endpoint from inside the container.
+# - sqlite3: lets the transient-db-failure e2e phase open the same meta.db
+#   from a sidecar shell and hold the writer lock to force SQLITE_BUSY at the
+#   server, exercising sqlx's busy_timeout-driven retry loop.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         openssh-server \
@@ -29,6 +32,7 @@ RUN apt-get update \
         util-linux \
         procps \
         curl \
+        sqlite3 \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --home /var/lib/baleforgit-server --create-home bale \
  && useradd --uid 1100 --create-home --shell /bin/bash git \
