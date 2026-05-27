@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use git_bale::install::{self, Scope};
-use git_bale::mount::{self, MountDiffArgs};
+use git_bale::mount::{self, MountDiffArgs, MountRevArgs};
 use git_bale::{filter_process, track};
 
 #[derive(Parser, Debug)]
@@ -36,6 +36,8 @@ enum Command {
     FilterProcess,
     /// Mount a read-only virtual FS exposing both sides of a `git diff`.
     MountDiff(MountDiffCliArgs),
+    /// Mount a read-only virtual FS exposing the files at one revision.
+    Mount(MountCliArgs),
 }
 
 #[derive(Args, Debug)]
@@ -91,6 +93,20 @@ struct MountDiffCliArgs {
     paths: Vec<String>,
 }
 
+#[derive(Args, Debug)]
+struct MountCliArgs {
+    /// Revision to mount (commit, branch, tag, etc.). Files appear under the
+    /// mount point with their original names.
+    rev: String,
+    /// Directory to mount on. Must exist and be empty (or you'll mask its
+    /// contents until unmount).
+    #[arg(long)]
+    mount: PathBuf,
+    /// Optional path filters, like `git diff <rev> -- <paths>...`.
+    #[arg(last = true)]
+    paths: Vec<String>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -139,6 +155,11 @@ fn main() -> Result<()> {
             mount_point: a.mount,
             label_a: a.label_a,
             label_b: a.label_b,
+            paths: a.paths,
+        }),
+        Command::Mount(a) => mount::run_rev(MountRevArgs {
+            rev: a.rev,
+            mount_point: a.mount,
             paths: a.paths,
         }),
     }

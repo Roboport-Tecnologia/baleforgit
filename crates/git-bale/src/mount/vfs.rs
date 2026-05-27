@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::mount::diff::DiffEntry;
 use crate::mount::reader::{BlobSource, Reader};
+use crate::mount::tree::TreeEntry;
 
 pub const ROOT_INODE: u64 = 1;
 
@@ -40,16 +41,34 @@ pub struct DiffVfs {
 }
 
 impl DiffVfs {
+    /// Two-sided diff view: each side's path is labelled (`foo__main.rs` vs
+    /// `foo__feature.rs`) so a single mount point can show both versions
+    /// without overwriting each other.
     pub fn build(entries: &[DiffEntry], label_a: &str, label_b: &str, reader: Arc<Reader>) -> Self {
         let mut builder = Builder::new();
         builder.add_root();
         for entry in entries {
             if let (Some(path), Some(oid)) = (&entry.path_a, &entry.oid_a) {
-                builder.insert_side(path, oid, label_a);
+                builder.insert(path, oid, Some(label_a));
             }
             if let (Some(path), Some(oid)) = (&entry.path_b, &entry.oid_b) {
-                builder.insert_side(path, oid, label_b);
+                builder.insert(path, oid, Some(label_b));
             }
+        }
+        DiffVfs {
+            nodes: builder.nodes,
+            dirs: builder.dirs,
+            reader,
+        }
+    }
+
+    /// Single-rev view: every file keeps its original name. Used by
+    /// `git-bale mount <rev>`.
+    pub fn build_single(entries: &[TreeEntry], reader: Arc<Reader>) -> Self {
+        let mut builder = Builder::new();
+        builder.add_root();
+        for entry in entries {
+            builder.insert(&entry.path, &entry.oid, None);
         }
         DiffVfs {
             nodes: builder.nodes,
@@ -158,7 +177,7 @@ impl Builder {
         inode
     }
 
-    fn insert_side(&mut self, path: &str, oid: &str, label: &str) {
+    fn insert(&mut self, path: &str, oid: &str, label: Option<&str>) {
         let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         let Some((file_component, dir_components)) = components.split_last() else {
             return;
@@ -169,8 +188,11 @@ impl Builder {
             parent = self.ensure_dir(parent, dir);
         }
 
-        let labeled = label_filename(file_component, label);
-        let key = OsString::from(&labeled);
+        let final_name = match label {
+            Some(l) => label_filename(file_component, l),
+            None => (*file_component).to_string(),
+        };
+        let key = OsString::from(&final_name);
         // First write wins on collision — we never overwrite an existing entry
         // because that would silently lose data (e.g. two different OIDs at
         // the same labeled name).

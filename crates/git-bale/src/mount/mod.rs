@@ -20,6 +20,7 @@ use crate::mount::vfs::DiffVfs;
 pub mod backend;
 pub mod diff;
 pub mod reader;
+pub mod tree;
 pub mod vfs;
 
 #[derive(Debug, Clone)]
@@ -30,6 +31,53 @@ pub struct MountDiffArgs {
     pub label_a: Option<String>,
     pub label_b: Option<String>,
     pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MountRevArgs {
+    pub rev: String,
+    pub mount_point: PathBuf,
+    pub paths: Vec<String>,
+}
+
+pub fn run_rev(args: MountRevArgs) -> Result<()> {
+    if let Err(e) = backend::libfuse::ensure_available() {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
+
+    let cwd = std::env::current_dir().context("resolving cwd")?;
+    // Resolve the rev so we get a clear "no such ref" error before doing the
+    // full tree walk.
+    diff::rev_parse_commit(&cwd, &args.rev).with_context(|| format!("resolving {}", args.rev))?;
+
+    let entries = tree::walk_rev(&cwd, &args.rev, &args.paths)
+        .context("walking tree for single-rev mount")?;
+    if entries.is_empty() {
+        return Err(anyhow!(
+            "no files in {}{}",
+            args.rev,
+            if args.paths.is_empty() {
+                String::new()
+            } else {
+                format!(" under {:?}", args.paths)
+            }
+        ));
+    }
+
+    let raw = RawConfig::load(Some(cwd.as_path())).context("loading bale config")?;
+    let reader = Arc::new(reader::Reader::new(cwd.clone(), raw).context("starting blob reader")?);
+    let vfs = Arc::new(DiffVfs::build_single(&entries, reader));
+
+    eprintln!(
+        "git-bale: mounting {} ({} files) at {}",
+        args.rev,
+        entries.len(),
+        args.mount_point.display(),
+    );
+
+    let backend = LibfuseBackend::new();
+    backend.mount(&args.mount_point, vfs)
 }
 
 pub fn run(args: MountDiffArgs) -> Result<()> {
