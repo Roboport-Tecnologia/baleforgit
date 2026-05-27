@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 clap = { version = "=4.5.50", features = ["derive"] }
 gix = "=0.84.0"

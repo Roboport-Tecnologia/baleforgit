@@ -6,6 +6,7 @@
 //!   2. Git config keys under `bale.*` (read via `git config --get`).
 //!   3. Built-in defaults (XDG cache dir; no default server URL or token).
 
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -38,21 +39,25 @@ impl RawConfig {
     /// Server URL and token are optional — the resolver auto-discovers them
     /// from `git remote` + a forge auth roundtrip when absent.
     pub fn load(repo: Option<&Path>) -> Result<Self> {
-        let server_url = lookup(repo, "BALE_SERVER_URL", "bale.serverUrl")?;
-        let token = lookup(repo, "BALE_TOKEN", "bale.token")?;
-        let token_expiration = match lookup(repo, "BALE_TOKEN_EXPIRATION", "bale.tokenExpiration")?
-        {
-            Some(s) => Some(
-                s.parse::<u64>()
-                    .context("bale.tokenExpiration must be a unix timestamp")?,
-            ),
-            None => None,
-        };
+        // One `git config --get-regexp '^bale\\.'` shaves ~3 subprocess spawns
+        // off filter-process startup (was: one `--get` per key). Filter-process
+        // start cost dominates `git diff` time when the pointer cache hits.
+        let bale_cfg = read_bale_config(repo)?;
+        let server_url = env_or_cfg("BALE_SERVER_URL", &bale_cfg, "bale.serverurl");
+        let token = env_or_cfg("BALE_TOKEN", &bale_cfg, "bale.token");
+        let token_expiration =
+            match env_or_cfg("BALE_TOKEN_EXPIRATION", &bale_cfg, "bale.tokenexpiration") {
+                Some(s) => Some(
+                    s.parse::<u64>()
+                        .context("bale.tokenExpiration must be a unix timestamp")?,
+                ),
+                None => None,
+            };
         Ok(Self {
             server_url,
             token,
             token_expiration,
-            cache_dir: resolve_cache_dir(repo)?,
+            cache_dir: resolve_cache_dir(&bale_cfg)?,
             git_dir: resolve_git_dir(repo),
         })
     }
@@ -107,46 +112,69 @@ fn resolve_git_dir(repo: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
-fn lookup(repo: Option<&Path>, env_key: &str, git_key: &str) -> Result<Option<String>> {
-    if let Ok(v) = env::var(env_key) {
-        if !v.is_empty() {
-            return Ok(Some(v));
-        }
-    }
-    git_config_get(repo, git_key)
-}
-
-fn git_config_get(repo: Option<&Path>, key: &str) -> Result<Option<String>> {
+/// Fetch every `bale.*` key in one subprocess. Keys come back lower-cased
+/// (git's normalisation); callers must use lowercase lookups.
+fn read_bale_config(repo: Option<&Path>) -> Result<HashMap<String, String>> {
     let mut cmd = Command::new("git");
     if let Some(p) = repo {
         cmd.current_dir(p);
     }
-    cmd.arg("config").arg("--get").arg(key);
+    cmd.arg("config")
+        .arg("--null")
+        .arg("--get-regexp")
+        .arg("^bale\\.");
     let out = cmd
         .output()
-        .with_context(|| format!("spawning git config --get {key}"))?;
-    if out.status.success() {
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        return Ok(if s.is_empty() { None } else { Some(s) });
+        .with_context(|| "spawning git config --get-regexp '^bale\\.'")?;
+    // Exit 1 = no matches; not an error.
+    if !out.status.success() {
+        if out.status.code() == Some(1) {
+            return Ok(HashMap::new());
+        }
+        return Err(anyhow!(
+            "git config --get-regexp '^bale\\.' failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
-    // Exit 1 means "key not found" — not an error here.
-    if out.status.code() == Some(1) {
-        return Ok(None);
+    // `--null` separates records with `\0`; within each record the key and
+    // value are separated by `\n` (or no separator if value is empty).
+    let mut map = HashMap::new();
+    for record in out.stdout.split(|&b| b == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let s = String::from_utf8_lossy(record);
+        let (k, v) = match s.split_once('\n') {
+            Some((k, v)) => (k.to_string(), v.to_string()),
+            None => (s.into_owned(), String::new()),
+        };
+        map.insert(k, v);
     }
-    Err(anyhow!(
-        "git config --get {key} failed: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    ))
+    Ok(map)
 }
 
-fn resolve_cache_dir(repo: Option<&Path>) -> Result<PathBuf> {
+fn env_or_cfg(env_key: &str, cfg: &HashMap<String, String>, cfg_key: &str) -> Option<String> {
+    if let Ok(v) = env::var(env_key) {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    cfg.get(cfg_key)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn resolve_cache_dir(cfg: &HashMap<String, String>) -> Result<PathBuf> {
     if let Ok(v) = env::var("BALE_CACHE_DIR") {
         if !v.is_empty() {
             return Ok(PathBuf::from(v));
         }
     }
-    if let Some(s) = git_config_get(repo, "bale.cacheDir")? {
-        return Ok(PathBuf::from(s));
+    if let Some(s) = cfg.get("bale.cachedir") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Ok(PathBuf::from(s));
+        }
     }
     if let Ok(xdg) = env::var("XDG_CACHE_HOME") {
         if !xdg.is_empty() {

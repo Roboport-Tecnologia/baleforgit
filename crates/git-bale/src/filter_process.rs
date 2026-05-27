@@ -17,6 +17,7 @@ use xet_data::processing::data_client::default_config;
 use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy};
 use xet_runtime::core::XetRuntime;
 
+use crate::clean_cache::{self, ContentKey, TeeHasher};
 use crate::config::BaleConfig;
 use crate::local_reconstruct::{try_reconstruct_from_cache, CacheReconstructOutcome};
 use crate::manifest_cache;
@@ -31,7 +32,6 @@ const VERSION: &str = "version=2";
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let raw = crate::config::RawConfig::load(Some(cwd.as_path()))?;
-    let rt = XetRuntime::new().context("starting xet runtime")?;
 
     let stdin_lock = stdin().lock();
     let stdout_lock = stdout().lock();
@@ -41,6 +41,12 @@ pub fn run() -> Result<()> {
 
     handshake(&mut reader, &mut writer)?;
     negotiate_capabilities(&mut reader, &mut writer)?;
+
+    // XetRuntime startup allocates worker-thread stacks (8 MiB each by default).
+    // Cache-hit cleans don't need it, and `git diff` paying that cost on every
+    // invocation is what makes pointer-cache-hit cleans feel sluggish. Defer
+    // construction to the first caller that actually needs it.
+    let mut rt_slot: Option<Arc<XetRuntime>> = None;
 
     // Smudge auth is cached for the life of this filter-process. Clean no
     // longer needs auth — it writes to <git_dir>/bale/staging/ and the actual
@@ -74,13 +80,14 @@ pub fn run() -> Result<()> {
         // Git can surface them and continue with the next entry.
         match command {
             "clean" => {
-                if let Err(e) = do_clean(&rt, &raw, &mut reader, &mut writer, pathname) {
+                if let Err(e) = do_clean(&mut rt_slot, &raw, &mut reader, &mut writer, pathname) {
                     report_request_error(&mut reader, &mut writer, "clean", pathname, &e)?;
                 }
             }
             "smudge" => {
+                let rt = ensure_runtime(&mut rt_slot)?;
                 if let Err(e) = handle_smudge(
-                    &rt,
+                    rt,
                     &raw,
                     &mut smudge_cfg,
                     &mut reader,
@@ -194,22 +201,57 @@ fn report_request_error<R: Read, W: Write>(
     Ok(())
 }
 
+fn ensure_runtime(slot: &mut Option<Arc<XetRuntime>>) -> Result<&Arc<XetRuntime>> {
+    if slot.is_none() {
+        *slot = Some(XetRuntime::new().context("starting xet runtime")?);
+    }
+    Ok(slot.as_ref().unwrap())
+}
+
 fn do_clean<R: Read, W: Write>(
-    rt: &Arc<XetRuntime>,
+    rt_slot: &mut Option<Arc<XetRuntime>>,
     raw: &crate::config::RawConfig,
     reader: &mut PktReader<R>,
     writer: &mut PktWriter<W>,
     pathname: &str,
 ) -> Result<()> {
-    // Read the payload first so a later failure doesn't leave the pkt-line
-    // stream desynced.
+    // Tee the pkt-line payload into both a temp file (for xet-data) and a
+    // blake3 hasher (for the pointer cache lookup) — single pass, no extra
+    // disk reads.
     let mut tmp = NamedTempFile::new()?;
-    reader.read_binary_to(&mut tmp)?;
+    let content_key = {
+        let mut tee = TeeHasher::new(tmp.as_file_mut());
+        reader.read_binary_to(&mut tee)?;
+        tee.finalize().1
+    };
     tmp.flush()?;
+
     let git_dir = raw.git_dir.as_deref().ok_or_else(|| {
         anyhow!("clean: cannot stage upload — no git directory resolved from cwd")
     })?;
-    handle_clean(rt, git_dir, tmp, writer, pathname)
+
+    // Pointer cache: `git status` / `git diff` re-invoke clean on every
+    // command for any modified bale-filtered file. The pointer JSON is a
+    // pure function of the input bytes, so a content-keyed cache turns the
+    // second-and-onward calls into a stat + read.
+    match clean_cache::load(git_dir, &content_key) {
+        Ok(Some(cached)) if pointer::parse_pointer(&cached).is_ok() => {
+            writer.write_text_list(&["status=success"])?;
+            writer.write_all_then_flush(&cached)?;
+            writer.write_text_list(&["status=success"])?;
+            return Ok(());
+        }
+        Ok(Some(_)) => {
+            tracing::warn!(
+                "clean-cache entry for {pathname} didn't parse as a pointer; re-cleaning"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => tracing::debug!("clean-cache load failed for {pathname}: {e}; full clean"),
+    }
+
+    let rt = ensure_runtime(rt_slot)?;
+    handle_clean(rt, git_dir, tmp, writer, pathname, &content_key)
 }
 
 fn handle_clean<W: Write>(
@@ -217,7 +259,8 @@ fn handle_clean<W: Write>(
     git_dir: &Path,
     tmp: NamedTempFile,
     writer: &mut PktWriter<W>,
-    _pathname: &str,
+    pathname: &str,
+    content_key: &ContentKey,
 ) -> Result<()> {
     // Stage chunks/xorbs/shards under <git_dir>/bale/staging/ via xet-data's
     // LocalClient instead of uploading. `git-bale push-pending` (driven by a
@@ -252,6 +295,10 @@ fn handle_clean<W: Write>(
     // regression on the next checkout-after-add, not a correctness issue.
     if let Err(e) = mark_file_staged(git_dir, &file_hex) {
         tracing::warn!("failed to mark {file_hex} staged: {e}");
+    }
+
+    if let Err(e) = clean_cache::save(git_dir, content_key, &pointer_bytes) {
+        tracing::warn!("saving clean-cache entry for {pathname}: {e}");
     }
 
     writer.write_text_list(&["status=success"])?;

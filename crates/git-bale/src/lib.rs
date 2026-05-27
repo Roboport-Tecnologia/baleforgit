@@ -1,3 +1,4 @@
+pub mod clean_cache;
 pub mod config;
 pub mod filter_process;
 pub mod install;
