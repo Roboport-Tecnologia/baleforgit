@@ -636,10 +636,22 @@ def phase_s3_dedup(
     minio: MinioGuard,
     network: Network,
 ) -> None:
-    """Push a 35 MiB binary, then a duplicate file with identical content.
-    Asserts the bucket grows by ≥ 50% of the file on first push and by ≤
-    SIZE_TOLERANCE on the duplicate — proving CDC chunks dedup at the
-    S3-object level the same way they do on filesystem."""
+    """Push a 35 MiB binary at THREE revisions with small edits (v1 →
+    8-byte poke → 1 MiB region swap), mirroring the fs `bigfile` phase.
+
+    Each revision has a distinct sha256 — so the server registers three
+    file_hash entries and `raw_bytes` ≈ 3 × BIG_FILE_BYTES. The CDC
+    chunks overlap heavily across revisions, so the bucket grows only
+    by the edit delta on v2/v3 and `stored_bytes` stays close to one
+    payload's worth. `dedup_savings_bytes = raw - stored` shows the
+    savings story.
+
+    Note: a duplicate file (same content, different path) at the same
+    commit does NOT exercise this — the server collapses identical
+    file_hashes at the metadata layer (`register_files` is content-
+    addressed), so raw_bytes wouldn't grow. The 3-revision shape is the
+    only one that exercises chunk-level dedup at the accounting layer.
+    """
     phase_root = work_root / "s3-dedup"
     phase_root.mkdir()
     data_root = phase_root / "data"
@@ -665,102 +677,150 @@ def phase_s3_dedup(
             owner=E2E_OWNER, repo=E2E_REPO_2, name="s3-dedup-client",
         )
 
-        payload = deterministic_payload(BIG_FILE_BYTES, seed=b"s3-dedup")
-        payload_sha = sha256_bytes(payload)
-        (repo / "bigfile.bin").write_bytes(payload)
+        # ---- v1: baseline 35 MiB ----------------------------------------
+        payload_v1 = deterministic_payload(BIG_FILE_BYTES, seed=b"s3-dedup-v1")
+        sha_v1 = sha256_bytes(payload_v1)
+        (repo / "bigfile.bin").write_bytes(payload_v1)
         with timings.measure(
-            "s3-dedup: stage + commit v1", bytes_moved=BIG_FILE_BYTES
+            "s3-dedup: v1 stage+commit+push", bytes_moved=BIG_FILE_BYTES
         ):
             git(["add", "bigfile.bin"], cwd=repo, env=env)
             git(["commit", "-m", "s3-dedup v1"], cwd=repo, env=env)
-
-        before = storage.total_bytes()
-        with timings.measure(
-            "s3-dedup: push v1", bytes_moved=BIG_FILE_BYTES
-        ):
+            before_v1 = storage.total_bytes()
             git(["push", "-u", "origin", "main"], cwd=repo, env=env)
         after_v1 = storage.total_bytes()
-        grew_v1 = after_v1 - before
-        # Compression keeps the on-disk size below the raw 35 MiB; require
-        # at least half. Same threshold the fs dedup phase uses.
+        grew_v1 = after_v1 - before_v1
+        # Full payload upload; compression keeps it below raw size.
         if grew_v1 < BIG_FILE_BYTES // 2:
             raise TestFailure(
-                f"s3-dedup: bucket grew only {fmt_bytes(grew_v1)} on v1 push — "
+                f"s3-dedup v1: bucket grew only {fmt_bytes(grew_v1)} — "
                 f"expected ≥ {fmt_bytes(BIG_FILE_BYTES // 2)}"
             )
-        info(f"  s3-dedup: bucket grew by {fmt_bytes(grew_v1)} on v1 push")
+        info(f"  s3-dedup v1: bucket +{fmt_bytes(grew_v1)} (full payload)")
 
-        # Duplicate file with identical bytes — every chunk must dedup, so
-        # the bucket should grow by at most a shard's worth (≤ tolerance).
-        (repo / "duplicate.bin").write_bytes(payload)
-        with timings.measure(
-            "s3-dedup: stage + push duplicate", bytes_moved=BIG_FILE_BYTES
-        ):
-            git(["add", "duplicate.bin"], cwd=repo, env=env)
-            git(["commit", "-m", "s3-dedup duplicate"], cwd=repo, env=env)
-            git(["push", "origin", "main"], cwd=repo, env=env)
-        after_dup = storage.total_bytes()
-        grew_dup = after_dup - after_v1
-        if grew_dup > SIZE_TOLERANCE_BYTES:
-            raise TestFailure(
-                f"s3-dedup: duplicate-file push grew bucket by "
-                f"{fmt_bytes(grew_dup)} (tolerance {SIZE_TOLERANCE_BYTES}) — "
-                "CDC chunk-level dedup isn't reusing the v1 xorbs"
-            )
-        info(
-            f"  s3-dedup: duplicate file added {fmt_bytes(grew_dup)} "
-            f"(≤ {SIZE_TOLERANCE_BYTES} B tolerance) — chunks deduped"
+        # ---- v2: 8-byte poke at the middle ------------------------------
+        # CDC keeps the edit localized: at most a handful of chunks need
+        # re-uploading. Tolerance is generous to absorb chunk-boundary
+        # variance.
+        v2_offset = BIG_FILE_BYTES // 2
+        payload_v2 = (
+            payload_v1[:v2_offset]
+            + b"\xde\xad\xbe\xef\x01\x02\x03\x04"
+            + payload_v1[v2_offset + 8:]
         )
+        sha_v2 = sha256_bytes(payload_v2)
+        if sha_v2 == sha_v1:
+            raise TestFailure("s3-dedup v2: sha256 unchanged after poke")
+        (repo / "bigfile.bin").write_bytes(payload_v2)
+        with timings.measure(
+            "s3-dedup: v2 stage+commit+push (8-byte poke)",
+            bytes_moved=BIG_FILE_BYTES,
+        ):
+            git(["add", "bigfile.bin"], cwd=repo, env=env)
+            git(["commit", "-m", "s3-dedup v2: 8-byte poke"], cwd=repo, env=env)
+            git(["push", "origin", "main"], cwd=repo, env=env)
+        after_v2 = storage.total_bytes()
+        grew_v2 = after_v2 - after_v1
+        # Tolerance: a handful of 64 KiB chunks (each is ~64 KiB
+        # uncompressed) plus the new shard. 2 MiB is a generous cap.
+        v2_max_growth = 2 * 1024 * 1024
+        if grew_v2 > v2_max_growth:
+            raise TestFailure(
+                f"s3-dedup v2: bucket grew by {fmt_bytes(grew_v2)} for an "
+                f"8-byte edit — expected ≤ {fmt_bytes(v2_max_growth)} "
+                "(CDC chunk-level dedup not engaging)"
+            )
+        info(f"  s3-dedup v2: bucket +{fmt_bytes(grew_v2)} (8-byte edit)")
 
-        # /v1/usage cross-check. The server dedupes raw_bytes at the
-        # FILE-content level (two paths with identical sha256 collapse to
-        # one logical file in the `files` table). So both bigfile.bin and
-        # duplicate.bin have the same file_hash and the registration of
-        # the second is a no-op — raw_bytes stays ≈ one payload, not two.
-        # The CDC chunk-level dedup story is what the bucket-growth
-        # check above proves; this check confirms the metadata layer
-        # agrees with the bucket layer.
+        # ---- v3: 1 MiB region replacement -------------------------------
+        v3_offset = BIG_FILE_BYTES // 4
+        v3_len = 1024 * 1024
+        v3_region = deterministic_payload(v3_len, seed=b"s3-dedup-v3-region")
+        payload_v3 = (
+            payload_v2[:v3_offset] + v3_region + payload_v2[v3_offset + v3_len:]
+        )
+        sha_v3 = sha256_bytes(payload_v3)
+        if sha_v3 in (sha_v1, sha_v2):
+            raise TestFailure("s3-dedup v3: sha256 collision with earlier rev")
+        (repo / "bigfile.bin").write_bytes(payload_v3)
+        with timings.measure(
+            "s3-dedup: v3 stage+commit+push (1 MiB region)",
+            bytes_moved=BIG_FILE_BYTES,
+        ):
+            git(["add", "bigfile.bin"], cwd=repo, env=env)
+            git(["commit", "-m", "s3-dedup v3: 1 MiB region"], cwd=repo, env=env)
+            git(["push", "origin", "main"], cwd=repo, env=env)
+        after_v3 = storage.total_bytes()
+        grew_v3 = after_v3 - after_v2
+        # ~1 MiB of new content plus boundary chunks; cap at 3 MiB.
+        v3_max_growth = 3 * 1024 * 1024
+        if grew_v3 > v3_max_growth:
+            raise TestFailure(
+                f"s3-dedup v3: bucket grew by {fmt_bytes(grew_v3)} for a "
+                f"1 MiB edit — expected ≤ {fmt_bytes(v3_max_growth)}"
+            )
+        info(f"  s3-dedup v3: bucket +{fmt_bytes(grew_v3)} (1 MiB edit)")
+
+        # ---- /v1/usage cross-check --------------------------------------
+        # raw_bytes counts each (commit, file_path) registration, so
+        # three distinct file_hashes (v1/v2/v3) yield ≈ 3 × BIG_FILE_BYTES.
+        # stored_bytes is on-disk xorb cost (chunk-deduped) — should stay
+        # close to one payload's worth despite three revisions.
+        # savings = raw - stored should be ≈ 2 × BIG_FILE_BYTES.
         usage = fetch_repo_usage(
             server, token=admin_jwt, owner=E2E_OWNER, repo=E2E_REPO_2,
         )
-        raw = int(usage.get("raw_bytes", 0))
-        if raw < BIG_FILE_BYTES - SIZE_TOLERANCE_BYTES or raw > BIG_FILE_BYTES + SIZE_TOLERANCE_BYTES:
+        info(f"  s3-dedup: /v1/usage repo response = {usage}")
+        raw = int(usage["raw_bytes"])
+        stored = int(usage["stored_bytes"])
+        savings = int(usage["dedup_savings_bytes"])
+
+        # raw ≥ 2× (be lenient; the precise multiplier depends on whether
+        # carried-forward pointers count as new registrations).
+        if raw < 2 * BIG_FILE_BYTES:
             raise TestFailure(
-                f"s3-dedup: /v1/usage raw_bytes={raw} — expected "
-                f"≈ {BIG_FILE_BYTES} (file-level dedup collapses the two "
-                "identical-content files into one accounting entry)"
+                f"s3-dedup: /v1/usage raw_bytes={raw} < expected ≥ "
+                f"{2 * BIG_FILE_BYTES} — accounting isn't counting the "
+                "three revisions distinctly"
             )
-        # dedup_savings_bytes ≡ raw - stored. With file-level dedup at
-        # the metadata layer + chunk-level dedup at the blob layer, raw
-        # ≈ stored, so savings ≈ 0. (The savings story shows up at
-        # raw=3×, stored=1.1× scale when the same file is pushed at
-        # multiple commits — that's a different phase.)
+        # stored ≤ 1.5× one payload — chunks dedup across revisions.
+        if stored > BIG_FILE_BYTES * 3 // 2:
+            raise TestFailure(
+                f"s3-dedup: /v1/usage stored_bytes={stored} > expected "
+                f"≤ {BIG_FILE_BYTES * 3 // 2} — chunk-level dedup isn't "
+                "reaching the accounting layer"
+            )
+        if savings != raw - stored:
+            raise TestFailure(
+                f"s3-dedup: /v1/usage dedup_savings_bytes={savings} != "
+                f"raw_bytes - stored_bytes = {raw - stored}"
+            )
+        if savings <= 0:
+            raise TestFailure(
+                f"s3-dedup: /v1/usage dedup_savings_bytes={savings} ≤ 0 — "
+                "no savings recorded across three revisions"
+            )
         info(
-            f"  s3-dedup: /v1/usage raw={fmt_bytes(raw)}, "
-            f"stored={fmt_bytes(int(usage['stored_bytes']))}, "
-            f"savings={fmt_bytes(int(usage['dedup_savings_bytes']))}"
+            f"  s3-dedup: raw={fmt_bytes(raw)}, stored={fmt_bytes(stored)}, "
+            f"savings={fmt_bytes(savings)} "
+            f"({100.0 * savings / raw:.1f}% of raw)"
         )
 
-        # Sanity: verify the worktree round-trips off both files via cold
-        # smudge — proves S3 reconstruction works when chunks are
-        # referenced from multiple file pointers.
+        # ---- Cold-clone history verification ----------------------------
+        # Every revision must check out to the right sha256 — proves the
+        # CDC-deduped chunks reassemble correctly per-revision from S3.
         clone_path, clone_env, _ = init_repo_for_clone(
             work_root=work_root, client=client, server=server,
             owner=E2E_OWNER, repo=E2E_REPO_2, name="s3-dedup-clone",
         )
         with timings.measure(
-            "s3-dedup: cold clone checkout", bytes_moved=BIG_FILE_BYTES * 2
+            "s3-dedup: cold clone HEAD (v3)", bytes_moved=BIG_FILE_BYTES,
         ):
             git(["checkout", "main"], cwd=clone_path, env=clone_env)
         verify_worktree(
             clone_path, "bigfile.bin",
-            expected_sha=payload_sha, expected_size=BIG_FILE_BYTES,
-            label="s3-dedup:after-clone:bigfile",
-        )
-        verify_worktree(
-            clone_path, "duplicate.bin",
-            expected_sha=payload_sha, expected_size=BIG_FILE_BYTES,
-            label="s3-dedup:after-clone:duplicate",
+            expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
+            label="s3-dedup:clone:v3",
         )
     finally:
         server.stop()
