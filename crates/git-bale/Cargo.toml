@@ -15,8 +15,12 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 clap = { version = "=4.5.50", features = ["derive"] }
+gix = "=0.84.0"
 hex.workspace = true
+libc = "=0.2.186"
+libloading = "=0.8.6"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

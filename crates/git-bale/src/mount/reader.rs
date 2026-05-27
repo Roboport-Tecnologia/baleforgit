@@ -1,0 +1,462 @@
+//! Byte-source for virtual files. Two kinds of blob:
+//!
+//! 1. A plain git blob — fetched from the repo's object database via gix.
+//! 2. A Bale pointer — parsed to a `XetFileInfo`, then reconstructed from the
+//!    chunk cache (fast path) with a `FileDownloadSession` fallback that also
+//!    repopulates the cache (cold path). The decompressed body is held in a
+//!    bounded in-memory LRU so repeat reads don't re-decompress.
+//!
+//! Caching strategy:
+//! - Plain blobs: cached in their entirety on first read (cap each at 16 MiB
+//!   — anything larger should have been Bale-tracked at commit time).
+//! - Bale-tracked blobs: cached as a decompressed `Bytes` in an LRU sized by
+//!   total bytes (default 1 GiB).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use xet_client::chunk_cache::{get_cache, CacheConfig, ChunkCache};
+use xet_data::processing::configurations::TranslatorConfig;
+use xet_data::processing::data_client::default_config;
+use xet_data::processing::FileDownloadSession;
+use xet_runtime::core::XetRuntime;
+
+use crate::config::{BaleConfig, RawConfig};
+use crate::local_reconstruct::{try_reconstruct_from_cache, CacheReconstructOutcome};
+use crate::manifest_cache;
+use crate::pointer;
+use crate::remote_manifest::fetch_manifest;
+use crate::resolver;
+
+const PLAIN_BLOB_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Total cache budget for decompressed Bale file bodies. Sized for "a few
+/// big files in flight"; smaller than typical RAM so the OS still has room.
+const BALE_LRU_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Identifies a blob's source in git's ODB. The reader resolves this to bytes
+/// either directly (small plain blobs) or via the Bale reconstruction path
+/// (pointer blobs).
+#[derive(Clone, Debug)]
+pub struct BlobSource {
+    /// Hex string. Length is 40 (SHA-1) or 64 (SHA-256), validated by gix.
+    pub oid: String,
+}
+
+/// In-memory cache entry. Holding `Bytes` lets us hand out `clone`s without
+/// re-allocating on every read (it's an Arc-backed slice).
+struct CachedBlob {
+    data: Bytes,
+}
+
+pub struct Reader {
+    repo_path: PathBuf,
+    raw: Option<RawConfig>,
+    rt: Option<Arc<XetRuntime>>,
+    chunk_cache: Option<Arc<dyn ChunkCache>>,
+    /// Lazily-resolved (server_url, token). Read-scope only.
+    bale_cfg: Mutex<Option<BaleConfig>>,
+    /// `oid → decompressed file size`. Populated by `size_of` (cheap, no
+    /// reconstruction) and `fetch` (free side effect). Lets `getattr` answer
+    /// `stat` in O(1) after the first call without ever decompressing chunks.
+    size_cache: Mutex<HashMap<String, u64>>,
+    plain_cache: Mutex<HashMap<String, Arc<CachedBlob>>>,
+    /// Bale file body cache keyed by xet file id (the pointer's `hash`).
+    bale_cache: Mutex<BaleLru>,
+}
+
+struct BaleLru {
+    map: HashMap<String, Arc<CachedBlob>>,
+    /// Insertion order; oldest at the front. Tiny VFS sizes mean we can
+    /// afford a Vec — the LRU semantics matter more than O(1) push/pop.
+    order: Vec<String>,
+    bytes_used: u64,
+    budget: u64,
+}
+
+impl BaleLru {
+    fn new(budget: u64) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: Vec::new(),
+            bytes_used: 0,
+            budget,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Arc<CachedBlob>> {
+        let v = self.map.get(key).cloned()?;
+        // Touch: move to back. Cheap because Vec is small.
+        if let Some(idx) = self.order.iter().position(|k| k == key) {
+            let s = self.order.remove(idx);
+            self.order.push(s);
+        }
+        Some(v)
+    }
+
+    fn put(&mut self, key: String, blob: Arc<CachedBlob>) {
+        let size = blob.data.len() as u64;
+        if size > self.budget {
+            // Single entry busts the budget; don't cache it. Still serve the bytes.
+            return;
+        }
+        while self.bytes_used + size > self.budget {
+            let Some(victim) = self.order.first().cloned() else {
+                break;
+            };
+            self.order.remove(0);
+            if let Some(old) = self.map.remove(&victim) {
+                self.bytes_used = self.bytes_used.saturating_sub(old.data.len() as u64);
+            }
+        }
+        self.bytes_used += size;
+        self.order.push(key.clone());
+        self.map.insert(key, blob);
+    }
+}
+
+impl Reader {
+    pub fn new(repo_path: PathBuf, raw: RawConfig) -> Result<Self> {
+        // Verify the repo opens before we mount — fails fast on a bad cwd.
+        gix::open(&repo_path)
+            .with_context(|| format!("opening git repo at {}", repo_path.display()))?;
+        let rt = XetRuntime::new().context("starting xet runtime")?;
+        let cache_cfg = CacheConfig {
+            cache_directory: raw.cache_dir.clone(),
+            cache_size: rt.config().chunk_cache.size_bytes,
+        };
+        let chunk_cache = get_cache(&cache_cfg)
+            .map_err(|e| anyhow!("init chunk cache at {}: {e}", raw.cache_dir.display()))?;
+
+        Ok(Self {
+            repo_path,
+            raw: Some(raw),
+            rt: Some(rt),
+            chunk_cache: Some(chunk_cache),
+            bale_cfg: Mutex::new(None),
+            size_cache: Mutex::new(HashMap::new()),
+            plain_cache: Mutex::new(HashMap::new()),
+            bale_cache: Mutex::new(BaleLru::new(BALE_LRU_BUDGET_BYTES)),
+        })
+    }
+
+    /// Test-only constructor that skips xet-runtime + chunk-cache setup.
+    /// `read` will panic via `expect` if a real fetch is attempted.
+    #[cfg(test)]
+    pub fn for_test_only(repo_path: PathBuf) -> Self {
+        Self {
+            repo_path,
+            raw: None,
+            rt: None,
+            chunk_cache: None,
+            bale_cfg: Mutex::new(None),
+            size_cache: Mutex::new(HashMap::new()),
+            plain_cache: Mutex::new(HashMap::new()),
+            bale_cache: Mutex::new(BaleLru::new(BALE_LRU_BUDGET_BYTES)),
+        }
+    }
+
+    /// Decompressed logical size of the file. Cheap: for a Bale pointer this
+    /// just reads the pointer JSON from the ODB and returns `file_size`; for a
+    /// plain blob it returns the ODB blob length. Never triggers chunk
+    /// reconstruction.
+    pub fn size_of(&self, source: &BlobSource) -> Result<u64> {
+        if let Some(&s) = self.size_cache.lock().unwrap().get(&source.oid) {
+            return Ok(s);
+        }
+        let repo = gix::open(&self.repo_path)
+            .with_context(|| format!("opening git repo at {}", self.repo_path.display()))?;
+        let oid = gix::ObjectId::from_hex(source.oid.as_bytes())
+            .with_context(|| format!("parsing OID {}", source.oid))?;
+        let obj = repo
+            .find_object(oid)
+            .with_context(|| format!("loading object {}", source.oid))?;
+        if obj.kind != gix::object::Kind::Blob {
+            return Err(anyhow!(
+                "expected blob for OID {}, found {:?}",
+                source.oid,
+                obj.kind
+            ));
+        }
+        let size = if pointer::looks_like_pointer(&obj.data) {
+            match pointer::parse_pointer(&obj.data) {
+                Ok(info) => info
+                    .file_size()
+                    .ok_or_else(|| anyhow!("bale pointer {} missing file_size", source.oid))?,
+                // Sentinel matched but JSON parse failed — it's a plain blob
+                // that happens to contain the `"hash"` token. Fall back.
+                Err(_) => obj.data.len() as u64,
+            }
+        } else {
+            obj.data.len() as u64
+        };
+        self.size_cache
+            .lock()
+            .unwrap()
+            .insert(source.oid.clone(), size);
+        Ok(size)
+    }
+
+    /// Reads `len` bytes starting at `offset`. Returns fewer than `len` only
+    /// at EOF. Backfills `size_cache` as a free side effect.
+    pub fn read(&self, source: &BlobSource, offset: u64, len: usize) -> Result<Bytes> {
+        let bytes = self.fetch(source)?;
+        let total = bytes.len() as u64;
+        self.size_cache
+            .lock()
+            .unwrap()
+            .insert(source.oid.clone(), total);
+        if offset >= total {
+            return Ok(Bytes::new());
+        }
+        let start = offset as usize;
+        let end = (start + len).min(bytes.len());
+        Ok(bytes.slice(start..end))
+    }
+
+    fn fetch(&self, source: &BlobSource) -> Result<Bytes> {
+        // Plain blob hit?
+        if let Some(c) = self.plain_cache.lock().unwrap().get(&source.oid).cloned() {
+            return Ok(c.data.clone());
+        }
+
+        let repo = gix::open(&self.repo_path)
+            .with_context(|| format!("opening git repo at {}", self.repo_path.display()))?;
+        let oid = gix::ObjectId::from_hex(source.oid.as_bytes())
+            .with_context(|| format!("parsing OID {}", source.oid))?;
+        let obj = repo
+            .find_object(oid)
+            .with_context(|| format!("loading object {}", source.oid))?;
+        if obj.kind != gix::object::Kind::Blob {
+            return Err(anyhow!(
+                "expected blob for OID {}, found {:?}",
+                source.oid,
+                obj.kind
+            ));
+        }
+        let raw = obj.data.clone();
+
+        // Bale pointer? Try to parse — failures just mean "treat as plain blob".
+        if pointer::looks_like_pointer(&raw) {
+            if let Ok(info) = pointer::parse_pointer(&raw) {
+                let file_id_hex = info.hash().to_string();
+                if let Some(cached) = self.bale_cache.lock().unwrap().get(&file_id_hex) {
+                    return Ok(cached.data.clone());
+                }
+                let data = self.reconstruct_bale(&info)?;
+                let blob = Arc::new(CachedBlob { data: data.clone() });
+                self.bale_cache.lock().unwrap().put(file_id_hex, blob);
+                return Ok(data);
+            }
+        }
+
+        if raw.len() > PLAIN_BLOB_MAX_BYTES {
+            return Err(anyhow!(
+                "plain blob {} is {} bytes (> {}); mount-diff only handles plain blobs up to 16 MiB. Track it via `git-bale track` so it's stored as a Bale pointer.",
+                source.oid,
+                raw.len(),
+                PLAIN_BLOB_MAX_BYTES,
+            ));
+        }
+        let bytes = Bytes::from(raw);
+        self.plain_cache.lock().unwrap().insert(
+            source.oid.clone(),
+            Arc::new(CachedBlob {
+                data: bytes.clone(),
+            }),
+        );
+        Ok(bytes)
+    }
+
+    fn reconstruct_bale(&self, info: &xet_data::processing::XetFileInfo) -> Result<Bytes> {
+        let rt = self
+            .rt
+            .as_ref()
+            .ok_or_else(|| anyhow!("reader was constructed without a xet runtime"))?;
+        let chunk_cache = self
+            .chunk_cache
+            .as_ref()
+            .ok_or_else(|| anyhow!("reader was constructed without a chunk cache"))?;
+        let raw = self
+            .raw
+            .as_ref()
+            .ok_or_else(|| anyhow!("reader was constructed without a config"))?;
+        let file_size = info
+            .file_size()
+            .ok_or_else(|| anyhow!("bale pointer missing file_size"))?;
+        let file_id_hex = info.hash().to_string();
+        if !is_safe_file_id(&file_id_hex) {
+            return Err(anyhow!(
+                "bale pointer hash is not canonical hex (got {} chars)",
+                file_id_hex.len()
+            ));
+        }
+
+        // Same temp-file dance as the smudge filter: the xet-data download
+        // API takes its writer by value and requires it to be `'static`, so
+        // we spool through a tempfile and slurp it back after.
+        let tmp = tempfile::NamedTempFile::new()?;
+
+        let cache_hit = if let Some(git_dir) = raw.git_dir.as_deref() {
+            match manifest_cache::load(git_dir, &file_id_hex)? {
+                Some(manifest) => {
+                    let dest_file = tmp.reopen()?;
+                    let rt_clone = rt.clone();
+                    let cache_clone = chunk_cache.clone();
+                    let outcome = rt
+                        .bridge_sync(async move {
+                            let mut dest = dest_file;
+                            try_reconstruct_from_cache(
+                                &rt_clone,
+                                &cache_clone,
+                                &manifest,
+                                file_size,
+                                &mut dest,
+                            )
+                            .await
+                        })
+                        .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+                    matches!(outcome, CacheReconstructOutcome::Wrote(_))
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+
+        if !cache_hit {
+            // Discard any partial bytes from a failed hot-path attempt.
+            let mut trunc = tmp.reopen()?;
+            trunc.set_len(0)?;
+            std::io::Seek::seek(&mut trunc, std::io::SeekFrom::Start(0))?;
+            drop(trunc);
+
+            let cfg = self.resolved_cfg()?;
+            let translator = build_translator_config(&cfg)?;
+            let info_clone = info.clone();
+            let cache_clone = chunk_cache.clone();
+            let dest_file = tmp.reopen()?;
+            rt.bridge_sync(async move {
+                let session =
+                    FileDownloadSession::new(Arc::new(translator), Some(cache_clone)).await?;
+                // Same `0..file_size` range cap as the smudge filter — see
+                // filter_process.rs for why this is load-bearing.
+                let (_id, _n) = session
+                    .download_to_writer(&info_clone, 0..file_size, dest_file)
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+
+            // Backfill the per-repo manifest cache for the next mount.
+            if let Some(git_dir) = raw.git_dir.as_deref() {
+                if let Ok(merkle) = info.merkle_hash() {
+                    let cfg_clone = cfg.clone();
+                    let fetched =
+                        rt.bridge_sync(async move { fetch_manifest(&cfg_clone, &merkle).await });
+                    if let Ok(Ok(manifest)) = fetched {
+                        let _ = manifest_cache::save(git_dir, &file_id_hex, &manifest);
+                    }
+                }
+            }
+        }
+
+        let buf = std::fs::read(tmp.path())?;
+        Ok(Bytes::from(buf))
+    }
+
+    fn resolved_cfg(&self) -> Result<BaleConfig> {
+        if let Some(cfg) = self.bale_cfg.lock().unwrap().clone() {
+            return Ok(cfg);
+        }
+        let rt = self
+            .rt
+            .as_ref()
+            .ok_or_else(|| anyhow!("reader was constructed without a xet runtime"))?;
+        let raw = self
+            .raw
+            .as_ref()
+            .ok_or_else(|| anyhow!("reader was constructed without a config"))?;
+        let raw_clone = raw.clone();
+        let resolved = rt
+            .bridge_sync(async move { resolver::resolve(&raw_clone, resolver::Scope::Read).await })
+            .map_err(|e| anyhow!("xet runtime error during Bale auth resolution: {e:?}"))??;
+        let cfg = BaleConfig {
+            server_url: resolved.server_url,
+            token: resolved.token,
+            token_expiration: resolved.token_expiration,
+            cache_dir: raw.cache_dir.clone(),
+            git_dir: raw.git_dir.clone(),
+        };
+        *self.bale_cfg.lock().unwrap() = Some(cfg.clone());
+        Ok(cfg)
+    }
+}
+
+fn build_translator_config(cfg: &BaleConfig) -> Result<TranslatorConfig> {
+    Ok(default_config(
+        cfg.server_url.clone(),
+        Some((cfg.token.clone(), cfg.token_expiration)),
+        None,
+        None,
+    )?)
+}
+
+/// 64 lowercase hex chars; same constraint as the smudge filter.
+fn is_safe_file_id(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Process-wide handle to the active reader, so libfuse C callbacks (which
+/// don't get user_data on every call) can find it. Set once per mount.
+static ACTIVE_READER: OnceLock<Arc<Reader>> = OnceLock::new();
+
+pub fn install_active(reader: Arc<Reader>) -> Result<()> {
+    ACTIVE_READER
+        .set(reader)
+        .map_err(|_| anyhow!("active reader already installed; only one mount per process"))
+}
+
+pub fn active() -> Option<Arc<Reader>> {
+    ACTIVE_READER.get().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bale_lru_evicts_oldest_under_budget() {
+        let mut lru = BaleLru::new(10);
+        let make = |n: usize| {
+            Arc::new(CachedBlob {
+                data: Bytes::from(vec![0u8; n]),
+            })
+        };
+        lru.put("a".into(), make(4));
+        lru.put("b".into(), make(4));
+        // Touch "a" so "b" is now the oldest by recency.
+        assert!(lru.get("a").is_some());
+        // c (4 bytes) makes total 12 > 10 → evict oldest = "b".
+        lru.put("c".into(), make(4));
+        assert!(lru.get("a").is_some());
+        assert!(lru.get("b").is_none());
+        assert!(lru.get("c").is_some());
+    }
+
+    #[test]
+    fn bale_lru_refuses_oversized_entry() {
+        let mut lru = BaleLru::new(10);
+        lru.put(
+            "huge".into(),
+            Arc::new(CachedBlob {
+                data: Bytes::from(vec![0u8; 100]),
+            }),
+        );
+        assert!(lru.get("huge").is_none());
+    }
+}

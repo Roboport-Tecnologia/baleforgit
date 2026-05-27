@@ -3,6 +3,7 @@ pub mod filter_process;
 pub mod install;
 pub mod local_reconstruct;
 pub mod manifest_cache;
+pub mod mount;
 pub mod pktline;
 pub mod pointer;
 pub mod remote;

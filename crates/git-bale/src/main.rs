@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use git_bale::install::{self, Scope};
+use git_bale::mount::{self, MountDiffArgs};
 use git_bale::{filter_process, track};
 
 #[derive(Parser, Debug)]
@@ -33,6 +34,8 @@ enum Command {
     Track(TrackArgs),
     /// Run the long-running filter protocol. Invoked by Git, not by users.
     FilterProcess,
+    /// Mount a read-only virtual FS exposing both sides of a `git diff`.
+    MountDiff(MountDiffCliArgs),
 }
 
 #[derive(Args, Debug)]
@@ -63,6 +66,29 @@ struct UninstallArgs {
 struct TrackArgs {
     /// Patterns to add to .gitattributes (e.g. `*.bin`, `models/**/*.safetensors`).
     patterns: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct MountDiffCliArgs {
+    /// "Old" side of the diff (rev, branch, tag, etc.).
+    rev_a: String,
+    /// "New" side of the diff (rev, branch, tag, etc.).
+    rev_b: String,
+    /// Directory to mount on. Must exist and be empty (or you'll mask its
+    /// contents until unmount).
+    #[arg(long)]
+    mount: PathBuf,
+    /// Override the label embedded in side-A filenames. Defaults to a
+    /// filesystem-sanitised form of `rev_a`.
+    #[arg(long = "label-a")]
+    label_a: Option<String>,
+    /// Override the label embedded in side-B filenames. Defaults to a
+    /// filesystem-sanitised form of `rev_b`.
+    #[arg(long = "label-b")]
+    label_b: Option<String>,
+    /// Optional path filters, like `git diff <revA> <revB> -- <paths>...`.
+    #[arg(last = true)]
+    paths: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -107,6 +133,14 @@ fn main() -> Result<()> {
             track::track(&cwd, &a.patterns)
         }
         Command::FilterProcess => filter_process::run(),
+        Command::MountDiff(a) => mount::run(MountDiffArgs {
+            rev_a: a.rev_a,
+            rev_b: a.rev_b,
+            mount_point: a.mount,
+            label_a: a.label_a,
+            label_b: a.label_b,
+            paths: a.paths,
+        }),
     }
 }
 
