@@ -27,6 +27,7 @@ import hmac
 import json
 import os
 import platform
+import random
 import secrets
 import shutil
 import socket
@@ -2228,6 +2229,85 @@ def resolve_git_bale(arg_path: Optional[str]) -> Path:
     raise AssertionError("unreachable")
 
 
+# =============================================================================
+# Phase registry + ordering
+# =============================================================================
+
+# A phase has:
+#   name:      CLI-visible identifier (matches --skip filters)
+#   group:     "g1" (independent push-side), "g2-head" (always first in g2),
+#              "g2-tail" (depends on bigfile's rev_state), "g3" (isolated)
+#   read_only: True for phases that don't mutate server state from the client
+#              side; these are the only ones a --reuse-from run is allowed to
+#              execute. False = phase pushes new commits or boots a fresh
+#              container with empty data.
+#
+# Group ORDER is fixed: g1 → g2-head → g2-tail → g3. Within each group the
+# order is determined by --order. g2-head only ever holds bigfile (so it's a
+# noop group for reordering), but it lets us guarantee bigfile runs before
+# anything that consumes rev_state without making the ordering function
+# inspect dependencies.
+
+PHASE_GROUPS_ORDER = ["g1", "g2-head", "g2-tail", "g3"]
+
+
+def order_within_group(phases: list[str], order: str, rng: random.Random) -> list[str]:
+    if order == "forward":
+        return list(phases)
+    if order == "reverse":
+        return list(reversed(phases))
+    if order == "random":
+        out = list(phases)
+        rng.shuffle(out)
+        return out
+    raise ValueError(f"unknown order: {order!r}")
+
+
+# =============================================================================
+# Multi-run state stash (for --state-dir / --reuse-from)
+# =============================================================================
+
+
+STATE_FILE = ".e2e_state.json"
+
+
+def save_state(
+    state_dir: Path,
+    *,
+    jwt_secret_hex: str,
+    transfer_secret_hex: str,
+    admin_token_hex: str,
+    rev_state: dict,
+) -> None:
+    """Persist the bits a follow-up --reuse-from run needs: server-side
+    secrets so JWT/transfer signatures stay valid against the same data
+    dir, and rev_state's shas/commits so read-only phases know what to
+    expect from the already-pushed history."""
+    payload = {
+        "jwt_secret_hex": jwt_secret_hex,
+        "transfer_secret_hex": transfer_secret_hex,
+        "admin_token_hex": admin_token_hex,
+        # rev_state contains Paths and a dict env; strip to the JSON-friendly
+        # subset the read-only phases actually consume.
+        "rev_state": {
+            "shas": list(rev_state.get("shas", [])),
+            "commits": list(rev_state.get("commits", [])),
+            "disk_after": list(rev_state.get("disk_after", [])),
+            "raw_after": list(rev_state.get("raw_after", [])),
+        },
+    }
+    (state_dir / STATE_FILE).write_text(json.dumps(payload, indent=2))
+
+
+def load_state(state_dir: Path) -> dict:
+    return json.loads((state_dir / STATE_FILE).read_text())
+
+
+# =============================================================================
+# main()
+# =============================================================================
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--git-bale", default=None)
@@ -2235,15 +2315,39 @@ def main() -> int:
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--keep-tmpdir", action="store_true")
     parser.add_argument(
-        "--skip",
-        action="append",
-        default=[],
+        "--skip", action="append", default=[],
         help="Phase name(s) to skip (repeat the flag for multiple).",
+    )
+    parser.add_argument(
+        "--order", choices=["forward", "reverse", "random"], default="forward",
+        help="Within-group phase order. Group order itself is always fixed.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Seed for --order=random (so a failing matrix run reproduces).",
+    )
+    parser.add_argument(
+        "--state-dir", default=None,
+        help="Use this path as the work directory instead of mkdtemp, and "
+             "leave it intact on exit. Writes .e2e_state.json with secrets + "
+             "rev_state so a follow-up --reuse-from run can continue.",
+    )
+    parser.add_argument(
+        "--reuse-from", default=None,
+        help="Reuse the data dir + git-home + secrets from a prior run "
+             "(must have been launched with --state-dir). Only `read_only` "
+             "phases are eligible to run in this mode.",
     )
     args = parser.parse_args()
 
+    if args.reuse_from and args.state_dir:
+        die("--reuse-from and --state-dir are mutually exclusive")
+
     info(f"platform: {platform.system()} {platform.release()} ({platform.machine()})")
     info(f"repo root: {REPO_ROOT}")
+    info(f"phase order: {args.order}")
+    if args.reuse_from:
+        info(f"reusing state from: {args.reuse_from}")
 
     for tool in ("git", "ssh", "ssh-keygen"):
         if not tool_on_path(tool):
@@ -2257,19 +2361,60 @@ def main() -> int:
     elif not image_exists(rt, args.image_tag):
         die(f"--no-build was passed but image {args.image_tag} doesn't exist")
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="baleforgit-e2e-"))
-    info(f"work dir: {tmpdir}")
-    data_root = tmpdir / "server-data"
-    data_root.mkdir()
-    work_root = tmpdir / "work"
-    work_root.mkdir()
+    # Resolve the on-disk layout. With --reuse-from the data_root + git-home
+    # already exist and must be left alone; with --state-dir we own the path
+    # and create the per-run subdirs inside it; otherwise it's a private
+    # mkdtemp.
+    rng_seed = args.seed if args.seed is not None else secrets.randbits(64)
+    rng = random.Random(rng_seed)
+    if args.order == "random":
+        info(f"random seed: {rng_seed}")
 
-    jwt_secret_hex = secrets.token_bytes(32).hex()
-    transfer_secret_hex = secrets.token_bytes(32).hex()
-    admin_token_hex = secrets.token_bytes(32).hex()
+    reused: Optional[dict] = None
+    delete_tmpdir_on_exit = True
+    if args.reuse_from:
+        tmpdir = Path(args.reuse_from).resolve()
+        if not tmpdir.is_dir():
+            die(f"--reuse-from path doesn't exist or isn't a directory: {tmpdir}")
+        try:
+            reused = load_state(tmpdir)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            die(f"--reuse-from: can't load {tmpdir / STATE_FILE}: {e}")
+        # Fresh client work dir under the reused tempdir so each preserved
+        # run gets clean client caches even though server state persists.
+        work_root = tmpdir / f"work-{secrets.token_hex(3)}"
+        work_root.mkdir()
+        data_root = tmpdir / "server-data"
+        if not data_root.is_dir():
+            die(f"--reuse-from: server-data missing under {tmpdir}")
+        delete_tmpdir_on_exit = False  # never delete state owned by caller
+    elif args.state_dir:
+        tmpdir = Path(args.state_dir).resolve()
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        data_root = tmpdir / "server-data"
+        data_root.mkdir(exist_ok=True)
+        work_root = tmpdir / "work"
+        work_root.mkdir(exist_ok=True)
+        delete_tmpdir_on_exit = False
+    else:
+        tmpdir = Path(tempfile.mkdtemp(prefix="baleforgit-e2e-"))
+        data_root = tmpdir / "server-data"
+        data_root.mkdir()
+        work_root = tmpdir / "work"
+        work_root.mkdir()
+        delete_tmpdir_on_exit = not args.keep_tmpdir
+    info(f"work dir: {tmpdir}")
+
+    if reused is not None:
+        jwt_secret_hex = reused["jwt_secret_hex"]
+        transfer_secret_hex = reused["transfer_secret_hex"]
+        admin_token_hex = reused["admin_token_hex"]
+    else:
+        jwt_secret_hex = secrets.token_bytes(32).hex()
+        transfer_secret_hex = secrets.token_bytes(32).hex()
+        admin_token_hex = secrets.token_bytes(32).hex()
     # JWT minted from the same secret the server uses, scoped to the test
     # owner — used by the test itself to call the usage admin endpoints.
-    # Without an admin token the usage endpoints accept owner-scoped JWTs.
     admin_jwt = mint_bale_jwt(
         secret=bytes.fromhex(jwt_secret_hex),
         sub=E2E_USER,
@@ -2285,6 +2430,10 @@ def main() -> int:
     client: Optional[ClientEnv] = None
     exit_code = 0
     rev_state: dict = {}
+    if reused is not None:
+        # Seed rev_state from disk so read-only phases (clone, tampered-xorb)
+        # know what to verify against.
+        rev_state.update(reused.get("rev_state", {}))
 
     try:
         client = setup_client(work_root=work_root, git_bale_bin=git_bale_bin)
@@ -2305,123 +2454,125 @@ def main() -> int:
                 admin_token_hex=admin_token_hex,
             )
 
-        # ---- run scenarios -------------------------------------------------
-        def maybe(name: str, fn: Callable[[], None]) -> None:
-            if name in args.skip:
-                info(f"-- skipping phase {name!r} (per --skip)")
-                return
-            fn()
+        # ---- phase registry ------------------------------------------------
+        # Each entry: (name, group, read_only, fn). fn is a thunk so we can
+        # rebuild and reorder it without re-binding the captured variables.
+        # rev_state and `server` are looked up at call time via the enclosing
+        # scope, so the offline-restart rebind is visible to later phases.
 
-        maybe(
-            "basic",
-            lambda: phase_basic_user_ops(
-                timings=timings,
-                server=server,
-                client=client,
-                work_root=work_root,
-            ),
-        )
-        # rev_state is shared by several later phases — keep a closure.
-        def _run_bigfile() -> None:
+        def _phase_basic() -> None:
+            phase_basic_user_ops(
+                timings=timings, server=server, client=client, work_root=work_root,
+            )
+
+        def _phase_wrong_token() -> None:
+            phase_adversarial_wrong_token(
+                timings=timings, server=server, client=client, work_root=work_root,
+            )
+
+        def _phase_bigfile() -> None:
             nonlocal rev_state
             rev_state = phase_big_file_dedup(
-                timings=timings,
-                server=server,
-                client=client,
-                work_root=work_root,
-                bale_admin_token=admin_jwt,
+                timings=timings, server=server, client=client,
+                work_root=work_root, bale_admin_token=admin_jwt,
             )
 
-        maybe("bigfile", _run_bigfile)
-        if rev_state:
-            maybe(
-                "usage",
-                lambda: phase_usage_api(
-                    timings=timings,
-                    server=server,
-                    bale_admin_token=admin_jwt,
-                    rev_state=rev_state,
-                ),
+        def _phase_usage() -> None:
+            phase_usage_api(
+                timings=timings, server=server,
+                bale_admin_token=admin_jwt, rev_state=rev_state,
             )
-            maybe(
-                "dedup",
-                lambda: phase_dedup_duplicate_file(
-                    timings=timings,
-                    server=server,
-                    rev_state=rev_state,
-                ),
-            )
-            maybe(
-                "idempotency",
-                lambda: phase_push_idempotency(
-                    timings=timings,
-                    server=server,
-                    rev_state=rev_state,
-                ),
-            )
-            maybe(
-                "clone",
-                lambda: phase_clone_and_verify_history(
-                    timings=timings,
-                    server=server,
-                    client=client,
-                    work_root=work_root,
-                    rev_state=rev_state,
-                ),
-            )
-            if "offline-restart" not in args.skip:
-                # Replaces the server handle: the merged phase stops the old
-                # container and brings up a fresh one against the same data
-                # dir, returning the new handle for downstream phases.
-                server = phase_offline_and_restart(
-                    timings=timings,
-                    server=server,
-                    rt=rt,
-                    image_tag=args.image_tag,
-                    data_root=data_root,
-                    jwt_secret_hex=jwt_secret_hex,
-                    transfer_secret_hex=transfer_secret_hex,
-                    client=client,
-                    ssh_public_key=ssh_public_key,
-                    work_root=work_root,
-                    rev_state=rev_state,
-                    cas_port=cas_port,
-                    ssh_port=ssh_port,
-                    admin_token_hex=admin_token_hex,
-                )
 
-        maybe(
-            "wrong-token",
-            lambda: phase_adversarial_wrong_token(
-                timings=timings,
-                server=server,
-                client=client,
-                work_root=work_root,
-            ),
-        )
-        if rev_state:
-            maybe(
-                "tampered-xorb",
-                lambda: phase_adversarial_tampered_xorb(
-                    timings=timings,
-                    server=server,
-                    client=client,
-                    work_root=work_root,
-                    rev_state=rev_state,
-                ),
+        def _phase_dedup() -> None:
+            phase_dedup_duplicate_file(
+                timings=timings, server=server, rev_state=rev_state,
             )
-        maybe(
-            "quota",
-            lambda: phase_adversarial_quota_exceeded(
-                timings=timings,
-                rt=rt,
-                image_tag=args.image_tag,
-                work_root=work_root,
-                client=client,
+
+        def _phase_idempotency() -> None:
+            phase_push_idempotency(
+                timings=timings, server=server, rev_state=rev_state,
+            )
+
+        def _phase_clone() -> None:
+            phase_clone_and_verify_history(
+                timings=timings, server=server, client=client,
+                work_root=work_root, rev_state=rev_state,
+            )
+
+        def _phase_offline_restart() -> None:
+            nonlocal server
+            server = phase_offline_and_restart(
+                timings=timings, server=server, rt=rt,
+                image_tag=args.image_tag, data_root=data_root,
+                jwt_secret_hex=jwt_secret_hex,
+                transfer_secret_hex=transfer_secret_hex,
+                client=client, ssh_public_key=ssh_public_key,
+                work_root=work_root, rev_state=rev_state,
+                cas_port=cas_port, ssh_port=ssh_port,
+                admin_token_hex=admin_token_hex,
+            )
+
+        def _phase_tampered_xorb() -> None:
+            phase_adversarial_tampered_xorb(
+                timings=timings, server=server, client=client,
+                work_root=work_root, rev_state=rev_state,
+            )
+
+        def _phase_quota() -> None:
+            phase_adversarial_quota_exceeded(
+                timings=timings, rt=rt, image_tag=args.image_tag,
+                work_root=work_root, client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
-            ),
-        )
+            )
+
+        # name -> (group, read_only, fn)
+        REGISTRY: dict[str, tuple[str, bool, Callable[[], None]]] = {
+            "basic":           ("g1",      False, _phase_basic),
+            "wrong-token":     ("g1",      False, _phase_wrong_token),
+            "bigfile":         ("g2-head", False, _phase_bigfile),
+            "usage":           ("g2-tail", True,  _phase_usage),
+            "dedup":           ("g2-tail", False, _phase_dedup),
+            # idempotency dereferences rev_state["repo_path"] (the bigfile
+            # client repo from the same process), so it can't run from a
+            # --reuse-from where rev_state was reconstructed from JSON.
+            "idempotency":     ("g2-tail", False, _phase_idempotency),
+            "clone":           ("g2-tail", True,  _phase_clone),
+            "offline-restart": ("g2-tail", True,  _phase_offline_restart),
+            "tampered-xorb":   ("g2-tail", True,  _phase_tampered_xorb),
+            "quota":           ("g3",      False, _phase_quota),
+        }
+
+        # Build the within-group lists in declaration order, then apply
+        # --order per group.
+        by_group: dict[str, list[str]] = {g: [] for g in PHASE_GROUPS_ORDER}
+        for name, (g, _ro, _fn) in REGISTRY.items():
+            by_group[g].append(name)
+
+        ordered: list[str] = []
+        for g in PHASE_GROUPS_ORDER:
+            # g2-head only ever has bigfile, but be defensive: never shuffle
+            # the head group's contents — it exists precisely to pin order.
+            if g == "g2-head":
+                ordered.extend(by_group[g])
+            else:
+                ordered.extend(order_within_group(by_group[g], args.order, rng))
+
+        in_reuse = reused is not None
+        info(f"phase order resolved: {ordered}")
+
+        for name in ordered:
+            group, read_only, fn = REGISTRY[name]
+            if name in args.skip:
+                info(f"-- skipping phase {name!r} (per --skip)")
+                continue
+            if in_reuse and not read_only:
+                info(f"-- skipping phase {name!r} (not read-only in --reuse-from)")
+                continue
+            if group == "g2-tail" and not rev_state:
+                info(f"-- skipping phase {name!r} (no rev_state yet)")
+                continue
+            fn()
 
         info("ALL CHECKS PASSED")
     except TestFailure as e:
@@ -2447,10 +2598,23 @@ def main() -> int:
         # matching CONTAINER_NAME_PREFIX — that would clobber concurrent
         # runs sharing the host (CI matrices, two devs on the same box).
         timings.print_report()
-        if args.keep_tmpdir:
-            info(f"keeping work dir: {tmpdir}")
-        else:
+        # Persist state for a follow-up --reuse-from run (only when we own
+        # the path: explicit --state-dir, or --reuse-from itself updating
+        # its source. In a plain --reuse-from run we don't write — the
+        # caller's stash should stay frozen as the canonical reference.)
+        if exit_code == 0 and args.state_dir and rev_state:
+            save_state(
+                tmpdir,
+                jwt_secret_hex=jwt_secret_hex,
+                transfer_secret_hex=transfer_secret_hex,
+                admin_token_hex=admin_token_hex,
+                rev_state=rev_state,
+            )
+            info(f"wrote {tmpdir / STATE_FILE}")
+        if delete_tmpdir_on_exit:
             shutil.rmtree(tmpdir, ignore_errors=True)
+        else:
+            info(f"keeping work dir: {tmpdir}")
     return exit_code
 
 
