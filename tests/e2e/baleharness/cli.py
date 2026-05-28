@@ -80,6 +80,7 @@ from baleharness.phases.gc import (
 from baleharness.phases.mount import (
     phase_mount_diff,
     phase_mount_diff_mixed,
+    phase_mount_edge_cases,
     phase_mount_rev,
 )
 from baleharness.phases.push_pending import (
@@ -516,6 +517,13 @@ def main() -> int:
                 work_root=work_root,
             )
 
+        def _phase_mount_edge() -> None:
+            phase_mount_edge_cases(
+                timings=timings,
+                client=client,
+                work_root=work_root,
+            )
+
         def _phase_quota() -> None:
             phase_adversarial_quota_exceeded(
                 timings=timings,
@@ -624,6 +632,10 @@ def main() -> int:
             # Own repo + commits, forces the clean filter's spill path via a
             # capped BALE_MAX_INLINE_CLEAN. g3 for the same reason as above.
             "spilled-clean": ("g3", False, _phase_spilled),
+            # mount/mount-diff arg+diff validation in mount/mod.rs (label
+            # collision, empty diff, empty mount, sanitize_label). Own local
+            # repo, no server, so g3 (independent).
+            "mount-edge": ("g3", False, _phase_mount_edge),
             # Failure-recovery phases each own their own isolated container
             # + data dir, so they can crash/restart the server or block its
             # DB without disturbing earlier phases' state.

@@ -187,20 +187,18 @@ def mount_diff_session(
     mount_root: Path,
     rev_a: str,
     rev_b: str,
-    label_a: str,
-    label_b: str,
+    label_a: Optional[str] = None,
+    label_b: Optional[str] = None,
     paths: Optional[list[str]] = None,
     label: str = "mount-diff",
 ):
-    argv = [
-        "mount-diff",
-        rev_a,
-        rev_b,
-        "--label-a",
-        label_a,
-        "--label-b",
-        label_b,
-    ]
+    # Omitting --label-a/--label-b lets the binary derive labels from the revs
+    # via sanitize_label (mount/mod.rs); pass them to pin explicit labels.
+    argv = ["mount-diff", rev_a, rev_b]
+    if label_a is not None:
+        argv += ["--label-a", label_a]
+    if label_b is not None:
+        argv += ["--label-b", label_b]
     if paths:
         argv.append("--")
         argv.extend(paths)

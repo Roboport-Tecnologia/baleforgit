@@ -439,3 +439,158 @@ def phase_mount_diff_mixed(
         info(f"-- mount-diff-mixed: skipping ({e})")
         if e.stderr and e.stderr != str(e):
             info(f"-- mount-diff-mixed: binary stderr:\n{e.stderr}")
+
+
+def phase_mount_edge_cases(
+    *,
+    timings: Timings,
+    client: ClientEnv,
+    work_root: Path,
+) -> None:
+    """`mount` / `mount-diff` argument + diff validation in `mount/mod.rs`,
+    the paths the happy-path mount phases never reach. All git-level (no
+    bale/server), so it builds its own throwaway repo with plain text files:
+
+      - mount-diff with identical labels is rejected (`both resolve`);
+      - mount-diff of two identical-tree commits errors `no files differ`
+        with no pathspec (the paths-empty arm of the empty-diff guard);
+      - mount of a revision filtered to nothing errors `no files in`;
+      - mount of an empty-tree commit errors `no files in` (paths-empty arm);
+      - mount-diff with NO --label-a/--label-b derives labels via
+        sanitize_label — `HEAD~2`/`HEAD~1` sanitize to `HEAD_2`/`HEAD_1`
+        (the `~` exercises the non-alnum replacement), and those labels must
+        show up in the mounted filenames.
+
+    Skips cleanly (like the other mount phases) when libfuse/fuse-t is absent."""
+    env = client.make_env()
+    bale = str(client.git_bale_bin)
+
+    # Three commits: c1, c2 (differs from c1), c3 (--allow-empty, same tree as
+    # c2). So HEAD=c3, HEAD~1=c2, HEAD~2=c1: HEAD~2..HEAD~1 has a real diff,
+    # HEAD~1..HEAD is empty.
+    repo = work_root / "mount-edge"
+    repo.mkdir()
+    git(["init", "-b", "main", "."], cwd=repo, env=env)
+    (repo / "notes.txt").write_text("alpha\nbravo\n")
+    git(["add", "notes.txt"], cwd=repo, env=env)
+    git(["commit", "-m", "c1"], cwd=repo, env=env)
+    (repo / "notes.txt").write_text("alpha\nbravo CHANGED\ncharlie\n")
+    git(["add", "notes.txt"], cwd=repo, env=env)
+    git(["commit", "-m", "c2"], cwd=repo, env=env)
+    git(["commit", "--allow-empty", "-m", "c3 (same tree as c2)"], cwd=repo, env=env)
+
+    # Separate repo whose only commit has an empty tree (no files at all).
+    empty_repo = work_root / "mount-edge-empty"
+    empty_repo.mkdir()
+    git(["init", "-b", "main", "."], cwd=empty_repo, env=env)
+    git(["commit", "--allow-empty", "-m", "empty root"], cwd=empty_repo, env=env)
+
+    mount_root = work_root / "mount-edge-points"
+    mount_root.mkdir()
+    throwaway = mount_root / "unused"
+    throwaway.mkdir()
+
+    def expect_fail(cwd: Path, argv_tail: list[str], needle: str, what: str) -> None:
+        """Run a mount/mount-diff expected to exit before mounting; assert it
+        failed with `needle` in stderr. A libfuse-missing exit short-circuits
+        the whole phase to a skip (the binary can't reach the validation)."""
+        # --mount must precede any `--` pathspec separator, else clap folds it
+        # into the (last = true) `paths` and reports it as missing.
+        if "--" in argv_tail:
+            i = argv_tail.index("--")
+            argv = [*argv_tail[:i], "--mount", str(throwaway), *argv_tail[i:]]
+        else:
+            argv = [*argv_tail, "--mount", str(throwaway)]
+        completed = subprocess.run(
+            [bale, *argv],
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            check=False,
+            timeout=120.0,
+        )
+        err = completed.stderr.decode("utf-8", "replace")
+        if _LIBFUSE_HINT in err:
+            raise MountUnavailable(
+                err.strip().splitlines()[0] if err.strip() else _LIBFUSE_HINT,
+                stderr=err.strip(),
+            )
+        if completed.returncode == 0:
+            raise TestFailure(f"mount-edge: {what} unexpectedly succeeded")
+        if needle not in err:
+            raise TestFailure(
+                f"mount-edge: {what} failed but stderr lacked {needle!r}:\n{err}"
+            )
+
+    try:
+        with timings.measure("mount-edge: arg/diff validation + sanitize labels"):
+            # Identical labels collide (reached only after a non-empty diff).
+            expect_fail(
+                repo,
+                [
+                    "mount-diff",
+                    "HEAD~2",
+                    "HEAD~1",
+                    "--label-a",
+                    "dup",
+                    "--label-b",
+                    "dup",
+                ],
+                "both resolve",
+                "identical labels",
+            )
+            # Two identical-tree commits, no pathspec: paths-empty empty-diff arm.
+            expect_fail(
+                repo,
+                ["mount-diff", "HEAD~1", "HEAD"],
+                "no files differ",
+                "empty diff (no pathspec)",
+            )
+            # Single-rev mount filtered to nothing: paths-nonempty empty arm.
+            expect_fail(
+                repo,
+                ["mount", "HEAD", "--", "no-such-path"],
+                "no files in",
+                "mount with empty pathspec result",
+            )
+            # Single-rev mount of an empty tree, no pathspec: paths-empty arm.
+            expect_fail(
+                empty_repo,
+                ["mount", "HEAD"],
+                "no files in",
+                "mount of an empty-tree commit",
+            )
+
+            # Auto-derived labels: HEAD~2 -> "HEAD_2", HEAD~1 -> "HEAD_1".
+            with mount_diff_session(
+                client=client,
+                repo=repo,
+                env=env,
+                mount_root=mount_root,
+                rev_a="HEAD~2",
+                rev_b="HEAD~1",
+                label="mount-edge-autolabel",
+            ) as mp:
+                names = sorted(p.name for p in mp.iterdir())
+                for required in ("notes__HEAD_2.txt", "notes__HEAD_1.txt"):
+                    if required not in names:
+                        raise TestFailure(
+                            f"mount-edge: auto-label {required!r} missing from "
+                            f"readdir (sanitize_label not applied?); got {names}"
+                        )
+                mounted = (mp / "notes__HEAD_2.txt").read_bytes()
+                source = git(["show", "HEAD~2:notes.txt"], cwd=repo, env=env).stdout
+                if mounted != source:
+                    raise TestFailure(
+                        "mount-edge: notes__HEAD_2.txt bytes "
+                        f"{mounted!r} != git show HEAD~2:notes.txt {source!r}"
+                    )
+    except MountUnavailable as e:
+        info(f"-- mount-edge: skipping ({e})")
+        if e.stderr and e.stderr != str(e):
+            info(f"-- mount-edge: binary stderr:\n{e.stderr}")
+    finally:
+        try:
+            throwaway.rmdir()
+        except OSError:
+            pass
