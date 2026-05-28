@@ -145,6 +145,15 @@ def main() -> int:
         help="Phase name(s) to skip (repeat the flag for multiple).",
     )
     parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        help="Run ONLY the named phase(s) (repeat the flag for multiple); "
+        "every other phase is skipped. Composes with --skip (a phase named "
+        "in both is skipped). Handy for iterating on one phase without "
+        "listing every other phase after --skip.",
+    )
+    parser.add_argument(
         "--order",
         choices=["forward", "reverse", "random"],
         default="forward",
@@ -683,10 +692,42 @@ def main() -> int:
         in_reuse = reused is not None
         info(f"phase order resolved: {ordered}")
 
+        # --only is an allowlist. Validate its names against the full phase
+        # set (REGISTRY + the coverage-only phases) so a typo fails loudly
+        # instead of silently running nothing.
+        coverage_only_phases = {
+            "s3-basic",
+            "s3-dedup",
+            "authz-http",
+            "https-origin",
+            "otlp",
+        }
+        valid_phase_names = set(REGISTRY) | coverage_only_phases
+        unknown_only = [n for n in args.only if n not in valid_phase_names]
+        if unknown_only:
+            die(
+                f"--only: unknown phase name(s): {', '.join(unknown_only)}.\n"
+                f"valid phases: {', '.join(sorted(valid_phase_names))}"
+            )
+        if args.only:
+            info(f"--only active: running only {args.only}")
+
+        def filtered_out(name: str) -> Optional[str]:
+            """Reason `name` is excluded by --skip / --only, or None to run it."""
+            if name in args.skip:
+                return "per --skip"
+            if args.only and name not in args.only:
+                return "not in --only"
+            return None
+
         for name in ordered:
             group, read_only, fn = REGISTRY[name]
-            if name in args.skip:
-                info(f"-- skipping phase {name!r} (per --skip)")
+            reason = filtered_out(name)
+            if reason is not None:
+                # Don't log the --only exclusion per phase — that's a line for
+                # every other phase, which is exactly the noise --only avoids.
+                if reason == "per --skip":
+                    info(f"-- skipping phase {name!r} ({reason})")
                 continue
             if in_reuse and not read_only:
                 info(f"-- skipping phase {name!r} (not read-only in --reuse-from)")
@@ -717,45 +758,27 @@ def main() -> int:
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
                 skip=set(args.skip),
+                only=set(args.only),
             )
-            if "authz-http" not in args.skip:
-                phase_authz_http_coverage(
-                    timings=timings,
-                    rt=rt,
-                    image_tag=image_tag,
-                    work_root=work_root,
-                    client=client,
-                    ssh_public_key=ssh_public_key,
-                    admin_token_hex=admin_token_hex,
-                )
-            else:
-                info("-- skipping phase 'authz-http' (per --skip)")
-
-            if "https-origin" not in args.skip:
-                phase_https_origin_coverage(
-                    timings=timings,
-                    rt=rt,
-                    image_tag=image_tag,
-                    work_root=work_root,
-                    client=client,
-                    ssh_public_key=ssh_public_key,
-                    admin_token_hex=admin_token_hex,
-                )
-            else:
-                info("-- skipping phase 'https-origin' (per --skip)")
-
-            if "otlp" not in args.skip:
-                phase_otlp_telemetry(
-                    timings=timings,
-                    rt=rt,
-                    image_tag=image_tag,
-                    work_root=work_root,
-                    client=client,
-                    ssh_public_key=ssh_public_key,
-                    admin_token_hex=admin_token_hex,
-                )
-            else:
-                info("-- skipping phase 'otlp' (per --skip)")
+            extra_kwargs = dict(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+            for cov_name, cov_fn in (
+                ("authz-http", phase_authz_http_coverage),
+                ("https-origin", phase_https_origin_coverage),
+                ("otlp", phase_otlp_telemetry),
+            ):
+                reason = filtered_out(cov_name)
+                if reason is not None:
+                    info(f"-- skipping phase {cov_name!r} ({reason})")
+                    continue
+                cov_fn(**extra_kwargs)
 
         info("ALL CHECKS PASSED")
     except TestFailure as e:

@@ -96,7 +96,7 @@ bytes-relevant phases) prints at the end of every run.
 
 ```
 python3 tests/e2e/run.py [--git-bale PATH] [--image-tag TAG] [--no-build]
-                        [--keep-tmpdir] [--skip PHASE ...]
+                        [--keep-tmpdir] [--skip PHASE ...] [--only PHASE ...]
 ```
 
 - `--git-bale PATH` — path to the release binary if not at
@@ -108,6 +108,12 @@ python3 tests/e2e/run.py [--git-bale PATH] [--image-tag TAG] [--no-build]
 - `--skip PHASE` — skip a named phase (repeatable). Phases that depend
   on earlier state (e.g., `usage` depends on `bigfile`) auto-skip when
   their prerequisites were skipped.
+- `--only PHASE` — run *only* the named phase(s) (repeatable); every other
+  phase is skipped. The quick way to iterate on a single self-contained
+  phase — `--only resync-wipe` instead of `--skip`-ing all the others. An
+  unknown phase name errors out. Composes with `--skip` (a phase named in
+  both is skipped). Note phases needing earlier state still auto-skip:
+  `--only usage` runs nothing because `bigfile` didn't populate `rev_state`.
 - `--coverage` — see [Coverage mode](#coverage-mode) below.
 - `--coverage-dir PATH` — override the coverage output directory
   (implies `--coverage`). Defaults to `<repo>/target/coverage-e2e/`.

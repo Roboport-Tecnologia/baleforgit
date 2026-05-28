@@ -217,6 +217,7 @@ def run_s3_coverage_phases(
     ssh_public_key: str,
     admin_token_hex: str,
     skip: set,
+    only: set = frozenset(),
 ) -> None:
     """Run s3-basic + s3-dedup with the same instrumented image so
     bale-server-storage-s3 shows up in the coverage report.
@@ -227,6 +228,15 @@ def run_s3_coverage_phases(
     s3-failure-kill / s3-failure-conndrop are NOT run in coverage mode
     for the same reason as the fs failure-* phases: SIGKILL prevents the
     LLVM atexit hook from flushing .profraw."""
+    s3_phase_names = ("s3-basic", "s3-dedup")
+    # Bail before the MinIO sidecar even starts if --skip/--only leave no
+    # S3 phase to run — otherwise we'd pay for a network + container we
+    # never use.
+    if not [
+        n for n in s3_phase_names if n not in skip and not (only and n not in only)
+    ]:
+        info("-- skipping S3 coverage setup (no S3 phases selected)")
+        return
     from s3lib import (
         MinioGuard,
         Network,
@@ -262,6 +272,9 @@ def run_s3_coverage_phases(
         for name, fn in phases:
             if name in skip:
                 info(f"-- skipping phase {name!r} (per --skip)")
+                continue
+            if only and name not in only:
+                info(f"-- skipping phase {name!r} (not in --only)")
                 continue
             fn()
     finally:
