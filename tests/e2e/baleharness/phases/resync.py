@@ -35,9 +35,19 @@ def phase_resync_after_cas_wipe(
     """User-perspective disaster recovery. Push a binary file, then bring the
     server back up with a BLANK CAS (fresh data dir, same bare repo). The user
     deletes `.git`, re-inits, re-installs bale, and re-adds the same file —
-    which must re-chunk it into local staging — then force-pushes to
-    repopulate the wiped server. A cold clone must then reconstruct the file
-    byte-for-byte. Owns its own isolated container, so wiping server state
+    which must re-chunk it into local staging — then force-pushes.
+
+    The first force-push MUST be rejected: every chunk dedups against the
+    client's stale xet cache (which survives both the `.git` delete and the
+    server wipe), so the re-upload is skipped and the blank server rejects the
+    shard that references the now-absent xorbs. The client must explain the
+    cache mismatch in plain terms (not a bare `400`), and the rejected push must
+    leave staging intact and write nothing to the server.
+
+    Recovery then follows the error's own advice: point `BALE_XET_CACHE` at a
+    fresh cache directory and force-push again. With no stale dedup entries the
+    xorbs are re-uploaded, the push succeeds, and a cold clone reconstructs the
+    file byte-for-byte. Owns its own isolated container so wiping server state
     doesn't disturb the shared-server phases."""
     phase_root = work_root / "resync-wipe"
     phase_root.mkdir()
@@ -145,22 +155,78 @@ def phase_resync_after_cas_wipe(
         )
         git(["commit", "-m", "re-add binary asset after wipe"], cwd=repo, env=env)
 
-        # Force-push: non-fast-forward over the stale `main`; the pre-push hook
-        # drains staging to repopulate the blank server.
-        with timings.measure(
-            "resync: force-push after wipe", bytes_moved=RESYNC_PAYLOAD_BYTES
-        ):
-            git(["push", "-f", "-u", "origin", "main"], cwd=repo, env=env)
-        if staging_files(repo):
+        # Force-push MUST be rejected: every chunk deduped against the stale
+        # local xet cache, so push-pending skipped re-uploading the xorbs, and
+        # the blank server rejects the shard that references them.
+        with timings.measure("resync: force-push after wipe (expected reject)"):
+            pushed = git(
+                ["push", "-f", "-u", "origin", "main"],
+                cwd=repo,
+                env=env,
+                expect_fail=True,
+            )
+        if pushed.returncode == 0:
             raise TestFailure(
-                "resync: staging not drained after force-push — push-pending "
-                "didn't finalize the re-upload"
+                "resync: force-push unexpectedly succeeded — the wiped server "
+                "cannot hold xorbs the dedup cache skipped re-uploading"
             )
 
-        # Success criterion: a cold clone (fresh cache → /v1/reconstructions/)
-        # reconstructs the file, proving the server genuinely has the bytes.
+        # The whole point of the phase: a plain-language cache-mismatch
+        # explanation, not the bare `400 Bad Request on /shards` that xet
+        # surfaces by default.
+        stderr = pushed.stderr.decode("utf-8", "replace")
+        for needle in (
+            "the server is missing content",
+            "your local cache is incompatible",
+            "Active cache directory:",
+        ):
+            if needle not in stderr:
+                raise TestFailure(
+                    f"resync: push was rejected but without the cache-mismatch "
+                    f"explanation (missing {needle!r}). stderr:\n{stderr}"
+                )
+
+        # A rejected push must neither drain staging (the staged bytes are still
+        # the only local copy) nor leave a partial write on the server.
+        if not staging_files(repo):
+            raise TestFailure(
+                "resync: staging drained despite a rejected push — push-pending "
+                "cleared markers without a successful finalize"
+            )
+        if wiped.disk_total_bytes() != 0:
+            raise TestFailure(
+                f"resync: rejected push left {wiped.disk_total_bytes()} bytes of "
+                "xorbs/shards on the server — partial write on a failed push"
+            )
+
+        # Recovery: follow the error's advice — point BALE_XET_CACHE at a fresh,
+        # empty cache. With no stale dedup entries, push-pending re-uploads every
+        # xorb from the still-intact staging, the shard's references resolve, and
+        # the server accepts the push.
+        fresh_cache = phase_root / "fresh-xet-cache"
+        recover_env = dict(env)
+        recover_env["BALE_XET_CACHE"] = str(fresh_cache)
         with timings.measure(
-            "resync: cold clone after resync", bytes_moved=RESYNC_PAYLOAD_BYTES
+            "resync: force-push with fresh cache (recovers)",
+            bytes_moved=RESYNC_PAYLOAD_BYTES,
+        ):
+            git(["push", "-f", "-u", "origin", "main"], cwd=repo, env=recover_env)
+        if staging_files(repo):
+            raise TestFailure(
+                "resync: staging not drained after the recovering push — "
+                "push-pending didn't finalize the re-upload"
+            )
+        if wiped.disk_total_bytes() == 0:
+            raise TestFailure(
+                "resync: recovering push reported success but the server holds "
+                "no xorbs/shards — nothing was actually uploaded"
+            )
+
+        # Prove the bytes are genuinely retrievable from the server: a cold
+        # clone (fresh chunk cache → /v1/reconstructions/) must reconstruct the
+        # file byte-for-byte.
+        with timings.measure(
+            "resync: cold clone after recovery", bytes_moved=RESYNC_PAYLOAD_BYTES
         ):
             clone_path, clone_env, _ = init_repo_for_clone(
                 work_root=work_root,
@@ -176,7 +242,7 @@ def phase_resync_after_cas_wipe(
             "asset.bin",
             expected_sha=payload_sha,
             expected_size=RESYNC_PAYLOAD_BYTES,
-            label="resync:after-clone",
+            label="resync:after-recovery-clone",
         )
     finally:
         if wiped is not None:

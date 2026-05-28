@@ -67,6 +67,7 @@ pub fn run() -> Result<()> {
         .context("building local TranslatorConfig for staging reconstruction")?;
 
     let staged_files_for_async = staged_files.clone();
+    let server_url = auth.server_url.clone();
     rt.bridge_sync(async move {
         let upload_session = FileUploadSession::new(Arc::new(online_cfg)).await?;
         let download_session = FileDownloadSession::new(Arc::new(local_cfg), None).await?;
@@ -90,7 +91,8 @@ pub fn run() -> Result<()> {
         upload_session.finalize().await?;
         Ok::<(), anyhow::Error>(())
     })
-    .map_err(|e| anyhow!("xet runtime error during push-pending: {e:?}"))??;
+    .map_err(|e| anyhow!("xet runtime error during push-pending: {e:?}"))?
+    .map_err(|e| explain_dedup_cache_mismatch(e, &server_url))?;
 
     // Server now holds the reconstruction info; safe to drop staging.
     if let Err(e) = clear_file_markers(&git_dir) {
@@ -139,4 +141,31 @@ async fn re_translate_one(
         );
     }
     Ok(())
+}
+
+// Turn the opaque "400 Bad Request on /shards" that xet surfaces into an
+// actionable diagnosis. The server rejects a shard whose CAS blocks name a xorb
+// it doesn't hold; in push-pending that happens when our local xet dedup cache
+// recorded a xorb as already uploaded and so skipped re-sending it, but the
+// server no longer has it (its storage was reset or gc'd). xet erases the
+// response body and hands us only status + URL, so we key on those — a /shards
+// 400 here is overwhelmingly this case (a freshly round-tripped shard can't be
+// malformed or oversized).
+fn explain_dedup_cache_mismatch(err: anyhow::Error, server_url: &str) -> anyhow::Error {
+    let chain = format!("{err:#}");
+    let is_shards_400 =
+        chain.contains("shards") && (chain.contains("400") || chain.contains("Bad Request"));
+    if !is_shards_400 {
+        return err;
+    }
+    // main()'s set_default_xet_cache_root() pins HF_XET_CACHE before any work,
+    // so this is the directory xet actually used for this session's dedup.
+    let current_cache_dir =
+        std::env::var("HF_XET_CACHE").unwrap_or_else(|_| "~/.cache/bale/xet".to_string());
+    err.context(format!(
+        "push to {server_url} was rejected: the server is missing content this \
+         push depends on. This almost always means your local cache is incompatible \
+         with the server. Either clear the cache to continue or set a new cache directory. \
+         Active cache directory: {current_cache_dir}. Set env var \"$BALE_XET_CACHE\" to override."
+    ))
 }

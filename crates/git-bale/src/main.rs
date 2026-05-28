@@ -176,11 +176,18 @@ fn main() -> Result<()> {
     }
 }
 
-/// Redirect xet-runtime's per-endpoint cache root to a bale-branded path so
-/// the default isn't `~/.cache/huggingface/xet`. Respects an explicit
-/// `HF_XET_CACHE` override. Must run before any threads spawn — Rust's
-/// `set_var` is UB in a multi-threaded process on some platforms.
+/// Point xet-runtime's cache root at a bale-branded path instead of
+/// `~/.cache/huggingface/xet`. Precedence: `BALE_XET_CACHE` (the bale-branded
+/// knob) wins, mapped onto the `HF_XET_CACHE` xet actually reads; else a
+/// directly-set `HF_XET_CACHE` is kept; else `<XDG_CACHE_HOME|~/.cache>/bale/xet`.
+/// Must run before any threads spawn — `set_var` is UB in a multi-threaded
+/// process on some platforms.
 fn set_default_xet_cache_root() {
+    if let Some(bale_cache) = std::env::var_os("BALE_XET_CACHE") {
+        // SAFETY: called from main() before any threads or async runtime spawn.
+        unsafe { std::env::set_var("HF_XET_CACHE", bale_cache) };
+        return;
+    }
     if std::env::var_os("HF_XET_CACHE").is_some() {
         return;
     }
