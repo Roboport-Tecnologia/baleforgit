@@ -38,6 +38,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -61,6 +62,29 @@ E2E_REPO = "repo"
 E2E_REPO_2 = "repo2"
 E2E_REPO_3 = "mixed-files"
 E2E_USER = "e2e"
+
+
+def _b64url_no_pad(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def forge_jwt_with_filename(filename: str) -> str:
+    """A forge-style JWT carrying gitea's `FilenameSHA256` claim. bale-server
+    base64url-decodes the payload to gate the download's `Content-Disposition`
+    but never verifies the signature (the forge does), so a dummy sig is fine.
+    No `:` in the base64url alphabet, so it slots into a BALE_GRANTS tuple."""
+    header = _b64url_no_pad(b'{"alg":"HS256","typ":"JWT"}')
+    claim = hashlib.sha256(filename.encode("utf-8")).hexdigest()
+    payload = _b64url_no_pad(
+        json.dumps({"FilenameSHA256": claim}, separators=(",", ":")).encode("utf-8")
+    )
+    return f"{header}.{payload}.{_b64url_no_pad(b'e2e-unverified-sig')}"
+
+
+# The browser-download phase downloads bigfile.bin (pushed to repo2) through
+# GET /v1/files/{id}, using this JWT to exercise the filename-binding branch.
+BROWSER_DL_FILENAME = "bigfile.bin"
+BROWSER_DL_JWT = forge_jwt_with_filename(BROWSER_DL_FILENAME)
 
 # Tolerance for "no growth" assertions on disk: filesystems may round up to
 # block boundaries even when nothing logically changed.
@@ -767,6 +791,12 @@ def start_container(
     bale_grants = ",".join(
         f"{E2E_HUB_TOKEN}:{E2E_USER}:{r}:write" for r in test_repos
     )
+    # The browser-download phase presents a forge-style JWT instead of the
+    # opaque hub token, so register it as a read grant on repo2 wherever repo2
+    # is hosted (static authz matches the bearer verbatim).
+    repo2_id = f"{E2E_OWNER}/{E2E_REPO_2}"
+    if repo2_id in test_repos:
+        bale_grants += f",{BROWSER_DL_JWT}:{E2E_USER}:{repo2_id}:read"
 
     env_kvs = [
         f"BALE_LISTEN=0.0.0.0:8080",
@@ -1362,6 +1392,32 @@ def fetch_repo_usage(
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def http_get_file(
+    handle: ServerHandle,
+    *,
+    file_id: str,
+    token: str,
+    repo: str,
+    filename: Optional[str] = None,
+) -> tuple[int, bytes, dict[str, str]]:
+    """GET the browser-facing /v1/files/{id} download. The bearer rides in the
+    query (`?token=`) because the forge 302s here without an Authorization
+    header. Returns (status, body, headers) for both success and 4xx so the
+    caller can assert on tamper-rejection too."""
+    params = {"token": token, "repo": repo}
+    if filename is not None:
+        params["filename"] = filename
+    url = (
+        f"{handle.public_host_url}/v1/files/{file_id}"
+        f"?{urllib.parse.urlencode(params)}"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return resp.status, resp.read(), {k.lower(): v for k, v in resp.headers.items()}
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), {k.lower(): v for k, v in e.headers.items()}
 
 
 # =============================================================================
@@ -2356,6 +2412,81 @@ def phase_usage_api(
                     f"{blob['dedup_savings_bytes']}, expected raw - stored = "
                     f"{expected_savings}"
                 )
+
+
+def phase_browser_file_download(
+    *,
+    timings: Timings,
+    server: ServerHandle,
+    rev_state: dict,
+) -> None:
+    """Exercises the browser-facing `GET /v1/files/{id}` streaming download —
+    the endpoint the forge 302s into so reconstructed bytes never round-trip
+    through it. Three sub-cases:
+
+    1. Opaque hub token, no filename → 200, bytes match HEAD, and *no*
+       `Content-Disposition` (the token carries no `FilenameSHA256` claim).
+    2. Forge JWT + matching filename → 200 with `Content-Disposition:
+       attachment; filename="bigfile.bin"` (the claim binds the name).
+    3. Forge JWT + tampered filename → 400 (the URL was rewritten).
+    """
+    repo, env = rev_state["repo_path"], rev_state["env"]
+    # The staged/committed blob is the JSON pointer; its `hash` is the file id.
+    file_id = pointer_field(cat_file_bytes(repo, env, "HEAD:bigfile.bin"), "hash")
+    expected_sha = rev_state["shas"][-1]  # HEAD == v3
+    repo_id = f"{E2E_OWNER}/{E2E_REPO_2}"
+
+    with timings.measure(
+        "browser-download: opaque token, no filename", bytes_moved=BIG_FILE_BYTES
+    ):
+        status, body, headers = http_get_file(
+            server, file_id=file_id, token=E2E_HUB_TOKEN, repo=repo_id
+        )
+        if status != 200:
+            raise TestFailure(
+                f"browser-download: expected 200, got {status}: {body[:200]!r}"
+            )
+        if len(body) != BIG_FILE_BYTES or sha256_bytes(body) != expected_sha:
+            raise TestFailure(
+                f"browser-download: reconstructed {len(body)} bytes / sha "
+                f"{sha256_bytes(body)} != HEAD {BIG_FILE_BYTES} / {expected_sha}"
+            )
+        if "content-disposition" in headers:
+            raise TestFailure(
+                "browser-download: Content-Disposition set for a token with no "
+                f"FilenameSHA256 claim ({headers['content-disposition']!r})"
+            )
+
+    with timings.measure(
+        "browser-download: forge JWT + matching filename", bytes_moved=BIG_FILE_BYTES
+    ):
+        status, body, headers = http_get_file(
+            server, file_id=file_id, token=BROWSER_DL_JWT, repo=repo_id,
+            filename=BROWSER_DL_FILENAME,
+        )
+        if status != 200:
+            raise TestFailure(
+                f"browser-download(jwt): expected 200, got {status}: {body[:200]!r}"
+            )
+        if sha256_bytes(body) != expected_sha:
+            raise TestFailure("browser-download(jwt): reconstructed bytes mismatch")
+        cd = headers.get("content-disposition")
+        expected_cd = f'attachment; filename="{BROWSER_DL_FILENAME}"'
+        if cd != expected_cd:
+            raise TestFailure(
+                f"browser-download(jwt): Content-Disposition {cd!r} != {expected_cd!r}"
+            )
+
+    with timings.measure("browser-download: tampered filename rejected"):
+        status, body, _ = http_get_file(
+            server, file_id=file_id, token=BROWSER_DL_JWT, repo=repo_id,
+            filename="evil.exe",
+        )
+        if status != 400:
+            raise TestFailure(
+                f"browser-download(tamper): expected 400 for a filename that "
+                f"doesn't match the JWT claim, got {status}: {body[:200]!r}"
+            )
 
 
 def phase_dedup_duplicate_file(
@@ -4431,6 +4562,11 @@ def main() -> int:
                 bale_admin_token=admin_jwt, rev_state=rev_state,
             )
 
+        def _phase_browser_download() -> None:
+            phase_browser_file_download(
+                timings=timings, server=server, rev_state=rev_state,
+            )
+
         def _phase_dedup() -> None:
             phase_dedup_duplicate_file(
                 timings=timings, server=server, rev_state=rev_state,
@@ -4523,6 +4659,11 @@ def main() -> int:
             "wrong-token":     ("g1",      False, _phase_wrong_token),
             "bigfile":         ("g2-head", False, _phase_bigfile),
             "usage":           ("g2-tail", True,  _phase_usage),
+            # Dereferences rev_state["repo_path"]/["env"] (the live bigfile
+            # client repo) to read the pushed pointer's file id, so — like
+            # idempotency — it can't run from a --reuse-from (hence not
+            # read_only). Streams 35 MB back through the reconstruction path.
+            "browser-download": ("g2-tail", False, _phase_browser_download),
             "dedup":           ("g2-tail", False, _phase_dedup),
             # idempotency dereferences rev_state["repo_path"] (the bigfile
             # client repo from the same process), so it can't run from a

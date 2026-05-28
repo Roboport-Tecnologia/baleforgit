@@ -129,8 +129,8 @@ Per-file detail (all MISSING-E2E unless noted):
 
 | # | Phase to add | Lines unlocked | Files |
 |---|---|---|---|
-| 1 | Fix happy mount sessions (see §1) | ~890 | mount/* |
-| 2 | `GET /v1/files/{file_id}` browser download | ~150 | bale-server-http:698-892 |
+| 1 | ~~Fix happy mount sessions (see §1)~~ **DONE** | ~890 | mount/* |
+| 2 | ~~`GET /v1/files/{file_id}` browser download~~ **DONE** (`browser-download` phase, +115 lines) | ~150 | bale-server-http:698-892 |
 | 3 | Spilled-clean (>4 GiB) path | ~130 | filter_process.rs:253-477, clean_cache.rs:220-382 |
 | 4 | HTTPS-origin phase | ~80 | resolver.rs:101-190, 281-337 |
 | 5 | OTLP-collector sub-phase | ~60 | bale-server-bin/telemetry.rs |
@@ -152,10 +152,15 @@ Per-file detail (all MISSING-E2E unless noted):
 
 Notes on a few of these:
 
-**Phase 2 (`/v1/files/{file_id}`)**: mint a forge-style JWT with the
-`FilenameSHA256` claim, GET the endpoint, assert streamed bytes match
-and `Content-Disposition` is set. Add a second variant with a
-*mismatched* filename hash → 400.
+**Phase 2 (`/v1/files/{file_id}`)** — **DONE**, the `browser-download`
+phase. Implemented as three sub-cases against the bigfile pushed to
+repo2: (a) opaque hub token + no filename → 200, bytes match HEAD, no
+`Content-Disposition`; (b) a forge-style JWT carrying `FilenameSHA256`
+(registered as its own repo2 read grant, since static authz matches the
+bearer verbatim) + matching filename → 200 with `Content-Disposition:
+attachment; filename="bigfile.bin"`; (c) same JWT + tampered filename →
+400. `forge_jwt_with_filename()` builds the JWT; `http_get_file()` is the
+probe. Lifted bale-server-http line coverage 63.9% → 76.4%.
 
 **Phase 3 (>4 GiB spilled clean)**: two options: (a) push an actual
 >4 GiB file in a dedicated phase, or (b) make `MAX_INLINE_CLEAN`
@@ -349,7 +354,9 @@ run for those phases.
    biggest lift, took the report from 51.5% to 65.3% line coverage. Root
    cause was SIGPIPE dropping profraws, not a mount timeout; fixed with a
    coverage-only SIGPIPE handler that flushes the llvm profile.
-2. **Browser `/v1/files/...` phase** (§2.2). ~150 lines.
+2. ~~**Browser `/v1/files/...` phase** (§2.2).~~ **DONE** — `browser-download`
+   phase, +115 lines on bale-server-http (63.9% → 76.4%), overall 65.3% →
+   67.6% line coverage.
 3. **Spilled-clean threshold knob** (§2.3). ~130 lines.
 4. **HTTPS-origin + OTLP collector + admin-quota + uninstall + track
    phases** (§2.4–§2.8). ~210 lines combined, each phase modest in
