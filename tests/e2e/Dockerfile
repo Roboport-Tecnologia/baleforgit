@@ -12,13 +12,30 @@ ARG COVERAGE=0
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN if [ "$COVERAGE" = "1" ]; then \
-        RUSTFLAGS="-C instrument-coverage" \
-        cargo build --release -p bale-server-bin; \
+# BuildKit cache mounts (buildah supports them natively) persist across image
+# builds on this machine, so editing a source file recompiles only the changed
+# crate instead of re-downloading + re-compiling all ~200 dependencies from
+# scratch every time `COPY crates` busts the layer. Three caches:
+#   - the cargo registry/git (downloaded crate sources)
+#   - a per-mode target dir (compiled artifacts; incremental rebuilds)
+# Coverage and non-coverage builds get separate target subdirs because
+# `-C instrument-coverage` changes every fingerprint — sharing one dir would
+# make each mode invalidate the other's cache on every switch.
+# The target dir lives inside a cache mount, which is NOT captured in the
+# image layer, so the binary is copied out to a normal path in the same RUN.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build-cache \
+    set -eu; \
+    if [ "$COVERAGE" = "1" ]; then \
+        export RUSTFLAGS="-C instrument-coverage"; \
+        export CARGO_TARGET_DIR=/build-cache/cov; \
     else \
-        cargo build --release -p bale-server-bin \
-        && strip target/release/baleforgit-server; \
-    fi
+        export CARGO_TARGET_DIR=/build-cache/rel; \
+    fi; \
+    cargo build --release -p bale-server-bin; \
+    cp "$CARGO_TARGET_DIR/release/baleforgit-server" /usr/local/bin/baleforgit-server; \
+    if [ "$COVERAGE" != "1" ]; then strip /usr/local/bin/baleforgit-server; fi
 
 FROM debian:bookworm-slim
 
@@ -53,7 +70,7 @@ RUN apt-get update \
  && chown -R git:git /home/git \
  && chmod 700 /home/git/.ssh
 
-COPY --from=builder /src/target/release/baleforgit-server /usr/local/bin/baleforgit-server
+COPY --from=builder /usr/local/bin/baleforgit-server /usr/local/bin/baleforgit-server
 COPY tests/e2e/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/baleforgit-server
 
