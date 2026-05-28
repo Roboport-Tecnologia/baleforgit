@@ -71,7 +71,9 @@ CREATE TABLE IF NOT EXISTS file_terms (
     verification    BLOB,
     PRIMARY KEY (file_hash, term_index)
 );
--- Quota checks join file_terms by xorb_hash; without this index each is a full scan.
+-- Quota checks join file_terms by xorb_hash, so without this index each is a full scan.
+-- Do not put a statement separator inside a comment here: open_url splits
+-- SCHEMA_SQL on that character, so one in a comment truncates the next statement.
 CREATE INDEX IF NOT EXISTS file_terms_by_xorb ON file_terms(xorb_hash);
 "#;
 

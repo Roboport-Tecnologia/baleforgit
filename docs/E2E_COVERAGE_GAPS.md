@@ -67,10 +67,32 @@ was excluded from the analysis on purpose.
 Overall totals progression:
 - Original analysis: 46.8% fn / 51.5% line / 49.5% region.
 - After §1 mount-session fix: ~65.3% line.
-- **Current (2026-05-28, full suite green incl. `spilled-clean` + `otlp`):
+- **2026-05-28, full suite green incl. `spilled-clean` + `otlp`:
   60.87% fn / 73.10% line / 72.04% region.** Targeted files this round:
   `telemetry.rs` ~0 → 92.1% line, `clean_cache.rs` → 84.2%,
   `filter_process.rs` → 80.2%, `gc.rs` → 87.9%.
+- **2026-05-28 (re-measured, full green run, 235 profraws): 60.87% fn
+  (406/667) / 73.13% line (4074/5571) / 72.04% region (6054/8404)** — i.e.
+  unchanged from the prior measurement (the phase set hasn't grown since), so
+  the per-file numbers below all still stand within rounding (`telemetry.rs`
+  92.05%, `clean_cache.rs` 84.17%, `filter_process.rs` 80.21%, `reader.rs`
+  74.47%, `vfs.rs` 67.99%, `resolver.rs` 79.17%). **One file the doc never
+  scored: `meta-sqlite/src/lib.rs` sits at only 63.43% line (137/216)** — the
+  metadata store is exercised on the happy path but its quota/usage SQL and
+  error arms are thin; a candidate for a future targeted phase.
+
+> **This re-measurement run surfaced + fixed a server-boot-blocking bug.**
+> Commit `99da942 "Trim comments"` collapsed a schema comment in
+> `crates/bale-server-meta-sqlite/src/lib.rs` onto one line that contained a
+> `;`. `SqliteMetadataStore::open_url` builds the schema by `SCHEMA_SQL.split(';')`
+> and running each fragment, so the comment's `;` truncated the next statement
+> and SQLite rejected the tail with `near "without": syntax error` — **a fresh
+> server could not create its schema and exited on boot.** Every `--coverage`
+> (and every normal) e2e run after `99da942` would have died at the first
+> container start with zero profraws. Fixed by removing the `;` from the
+> comment (+ a warning not to put a statement separator inside `SCHEMA_SQL`
+> comments). Verified: fresh-DB boot logs `baleforgit-server up`, and the full
+> coverage suite is green again. The percentages here are post-fix.
 
 Two production bugs were surfaced while wiring these phases (both fixed):
 - **gc data-loss**: `git restore --staged` fires the post-checkout gc hook,
