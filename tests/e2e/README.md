@@ -174,7 +174,9 @@ testing and coverage measurement stay separate.
 | `Dockerfile`               | Multi-stage build of the bundled `baleforgit-server` + `sshd` image.   |
 | `entrypoint.sh`            | Generates ssh host keys + authorized_keys + bare repos + the fake     |
 |                            | `git-bale-authenticate` script, starts sshd, execs `baleforgit-server`. Also pass-through for `BALE_S3_*` env vars when set. |
-| `run.py`                   | The fs-mode harness (includes the `git-bale gc` phases).               |
+| `run.py`                   | Thin fs-mode entry point: runs `baleharness.cli.main` and re-exports the names `s3lib.py` / `run_s3.py` import via `from run import …`. |
+| `baleharness/`             | The harness itself, split into focused modules (see below). `cli.py` owns the phase registry + `main()`; `phases/` holds one module per phase category (`scenario`, `mount`, `adversarial`, `failure`, `coverage_phases`, `gc`). |
+| `run_legacy.py`            | Frozen copy of the pre-split monolithic `run.py`, kept only to validate the refactor against. Delete once parity is confirmed. |
 | `run_s3.py`                | The S3-mode harness (MinIO sidecar; 4 phases).                         |
 | `s3lib.py`                 | `MinioGuard`, `Network`, `S3StorageView`, and the 4 S3 phase functions.|
 | `run_matrix.py`            | Multi-run driver for `run.py`. Pass `--s3` to invoke `run_s3.py` once. |
@@ -288,30 +290,33 @@ remapping handles the cross-UID story transparently.
 
 ### Phase orchestration
 
-`maybe(name, fn)` skips a named phase. Phases that depend on earlier
-state (e.g. `usage` needs the pushes from `bigfile`) guard themselves
-with `if rev_state:`. `offline-restart` is a *merged* phase that
+The `REGISTRY` dict in `baleharness/cli.py` maps each phase name to its
+group + `read_only` flag + thunk; `--skip` drops a named phase. Phases
+that depend on earlier state (e.g. `usage` needs the pushes from
+`bigfile`) live in group `g2-tail` and auto-skip when `rev_state` is
+empty. `offline-restart` is a *merged* phase that
 deliberately can't be split: it stops the server, runs an offline
 smudge, then starts a fresh container against the same data dir. If you
 add a phase between offline-smudge and restart, restructure the merged
 function first.
 
-The orchestration is intentionally linear (sequential `maybe(...)`
-calls in `main()`) rather than a dependency graph. The test takes
-minutes, not seconds — parallelism would buy us little and obscure
-failures.
+The orchestration is intentionally linear (the ordered `REGISTRY` walk
+in `main()`) rather than a dependency graph. The test takes minutes,
+not seconds — parallelism would buy us little and obscure failures.
 
 ### Adding a new phase
 
-1. Define `def phase_<your_name>(...)` in the *Scenario phases* or
-   *Adversarial phases* section.
+1. Define `def phase_<your_name>(...)` in the matching
+   `baleharness/phases/<category>.py` module (`scenario`, `mount`,
+   `adversarial`, `failure`, `coverage_phases`, or `gc`). A brand-new
+   category gets a new module under `baleharness/phases/`.
 2. Take an explicit `timings: Timings` parameter so its wallclock shows
    up in the summary. Use `with timings.measure("name", bytes_moved=…)`
    for any IO-heavy stretch — `bytes_moved` turns into a throughput
    line in the final report.
-3. Wire it into `main()` via `maybe("your-name", lambda: ...)`. If it
-   depends on prior `rev_state`, drop it under the `if rev_state:`
-   block.
+3. Wire it into the `REGISTRY` dict in `baleharness/cli.py` (`main()`),
+   choosing its group (`g1` / `g2-head` / `g2-tail` / `g3`) and
+   `read_only` flag. g2-tail phases auto-skip when `rev_state` is empty.
 4. Document it in the README phase table above.
 
 ### Gotchas
