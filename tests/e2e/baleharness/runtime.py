@@ -1,4 +1,5 @@
 """Container runtime detection + image build helpers."""
+
 from __future__ import annotations
 
 import subprocess
@@ -64,6 +65,8 @@ def build_image(rt: Runtime, tag: str, *, coverage: bool = False) -> None:
     )
     if completed.returncode != 0:
         raise TestFailure(f"image build failed (exit {completed.returncode})")
+
+
 def image_exists(rt: Runtime, tag: str) -> bool:
     # podman has `image exists`; docker doesn't. Fall back to `image inspect`.
     if rt.exe == "podman":

@@ -1,4 +1,5 @@
 """Repo bootstrap (the user-side push/clone repos)."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -70,4 +71,3 @@ def init_repo_for_clone(
     run([str(client.git_bale_bin), "install", "--local"], cwd=target, env=env)
     git(["config", "--local", "bale.cacheDir", str(cache_dir)], cwd=target, env=env)
     return target, env, cache_dir
-

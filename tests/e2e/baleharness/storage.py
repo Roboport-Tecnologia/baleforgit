@@ -1,4 +1,5 @@
 """Storage / cache footprint helpers (staging, clean-cache, manifests)."""
+
 from __future__ import annotations
 
 import os
@@ -13,7 +14,7 @@ def staging_files(repo: Path) -> list[Path]:
     for cur, _dirs, files in os.walk(staging):
         for f in files:
             is_xorb = f.startswith("default.") and _is_64_lower_hex(
-                f[len("default."):]
+                f[len("default.") :]
             )
             is_shard = f.endswith(".mdb") and _is_64_lower_hex(f[: -len(".mdb")])
             if is_xorb or is_shard:
@@ -49,4 +50,3 @@ def staged_markers(repo: Path) -> set[str]:
     if not d.exists():
         return set()
     return {p.name for p in d.iterdir() if p.is_file()}
-

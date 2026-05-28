@@ -1,6 +1,8 @@
 """Failure-injection + in-process mock servers (proxy, authz, forge, otlp)."""
+
 from __future__ import annotations
 
+import http.server
 import json
 import socket
 import subprocess
@@ -208,7 +210,9 @@ class MockAuthzServer:
     ) -> None:
         self.decide = decide
         self.port = port or pick_free_port()
-        self.calls: list[tuple[str, str, str, int]] = []  # (bearer, repo_id, scope, status)
+        self.calls: list[
+            tuple[str, str, str, int]
+        ] = []  # (bearer, repo_id, scope, status)
         self._server: Optional["http.server.ThreadingHTTPServer"] = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -221,8 +225,6 @@ class MockAuthzServer:
         return f"http://{host_primary_ip()}:{self.port}"
 
     def start(self) -> None:
-        import http.server
-
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -309,8 +311,6 @@ class MockForgeServer:
         return f"http://127.0.0.1:{self.port}"
 
     def start(self) -> None:
-        import http.server
-
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -342,7 +342,9 @@ class MockForgeServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        self._server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", self.port), Handler
+        )
         self._thread = threading.Thread(
             target=self._server.serve_forever, daemon=True, name="MockForgeServer"
         )
@@ -386,8 +388,6 @@ class OtlpCollector:
             return self.hits.get(path, 0)
 
     def start(self) -> None:
-        import http.server
-
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -463,7 +463,8 @@ def hold_db_writer_lock(server: ServerHandle, hold_seconds: float) -> Iterator[N
     # Wipe any leftover marker from an earlier run inside the same container.
     subprocess.run(
         server.rt.cmd("exec", server.name, "rm", "-f", marker),
-        capture_output=True, check=False,
+        capture_output=True,
+        check=False,
     )
     script = (
         "sqlite3 /data/meta.db <<'EOF'\n"
@@ -475,7 +476,8 @@ def hold_db_writer_lock(server: ServerHandle, hold_seconds: float) -> Iterator[N
     )
     completed = subprocess.run(
         server.rt.cmd("exec", "-d", server.name, "bash", "-c", script),
-        capture_output=True, check=False,
+        capture_output=True,
+        check=False,
     )
     if completed.returncode != 0:
         raise TestFailure(
@@ -487,7 +489,8 @@ def hold_db_writer_lock(server: ServerHandle, hold_seconds: float) -> Iterator[N
     while time.monotonic() < deadline:
         check = subprocess.run(
             server.rt.cmd("exec", server.name, "test", "-f", marker),
-            capture_output=True, check=False,
+            capture_output=True,
+            check=False,
         )
         if check.returncode == 0:
             break
@@ -503,4 +506,3 @@ def hold_db_writer_lock(server: ServerHandle, hold_seconds: float) -> Iterator[N
         # The detached sqlite3 will COMMIT and exit on its own once
         # `sleep hold_seconds` elapses; nothing to clean up here.
         pass
-

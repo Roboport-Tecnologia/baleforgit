@@ -42,7 +42,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -88,10 +88,15 @@ def _invoke(
         assert output_file is not None
         with output_file.open("w") as fh:
             completed = subprocess.run(
-                cmd, env=env, stdout=fh, stderr=subprocess.STDOUT,
+                cmd,
+                env=env,
+                stdout=fh,
+                stderr=subprocess.STDOUT,
             )
     elapsed = time.perf_counter() - t0
-    status = "OK" if completed.returncode == 0 else f"FAIL (exit {completed.returncode})"
+    status = (
+        "OK" if completed.returncode == 0 else f"FAIL (exit {completed.returncode})"
+    )
     _info(f"<<< {label}: {status}  [{elapsed:.1f}s]")
     if completed.returncode != 0 and output_file is not None:
         # Surface the failing run's tail so CI logs aren't a black box.
@@ -102,39 +107,48 @@ def _invoke(
             print(line.rstrip(), flush=True)
         _info("--- end of tail ---")
     return RunResult(
-        label=label, cmd=cmd, exit_code=completed.returncode,
-        elapsed_s=elapsed, output_file=output_file,
+        label=label,
+        cmd=cmd,
+        exit_code=completed.returncode,
+        elapsed_s=elapsed,
+        output_file=output_file,
     )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--keep-tmpdir", action="store_true",
+        "--keep-tmpdir",
+        action="store_true",
         help="Don't delete the matrix tempdir on exit (for inspecting "
-             "the .e2e_state.json + data dirs of each preserved-state "
-             "pair).",
+        "the .e2e_state.json + data dirs of each preserved-state "
+        "pair).",
     )
     parser.add_argument(
-        "--seed", type=int, default=None,
+        "--seed",
+        type=int,
+        default=None,
         help="Seed for the run-5 random order. Default: a fresh random.",
     )
     parser.add_argument(
-        "--stop-on-failure", action="store_true",
+        "--stop-on-failure",
+        action="store_true",
         help="Abort the matrix as soon as one run fails (default: keep "
-             "going so you see every run's status).",
+        "going so you see every run's status).",
     )
     parser.add_argument(
-        "--quiet", action="store_true",
+        "--quiet",
+        action="store_true",
         help="Suppress each inner run's live output; capture to per-run "
-             "log files and print only summaries. Failing runs still dump "
-             "their tail.",
+        "log files and print only summaries. Failing runs still dump "
+        "their tail.",
     )
     parser.add_argument(
-        "--s3", action="store_true",
+        "--s3",
+        action="store_true",
         help="Run the S3 suite (run_s3.py) instead of the fs suite. The "
-             "S3 suite has no concept of ordering or preserved state, so "
-             "the matrix collapses to a single invocation.",
+        "S3 suite has no concept of ordering or preserved state, so "
+        "the matrix collapses to a single invocation.",
     )
     args = parser.parse_args()
 
@@ -143,7 +157,8 @@ def main() -> int:
         # --reuse-from to vary. Run it once and surface the result.
         _info("S3 mode: running run_s3.py once (no matrix permutations apply)")
         r = _invoke(
-            label="s3 suite", extra_args=[],
+            label="s3 suite",
+            extra_args=[],
             runner=RUN_S3_PY,
             stream=not args.quiet,
             output_file=None,
@@ -190,8 +205,10 @@ def main() -> int:
         for i, step in enumerate(matrix, start=1):
             output_file = logs_dir / f"run-{i}.log" if args.quiet else None
             r = _invoke(
-                label=step["label"], extra_args=step["args"],
-                output_file=output_file, stream=not args.quiet,
+                label=step["label"],
+                extra_args=step["args"],
+                output_file=output_file,
+                stream=not args.quiet,
             )
             results.append(r)
             if r.exit_code != 0 and args.stop_on_failure:

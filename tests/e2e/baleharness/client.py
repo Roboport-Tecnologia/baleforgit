@@ -1,4 +1,5 @@
 """Git client setup: isolated HOME, ssh agent/keys, remote URLs."""
+
 from __future__ import annotations
 
 import os
@@ -30,9 +31,9 @@ class SshAgent:
         for raw in out.splitlines():
             line = raw.strip()
             if line.startswith("SSH_AUTH_SOCK="):
-                self.sock = line[len("SSH_AUTH_SOCK="):].split(";", 1)[0]
+                self.sock = line[len("SSH_AUTH_SOCK=") :].split(";", 1)[0]
             elif line.startswith("SSH_AGENT_PID="):
-                self.pid = int(line[len("SSH_AGENT_PID="):].split(";", 1)[0])
+                self.pid = int(line[len("SSH_AGENT_PID=") :].split(";", 1)[0])
         if self.sock is None or self.pid is None:
             raise TestFailure(f"could not parse `ssh-agent -s` output:\n{out}")
         env = os.environ.copy()
@@ -80,9 +81,7 @@ class ClientEnv:
         env["GIT_CONFIG_NOSYSTEM"] = "1"
         # The pre-push hook runs `git-bale push-pending` with no path; the
         # release binary's directory must be on PATH for the hook to find it.
-        env["PATH"] = (
-            str(self.git_bale_bin.parent) + os.pathsep + env.get("PATH", "")
-        )
+        env["PATH"] = str(self.git_bale_bin.parent) + os.pathsep + env.get("PATH", "")
         env["GIT_AUTHOR_NAME"] = "Bale E2E"
         env["GIT_AUTHOR_EMAIL"] = "e2e@bale.invalid"
         env["GIT_COMMITTER_NAME"] = "Bale E2E"
@@ -167,4 +166,3 @@ def remote_url_ssh(*, ssh_port: int, owner: str, repo: str) -> str:
     to extract owner/repo, so this URL also yields owner=<owner>,
     repo=<repo> for the Bale forge-auth handshake."""
     return f"ssh://git@127.0.0.1:{ssh_port}/{owner}/{repo}.git"
-

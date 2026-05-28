@@ -1,4 +1,5 @@
 """Failure-recovery phases + shared background-push helpers."""
+
 from __future__ import annotations
 
 import secrets
@@ -22,9 +23,7 @@ from baleharness.storage import staging_files
 from baleharness.timing import Timings
 
 
-def _start_push_background(
-    repo: Path, env: dict
-) -> subprocess.Popen:
+def _start_push_background(repo: Path, env: dict) -> subprocess.Popen:
     """Spawn `git push -u origin main` in the background so the harness can
     interrupt it while it's still streaming bytes. Stdout/stderr are captured
     so the failure mode can be inspected after the kill."""
@@ -60,6 +59,8 @@ def _wait_push(proc: subprocess.Popen, timeout_s: float) -> int:
             f"git push subprocess did not exit within {timeout_s}s; killed"
         )
     return proc.returncode
+
+
 def phase_failure_server_kill_mid_upload(
     *,
     timings: Timings,
@@ -130,8 +131,11 @@ def phase_failure_server_kill_mid_upload(
             git(["add", "killtest.bin"], cwd=repo, env=env)
             git(["commit", "-m", "kill mid-upload"], cwd=repo, env=env)
         verify_pointer_at(
-            repo, env, spec="HEAD:killtest.bin",
-            expected_sha=payload_sha, expected_size=payload_size,
+            repo,
+            env,
+            spec="HEAD:killtest.bin",
+            expected_sha=payload_sha,
+            expected_size=payload_size,
             label="failure-kill:after-commit",
         )
 
@@ -178,13 +182,18 @@ def phase_failure_server_kill_mid_upload(
                 "push-pending drained staging before the upload finalized"
             )
         verify_worktree(
-            repo, "killtest.bin",
-            expected_sha=payload_sha, expected_size=payload_size,
+            repo,
+            "killtest.bin",
+            expected_sha=payload_sha,
+            expected_size=payload_size,
             label="failure-kill:after-crashed-push",
         )
         verify_pointer_at(
-            repo, env, spec="HEAD:killtest.bin",
-            expected_sha=payload_sha, expected_size=payload_size,
+            repo,
+            env,
+            spec="HEAD:killtest.bin",
+            expected_sha=payload_sha,
+            expected_size=payload_size,
             label="failure-kill:after-crashed-push",
         )
 
@@ -240,8 +249,10 @@ def phase_failure_server_kill_mid_upload(
             )
             git(["checkout", "main"], cwd=clone_path, env=clone_env)
         verify_worktree(
-            clone_path, "killtest.bin",
-            expected_sha=payload_sha, expected_size=payload_size,
+            clone_path,
+            "killtest.bin",
+            expected_sha=payload_sha,
+            expected_size=payload_size,
             label="failure-kill:after-recovery-clone",
         )
     finally:
@@ -315,7 +326,9 @@ def phase_failure_connection_drop_mid_upload(
         payload = deterministic_payload(payload_size, seed=b"conndrop")
         payload_sha = sha256_bytes(payload)
         (repo / "conndrop.bin").write_bytes(payload)
-        with timings.measure("failure-conndrop: stage + commit", bytes_moved=payload_size):
+        with timings.measure(
+            "failure-conndrop: stage + commit", bytes_moved=payload_size
+        ):
             git(["add", "conndrop.bin"], cwd=repo, env=env)
             git(["commit", "-m", "conndrop mid-upload"], cwd=repo, env=env)
 
@@ -348,9 +361,7 @@ def phase_failure_connection_drop_mid_upload(
                     "connection drop"
                 )
         if not staging_files(repo):
-            raise TestFailure(
-                "failure-conndrop: staging dir empty after dropped push"
-            )
+            raise TestFailure("failure-conndrop: staging dir empty after dropped push")
         # Confirm the server itself is still healthy — the whole point of
         # this phase versus the kill phase is the server stays up. Bypass
         # the (just-killed) proxy by hitting the container's mapped cas
@@ -388,8 +399,10 @@ def phase_failure_connection_drop_mid_upload(
             )
             git(["checkout", "main"], cwd=clone_path, env=clone_env)
         verify_worktree(
-            clone_path, "conndrop.bin",
-            expected_sha=payload_sha, expected_size=payload_size,
+            clone_path,
+            "conndrop.bin",
+            expected_sha=payload_sha,
+            expected_size=payload_size,
             label="failure-conndrop:after-recovery-clone",
         )
     finally:
@@ -449,7 +462,9 @@ def phase_failure_transient_db(
         payload = deterministic_payload(payload_size, seed=b"dbbusy")
         payload_sha = sha256_bytes(payload)
         (repo / "dbbusy.bin").write_bytes(payload)
-        with timings.measure("failure-dbbusy: stage + commit", bytes_moved=payload_size):
+        with timings.measure(
+            "failure-dbbusy: stage + commit", bytes_moved=payload_size
+        ):
             git(["add", "dbbusy.bin"], cwd=repo, env=env)
             git(["commit", "-m", "dbbusy"], cwd=repo, env=env)
 
@@ -482,9 +497,7 @@ def phase_failure_transient_db(
             )
         # Verify the file actually round-tripped: cold-clone in a fresh
         # worktree and check the bytes against the original.
-        with timings.measure(
-            "failure-dbbusy: cold clone", bytes_moved=payload_size
-        ):
+        with timings.measure("failure-dbbusy: cold clone", bytes_moved=payload_size):
             clone_path, clone_env, _ = init_repo_for_clone(
                 work_root=work_root,
                 client=client,
@@ -495,8 +508,10 @@ def phase_failure_transient_db(
             )
             git(["checkout", "main"], cwd=clone_path, env=clone_env)
         verify_worktree(
-            clone_path, "dbbusy.bin",
-            expected_sha=payload_sha, expected_size=payload_size,
+            clone_path,
+            "dbbusy.bin",
+            expected_sha=payload_sha,
+            expected_size=payload_size,
             label="failure-dbbusy:after-clone",
         )
     finally:

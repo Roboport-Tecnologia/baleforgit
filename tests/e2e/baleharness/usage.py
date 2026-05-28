@@ -1,4 +1,5 @@
 """Usage API + browser-style file download over HTTP."""
+
 from __future__ import annotations
 
 import json
@@ -46,12 +47,14 @@ def http_get_file(
     if filename is not None:
         params["filename"] = filename
     url = (
-        f"{handle.public_host_url}/v1/files/{file_id}"
-        f"?{urllib.parse.urlencode(params)}"
+        f"{handle.public_host_url}/v1/files/{file_id}?{urllib.parse.urlencode(params)}"
     )
     try:
         with urllib.request.urlopen(url, timeout=30) as resp:
-            return resp.status, resp.read(), {k.lower(): v for k, v in resp.headers.items()}
+            return (
+                resp.status,
+                resp.read(),
+                {k.lower(): v for k, v in resp.headers.items()},
+            )
     except urllib.error.HTTPError as e:
         return e.code, e.read(), {k.lower(): v for k, v in e.headers.items()}
-

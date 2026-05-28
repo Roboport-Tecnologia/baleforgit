@@ -1,4 +1,5 @@
 """Adversarial phases (wrong token, tampered xorb, quota exceeded)."""
+
 from __future__ import annotations
 
 import os
@@ -8,7 +9,14 @@ from pathlib import Path
 from typing import Optional
 
 from baleharness.client import ClientEnv
-from baleharness.config import BIG_FILE_BYTES, E2E_OWNER, E2E_REPO, E2E_REPO_2, SIZE_TOLERANCE_BYTES, SMALL_FILE_BYTES
+from baleharness.config import (
+    BIG_FILE_BYTES,
+    E2E_OWNER,
+    E2E_REPO,
+    E2E_REPO_2,
+    SIZE_TOLERANCE_BYTES,
+    SMALL_FILE_BYTES,
+)
 from baleharness.gitutil import git, verify_pointer_at, verify_worktree
 from baleharness.logutil import TestFailure, fmt_bytes, info
 from baleharness.payloads import deterministic_payload
@@ -55,14 +63,20 @@ def phase_adversarial_wrong_token(
         # Stage succeeds — clean is offline.
         git(["add", "wrongtoken.bin"], cwd=repo, env=env)
         verify_pointer_at(
-            repo, env, spec=":wrongtoken.bin",
-            expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+            repo,
+            env,
+            spec=":wrongtoken.bin",
+            expected_sha=payload_sha,
+            expected_size=SMALL_FILE_BYTES,
             label="wrongtoken:after-stage",
         )
         git(["commit", "-m", "wrongtoken"], cwd=repo, env=env)
         verify_pointer_at(
-            repo, env, spec="HEAD:wrongtoken.bin",
-            expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+            repo,
+            env,
+            spec="HEAD:wrongtoken.bin",
+            expected_sha=payload_sha,
+            expected_size=SMALL_FILE_BYTES,
             label="wrongtoken:after-commit",
         )
     disk_before = server.disk_total_bytes()
@@ -86,13 +100,18 @@ def phase_adversarial_wrong_token(
         )
     # A rejected push must not corrupt the client's worktree or its index/HEAD.
     verify_worktree(
-        repo, "wrongtoken.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        "wrongtoken.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="wrongtoken:after-failed-push",
     )
     verify_pointer_at(
-        repo, env, spec="HEAD:wrongtoken.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        env,
+        spec="HEAD:wrongtoken.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="wrongtoken:after-failed-push",
     )
 
@@ -205,14 +224,20 @@ def phase_adversarial_quota_exceeded(
         with timings.measure("adversarial: push past quota (must fail)"):
             git(["add", "fatfile.bin"], cwd=repo, env=env)
             verify_pointer_at(
-                repo, env, spec=":fatfile.bin",
-                expected_sha=payload_sha, expected_size=BIG_FILE_BYTES,
+                repo,
+                env,
+                spec=":fatfile.bin",
+                expected_sha=payload_sha,
+                expected_size=BIG_FILE_BYTES,
                 label="quota:after-stage",
             )
             git(["commit", "-m", "fatfile"], cwd=repo, env=env)
             verify_pointer_at(
-                repo, env, spec="HEAD:fatfile.bin",
-                expected_sha=payload_sha, expected_size=BIG_FILE_BYTES,
+                repo,
+                env,
+                spec="HEAD:fatfile.bin",
+                expected_sha=payload_sha,
+                expected_size=BIG_FILE_BYTES,
                 label="quota:after-commit",
             )
             completed = git(
@@ -222,9 +247,7 @@ def phase_adversarial_quota_exceeded(
                 expect_fail=True,
             )
         if completed.returncode == 0:
-            raise TestFailure(
-                "push past the 1 KiB quota unexpectedly succeeded"
-            )
+            raise TestFailure("push past the 1 KiB quota unexpectedly succeeded")
         # Server should still be healthy after the rejected push.
         with urllib.request.urlopen(server.healthz_url, timeout=5) as resp:
             if resp.status != 200:
@@ -242,16 +265,19 @@ def phase_adversarial_quota_exceeded(
                 "is leaking xorbs through"
             )
         verify_worktree(
-            repo, "fatfile.bin",
-            expected_sha=payload_sha, expected_size=BIG_FILE_BYTES,
+            repo,
+            "fatfile.bin",
+            expected_sha=payload_sha,
+            expected_size=BIG_FILE_BYTES,
             label="quota:after-failed-push",
         )
         verify_pointer_at(
-            repo, env, spec="HEAD:fatfile.bin",
-            expected_sha=payload_sha, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            spec="HEAD:fatfile.bin",
+            expected_sha=payload_sha,
+            expected_size=BIG_FILE_BYTES,
             label="quota:after-failed-push",
         )
     finally:
         server.stop()
-
-

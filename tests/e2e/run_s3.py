@@ -73,7 +73,7 @@ def resolve_git_bale(explicit: Optional[str]) -> Path:
         if not p.is_file():
             die(f"--git-bale: {p} is not a file")
         return p
-    env_path = (Path(__file__).resolve().parents[2] / "target" / "release" / "git-bale")
+    env_path = Path(__file__).resolve().parents[2] / "target" / "release" / "git-bale"
     if env_path.is_file():
         return env_path
     die(
@@ -90,7 +90,9 @@ def main() -> int:
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--keep-tmpdir", action="store_true")
     parser.add_argument(
-        "--skip", action="append", default=[],
+        "--skip",
+        action="append",
+        default=[],
         help="Phase name(s) to skip (repeat for multiple).",
     )
     args = parser.parse_args()
@@ -134,11 +136,15 @@ def main() -> int:
             minio = MinioGuard.start(rt, network)
 
         common_kwargs = dict(
-            timings=timings, rt=rt, image_tag=args.image_tag,
-            work_root=work_root, client=client,
+            timings=timings,
+            rt=rt,
+            image_tag=args.image_tag,
+            work_root=work_root,
+            client=client,
             ssh_public_key=ssh_public_key,
             admin_token_hex=admin_token_hex,
-            minio=minio, network=network,
+            minio=minio,
+            network=network,
         )
 
         # Phase registry. Plain list (not the g1/g2/g3 grouping run.py uses)
@@ -146,10 +152,14 @@ def main() -> int:
         # container, its own BALE_S3_PREFIX subtree of the bucket, its own
         # data_root for meta.db. No cross-phase dependencies.
         registry: dict[str, PhaseFn] = {
-            "s3-basic":             lambda: phase_s3_basic(**common_kwargs),
-            "s3-dedup":             lambda: phase_s3_dedup(**common_kwargs),
-            "s3-failure-kill":      lambda: phase_s3_failure_server_kill_mid_upload(**common_kwargs),
-            "s3-failure-conndrop":  lambda: phase_s3_failure_connection_drop_mid_upload(**common_kwargs),
+            "s3-basic": lambda: phase_s3_basic(**common_kwargs),
+            "s3-dedup": lambda: phase_s3_dedup(**common_kwargs),
+            "s3-failure-kill": lambda: phase_s3_failure_server_kill_mid_upload(
+                **common_kwargs
+            ),
+            "s3-failure-conndrop": lambda: phase_s3_failure_connection_drop_mid_upload(
+                **common_kwargs
+            ),
         }
         ordered = list(registry.keys())
         info(f"phase order: {ordered}")
@@ -170,12 +180,14 @@ def main() -> int:
             print("--- minio logs ---", file=sys.stderr, flush=True)
             completed = subprocess.run(
                 rt.cmd("logs", minio.container),
-                capture_output=True, check=False,
+                capture_output=True,
+                check=False,
             )
             print(
                 completed.stdout.decode("utf-8", "replace")
                 + completed.stderr.decode("utf-8", "replace"),
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
         exit_code = 1
     except KeyboardInterrupt:

@@ -1,4 +1,5 @@
 """Mount phases (mount-rev, mount-diff, mount-diff-mixed)."""
+
 from __future__ import annotations
 
 import secrets
@@ -9,7 +10,12 @@ from baleharness.client import ClientEnv
 from baleharness.config import BIG_FILE_BYTES, E2E_OWNER, E2E_REPO_2, E2E_REPO_3
 from baleharness.gitutil import git, is_bale_pointer, pointer_field
 from baleharness.logutil import TestFailure, info
-from baleharness.mount import MountUnavailable, _LIBFUSE_HINT, mount_diff_session, mount_rev_session
+from baleharness.mount import (
+    MountUnavailable,
+    _LIBFUSE_HINT,
+    mount_diff_session,
+    mount_rev_session,
+)
 from baleharness.payloads import deterministic_payload, modify_bytes
 from baleharness.proc import sha256_bytes, sha256_file
 from baleharness.repo import init_repo_for_clone, init_repo_for_push
@@ -37,8 +43,12 @@ def phase_mount_rev(
         raise TestFailure("mount-rev: rev_state missing — bigfile phase didn't run")
     expected_sha = rev_state["shas"][-1]
     clone_path, env, _cache = init_repo_for_clone(
-        work_root=work_root, client=client, server=server,
-        owner=E2E_OWNER, repo=E2E_REPO_2, name="mount-rev-clone",
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_2,
+        name="mount-rev-clone",
     )
     mount_root = work_root / "mount-rev-points"
     mount_root.mkdir(exist_ok=True)
@@ -48,8 +58,11 @@ def phase_mount_rev(
             bytes_moved=BIG_FILE_BYTES,
         ):
             with mount_rev_session(
-                client=client, repo=clone_path, env=env,
-                mount_root=mount_root, rev="HEAD",
+                client=client,
+                repo=clone_path,
+                env=env,
+                mount_root=mount_root,
+                rev="HEAD",
                 label="mount-rev",
             ) as mp:
                 # Plain (non-bale) blob: byte-for-byte against what git itself
@@ -57,7 +70,9 @@ def phase_mount_rev(
                 # file served from gix's ODB through the FUSE plain_cache path.
                 mounted_attrs = (mp / ".gitattributes").read_bytes()
                 source_attrs = git(
-                    ["show", "HEAD:.gitattributes"], cwd=clone_path, env=env,
+                    ["show", "HEAD:.gitattributes"],
+                    cwd=clone_path,
+                    env=env,
                 ).stdout
                 if mounted_attrs != source_attrs:
                     raise TestFailure(
@@ -95,8 +110,11 @@ def phase_mount_rev(
             bytes_moved=BIG_FILE_BYTES,
         ):
             with mount_rev_session(
-                client=client, repo=clone_path, env=env,
-                mount_root=mount_root, rev="HEAD",
+                client=client,
+                repo=clone_path,
+                env=env,
+                mount_root=mount_root,
+                rev="HEAD",
                 label="mount-rev-hot",
             ) as mp:
                 got_sha = sha256_file(mp / "bigfile.bin")
@@ -133,8 +151,12 @@ def phase_mount_diff(
     v1_sha = rev_state["shas"][0]
     v3_sha = rev_state["shas"][2]
     clone_path, env, _cache = init_repo_for_clone(
-        work_root=work_root, client=client, server=server,
-        owner=E2E_OWNER, repo=E2E_REPO_2, name="mount-diff-clone",
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_2,
+        name="mount-diff-clone",
     )
     mount_root = work_root / "mount-diff-points"
     mount_root.mkdir(exist_ok=True)
@@ -144,10 +166,14 @@ def phase_mount_diff(
             bytes_moved=2 * BIG_FILE_BYTES,
         ):
             with mount_diff_session(
-                client=client, repo=clone_path, env=env,
+                client=client,
+                repo=clone_path,
+                env=env,
                 mount_root=mount_root,
-                rev_a=v1_commit, rev_b=v3_commit,
-                label_a="v1", label_b="v3",
+                rev_a=v1_commit,
+                rev_b=v3_commit,
+                label_a="v1",
+                label_b="v3",
                 label="mount-diff",
             ) as mp:
                 names = sorted(p.name for p in mp.iterdir())
@@ -173,8 +199,7 @@ def phase_mount_diff(
                     sz = (mp / name).stat().st_size
                     if sz != BIG_FILE_BYTES:
                         raise TestFailure(
-                            f"mount-diff: {name} stat size {sz} != "
-                            f"{BIG_FILE_BYTES}"
+                            f"mount-diff: {name} stat size {sz} != {BIG_FILE_BYTES}"
                         )
         # Pathspec must yield an empty diff and exit with "no files differ"
         # rather than silently mounting an empty FS.
@@ -184,14 +209,24 @@ def phase_mount_diff(
             with timings.measure("mount-diff: pathspec rejects empty result"):
                 completed = subprocess.run(
                     [
-                        str(client.git_bale_bin), "mount-diff",
-                        v1_commit, v3_commit,
-                        "--label-a", "v1", "--label-b", "v3",
-                        "--mount", str(empty_mp),
-                        "--", "no-such-path",
+                        str(client.git_bale_bin),
+                        "mount-diff",
+                        v1_commit,
+                        v3_commit,
+                        "--label-a",
+                        "v1",
+                        "--label-b",
+                        "v3",
+                        "--mount",
+                        str(empty_mp),
+                        "--",
+                        "no-such-path",
                     ],
-                    cwd=str(clone_path), env=env,
-                    capture_output=True, check=False, timeout=30.0,
+                    cwd=str(clone_path),
+                    env=env,
+                    capture_output=True,
+                    check=False,
+                    timeout=30.0,
                 )
             if completed.returncode == 0:
                 raise TestFailure(
@@ -240,8 +275,12 @@ def phase_mount_diff_mixed(
     git blobs and bale pointers go through divergent code paths in the
     Reader and one of them silently breaks."""
     repo, env = init_repo_for_push(
-        work_root=work_root, client=client, server=server,
-        owner=E2E_OWNER, repo=E2E_REPO_3, name="mount-diff-mixed",
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_3,
+        name="mount-diff-mixed",
     )
     plain_v1 = b"alpha\nbravo\ncharlie\ndelta\n"
     plain_v2 = b"alpha\nbravo CHANGED\ncharlie\ndelta\necho added\n"
@@ -254,25 +293,41 @@ def phase_mount_diff_mixed(
     (repo / "data.bin").write_bytes(bale_v1)
     git(["add", "notes.txt", "data.bin"], cwd=repo, env=env)
     git(["commit", "-m", "v1: notes + data"], cwd=repo, env=env)
-    commit_v1 = git(
-        ["rev-parse", "HEAD"], cwd=repo, env=env,
-    ).stdout.decode().strip()
+    commit_v1 = (
+        git(
+            ["rev-parse", "HEAD"],
+            cwd=repo,
+            env=env,
+        )
+        .stdout.decode()
+        .strip()
+    )
 
     (repo / "notes.txt").write_bytes(plain_v2)
     (repo / "data.bin").write_bytes(bale_v2)
     git(["add", "notes.txt", "data.bin"], cwd=repo, env=env)
     git(["commit", "-m", "v2: edit both"], cwd=repo, env=env)
-    commit_v2 = git(
-        ["rev-parse", "HEAD"], cwd=repo, env=env,
-    ).stdout.decode().strip()
+    commit_v2 = (
+        git(
+            ["rev-parse", "HEAD"],
+            cwd=repo,
+            env=env,
+        )
+        .stdout.decode()
+        .strip()
+    )
 
     git(["push", "-u", "origin", "main"], cwd=repo, env=env)
 
     # Cold-clone so mount goes through the same network reconstruction path
     # a fresh user would hit (no chunk cache, no manifests).
     clone_path, clone_env, _cache = init_repo_for_clone(
-        work_root=work_root, client=client, server=server,
-        owner=E2E_OWNER, repo=E2E_REPO_3, name="mount-diff-mixed-clone",
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_3,
+        name="mount-diff-mixed-clone",
     )
     mount_root = work_root / "mount-diff-mixed-points"
     mount_root.mkdir(exist_ok=True)
@@ -290,13 +345,18 @@ def phase_mount_diff_mixed(
     try:
         with timings.measure(
             "mount-diff-mixed: mount + byte-for-byte verify",
-            bytes_moved=2 * (len(plain_v1) + len(plain_v2) + len(bale_v1) + len(bale_v2)),
+            bytes_moved=2
+            * (len(plain_v1) + len(plain_v2) + len(bale_v1) + len(bale_v2)),
         ):
             with mount_diff_session(
-                client=client, repo=clone_path, env=clone_env,
+                client=client,
+                repo=clone_path,
+                env=clone_env,
                 mount_root=mount_root,
-                rev_a=commit_v1, rev_b=commit_v2,
-                label_a="v1", label_b="v2",
+                rev_a=commit_v1,
+                rev_b=commit_v2,
+                label_a="v1",
+                label_b="v2",
                 label="mount-diff-mixed",
             ) as mp:
                 names = sorted(p.name for p in mp.iterdir())
@@ -326,7 +386,8 @@ def phase_mount_diff_mixed(
                             )
                         odb_blob = git(
                             ["show", f"{src_rev}:{stem}{ext}"],
-                            cwd=clone_path, env=clone_env,
+                            cwd=clone_path,
+                            env=clone_env,
                         ).stdout
                         if kind == "plain":
                             # Plain blobs: the ODB stores the literal bytes,
@@ -365,7 +426,8 @@ def phase_mount_diff_mixed(
                     b = mp / f"{stem}__v2{ext}"
                     r = subprocess.run(
                         ["diff", "-q", str(a), str(b)],
-                        capture_output=True, check=False,
+                        capture_output=True,
+                        check=False,
                     )
                     if r.returncode != 1:
                         raise TestFailure(
@@ -377,5 +439,3 @@ def phase_mount_diff_mixed(
         info(f"-- mount-diff-mixed: skipping ({e})")
         if e.stderr and e.stderr != str(e):
             info(f"-- mount-diff-mixed: binary stderr:\n{e.stderr}")
-
-

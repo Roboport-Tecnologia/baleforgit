@@ -27,9 +27,7 @@ get from per-phase `data_root` directories.
 from __future__ import annotations
 
 import json
-import os
 import secrets
-import socket
 import subprocess
 import time
 import urllib.error
@@ -44,13 +42,11 @@ from typing import Callable, Optional
 # driving, payload generation, and the worktree/pointer verifiers.
 from run import (
     BIG_FILE_BYTES,
-    E2E_HUB_TOKEN,
     E2E_OWNER,
     E2E_REPO,
     E2E_REPO_2,
     E2E_USER,
     JWT_TTL_YEARS,
-    SIZE_TOLERANCE_BYTES,
     ClientEnv,
     Runtime,
     ServerHandle,
@@ -71,7 +67,6 @@ from run import (
     mint_bale_jwt,
     pick_free_port,
     sha256_bytes,
-    skip,
     staging_files,
     start_container,
     verify_pointer_at,
@@ -127,7 +122,8 @@ class Network:
         # they're stopped. Each MinioGuard/ServerHandle teardown precedes this.
         subprocess.run(
             self.rt.cmd("network", "rm", self.name),
-            capture_output=True, check=False,
+            capture_output=True,
+            check=False,
         )
 
 
@@ -190,19 +186,26 @@ class MinioGuard:
                 "run",
                 "-d",
                 "--rm",
-                "--name", container,
-                "--network", network.name,
+                "--name",
+                container,
+                "--network",
+                network.name,
                 # 0.0.0.0 (default when no bind address) so the published
                 # port is reachable both via the host's loopback (for the
                 # host-side TcpProxy + mc admin) AND via the host's
                 # primary IP (for containers on the shared bridge).
-                "-p", f"{host_port}:{MINIO_INTERNAL_PORT}",
-                "-e", f"MINIO_ROOT_USER={MINIO_ACCESS_KEY}",
-                "-e", f"MINIO_ROOT_PASSWORD={MINIO_SECRET_KEY}",
+                "-p",
+                f"{host_port}:{MINIO_INTERNAL_PORT}",
+                "-e",
+                f"MINIO_ROOT_USER={MINIO_ACCESS_KEY}",
+                "-e",
+                f"MINIO_ROOT_PASSWORD={MINIO_SECRET_KEY}",
                 MINIO_IMAGE,
-                "server", "/data",
+                "server",
+                "/data",
             ),
-            capture_output=True, check=False,
+            capture_output=True,
+            check=False,
         )
         if completed.returncode != 0:
             raise TestFailure(
@@ -257,9 +260,12 @@ class MinioGuard:
         # `mc` ships in the minio/minio image; alias set + mb -p covers the
         # "already exists" case without SigV4 plumbing on the host.
         self._mc(
-            "alias", "set", "local",
+            "alias",
+            "set",
+            "local",
             f"http://127.0.0.1:{MINIO_INTERNAL_PORT}",
-            MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+            MINIO_ACCESS_KEY,
+            MINIO_SECRET_KEY,
         )
         # mc mb -p is the idempotent form ("ignore already exists" + parent
         # creation). Without -p, a second run aborts with "Bucket already
@@ -269,7 +275,8 @@ class MinioGuard:
     def stop(self) -> None:
         subprocess.run(
             self.rt.cmd("rm", "-f", self.container),
-            capture_output=True, check=False,
+            capture_output=True,
+            check=False,
         )
 
     # ---- `mc` subprocess helpers ----------------------------------------
@@ -295,11 +302,16 @@ class MinioGuard:
         """
         completed = subprocess.run(
             self.rt.cmd(
-                "exec", self.container, "mc", "ls",
-                "--recursive", "--json",
+                "exec",
+                self.container,
+                "mc",
+                "ls",
+                "--recursive",
+                "--json",
                 f"local/{MINIO_BUCKET}/{prefix}",
             ),
-            capture_output=True, check=False,
+            capture_output=True,
+            check=False,
         )
         out: list[tuple[str, int]] = []
         for raw in completed.stdout.decode("utf-8", "replace").splitlines():
@@ -331,10 +343,14 @@ class MinioGuard:
         """
         completed = subprocess.run(
             self.rt.cmd(
-                "exec", self.container, "mc", "cat",
+                "exec",
+                self.container,
+                "mc",
+                "cat",
                 f"local/{MINIO_BUCKET}/{prefix_key}",
             ),
-            capture_output=True, check=False,
+            capture_output=True,
+            check=False,
         )
         if completed.returncode != 0:
             raise TestFailure(
@@ -539,18 +555,27 @@ def phase_s3_basic(
     storage = S3StorageView(minio, prefix=prefix)
 
     server = _start_s3_server(
-        rt=rt, image_tag=image_tag, data_root=data_root,
-        jwt_secret_hex=jwt_secret, transfer_secret_hex=transfer_secret,
+        rt=rt,
+        image_tag=image_tag,
+        data_root=data_root,
+        jwt_secret_hex=jwt_secret,
+        transfer_secret_hex=transfer_secret,
         ssh_public_key=ssh_public_key,
         test_repos=[f"{E2E_OWNER}/{E2E_REPO}"],
         admin_token_hex=admin_token_hex,
         name_suffix="s3-basic",
-        minio=minio, network=network, prefix=prefix,
+        minio=minio,
+        network=network,
+        prefix=prefix,
     )
     try:
         repo, env = init_repo_for_push(
-            work_root=work_root, client=client, server=server,
-            owner=E2E_OWNER, repo=E2E_REPO, name="s3-basic-client",
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO,
+            name="s3-basic-client",
         )
         payload = deterministic_payload(64 * 1024, seed=b"s3-basic")
         payload_sha = sha256_bytes(payload)
@@ -559,8 +584,11 @@ def phase_s3_basic(
         with timings.measure("s3-basic: stage + commit", bytes_moved=len(payload)):
             git(["add", "smallish.bin"], cwd=repo, env=env)
             verify_pointer_at(
-                repo, env, spec=":smallish.bin",
-                expected_sha=payload_sha, expected_size=len(payload),
+                repo,
+                env,
+                spec=":smallish.bin",
+                expected_sha=payload_sha,
+                expected_size=len(payload),
                 label="s3-basic:after-stage",
             )
             git(["commit", "-m", "s3-basic"], cwd=repo, env=env)
@@ -586,15 +614,23 @@ def phase_s3_basic(
         # Cold clone in a fresh worktree — the smudge has to traverse
         # /v1/reconstructions/ AND the resulting presigned URL has to fetch
         # the right bytes back from MinIO. Both ends matter.
-        with timings.measure("s3-basic: cold clone + checkout", bytes_moved=len(payload)):
+        with timings.measure(
+            "s3-basic: cold clone + checkout", bytes_moved=len(payload)
+        ):
             clone_path, clone_env, _ = init_repo_for_clone(
-                work_root=work_root, client=client, server=server,
-                owner=E2E_OWNER, repo=E2E_REPO, name="s3-basic-clone",
+                work_root=work_root,
+                client=client,
+                server=server,
+                owner=E2E_OWNER,
+                repo=E2E_REPO,
+                name="s3-basic-clone",
             )
             git(["checkout", "main"], cwd=clone_path, env=clone_env)
         verify_worktree(
-            clone_path, "smallish.bin",
-            expected_sha=payload_sha, expected_size=len(payload),
+            clone_path,
+            "smallish.bin",
+            expected_sha=payload_sha,
+            expected_size=len(payload),
             label="s3-basic:after-clone",
         )
     finally:
@@ -644,19 +680,28 @@ def phase_s3_dedup(
     storage = S3StorageView(minio, prefix=prefix)
 
     server = _start_s3_server(
-        rt=rt, image_tag=image_tag, data_root=data_root,
-        jwt_secret_hex=jwt_secret, transfer_secret_hex=transfer_secret,
+        rt=rt,
+        image_tag=image_tag,
+        data_root=data_root,
+        jwt_secret_hex=jwt_secret,
+        transfer_secret_hex=transfer_secret,
         ssh_public_key=ssh_public_key,
         test_repos=[f"{E2E_OWNER}/{E2E_REPO_2}"],
         admin_token_hex=admin_token_hex,
         name_suffix="s3-dedup",
-        minio=minio, network=network, prefix=prefix,
+        minio=minio,
+        network=network,
+        prefix=prefix,
     )
     admin_jwt = _mint_admin_jwt(jwt_secret, E2E_REPO_2)
     try:
         repo, env = init_repo_for_push(
-            work_root=work_root, client=client, server=server,
-            owner=E2E_OWNER, repo=E2E_REPO_2, name="s3-dedup-client",
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO_2,
+            name="s3-dedup-client",
         )
 
         # ---- v1: baseline 35 MiB ----------------------------------------
@@ -688,7 +733,7 @@ def phase_s3_dedup(
         payload_v2 = (
             payload_v1[:v2_offset]
             + b"\xde\xad\xbe\xef\x01\x02\x03\x04"
-            + payload_v1[v2_offset + 8:]
+            + payload_v1[v2_offset + 8 :]
         )
         sha_v2 = sha256_bytes(payload_v2)
         if sha_v2 == sha_v1:
@@ -719,7 +764,7 @@ def phase_s3_dedup(
         v3_len = 1024 * 1024
         v3_region = deterministic_payload(v3_len, seed=b"s3-dedup-v3-region")
         payload_v3 = (
-            payload_v2[:v3_offset] + v3_region + payload_v2[v3_offset + v3_len:]
+            payload_v2[:v3_offset] + v3_region + payload_v2[v3_offset + v3_len :]
         )
         sha_v3 = sha256_bytes(payload_v3)
         if sha_v3 in (sha_v1, sha_v2):
@@ -750,7 +795,10 @@ def phase_s3_dedup(
         # close to one payload's worth despite three revisions.
         # savings = raw - stored should be ≈ 2 × BIG_FILE_BYTES.
         usage = fetch_repo_usage(
-            server, token=admin_jwt, owner=E2E_OWNER, repo=E2E_REPO_2,
+            server,
+            token=admin_jwt,
+            owner=E2E_OWNER,
+            repo=E2E_REPO_2,
         )
         info(f"  s3-dedup: /v1/usage repo response = {usage}")
         raw = int(usage["raw_bytes"])
@@ -792,16 +840,23 @@ def phase_s3_dedup(
         # Every revision must check out to the right sha256 — proves the
         # CDC-deduped chunks reassemble correctly per-revision from S3.
         clone_path, clone_env, _ = init_repo_for_clone(
-            work_root=work_root, client=client, server=server,
-            owner=E2E_OWNER, repo=E2E_REPO_2, name="s3-dedup-clone",
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO_2,
+            name="s3-dedup-clone",
         )
         with timings.measure(
-            "s3-dedup: cold clone HEAD (v3)", bytes_moved=BIG_FILE_BYTES,
+            "s3-dedup: cold clone HEAD (v3)",
+            bytes_moved=BIG_FILE_BYTES,
         ):
             git(["checkout", "main"], cwd=clone_path, env=clone_env)
         verify_worktree(
-            clone_path, "bigfile.bin",
-            expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
+            clone_path,
+            "bigfile.bin",
+            expected_sha=sha_v3,
+            expected_size=BIG_FILE_BYTES,
             label="s3-dedup:clone:v3",
         )
     finally:
@@ -840,7 +895,6 @@ def phase_s3_failure_server_kill_mid_upload(
     jwt_secret = secrets.token_bytes(32).hex()
     transfer_secret = secrets.token_bytes(32).hex()
     prefix = "kill/"
-    storage = S3StorageView(minio, prefix=prefix)
     # 4 MiB payload — matches the fs failure-kill phase. Large enough
     # that the throttled proxy gives a multi-second window to land the
     # kill mid-stream, small enough that the suite stays fast.
@@ -864,21 +918,31 @@ def phase_s3_failure_server_kill_mid_upload(
     proxy_url = f"http://127.0.0.1:{proxy_port}"
 
     server = _start_s3_server(
-        rt=rt, image_tag=image_tag, data_root=data_root,
-        jwt_secret_hex=jwt_secret, transfer_secret_hex=transfer_secret,
+        rt=rt,
+        image_tag=image_tag,
+        data_root=data_root,
+        jwt_secret_hex=jwt_secret,
+        transfer_secret_hex=transfer_secret,
         ssh_public_key=ssh_public_key,
         test_repos=[f"{E2E_OWNER}/{E2E_REPO}"],
-        cas_port=cas_port, ssh_port=ssh_port,
+        cas_port=cas_port,
+        ssh_port=ssh_port,
         admin_token_hex=admin_token_hex,
         name_suffix="s3-kill",
-        minio=minio, network=network, prefix=prefix,
+        minio=minio,
+        network=network,
+        prefix=prefix,
         public_host_url_override=proxy_url,
     )
     new_server: Optional[ServerHandle] = None
     try:
         repo, env = init_repo_for_push(
-            work_root=work_root, client=client, server=server,
-            owner=E2E_OWNER, repo=E2E_REPO, name="s3-kill-client",
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO,
+            name="s3-kill-client",
         )
         # Trim xet retry budget so a deliberately-broken upstream surfaces
         # as a push failure in ~1s rather than ~30s.
@@ -934,14 +998,20 @@ def phase_s3_failure_server_kill_mid_upload(
         # there. Retry push converges by content-addressed idempotency.
         with timings.measure("s3-failure-kill: restart server"):
             new_server = _start_s3_server(
-                rt=rt, image_tag=image_tag, data_root=data_root,
-                jwt_secret_hex=jwt_secret, transfer_secret_hex=transfer_secret,
+                rt=rt,
+                image_tag=image_tag,
+                data_root=data_root,
+                jwt_secret_hex=jwt_secret,
+                transfer_secret_hex=transfer_secret,
                 ssh_public_key=ssh_public_key,
                 test_repos=[f"{E2E_OWNER}/{E2E_REPO}"],
-                cas_port=cas_port, ssh_port=ssh_port,
+                cas_port=cas_port,
+                ssh_port=ssh_port,
                 admin_token_hex=admin_token_hex,
                 name_suffix="s3-kill-restart",
-                minio=minio, network=network, prefix=prefix,
+                minio=minio,
+                network=network,
+                prefix=prefix,
                 public_host_url_override=proxy_url,
             )
         with timings.measure(
@@ -962,13 +1032,19 @@ def phase_s3_failure_server_kill_mid_upload(
             bytes_moved=kill_payload_size,
         ):
             clone_path, clone_env, _ = init_repo_for_clone(
-                work_root=work_root, client=client, server=new_server,
-                owner=E2E_OWNER, repo=E2E_REPO, name="s3-kill-clone",
+                work_root=work_root,
+                client=client,
+                server=new_server,
+                owner=E2E_OWNER,
+                repo=E2E_REPO,
+                name="s3-kill-clone",
             )
             git(["checkout", "main"], cwd=clone_path, env=clone_env)
         verify_worktree(
-            clone_path, "killtest.bin",
-            expected_sha=payload_sha, expected_size=kill_payload_size,
+            clone_path,
+            "killtest.bin",
+            expected_sha=payload_sha,
+            expected_size=kill_payload_size,
             label="s3-failure-kill:after-recovery-clone",
         )
     finally:
@@ -1042,19 +1118,28 @@ def phase_s3_failure_connection_drop_mid_upload(
     info(f"  server→S3 proxy URL: {proxy_url}")
 
     server = _start_s3_server(
-        rt=rt, image_tag=image_tag, data_root=data_root,
-        jwt_secret_hex=jwt_secret, transfer_secret_hex=transfer_secret,
+        rt=rt,
+        image_tag=image_tag,
+        data_root=data_root,
+        jwt_secret_hex=jwt_secret,
+        transfer_secret_hex=transfer_secret,
         ssh_public_key=ssh_public_key,
         test_repos=[f"{E2E_OWNER}/{E2E_REPO}"],
         admin_token_hex=admin_token_hex,
         name_suffix="s3-conndrop",
-        minio=minio, network=network, prefix=prefix,
+        minio=minio,
+        network=network,
+        prefix=prefix,
         endpoint_override=proxy_url,
     )
     try:
         repo, env = init_repo_for_push(
-            work_root=work_root, client=client, server=server,
-            owner=E2E_OWNER, repo=E2E_REPO, name="s3-conndrop-client",
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO,
+            name="s3-conndrop-client",
         )
         # Fast-fail xet so a server-side error (cascading from the dropped
         # S3 connection) doesn't burn 30s of retries before the push exits.
@@ -1134,13 +1219,19 @@ def phase_s3_failure_connection_drop_mid_upload(
             bytes_moved=BIG_FILE_BYTES,
         ):
             clone_path, clone_env, _ = init_repo_for_clone(
-                work_root=work_root, client=client, server=server,
-                owner=E2E_OWNER, repo=E2E_REPO, name="s3-conndrop-clone",
+                work_root=work_root,
+                client=client,
+                server=server,
+                owner=E2E_OWNER,
+                repo=E2E_REPO,
+                name="s3-conndrop-clone",
             )
             git(["checkout", "main"], cwd=clone_path, env=clone_env)
         verify_worktree(
-            clone_path, "s3drop.bin",
-            expected_sha=payload_sha, expected_size=BIG_FILE_BYTES,
+            clone_path,
+            "s3drop.bin",
+            expected_sha=payload_sha,
+            expected_size=BIG_FILE_BYTES,
             label="s3-failure-conndrop:after-recovery-clone",
         )
 

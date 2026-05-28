@@ -1,4 +1,5 @@
 """Multi-run state stash for --state-dir / --reuse-from."""
+
 from __future__ import annotations
 
 import json

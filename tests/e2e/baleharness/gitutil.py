@@ -1,4 +1,5 @@
 """git invocation + bale pointer / worktree / resmudge verification."""
+
 from __future__ import annotations
 
 import json
@@ -11,8 +12,14 @@ from baleharness.proc import run, sha256_file
 from baleharness.storage import staging_files
 
 
-def git(args: list[str], *, cwd: Path, env: dict, capture: bool = True,
-        expect_fail: bool = False) -> subprocess.CompletedProcess:
+def git(
+    args: list[str],
+    *,
+    cwd: Path,
+    env: dict,
+    capture: bool = True,
+    expect_fail: bool = False,
+) -> subprocess.CompletedProcess:
     return run(
         ["git", *args],
         cwd=cwd,
@@ -56,14 +63,12 @@ def verify_worktree(
     actual_size = p.stat().st_size
     if actual_size != expected_size:
         raise TestFailure(
-            f"[{label}] {rel}: worktree size {actual_size} != expected "
-            f"{expected_size}"
+            f"[{label}] {rel}: worktree size {actual_size} != expected {expected_size}"
         )
     actual_sha = sha256_file(p)
     if actual_sha != expected_sha:
         raise TestFailure(
-            f"[{label}] {rel}: worktree sha256 {actual_sha} != expected "
-            f"{expected_sha}"
+            f"[{label}] {rel}: worktree sha256 {actual_sha} != expected {expected_sha}"
         )
 
 
@@ -93,8 +98,7 @@ def verify_pointer_at(
     got_sha = str(pointer_field(blob, "sha256"))
     if got_sha != expected_sha:
         raise TestFailure(
-            f"[{label}] {spec}: pointer sha256 {got_sha} != expected "
-            f"{expected_sha}"
+            f"[{label}] {spec}: pointer sha256 {got_sha} != expected {expected_sha}"
         )
     return blob
 
@@ -134,8 +138,10 @@ def force_resmudge_and_verify(
         p.unlink()
     git(["checkout", "--", rel], cwd=repo, env=env)
     verify_worktree(
-        repo, rel,
-        expected_sha=expected_sha, expected_size=expected_size,
+        repo,
+        rel,
+        expected_sha=expected_sha,
+        expected_size=expected_size,
         label=label,
     )
 
@@ -145,14 +151,17 @@ def get_bale_cache_dir(repo: Path, env: dict) -> Path:
     `bale.cacheDir` in the per-repo git config). The test sets this
     explicitly in init_repo_for_push / init_repo_for_clone, so missing
     config here is a harness bug, not a product bug."""
-    out = git(
-        ["config", "--local", "--get", "bale.cacheDir"],
-        cwd=repo, env=env,
-    ).stdout.decode().strip()
-    if not out:
-        raise TestFailure(
-            f"bale.cacheDir not set in {repo}/.git/config — harness bug"
+    out = (
+        git(
+            ["config", "--local", "--get", "bale.cacheDir"],
+            cwd=repo,
+            env=env,
         )
+        .stdout.decode()
+        .strip()
+    )
+    if not out:
+        raise TestFailure(f"bale.cacheDir not set in {repo}/.git/config — harness bug")
     return Path(out)
 
 
@@ -193,8 +202,10 @@ def force_resmudge_cold(
     (repo / rel).unlink()
     git(["checkout", "--", rel], cwd=repo, env=env)
     verify_worktree(
-        repo, rel,
-        expected_sha=expected_sha, expected_size=expected_size,
+        repo,
+        rel,
+        expected_sha=expected_sha,
+        expected_size=expected_size,
         label=label,
     )
     if not _has_any_file(cache_dir):
@@ -229,9 +240,7 @@ def force_resmudge_lukewarm(
       - staging is still populated after — lukewarm reads but mustn't drain.
     """
     if not staging_files(repo):
-        raise TestFailure(
-            f"[{label}] staging dir empty — lukewarm needs a staged file"
-        )
+        raise TestFailure(f"[{label}] staging dir empty — lukewarm needs a staged file")
     manifests = repo / ".git" / "bale" / "manifests"
     if manifests.exists():
         shutil.rmtree(manifests)
@@ -240,14 +249,14 @@ def force_resmudge_lukewarm(
         shutil.rmtree(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     if _has_any_file(cache_dir):
-        raise TestFailure(
-            f"[{label}] chunk cache {cache_dir} not empty after wipe"
-        )
+        raise TestFailure(f"[{label}] chunk cache {cache_dir} not empty after wipe")
     (repo / rel).unlink()
     git(["checkout", "--", rel], cwd=repo, env=env)
     verify_worktree(
-        repo, rel,
-        expected_sha=expected_sha, expected_size=expected_size,
+        repo,
+        rel,
+        expected_sha=expected_sha,
+        expected_size=expected_size,
         label=label,
     )
     if not staging_files(repo):
@@ -255,6 +264,7 @@ def force_resmudge_lukewarm(
             f"[{label}] staging dir empty after lukewarm smudge — the filter "
             "drained the lukewarm input it was supposed to leave alone"
         )
+
 
 def pointer_hash_at(repo: Path, env: dict, spec: str, *, label: str) -> str:
     """The bale pointer `hash` (merkle file id) for the blob at git `spec`
@@ -266,4 +276,3 @@ def pointer_hash_at(repo: Path, env: dict, spec: str, *, label: str) -> str:
             f"[{label}] expected a bale pointer at {spec}, got: {blob[:200]!r}"
         )
     return str(pointer_field(blob, "hash"))
-

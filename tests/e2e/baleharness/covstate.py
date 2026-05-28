@@ -3,6 +3,7 @@
 Kept in its own module so server.py can read it without importing the
 heavier coverage.py (which pulls in the runtime + lazy s3lib).
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional

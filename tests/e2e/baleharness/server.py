@@ -1,4 +1,5 @@
 """baleforgit-server + sshd container lifecycle."""
+
 from __future__ import annotations
 
 import secrets
@@ -11,7 +12,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from baleharness.config import BROWSER_DL_JWT, CONTAINER_NAME_PREFIX, E2E_HUB_TOKEN, E2E_OWNER, E2E_REPO_2, E2E_USER, HEALTHZ_TIMEOUT_S, SSH_READY_TIMEOUT_S
+from baleharness.config import (
+    BROWSER_DL_JWT,
+    CONTAINER_NAME_PREFIX,
+    E2E_HUB_TOKEN,
+    E2E_OWNER,
+    E2E_REPO_2,
+    E2E_USER,
+    HEALTHZ_TIMEOUT_S,
+    SSH_READY_TIMEOUT_S,
+)
 from baleharness.covstate import get_coverage
 from baleharness.logutil import TestFailure, info
 from baleharness.proc import dir_size_bytes, pick_free_port
@@ -40,7 +50,8 @@ class ServerHandle:
         if get_coverage() is not None:
             subprocess.run(
                 self.rt.cmd("stop", "-t", "10", self.name),
-                capture_output=True, check=False,
+                capture_output=True,
+                check=False,
             )
         subprocess.run(
             self.rt.cmd("rm", "-f", self.name), capture_output=True, check=False
@@ -50,9 +61,8 @@ class ServerHandle:
         completed = subprocess.run(
             self.rt.cmd("logs", self.name), capture_output=True, check=False
         )
-        return (
-            completed.stdout.decode("utf-8", "replace")
-            + completed.stderr.decode("utf-8", "replace")
+        return completed.stdout.decode("utf-8", "replace") + completed.stderr.decode(
+            "utf-8", "replace"
         )
 
     def disk_xorb_bytes(self) -> int:
@@ -91,9 +101,7 @@ def start_container(
     # while the server itself stays running.
     public_host_url = public_host_url_override or f"http://127.0.0.1:{cas_port}"
     name = f"{CONTAINER_NAME_PREFIX}-{name_suffix or secrets.token_hex(4)}"
-    bale_grants = ",".join(
-        f"{E2E_HUB_TOKEN}:{E2E_USER}:{r}:write" for r in test_repos
-    )
+    bale_grants = ",".join(f"{E2E_HUB_TOKEN}:{E2E_USER}:{r}:write" for r in test_repos)
     # The browser-download phase presents a forge-style JWT instead of the
     # opaque hub token, so register it as a read grant on repo2 wherever repo2
     # is hosted (static authz matches the bearer verbatim).
@@ -102,8 +110,8 @@ def start_container(
         bale_grants += f",{BROWSER_DL_JWT}:{E2E_USER}:{repo2_id}:read"
 
     env_kvs = [
-        f"BALE_LISTEN=0.0.0.0:8080",
-        f"BALE_DATA_ROOT=/data",
+        "BALE_LISTEN=0.0.0.0:8080",
+        "BALE_DATA_ROOT=/data",
         f"BALE_PUBLIC_URL={public_host_url}",
         f"BALE_PUBLIC_HOST_URL={public_host_url}",
         f"BALE_JWT_SECRET_HEX={jwt_secret_hex}",
@@ -203,7 +211,9 @@ def wait_for_ssh(handle: ServerHandle) -> None:
     last_err: Optional[str] = None
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", handle.ssh_port), timeout=2) as s:
+            with socket.create_connection(
+                ("127.0.0.1", handle.ssh_port), timeout=2
+            ) as s:
                 banner = s.recv(64)
                 if banner.startswith(b"SSH-"):
                     info(f"sshd banner: {banner.strip().decode('ascii', 'replace')}")

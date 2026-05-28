@@ -1,4 +1,5 @@
 """Coverage mode (--coverage): instrumented builds + llvm-cov report."""
+
 from __future__ import annotations
 
 import os
@@ -6,19 +7,24 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from baleharness.config import COVERAGE_IMAGE_TAG, REPO_ROOT
 from baleharness.logutil import TestFailure, die, info, warn
 from baleharness.runtime import Runtime, build_image, image_exists
 
+if TYPE_CHECKING:
+    # Referenced only in the string annotations of run_s3_coverage_phases.
+    from baleharness.client import ClientEnv
+    from baleharness.timing import Timings
+
 
 @dataclass
 class CoverageConfig:
-    profile_dir: Path          # host dir; bind-mounted as /coverage in containers
-    git_bale_bin: Path         # instrumented host-side git-bale
-    server_bin_host: Path      # copy of /usr/local/bin/baleforgit-server, podman-cp'd out
-    html_out: Path             # llvm-cov show -output-dir target
+    profile_dir: Path  # host dir; bind-mounted as /coverage in containers
+    git_bale_bin: Path  # instrumented host-side git-bale
+    server_bin_host: Path  # copy of /usr/local/bin/baleforgit-server, podman-cp'd out
+    html_out: Path  # llvm-cov show -output-dir target
 
     @property
     def container_profile_template(self) -> str:
@@ -30,6 +36,8 @@ class CoverageConfig:
     @property
     def host_profile_template(self) -> str:
         return str(self.profile_dir / "host-%m-%p.profraw")
+
+
 def _find_llvm_tool(name: str) -> Optional[Path]:
     # llvm-tools-preview ships its binaries under
     # `<sysroot>/lib/rustlib/<host-triple>/bin/`, not under any path
@@ -37,16 +45,24 @@ def _find_llvm_tool(name: str) -> Optional[Path]:
     try:
         sysroot = subprocess.run(
             ["rustc", "--print", "sysroot"],
-            capture_output=True, check=False, text=True,
+            capture_output=True,
+            check=False,
+            text=True,
         )
         host = subprocess.run(
             ["rustc", "--print", "host-tuple"],
-            capture_output=True, check=False, text=True,
+            capture_output=True,
+            check=False,
+            text=True,
         )
         if sysroot.returncode == 0 and host.returncode == 0:
             candidate = (
                 Path(sysroot.stdout.strip())
-                / "lib" / "rustlib" / host.stdout.strip() / "bin" / name
+                / "lib"
+                / "rustlib"
+                / host.stdout.strip()
+                / "bin"
+                / name
             )
             if candidate.is_file():
                 return candidate
@@ -69,9 +85,15 @@ def build_instrumented_git_bale() -> Path:
     # process by SIGPIPE on macOS unmount teardown before atexit can flush.
     r = subprocess.run(
         [
-            "cargo", "build", "--release", "-p", "git-bale",
-            "--features", "coverage",
-            "--target-dir", str(target_dir),
+            "cargo",
+            "build",
+            "--release",
+            "-p",
+            "git-bale",
+            "--features",
+            "coverage",
+            "--target-dir",
+            str(target_dir),
         ],
         cwd=REPO_ROOT,
         env=env,
@@ -96,25 +118,27 @@ def extract_server_bin(rt: Runtime, image_tag: str, dest: Path) -> Path:
     info(f"extracting server binary from {image_tag} for llvm-cov")
     created = subprocess.run(
         rt.cmd("create", image_tag),
-        capture_output=True, check=False, text=True,
+        capture_output=True,
+        check=False,
+        text=True,
     )
     if created.returncode != 0:
-        raise TestFailure(
-            f"`{rt.exe} create` failed: {created.stderr.strip()}"
-        )
+        raise TestFailure(f"`{rt.exe} create` failed: {created.stderr.strip()}")
     cid = created.stdout.strip()
     try:
         cp = subprocess.run(
             rt.cmd("cp", f"{cid}:/usr/local/bin/baleforgit-server", str(dest)),
-            capture_output=True, check=False, text=True,
+            capture_output=True,
+            check=False,
+            text=True,
         )
         if cp.returncode != 0:
-            raise TestFailure(
-                f"`{rt.exe} cp` failed: {cp.stderr.strip()}"
-            )
+            raise TestFailure(f"`{rt.exe} cp` failed: {cp.stderr.strip()}")
     finally:
         subprocess.run(
-            rt.cmd("rm", cid), capture_output=True, check=False,
+            rt.cmd("rm", cid),
+            capture_output=True,
+            check=False,
         )
     return dest
 
@@ -156,8 +180,10 @@ def setup_coverage(
     server_bin_host_path = cov_root / "baleforgit-server"
     if no_build:
         if not existing_git_bale.is_file():
-            die("--no-build with --coverage: instrumented git-bale missing "
-                f"at {existing_git_bale}")
+            die(
+                "--no-build with --coverage: instrumented git-bale missing "
+                f"at {existing_git_bale}"
+            )
         if not image_exists(rt, COVERAGE_IMAGE_TAG):
             die("--no-build with --coverage: coverage image not built yet")
         git_bale_bin = existing_git_bale.resolve()
@@ -169,7 +195,9 @@ def setup_coverage(
         git_bale_bin = build_instrumented_git_bale()
         build_image(rt, COVERAGE_IMAGE_TAG, coverage=True)
         server_bin_host = extract_server_bin(
-            rt, COVERAGE_IMAGE_TAG, server_bin_host_path,
+            rt,
+            COVERAGE_IMAGE_TAG,
+            server_bin_host_path,
         )
     return CoverageConfig(
         profile_dir=profile_dir,
@@ -266,10 +294,17 @@ def generate_coverage_report(cov: CoverageConfig) -> None:
         return
     profdata = cov.profile_dir / "merged.profdata"
     merge = subprocess.run(
-        [str(llvm_profdata), "merge", "-sparse",
-         *[str(p) for p in profraws],
-         "-o", str(profdata)],
-        capture_output=True, check=False, text=True,
+        [
+            str(llvm_profdata),
+            "merge",
+            "-sparse",
+            *[str(p) for p in profraws],
+            "-o",
+            str(profdata),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
     )
     if merge.returncode != 0:
         warn(
@@ -280,7 +315,8 @@ def generate_coverage_report(cov: CoverageConfig) -> None:
     cov.html_out.mkdir(parents=True, exist_ok=True)
     show = subprocess.run(
         [
-            str(llvm_cov), "show",
+            str(llvm_cov),
+            "show",
             f"-instr-profile={profdata}",
             "-format=html",
             f"-output-dir={cov.html_out}",
@@ -290,14 +326,14 @@ def generate_coverage_report(cov: CoverageConfig) -> None:
             "-ignore-filename-regex=(/\\.cargo/|/rustc/|/registry/|/\\.rustup/)",
             # First positional is the "main" binary; -object adds more.
             str(cov.git_bale_bin),
-            "-object", str(cov.server_bin_host),
+            "-object",
+            str(cov.server_bin_host),
         ],
-        capture_output=True, check=False, text=True,
+        capture_output=True,
+        check=False,
+        text=True,
     )
     if show.returncode != 0:
-        warn(
-            f"coverage: llvm-cov show failed (exit {show.returncode}):\n"
-            f"{show.stderr}"
-        )
+        warn(f"coverage: llvm-cov show failed (exit {show.returncode}):\n{show.stderr}")
         return
     info(f"coverage report: {cov.html_out / 'index.html'}")

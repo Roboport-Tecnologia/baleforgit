@@ -1,4 +1,5 @@
 """Scenario phases (basic ops, offline, dedup, usage, clone, restart)."""
+
 from __future__ import annotations
 
 import os
@@ -6,8 +7,38 @@ import secrets
 from pathlib import Path
 
 from baleharness.client import ClientEnv
-from baleharness.config import BIG_FILE_BYTES, BROWSER_DL_FILENAME, BROWSER_DL_JWT, E2E_HUB_TOKEN, E2E_OWNER, E2E_REPO, E2E_REPO_2, E2E_REPO_3, E2E_REPO_GC1, E2E_REPO_GC2, E2E_REPO_GC3, E2E_REPO_OFFLINE, E2E_REPO_SPILL, E2E_USER, GC_PAYLOAD_BYTES, JWT_TTL_YEARS, SIZE_TOLERANCE_BYTES, SMALL_FILE_BYTES, SPILL_FILE_BYTES, SPILL_INLINE_THRESHOLD
-from baleharness.gitutil import cat_file_bytes, force_resmudge_and_verify, force_resmudge_cold, force_resmudge_lukewarm, git, pointer_field, verify_pointer_at, verify_worktree
+from baleharness.config import (
+    BIG_FILE_BYTES,
+    BROWSER_DL_FILENAME,
+    BROWSER_DL_JWT,
+    E2E_HUB_TOKEN,
+    E2E_OWNER,
+    E2E_REPO,
+    E2E_REPO_2,
+    E2E_REPO_3,
+    E2E_REPO_GC1,
+    E2E_REPO_GC2,
+    E2E_REPO_GC3,
+    E2E_REPO_OFFLINE,
+    E2E_REPO_SPILL,
+    E2E_USER,
+    GC_PAYLOAD_BYTES,
+    JWT_TTL_YEARS,
+    SIZE_TOLERANCE_BYTES,
+    SMALL_FILE_BYTES,
+    SPILL_FILE_BYTES,
+    SPILL_INLINE_THRESHOLD,
+)
+from baleharness.gitutil import (
+    cat_file_bytes,
+    force_resmudge_and_verify,
+    force_resmudge_cold,
+    force_resmudge_lukewarm,
+    git,
+    pointer_field,
+    verify_pointer_at,
+    verify_worktree,
+)
 from baleharness.jwtutil import mint_bale_jwt
 from baleharness.logutil import TestFailure, fmt_bytes, info
 from baleharness.mocks import TcpProxy
@@ -16,7 +47,11 @@ from baleharness.proc import pick_free_port, run, sha256_bytes, sha256_file
 from baleharness.repo import init_repo_for_clone, init_repo_for_push
 from baleharness.runtime import Runtime
 from baleharness.server import ServerHandle, start_container
-from baleharness.storage import clean_cache_entries, manifest_cache_entries, staging_files
+from baleharness.storage import (
+    clean_cache_entries,
+    manifest_cache_entries,
+    staging_files,
+)
 from baleharness.timing import Timings
 from baleharness.usage import fetch_repo_usage, fetch_usage, http_get_file
 
@@ -44,21 +79,28 @@ def phase_basic_user_ops(
     blob_path = repo / "small.bin"
     blob_path.write_bytes(payload)
     verify_worktree(
-        repo, "small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        "small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:write",
     )
 
     with timings.measure("basic: stage small file"):
         git(["add", "small.bin"], cwd=repo, env=env)
     verify_pointer_at(
-        repo, env, spec=":small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        env,
+        spec=":small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:after-stage",
     )
     verify_worktree(
-        repo, "small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        "small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:after-stage",
     )
 
@@ -75,14 +117,14 @@ def phase_basic_user_ops(
 
     with timings.measure("basic: unstage"):
         git(["restore", "--staged", "small.bin"], cwd=repo, env=env)
-    if (
-        git(["ls-files", "--stage", "small.bin"], cwd=repo, env=env).stdout.strip()
-    ):
+    if git(["ls-files", "--stage", "small.bin"], cwd=repo, env=env).stdout.strip():
         raise TestFailure("small.bin still staged after `git restore --staged`")
     # Unstage must not touch the worktree bytes.
     verify_worktree(
-        repo, "small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        "small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:after-unstage",
     )
 
@@ -101,13 +143,18 @@ def phase_basic_user_ops(
             "re-stage; the staged bytes are now unreconstructable offline"
         )
     verify_pointer_at(
-        repo, env, spec=":small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        env,
+        spec=":small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:after-restage",
     )
     verify_worktree(
-        repo, "small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        "small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:after-restage",
     )
 
@@ -127,16 +174,21 @@ def phase_basic_user_ops(
     # stash's index tree has a matching pointer so we know the stash
     # captured the staged state intact, not the smudge-expanded bytes.
     verify_pointer_at(
-        repo, env, spec="stash@{0}:small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        env,
+        spec="stash@{0}:small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:in-stash",
     )
 
     with timings.measure("basic: stash pop"):
         git(["stash", "pop"], cwd=repo, env=env)
     verify_worktree(
-        repo, "small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        "small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:after-pop",
     )
 
@@ -144,21 +196,29 @@ def phase_basic_user_ops(
     # commit needs an explicit `git add` to pick the file back up.
     git(["add", "small.bin"], cwd=repo, env=env)
     verify_pointer_at(
-        repo, env, spec=":small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        env,
+        spec=":small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:after-pop-readd",
     )
 
     with timings.measure("basic: commit"):
         git(["commit", "-m", "add small.bin"], cwd=repo, env=env)
     verify_worktree(
-        repo, "small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        "small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:after-commit",
     )
     verify_pointer_at(
-        repo, env, spec="HEAD:small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        env,
+        spec="HEAD:small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:after-commit",
     )
 
@@ -167,8 +227,11 @@ def phase_basic_user_ops(
     # proves the filter is reconstructing from staging, not the wire.
     with timings.measure("basic: lukewarm resmudge (pre-push)"):
         force_resmudge_lukewarm(
-            repo, env, "small.bin",
-            expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+            repo,
+            env,
+            "small.bin",
+            expected_sha=payload_sha,
+            expected_size=SMALL_FILE_BYTES,
             label="basic:lukewarm-pre-push",
         )
 
@@ -178,9 +241,7 @@ def phase_basic_user_ops(
             f"server disk non-zero before push: {fmt_bytes(server.disk_total_bytes())}"
         )
 
-    with timings.measure(
-        "basic: push (drains staging)", bytes_moved=SMALL_FILE_BYTES
-    ):
+    with timings.measure("basic: push (drains staging)", bytes_moved=SMALL_FILE_BYTES):
         git(["push", "-u", "origin", "main"], cwd=repo, env=env)
     if staging_files(repo):
         raise TestFailure("staging not drained after push")
@@ -188,13 +249,18 @@ def phase_basic_user_ops(
         raise TestFailure("server disk still zero after push")
     # Post-push: worktree + HEAD pointer must still match the original payload.
     verify_worktree(
-        repo, "small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        "small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:after-push",
     )
     verify_pointer_at(
-        repo, env, spec="HEAD:small.bin",
-        expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+        repo,
+        env,
+        spec="HEAD:small.bin",
+        expected_sha=payload_sha,
+        expected_size=SMALL_FILE_BYTES,
         label="basic:after-push",
     )
     # Cold-then-hot ordering: the lukewarm step above wiped the local caches,
@@ -205,14 +271,20 @@ def phase_basic_user_ops(
         "basic: cold resmudge after push", bytes_moved=SMALL_FILE_BYTES
     ):
         force_resmudge_cold(
-            repo, env, "small.bin",
-            expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+            repo,
+            env,
+            "small.bin",
+            expected_sha=payload_sha,
+            expected_size=SMALL_FILE_BYTES,
             label="basic:cold-resmudge-after-push",
         )
     with timings.measure("basic: hot resmudge after push"):
         force_resmudge_and_verify(
-            repo, env, "small.bin",
-            expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
+            repo,
+            env,
+            "small.bin",
+            expected_sha=payload_sha,
+            expected_size=SMALL_FILE_BYTES,
             label="basic:hot-resmudge-after-push",
         )
 
@@ -262,9 +334,14 @@ def phase_offline_no_network(
     proxy.start()
     try:
         git(
-            ["config", "--local", "bale.serverUrl",
-             f"http://127.0.0.1:{proxy.listen_port}"],
-            cwd=repo, env=env,
+            [
+                "config",
+                "--local",
+                "bale.serverUrl",
+                f"http://127.0.0.1:{proxy.listen_port}",
+            ],
+            cwd=repo,
+            env=env,
         )
         git(["config", "--local", "bale.token", token], cwd=repo, env=env)
 
@@ -286,8 +363,11 @@ def phase_offline_no_network(
             git(["add", "data.bin"], cwd=repo, env=env)
             assert_offline("add")
             verify_pointer_at(
-                repo, env, spec=":data.bin",
-                expected_sha=payload_sha, expected_size=GC_PAYLOAD_BYTES,
+                repo,
+                env,
+                spec=":data.bin",
+                expected_sha=payload_sha,
+                expected_size=GC_PAYLOAD_BYTES,
                 label="offline:add",
             )
 
@@ -304,8 +384,10 @@ def phase_offline_no_network(
             (repo / "data.bin").unlink()
             git(["checkout", "--", "data.bin"], cwd=repo, env=env)
             verify_worktree(
-                repo, "data.bin",
-                expected_sha=payload_sha, expected_size=GC_PAYLOAD_BYTES,
+                repo,
+                "data.bin",
+                expected_sha=payload_sha,
+                expected_size=GC_PAYLOAD_BYTES,
                 label="offline:checkout",
             )
             assert_offline("checkout-smudge")
@@ -322,8 +404,10 @@ def phase_offline_no_network(
             assert_offline("stash")
             git(["stash", "pop"], cwd=repo, env=env)
             verify_worktree(
-                repo, "data.bin",
-                expected_sha=payload2_sha, expected_size=GC_PAYLOAD_BYTES,
+                repo,
+                "data.bin",
+                expected_sha=payload2_sha,
+                expected_size=GC_PAYLOAD_BYTES,
                 label="offline:stash-pop",
             )
             assert_offline("stash-pop")
@@ -404,8 +488,11 @@ def phase_spilled_clean(
     ):
         git(["add", "spilled.bin"], cwd=repo, env=env)
     verify_pointer_at(
-        repo, env, spec=":spilled.bin",
-        expected_sha=payload_sha, expected_size=SPILL_FILE_BYTES,
+        repo,
+        env,
+        spec=":spilled.bin",
+        expected_sha=payload_sha,
+        expected_size=SPILL_FILE_BYTES,
         label="spilled:after-stage",
     )
     staging_after_add = set(staging_files(repo))
@@ -430,8 +517,11 @@ def phase_spilled_clean(
             "spilled verify path"
         )
     verify_pointer_at(
-        repo, env, spec=":spilled.bin",
-        expected_sha=payload_sha, expected_size=SPILL_FILE_BYTES,
+        repo,
+        env,
+        spec=":spilled.bin",
+        expected_sha=payload_sha,
+        expected_size=SPILL_FILE_BYTES,
         label="spilled:after-readd",
     )
 
@@ -442,8 +532,11 @@ def phase_spilled_clean(
     # proves the tmpfile clean produced valid staging artifacts.
     with timings.measure("spilled: lukewarm resmudge (pre-push)"):
         force_resmudge_lukewarm(
-            repo, env, "spilled.bin",
-            expected_sha=payload_sha, expected_size=SPILL_FILE_BYTES,
+            repo,
+            env,
+            "spilled.bin",
+            expected_sha=payload_sha,
+            expected_size=SPILL_FILE_BYTES,
             label="spilled:lukewarm-pre-push",
         )
 
@@ -458,14 +551,20 @@ def phase_spilled_clean(
         "spilled: cold resmudge after push", bytes_moved=SPILL_FILE_BYTES
     ):
         force_resmudge_cold(
-            repo, env, "spilled.bin",
-            expected_sha=payload_sha, expected_size=SPILL_FILE_BYTES,
+            repo,
+            env,
+            "spilled.bin",
+            expected_sha=payload_sha,
+            expected_size=SPILL_FILE_BYTES,
             label="spilled:cold-resmudge-after-push",
         )
     with timings.measure("spilled: hot resmudge after push"):
         force_resmudge_and_verify(
-            repo, env, "spilled.bin",
-            expected_sha=payload_sha, expected_size=SPILL_FILE_BYTES,
+            repo,
+            env,
+            "spilled.bin",
+            expected_sha=payload_sha,
+            expected_size=SPILL_FILE_BYTES,
             label="spilled:hot-resmudge-after-push",
         )
 
@@ -503,31 +602,43 @@ def phase_big_file_dedup(
     sha_v1 = sha256_bytes(payload_v1)
     rev_state["shas"].append(sha_v1)
     verify_worktree(
-        repo, "bigfile.bin",
-        expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile.bin",
+        expected_sha=sha_v1,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v1:write",
     )
     with timings.measure("bigfile v1: stage", bytes_moved=BIG_FILE_BYTES):
         git(["add", "bigfile.bin"], cwd=repo, env=env)
     verify_pointer_at(
-        repo, env, spec=":bigfile.bin",
-        expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+        repo,
+        env,
+        spec=":bigfile.bin",
+        expected_sha=sha_v1,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v1:after-stage",
     )
     verify_worktree(
-        repo, "bigfile.bin",
-        expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile.bin",
+        expected_sha=sha_v1,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v1:after-stage",
     )
     git(["commit", "-m", "bigfile v1"], cwd=repo, env=env)
     verify_pointer_at(
-        repo, env, spec="HEAD:bigfile.bin",
-        expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+        repo,
+        env,
+        spec="HEAD:bigfile.bin",
+        expected_sha=sha_v1,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v1:after-commit",
     )
     verify_worktree(
-        repo, "bigfile.bin",
-        expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile.bin",
+        expected_sha=sha_v1,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v1:after-commit",
     )
     # Lukewarm reconstruction of 35 MB from staging only — the server has
@@ -536,8 +647,11 @@ def phase_big_file_dedup(
         "bigfile v1: lukewarm resmudge (pre-push)", bytes_moved=BIG_FILE_BYTES
     ):
         force_resmudge_lukewarm(
-            repo, env, "bigfile.bin",
-            expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            "bigfile.bin",
+            expected_sha=sha_v1,
+            expected_size=BIG_FILE_BYTES,
             label="bigfile-v1:lukewarm-pre-push",
         )
     disk_before = server.disk_total_bytes()
@@ -556,13 +670,18 @@ def phase_big_file_dedup(
         )
     info(f"  bigfile v1: disk grew by {fmt_bytes(growth_v1)}")
     verify_worktree(
-        repo, "bigfile.bin",
-        expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile.bin",
+        expected_sha=sha_v1,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v1:after-push",
     )
     verify_pointer_at(
-        repo, env, spec="HEAD:bigfile.bin",
-        expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+        repo,
+        env,
+        spec="HEAD:bigfile.bin",
+        expected_sha=sha_v1,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v1:after-push",
     )
     # Cold first to warm the cache via server download, then hot, otherwise
@@ -572,16 +691,22 @@ def phase_big_file_dedup(
         "bigfile v1: cold resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
         force_resmudge_cold(
-            repo, env, "bigfile.bin",
-            expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            "bigfile.bin",
+            expected_sha=sha_v1,
+            expected_size=BIG_FILE_BYTES,
             label="bigfile-v1:cold-resmudge-after-push",
         )
     with timings.measure(
         "bigfile v1: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
         force_resmudge_and_verify(
-            repo, env, "bigfile.bin",
-            expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            "bigfile.bin",
+            expected_sha=sha_v1,
+            expected_size=BIG_FILE_BYTES,
             label="bigfile-v1:hot-resmudge-after-push",
         )
     rev_state["commits"].append(
@@ -590,38 +715,53 @@ def phase_big_file_dedup(
 
     # ---- revision 2: 8-byte poke in the middle --------------------------
     payload_v2 = modify_bytes(
-        payload_v1, offset=BIG_FILE_BYTES // 2, replacement=b"\xde\xad\xbe\xef\x01\x02\x03\x04"
+        payload_v1,
+        offset=BIG_FILE_BYTES // 2,
+        replacement=b"\xde\xad\xbe\xef\x01\x02\x03\x04",
     )
     big_path.write_bytes(payload_v2)
     sha_v2 = sha256_bytes(payload_v2)
     rev_state["shas"].append(sha_v2)
     verify_worktree(
-        repo, "bigfile.bin",
-        expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile.bin",
+        expected_sha=sha_v2,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v2:write",
     )
     with timings.measure("bigfile v2: stage (8-byte poke)", bytes_moved=BIG_FILE_BYTES):
         git(["add", "bigfile.bin"], cwd=repo, env=env)
     verify_pointer_at(
-        repo, env, spec=":bigfile.bin",
-        expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
+        repo,
+        env,
+        spec=":bigfile.bin",
+        expected_sha=sha_v2,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v2:after-stage",
     )
     verify_worktree(
-        repo, "bigfile.bin",
-        expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile.bin",
+        expected_sha=sha_v2,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v2:after-stage",
     )
     git(["commit", "-m", "bigfile v2: 8-byte poke"], cwd=repo, env=env)
     verify_pointer_at(
-        repo, env, spec="HEAD:bigfile.bin",
-        expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
+        repo,
+        env,
+        spec="HEAD:bigfile.bin",
+        expected_sha=sha_v2,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v2:after-commit",
     )
     # v1's pointer must still be reachable through HEAD's history.
     verify_pointer_at(
-        repo, env, spec="HEAD~1:bigfile.bin",
-        expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+        repo,
+        env,
+        spec="HEAD~1:bigfile.bin",
+        expected_sha=sha_v1,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v2:HEAD~1-still-v1",
     )
     disk_before_v2 = server.disk_total_bytes()
@@ -645,8 +785,10 @@ def phase_big_file_dedup(
         f"dedup ratio ≈ {growth_v2 / BIG_FILE_BYTES:.4f}"
     )
     verify_worktree(
-        repo, "bigfile.bin",
-        expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile.bin",
+        expected_sha=sha_v2,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v2:after-push",
     )
     # v2 has no preceding lukewarm — v1's cold left the cache populated with
@@ -657,16 +799,22 @@ def phase_big_file_dedup(
         "bigfile v2: cold resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
         force_resmudge_cold(
-            repo, env, "bigfile.bin",
-            expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            "bigfile.bin",
+            expected_sha=sha_v2,
+            expected_size=BIG_FILE_BYTES,
             label="bigfile-v2:cold-resmudge-after-push",
         )
     with timings.measure(
         "bigfile v2: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
         force_resmudge_and_verify(
-            repo, env, "bigfile.bin",
-            expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            "bigfile.bin",
+            expected_sha=sha_v2,
+            expected_size=BIG_FILE_BYTES,
             label="bigfile-v2:hot-resmudge-after-push",
         )
     rev_state["commits"].append(
@@ -684,37 +832,55 @@ def phase_big_file_dedup(
     sha_v3 = sha256_bytes(payload_v3)
     rev_state["shas"].append(sha_v3)
     verify_worktree(
-        repo, "bigfile.bin",
-        expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile.bin",
+        expected_sha=sha_v3,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v3:write",
     )
-    with timings.measure("bigfile v3: stage (1 MiB region)", bytes_moved=BIG_FILE_BYTES):
+    with timings.measure(
+        "bigfile v3: stage (1 MiB region)", bytes_moved=BIG_FILE_BYTES
+    ):
         git(["add", "bigfile.bin"], cwd=repo, env=env)
     verify_pointer_at(
-        repo, env, spec=":bigfile.bin",
-        expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
+        repo,
+        env,
+        spec=":bigfile.bin",
+        expected_sha=sha_v3,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v3:after-stage",
     )
     verify_worktree(
-        repo, "bigfile.bin",
-        expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile.bin",
+        expected_sha=sha_v3,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v3:after-stage",
     )
     git(["commit", "-m", "bigfile v3: 1 MiB region replaced"], cwd=repo, env=env)
     verify_pointer_at(
-        repo, env, spec="HEAD:bigfile.bin",
-        expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
+        repo,
+        env,
+        spec="HEAD:bigfile.bin",
+        expected_sha=sha_v3,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v3:after-commit",
     )
     # The whole history must still resolve to the right pointers.
     verify_pointer_at(
-        repo, env, spec="HEAD~1:bigfile.bin",
-        expected_sha=sha_v2, expected_size=BIG_FILE_BYTES,
+        repo,
+        env,
+        spec="HEAD~1:bigfile.bin",
+        expected_sha=sha_v2,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v3:HEAD~1-still-v2",
     )
     verify_pointer_at(
-        repo, env, spec="HEAD~2:bigfile.bin",
-        expected_sha=sha_v1, expected_size=BIG_FILE_BYTES,
+        repo,
+        env,
+        spec="HEAD~2:bigfile.bin",
+        expected_sha=sha_v1,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v3:HEAD~2-still-v1",
     )
     disk_before_v3 = server.disk_total_bytes()
@@ -740,24 +906,32 @@ def phase_big_file_dedup(
         f"dedup ratio ≈ {growth_v3 / BIG_FILE_BYTES:.4f}"
     )
     verify_worktree(
-        repo, "bigfile.bin",
-        expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile.bin",
+        expected_sha=sha_v3,
+        expected_size=BIG_FILE_BYTES,
         label="bigfile-v3:after-push",
     )
     with timings.measure(
         "bigfile v3: cold resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
         force_resmudge_cold(
-            repo, env, "bigfile.bin",
-            expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            "bigfile.bin",
+            expected_sha=sha_v3,
+            expected_size=BIG_FILE_BYTES,
             label="bigfile-v3:cold-resmudge-after-push",
         )
     with timings.measure(
         "bigfile v3: hot resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
         force_resmudge_and_verify(
-            repo, env, "bigfile.bin",
-            expected_sha=sha_v3, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            "bigfile.bin",
+            expected_sha=sha_v3,
+            expected_size=BIG_FILE_BYTES,
             label="bigfile-v3:hot-resmudge-after-push",
         )
     rev_state["commits"].append(
@@ -889,7 +1063,10 @@ def phase_browser_file_download(
         "browser-download: forge JWT + matching filename", bytes_moved=BIG_FILE_BYTES
     ):
         status, body, headers = http_get_file(
-            server, file_id=file_id, token=BROWSER_DL_JWT, repo=repo_id,
+            server,
+            file_id=file_id,
+            token=BROWSER_DL_JWT,
+            repo=repo_id,
             filename=BROWSER_DL_FILENAME,
         )
         if status != 200:
@@ -907,7 +1084,10 @@ def phase_browser_file_download(
 
     with timings.measure("browser-download: tampered filename rejected"):
         status, body, _ = http_get_file(
-            server, file_id=file_id, token=BROWSER_DL_JWT, repo=repo_id,
+            server,
+            file_id=file_id,
+            token=BROWSER_DL_JWT,
+            repo=repo_id,
             filename="evil.exe",
         )
         if status != 400:
@@ -941,8 +1121,10 @@ def phase_dedup_duplicate_file(
     dup_path = repo / "bigfile_dup.bin"
     dup_path.write_bytes(src)
     verify_worktree(
-        repo, "bigfile_dup.bin",
-        expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile_dup.bin",
+        expected_sha=expected_sha,
+        expected_size=BIG_FILE_BYTES,
         label="dedup:write",
     )
 
@@ -955,8 +1137,11 @@ def phase_dedup_duplicate_file(
         # Staged dup pointer must match v3's pointer exactly — same hash,
         # same size, same sha256 — otherwise the dedup signal is bogus.
         dup_staged = verify_pointer_at(
-            repo, env, spec=":bigfile_dup.bin",
-            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            spec=":bigfile_dup.bin",
+            expected_sha=expected_sha,
+            expected_size=BIG_FILE_BYTES,
             label="dedup:after-stage",
         )
         orig_committed = cat_file_bytes(repo, env, "HEAD:bigfile.bin")
@@ -967,13 +1152,19 @@ def phase_dedup_duplicate_file(
             )
         git(["commit", "-m", "duplicate of bigfile v3"], cwd=repo, env=env)
         verify_pointer_at(
-            repo, env, spec="HEAD:bigfile_dup.bin",
-            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            spec="HEAD:bigfile_dup.bin",
+            expected_sha=expected_sha,
+            expected_size=BIG_FILE_BYTES,
             label="dedup:after-commit",
         )
         verify_pointer_at(
-            repo, env, spec="HEAD:bigfile.bin",
-            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            spec="HEAD:bigfile.bin",
+            expected_sha=expected_sha,
+            expected_size=BIG_FILE_BYTES,
             label="dedup:HEAD-bigfile-still-v3",
         )
         git(["push", "origin", "main"], cwd=repo, env=env)
@@ -991,34 +1182,40 @@ def phase_dedup_duplicate_file(
         )
     # Post-push worktree must still hold both files intact.
     verify_worktree(
-        repo, "bigfile.bin",
-        expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile.bin",
+        expected_sha=expected_sha,
+        expected_size=BIG_FILE_BYTES,
         label="dedup:after-push-orig",
     )
     verify_worktree(
-        repo, "bigfile_dup.bin",
-        expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+        repo,
+        "bigfile_dup.bin",
+        expected_sha=expected_sha,
+        expected_size=BIG_FILE_BYTES,
         label="dedup:after-push-dup",
     )
     # The dup's pointer references xorbs the server owes from v3; cold-path
     # smudge must download them under the *dup* repo's scope check and end
     # up at the exact same bytes as the original.
-    with timings.measure(
-        "dedup: cold resmudge dup", bytes_moved=BIG_FILE_BYTES
-    ):
+    with timings.measure("dedup: cold resmudge dup", bytes_moved=BIG_FILE_BYTES):
         force_resmudge_cold(
-            repo, env, "bigfile_dup.bin",
-            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            "bigfile_dup.bin",
+            expected_sha=expected_sha,
+            expected_size=BIG_FILE_BYTES,
             label="dedup:cold-resmudge-dup",
         )
     # And the original itself: the prior cold resmudge wiped the cache, so
     # this one starts from the same empty state and must also re-download.
-    with timings.measure(
-        "dedup: cold resmudge orig", bytes_moved=BIG_FILE_BYTES
-    ):
+    with timings.measure("dedup: cold resmudge orig", bytes_moved=BIG_FILE_BYTES):
         force_resmudge_cold(
-            repo, env, "bigfile.bin",
-            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            "bigfile.bin",
+            expected_sha=expected_sha,
+            expected_size=BIG_FILE_BYTES,
             label="dedup:cold-resmudge-orig",
         )
     # Hot path now exercises the cache that the cold resmudges just warmed.
@@ -1029,13 +1226,19 @@ def phase_dedup_duplicate_file(
         "dedup: hot resmudge orig + dup", bytes_moved=2 * BIG_FILE_BYTES
     ):
         force_resmudge_and_verify(
-            repo, env, "bigfile.bin",
-            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            "bigfile.bin",
+            expected_sha=expected_sha,
+            expected_size=BIG_FILE_BYTES,
             label="dedup:hot-resmudge-orig",
         )
         force_resmudge_and_verify(
-            repo, env, "bigfile_dup.bin",
-            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            repo,
+            env,
+            "bigfile_dup.bin",
+            expected_sha=expected_sha,
+            expected_size=BIG_FILE_BYTES,
             label="dedup:hot-resmudge-dup",
         )
 
@@ -1079,9 +1282,7 @@ def phase_clone_and_verify_history(
         name="bobclone",
     )
     disk_before_clone = server.disk_total_bytes()
-    with timings.measure(
-        "clone: cold smudge HEAD", bytes_moved=BIG_FILE_BYTES
-    ):
+    with timings.measure("clone: cold smudge HEAD", bytes_moved=BIG_FILE_BYTES):
         git(["checkout", "main"], cwd=clone_path, env=env)
     # Server disk must not have grown — clone is read-only.
     disk_after_clone = server.disk_total_bytes()
@@ -1105,7 +1306,9 @@ def phase_clone_and_verify_history(
     for idx, (commit, expected_sha) in enumerate(
         zip(rev_state["commits"], rev_state["shas"])
     ):
-        with timings.measure(f"clone: checkout rev {idx + 1}/{len(rev_state['commits'])}"):
+        with timings.measure(
+            f"clone: checkout rev {idx + 1}/{len(rev_state['commits'])}"
+        ):
             git(["checkout", commit, "--", "bigfile.bin"], cwd=clone_path, env=env)
         actual = sha256_file(clone_path / "bigfile.bin")
         if actual != expected_sha:
@@ -1166,8 +1369,7 @@ def phase_offline_and_restart(
     cold_sha = sha256_file(clone_path / "bigfile.bin")
     if cold_sha != expected_sha:
         raise TestFailure(
-            f"offline: cold checkout sha {cold_sha} != recorded v3 sha "
-            f"{expected_sha}"
+            f"offline: cold checkout sha {cold_sha} != recorded v3 sha {expected_sha}"
         )
     if not manifest_cache_entries(clone_path):
         raise TestFailure("manifest cache empty after cold checkout")
@@ -1179,8 +1381,10 @@ def phase_offline_and_restart(
     with timings.measure("offline: smudge with server down"):
         git(["checkout", "--", "bigfile.bin"], cwd=clone_path, env=env)
     verify_worktree(
-        clone_path, "bigfile.bin",
-        expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+        clone_path,
+        "bigfile.bin",
+        expected_sha=expected_sha,
+        expected_size=BIG_FILE_BYTES,
         label="offline:hot-smudge",
     )
 
@@ -1217,13 +1421,13 @@ def phase_offline_and_restart(
         repo=E2E_REPO_2,
         name="afterrestart",
     )
-    with timings.measure(
-        "restart: clone after restart", bytes_moved=BIG_FILE_BYTES
-    ):
+    with timings.measure("restart: clone after restart", bytes_moved=BIG_FILE_BYTES):
         git(["checkout", "main"], cwd=after_path, env=after_env)
     verify_worktree(
-        after_path, "bigfile.bin",
-        expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+        after_path,
+        "bigfile.bin",
+        expected_sha=expected_sha,
+        expected_size=BIG_FILE_BYTES,
         label="restart:post-restart-clone",
     )
     # The duplicate must also survive the restart — the prior phase pushed
@@ -1231,10 +1435,10 @@ def phase_offline_and_restart(
     # should rehydrate it from the persisted xorbs/shards.
     if (after_path / "bigfile_dup.bin").exists():
         verify_worktree(
-            after_path, "bigfile_dup.bin",
-            expected_sha=expected_sha, expected_size=BIG_FILE_BYTES,
+            after_path,
+            "bigfile_dup.bin",
+            expected_sha=expected_sha,
+            expected_size=BIG_FILE_BYTES,
             label="restart:post-restart-dup",
         )
     return new_server
-
-

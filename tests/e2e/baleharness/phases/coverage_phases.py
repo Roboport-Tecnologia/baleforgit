@@ -1,4 +1,5 @@
 """Coverage-only phases (https-origin, authz-http, otlp telemetry)."""
+
 from __future__ import annotations
 
 import secrets
@@ -112,10 +113,13 @@ def phase_https_origin_coverage(
         # any) so the resolver never blocks on an interactive prompt.
         git(
             [
-                "config", "--local", "credential.helper",
+                "config",
+                "--local",
+                "credential.helper",
                 "!f() { echo username=e2e; echo password=pw; }; f",
             ],
-            cwd=work, env=env,
+            cwd=work,
+            env=env,
         )
         origin = f"{forge.base_url}/{owner}/{name}.git"
         git(["remote", "add", "origin", origin], cwd=work, env=env)
@@ -138,8 +142,11 @@ def phase_https_origin_coverage(
         # resolve origin over HTTP (op=download) and reconstruct over the wire.
         with timings.measure("https-origin: cold smudge (HTTP resolve + reconstruct)"):
             force_resmudge_cold(
-                work, env, "f.bin",
-                expected_sha=sha, expected_size=SMALL_FILE_BYTES,
+                work,
+                env,
+                "f.bin",
+                expected_sha=sha,
+                expected_size=SMALL_FILE_BYTES,
                 label="https-origin",
             )
 
@@ -210,8 +217,12 @@ def phase_authz_http_coverage(
         def _push_small(repo_name: str, *, expect_fail: bool, label: str) -> None:
             owner, name = repo_name.split("/", 1)
             repo, env = init_repo_for_push(
-                work_root=work_root, client=client, server=server,
-                owner=owner, repo=name, name=f"authz-http-{name}",
+                work_root=work_root,
+                client=client,
+                server=server,
+                owner=owner,
+                repo=name,
+                name=f"authz-http-{name}",
             )
             payload = deterministic_payload(SMALL_FILE_BYTES, seed=label.encode())
             (repo / "f.bin").write_bytes(payload)
@@ -220,12 +231,13 @@ def phase_authz_http_coverage(
             with timings.measure(f"authz-http: push {label}"):
                 completed = git(
                     ["push", "-u", "origin", "main"],
-                    cwd=repo, env=env, expect_fail=True,
+                    cwd=repo,
+                    env=env,
+                    expect_fail=True,
                 )
             if expect_fail and completed.returncode == 0:
                 raise TestFailure(
-                    f"authz-http: push to {repo_name} unexpectedly succeeded "
-                    f"({label})"
+                    f"authz-http: push to {repo_name} unexpectedly succeeded ({label})"
                 )
             if not expect_fail and completed.returncode != 0:
                 raise TestFailure(
@@ -251,14 +263,12 @@ def phase_authz_http_coverage(
             try:
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     raise TestFailure(
-                        f"authz-http: 401 probe unexpectedly got "
-                        f"{resp.status}"
+                        f"authz-http: 401 probe unexpectedly got {resp.status}"
                     )
             except urllib.error.HTTPError as e:
                 if e.code != 401:
                     raise TestFailure(
-                        f"authz-http: 401 probe got HTTP {e.code}, "
-                        f"expected 401"
+                        f"authz-http: 401 probe got HTTP {e.code}, expected 401"
                     )
 
         statuses = [s for *_, s in mock.calls]
@@ -332,8 +342,12 @@ def phase_otlp_telemetry(
         # A real push drives the SSH authenticate + xorb/shard POST handlers,
         # each carrying a tower_http request span → exported to /v1/traces.
         repo, env = init_repo_for_push(
-            work_root=work_root, client=client, server=server,
-            owner=E2E_OWNER, repo=E2E_REPO, name="otlp-client",
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO,
+            name="otlp-client",
         )
         payload = deterministic_payload(SMALL_FILE_BYTES, seed=b"otlp")
         (repo / "f.bin").write_bytes(payload)

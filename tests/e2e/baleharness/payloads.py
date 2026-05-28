@@ -1,4 +1,5 @@
 """Deterministic sha256-chained payload generation."""
+
 from __future__ import annotations
 
 import hashlib
@@ -24,4 +25,3 @@ def replace_region(buf: bytes, *, offset: int, length: int, seed: bytes) -> byte
     arr = bytearray(buf)
     arr[offset : offset + length] = region
     return bytes(arr)
-

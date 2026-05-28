@@ -1,4 +1,5 @@
 """Read-only FUSE mount helpers shared by the mount phases."""
+
 from __future__ import annotations
 
 import secrets
@@ -169,8 +170,12 @@ def mount_rev_session(
         argv.append("--")
         argv.extend(paths)
     return _mount_session(
-        client=client, repo=repo, env=env, mount_root=mount_root,
-        argv_tail=argv, label=label,
+        client=client,
+        repo=repo,
+        env=env,
+        mount_root=mount_root,
+        argv_tail=argv,
+        label=label,
     )
 
 
@@ -188,14 +193,22 @@ def mount_diff_session(
     label: str = "mount-diff",
 ):
     argv = [
-        "mount-diff", rev_a, rev_b,
-        "--label-a", label_a, "--label-b", label_b,
+        "mount-diff",
+        rev_a,
+        rev_b,
+        "--label-a",
+        label_a,
+        "--label-b",
+        label_b,
     ]
     if paths:
         argv.append("--")
         argv.extend(paths)
     return _mount_session(
-        client=client, repo=repo, env=env, mount_root=mount_root,
-        argv_tail=argv, label=label,
+        client=client,
+        repo=repo,
+        env=env,
+        mount_root=mount_root,
+        argv_tail=argv,
+        label=label,
     )
-

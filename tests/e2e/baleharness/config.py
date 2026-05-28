@@ -1,4 +1,5 @@
 """Shared constants for the e2e harness."""
+
 from __future__ import annotations
 
 from pathlib import Path

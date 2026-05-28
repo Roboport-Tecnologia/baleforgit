@@ -1,4 +1,5 @@
 """Hand-rolled HS256 JWT + forge-style JWT helpers (no pip deps)."""
+
 from __future__ import annotations
 
 import base64
@@ -23,6 +24,8 @@ def forge_jwt_with_filename(filename: str) -> str:
         json.dumps({"FilenameSHA256": claim}, separators=(",", ":")).encode("utf-8")
     )
     return f"{header}.{payload}.{_b64url_no_pad(b'e2e-unverified-sig')}"
+
+
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 

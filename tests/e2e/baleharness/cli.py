@@ -15,6 +15,7 @@ Not invoked by `cargo test` — run it directly:
     python3 tests/e2e/run.py
 
 See `tests/e2e/README.md` for prereqs and flags."""
+
 from __future__ import annotations
 
 import argparse
@@ -31,17 +32,68 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from baleharness.client import ClientEnv, setup_client
-from baleharness.config import COVERAGE_IMAGE_TAG, DEFAULT_IMAGE_TAG, E2E_OWNER, E2E_REPO, E2E_REPO_2, E2E_REPO_3, E2E_REPO_GC1, E2E_REPO_GC2, E2E_REPO_GC3, E2E_REPO_OFFLINE, E2E_REPO_SPILL, E2E_USER, JWT_TTL_YEARS, REPO_ROOT
-from baleharness.coverage import CoverageConfig, generate_coverage_report, run_s3_coverage_phases, setup_coverage
+from baleharness.config import (
+    COVERAGE_IMAGE_TAG,
+    DEFAULT_IMAGE_TAG,
+    E2E_OWNER,
+    E2E_REPO,
+    E2E_REPO_2,
+    E2E_REPO_3,
+    E2E_REPO_GC1,
+    E2E_REPO_GC2,
+    E2E_REPO_GC3,
+    E2E_REPO_OFFLINE,
+    E2E_REPO_SPILL,
+    E2E_USER,
+    JWT_TTL_YEARS,
+    REPO_ROOT,
+)
+from baleharness.coverage import (
+    CoverageConfig,
+    generate_coverage_report,
+    run_s3_coverage_phases,
+    setup_coverage,
+)
 from baleharness.covstate import set_coverage
 from baleharness.jwtutil import mint_bale_jwt
 from baleharness.logutil import TestFailure, die, info, skip, warn
-from baleharness.phases.adversarial import phase_adversarial_quota_exceeded, phase_adversarial_tampered_xorb, phase_adversarial_wrong_token
-from baleharness.phases.coverage_phases import phase_authz_http_coverage, phase_https_origin_coverage, phase_otlp_telemetry
-from baleharness.phases.failure import phase_failure_connection_drop_mid_upload, phase_failure_server_kill_mid_upload, phase_failure_transient_db
-from baleharness.phases.gc import phase_gc_abandon_checkout, phase_gc_keeps_unpushed, phase_gc_mixed
-from baleharness.phases.mount import phase_mount_diff, phase_mount_diff_mixed, phase_mount_rev
-from baleharness.phases.scenario import phase_basic_user_ops, phase_big_file_dedup, phase_browser_file_download, phase_clone_and_verify_history, phase_dedup_duplicate_file, phase_offline_and_restart, phase_offline_no_network, phase_push_idempotency, phase_spilled_clean, phase_usage_api
+from baleharness.phases.adversarial import (
+    phase_adversarial_quota_exceeded,
+    phase_adversarial_tampered_xorb,
+    phase_adversarial_wrong_token,
+)
+from baleharness.phases.coverage_phases import (
+    phase_authz_http_coverage,
+    phase_https_origin_coverage,
+    phase_otlp_telemetry,
+)
+from baleharness.phases.failure import (
+    phase_failure_connection_drop_mid_upload,
+    phase_failure_server_kill_mid_upload,
+    phase_failure_transient_db,
+)
+from baleharness.phases.gc import (
+    phase_gc_abandon_checkout,
+    phase_gc_keeps_unpushed,
+    phase_gc_mixed,
+)
+from baleharness.phases.mount import (
+    phase_mount_diff,
+    phase_mount_diff_mixed,
+    phase_mount_rev,
+)
+from baleharness.phases.scenario import (
+    phase_basic_user_ops,
+    phase_big_file_dedup,
+    phase_browser_file_download,
+    phase_clone_and_verify_history,
+    phase_dedup_duplicate_file,
+    phase_offline_and_restart,
+    phase_offline_no_network,
+    phase_push_idempotency,
+    phase_spilled_clean,
+    phase_usage_api,
+)
 from baleharness.proc import pick_free_port, tool_on_path
 from baleharness.registry import PHASE_GROUPS_ORDER, order_within_group
 from baleharness.runtime import build_image, detect_runtime, image_exists
@@ -80,41 +132,51 @@ def main() -> int:
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--keep-tmpdir", action="store_true")
     parser.add_argument(
-        "--skip", action="append", default=[],
+        "--skip",
+        action="append",
+        default=[],
         help="Phase name(s) to skip (repeat the flag for multiple).",
     )
     parser.add_argument(
-        "--order", choices=["forward", "reverse", "random"], default="forward",
+        "--order",
+        choices=["forward", "reverse", "random"],
+        default="forward",
         help="Within-group phase order. Group order itself is always fixed.",
     )
     parser.add_argument(
-        "--seed", type=int, default=None,
+        "--seed",
+        type=int,
+        default=None,
         help="Seed for --order=random (so a failing matrix run reproduces).",
     )
     parser.add_argument(
-        "--state-dir", default=None,
+        "--state-dir",
+        default=None,
         help="Use this path as the work directory instead of mkdtemp, and "
-             "leave it intact on exit. Writes .e2e_state.json with secrets + "
-             "rev_state so a follow-up --reuse-from run can continue.",
+        "leave it intact on exit. Writes .e2e_state.json with secrets + "
+        "rev_state so a follow-up --reuse-from run can continue.",
     )
     parser.add_argument(
-        "--reuse-from", default=None,
+        "--reuse-from",
+        default=None,
         help="Reuse the data dir + git-home + secrets from a prior run "
-             "(must have been launched with --state-dir). Only `read_only` "
-             "phases are eligible to run in this mode.",
+        "(must have been launched with --state-dir). Only `read_only` "
+        "phases are eligible to run in this mode.",
     )
     parser.add_argument(
-        "--coverage", action="store_true",
+        "--coverage",
+        action="store_true",
         help="Build instrumented binaries (-C instrument-coverage) for both "
-             "git-bale and the server, collect .profraw files into the "
-             "coverage dir, and generate an HTML report at teardown. "
-             "Builds use a separate target dir and image tag so the prod "
-             "release/stripped path is left intact.",
+        "git-bale and the server, collect .profraw files into the "
+        "coverage dir, and generate an HTML report at teardown. "
+        "Builds use a separate target dir and image tag so the prod "
+        "release/stripped path is left intact.",
     )
     parser.add_argument(
-        "--coverage-dir", default=None,
+        "--coverage-dir",
+        default=None,
         help="Where to put coverage profiles + the HTML report. Defaults "
-             "to <repo>/target/coverage-e2e/. Implies --coverage.",
+        "to <repo>/target/coverage-e2e/. Implies --coverage.",
     )
     args = parser.parse_args()
     if args.coverage_dir and not args.coverage:
@@ -143,11 +205,12 @@ def main() -> int:
     cov: Optional[CoverageConfig] = None
     if args.coverage:
         if args.image_tag != DEFAULT_IMAGE_TAG:
-            die("--coverage manages its own image tag; --image-tag is ignored. "
-                "Remove one of the two.")
+            die(
+                "--coverage manages its own image tag; --image-tag is ignored. "
+                "Remove one of the two."
+            )
         if args.git_bale:
-            die("--coverage builds its own instrumented git-bale; "
-                "remove --git-bale.")
+            die("--coverage builds its own instrumented git-bale; remove --git-bale.")
         cov = setup_coverage(
             rt,
             coverage_dir_arg=args.coverage_dir,
@@ -171,8 +234,10 @@ def main() -> int:
         for name in ("failure-kill", "failure-conndrop", "failure-dbbusy"):
             if name not in args.skip:
                 args.skip.append(name)
-        info("coverage: auto-skipping failure-kill / -conndrop / -dbbusy "
-             "(server SIGKILL drops profraws)")
+        info(
+            "coverage: auto-skipping failure-kill / -conndrop / -dbbusy "
+            "(server SIGKILL drops profraws)"
+        )
     else:
         git_bale_bin = resolve_git_bale(args.git_bale)
         if not args.no_build:
@@ -290,188 +355,251 @@ def main() -> int:
 
         def _phase_basic() -> None:
             phase_basic_user_ops(
-                timings=timings, server=server, client=client, work_root=work_root,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
             )
 
         def _phase_wrong_token() -> None:
             phase_adversarial_wrong_token(
-                timings=timings, server=server, client=client, work_root=work_root,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
             )
 
         def _phase_offline_net() -> None:
             phase_offline_no_network(
-                timings=timings, server=server, client=client,
-                work_root=work_root, jwt_secret_hex=jwt_secret_hex,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+                jwt_secret_hex=jwt_secret_hex,
             )
 
         def _phase_spilled() -> None:
             phase_spilled_clean(
-                timings=timings, server=server, client=client, work_root=work_root,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
             )
 
         def _phase_bigfile() -> None:
             nonlocal rev_state
             rev_state = phase_big_file_dedup(
-                timings=timings, server=server, client=client,
-                work_root=work_root, bale_admin_token=admin_jwt,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+                bale_admin_token=admin_jwt,
             )
 
         def _phase_usage() -> None:
             phase_usage_api(
-                timings=timings, server=server,
-                bale_admin_token=admin_jwt, rev_state=rev_state,
+                timings=timings,
+                server=server,
+                bale_admin_token=admin_jwt,
+                rev_state=rev_state,
             )
 
         def _phase_browser_download() -> None:
             phase_browser_file_download(
-                timings=timings, server=server, rev_state=rev_state,
+                timings=timings,
+                server=server,
+                rev_state=rev_state,
             )
 
         def _phase_dedup() -> None:
             phase_dedup_duplicate_file(
-                timings=timings, server=server, rev_state=rev_state,
+                timings=timings,
+                server=server,
+                rev_state=rev_state,
             )
 
         def _phase_idempotency() -> None:
             phase_push_idempotency(
-                timings=timings, server=server, rev_state=rev_state,
+                timings=timings,
+                server=server,
+                rev_state=rev_state,
             )
 
         def _phase_clone() -> None:
             phase_clone_and_verify_history(
-                timings=timings, server=server, client=client,
-                work_root=work_root, rev_state=rev_state,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+                rev_state=rev_state,
             )
 
         def _phase_offline_restart() -> None:
             nonlocal server
             server = phase_offline_and_restart(
-                timings=timings, server=server, rt=rt,
+                timings=timings,
+                server=server,
+                rt=rt,
                 image_tag=image_tag,
                 data_root=data_root,
                 jwt_secret_hex=jwt_secret_hex,
                 transfer_secret_hex=transfer_secret_hex,
-                client=client, ssh_public_key=ssh_public_key,
-                work_root=work_root, rev_state=rev_state,
-                cas_port=cas_port, ssh_port=ssh_port,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                work_root=work_root,
+                rev_state=rev_state,
+                cas_port=cas_port,
+                ssh_port=ssh_port,
                 admin_token_hex=admin_token_hex,
             )
 
         def _phase_tampered_xorb() -> None:
             phase_adversarial_tampered_xorb(
-                timings=timings, server=server, client=client,
-                work_root=work_root, rev_state=rev_state,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+                rev_state=rev_state,
             )
 
         def _phase_mount_rev() -> None:
             phase_mount_rev(
-                timings=timings, server=server, client=client,
-                work_root=work_root, rev_state=rev_state,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+                rev_state=rev_state,
             )
 
         def _phase_mount_diff() -> None:
             phase_mount_diff(
-                timings=timings, server=server, client=client,
-                work_root=work_root, rev_state=rev_state,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+                rev_state=rev_state,
             )
 
         def _phase_mount_diff_mixed() -> None:
             phase_mount_diff_mixed(
-                timings=timings, server=server, client=client,
+                timings=timings,
+                server=server,
+                client=client,
                 work_root=work_root,
             )
 
         def _phase_quota() -> None:
             phase_adversarial_quota_exceeded(
-                timings=timings, rt=rt, image_tag=image_tag,
-                work_root=work_root, client=client,
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
             )
 
         def _phase_failure_kill() -> None:
             phase_failure_server_kill_mid_upload(
-                timings=timings, rt=rt, image_tag=image_tag,
-                work_root=work_root, client=client,
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
             )
 
         def _phase_failure_conndrop() -> None:
             phase_failure_connection_drop_mid_upload(
-                timings=timings, rt=rt, image_tag=image_tag,
-                work_root=work_root, client=client,
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
             )
 
         def _phase_failure_dbbusy() -> None:
             phase_failure_transient_db(
-                timings=timings, rt=rt, image_tag=image_tag,
-                work_root=work_root, client=client,
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
             )
 
         def _phase_gc_abandon() -> None:
             phase_gc_abandon_checkout(
-                timings=timings, server=server, client=client, work_root=work_root,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
             )
 
         def _phase_gc_keep() -> None:
             phase_gc_keeps_unpushed(
-                timings=timings, server=server, client=client, work_root=work_root,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
             )
 
         def _phase_gc_mixed() -> None:
             phase_gc_mixed(
-                timings=timings, server=server, client=client, work_root=work_root,
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
             )
 
         # name -> (group, read_only, fn)
         REGISTRY: dict[str, tuple[str, bool, Callable[[], None]]] = {
-            "basic":           ("g1",      False, _phase_basic),
-            "wrong-token":     ("g1",      False, _phase_wrong_token),
+            "basic": ("g1", False, _phase_basic),
+            "wrong-token": ("g1", False, _phase_wrong_token),
             # Routes git-bale's CAS traffic through a counting proxy and asserts
             # only push/pull cross it. Own repo + commits, so g1 (independent).
-            "offline-no-network": ("g1",   False, _phase_offline_net),
-            "bigfile":         ("g2-head", False, _phase_bigfile),
-            "usage":           ("g2-tail", True,  _phase_usage),
+            "offline-no-network": ("g1", False, _phase_offline_net),
+            "bigfile": ("g2-head", False, _phase_bigfile),
+            "usage": ("g2-tail", True, _phase_usage),
             # Dereferences rev_state["repo_path"]/["env"] (the live bigfile
             # client repo) to read the pushed pointer's file id, so — like
             # idempotency — it can't run from a --reuse-from (hence not
             # read_only). Streams 35 MB back through the reconstruction path.
             "browser-download": ("g2-tail", False, _phase_browser_download),
-            "dedup":           ("g2-tail", False, _phase_dedup),
+            "dedup": ("g2-tail", False, _phase_dedup),
             # idempotency dereferences rev_state["repo_path"] (the bigfile
             # client repo from the same process), so it can't run from a
             # --reuse-from where rev_state was reconstructed from JSON.
-            "idempotency":     ("g2-tail", False, _phase_idempotency),
-            "clone":           ("g2-tail", True,  _phase_clone),
-            "offline-restart": ("g2-tail", True,  _phase_offline_restart),
-            "tampered-xorb":   ("g2-tail", True,  _phase_tampered_xorb),
+            "idempotency": ("g2-tail", False, _phase_idempotency),
+            "clone": ("g2-tail", True, _phase_clone),
+            "offline-restart": ("g2-tail", True, _phase_offline_restart),
+            "tampered-xorb": ("g2-tail", True, _phase_tampered_xorb),
             # Read-only FUSE mounts of pushed history. Skip cleanly when the
             # host has no libfuse / fuse-t installed.
-            "mount-rev":       ("g2-tail", True,  _phase_mount_rev),
-            "mount-diff":      ("g2-tail", True,  _phase_mount_diff),
-            "quota":           ("g3",      False, _phase_quota),
+            "mount-rev": ("g2-tail", True, _phase_mount_rev),
+            "mount-diff": ("g2-tail", True, _phase_mount_diff),
+            "quota": ("g3", False, _phase_quota),
             # Independent (own repo + commits), so g3 — not read-only because
             # it pushes new history that other phases shouldn't see.
-            "mount-diff-mixed": ("g3",     False, _phase_mount_diff_mixed),
+            "mount-diff-mixed": ("g3", False, _phase_mount_diff_mixed),
             # Own repo + commits, forces the clean filter's spill path via a
             # capped BALE_MAX_INLINE_CLEAN. g3 for the same reason as above.
-            "spilled-clean":   ("g3",      False, _phase_spilled),
+            "spilled-clean": ("g3", False, _phase_spilled),
             # Failure-recovery phases each own their own isolated container
             # + data dir, so they can crash/restart the server or block its
             # DB without disturbing earlier phases' state.
-            "failure-kill":      ("g3", False, _phase_failure_kill),
-            "failure-conndrop":  ("g3", False, _phase_failure_conndrop),
-            "failure-dbbusy":    ("g3", False, _phase_failure_dbbusy),
+            "failure-kill": ("g3", False, _phase_failure_kill),
+            "failure-conndrop": ("g3", False, _phase_failure_conndrop),
+            "failure-dbbusy": ("g3", False, _phase_failure_dbbusy),
             # gc staging reconciliation. Each owns its own bare repo + commits,
             # so g3 — not read-only (they push new history).
             "gc-abandon-checkout": ("g3", False, _phase_gc_abandon),
-            "gc-keeps-unpushed":   ("g3", False, _phase_gc_keep),
-            "gc-mixed":            ("g3", False, _phase_gc_mixed),
+            "gc-keeps-unpushed": ("g3", False, _phase_gc_keep),
+            "gc-mixed": ("g3", False, _phase_gc_mixed),
         }
 
         # Build the within-group lists in declaration order, then apply

@@ -1,4 +1,5 @@
 """Logging + the TestFailure exception + byte formatting."""
+
 from __future__ import annotations
 
 import sys

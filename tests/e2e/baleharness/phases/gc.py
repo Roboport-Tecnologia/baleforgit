@@ -1,10 +1,17 @@
 """gc staging-reconciliation phases."""
+
 from __future__ import annotations
 
 from pathlib import Path
 
 from baleharness.client import ClientEnv
-from baleharness.config import E2E_OWNER, E2E_REPO_GC1, E2E_REPO_GC2, E2E_REPO_GC3, GC_PAYLOAD_BYTES
+from baleharness.config import (
+    E2E_OWNER,
+    E2E_REPO_GC1,
+    E2E_REPO_GC2,
+    E2E_REPO_GC3,
+    GC_PAYLOAD_BYTES,
+)
 from baleharness.gitutil import git, pointer_hash_at, verify_worktree
 from baleharness.logutil import TestFailure, info
 from baleharness.payloads import deterministic_payload
@@ -26,8 +33,12 @@ def phase_gc_abandon_checkout(
     left in git that references any staged bytes → gc does a full wipe."""
     with timings.measure("gc-abandon-checkout"):
         repo, env = init_repo_for_push(
-            work_root=work_root, client=client, server=server,
-            owner=E2E_OWNER, repo=E2E_REPO_GC1, name="gc-abandon",
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO_GC1,
+            name="gc-abandon",
         )
         rel = "big.bin"
         v1 = deterministic_payload(GC_PAYLOAD_BYTES, seed=b"gc-abandon-v1")
@@ -68,8 +79,11 @@ def phase_gc_abandon_checkout(
             )
         # Worktree is back to v1.
         verify_worktree(
-            repo, rel, expected_sha=sha256_bytes(v1),
-            expected_size=len(v1), label="gc-abandon",
+            repo,
+            rel,
+            expected_sha=sha256_bytes(v1),
+            expected_size=len(v1),
+            label="gc-abandon",
         )
         info("[gc-abandon] orphaned staging swept; v1 worktree intact")
 
@@ -88,8 +102,12 @@ def phase_gc_keeps_unpushed(
     the C1 checkout would fail or mismatch."""
     with timings.measure("gc-keeps-unpushed"):
         repo, env = init_repo_for_push(
-            work_root=work_root, client=client, server=server,
-            owner=E2E_OWNER, repo=E2E_REPO_GC2, name="gc-keep",
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO_GC2,
+            name="gc-keep",
         )
         rel = "data.bin"
         v1 = deterministic_payload(GC_PAYLOAD_BYTES, seed=b"gc-keep-v1")
@@ -127,18 +145,28 @@ def phase_gc_keeps_unpushed(
         # Push both commits, cold-clone, verify EVERY revision reconstructs.
         git(["push", "-u", "origin", "main"], cwd=repo, env=env)
         clone, cenv, _cache = init_repo_for_clone(
-            work_root=work_root, client=client, server=server,
-            owner=E2E_OWNER, repo=E2E_REPO_GC2, name="gc-keep-clone",
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO_GC2,
+            name="gc-keep-clone",
         )
         git(["checkout", c1], cwd=clone, env=cenv)
         verify_worktree(
-            clone, rel, expected_sha=sha256_bytes(v1),
-            expected_size=len(v1), label="gc-keep@C1",
+            clone,
+            rel,
+            expected_sha=sha256_bytes(v1),
+            expected_size=len(v1),
+            label="gc-keep@C1",
         )
         git(["checkout", c2], cwd=clone, env=cenv)
         verify_worktree(
-            clone, rel, expected_sha=sha256_bytes(v2),
-            expected_size=len(v2), label="gc-keep@C2",
+            clone,
+            rel,
+            expected_sha=sha256_bytes(v2),
+            expected_size=len(v2),
+            label="gc-keep@C2",
         )
         info("[gc-keep] unpushed v1 survived gc; all revisions reconstruct")
 
@@ -151,8 +179,12 @@ def phase_gc_mixed(
     marker and drops only the dangling one; v1 stays pushable + reconstructable."""
     with timings.measure("gc-mixed"):
         repo, env = init_repo_for_push(
-            work_root=work_root, client=client, server=server,
-            owner=E2E_OWNER, repo=E2E_REPO_GC3, name="gc-mixed",
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO_GC3,
+            name="gc-mixed",
         )
         rel = "m.bin"
         v1 = deterministic_payload(GC_PAYLOAD_BYTES, seed=b"gc-mixed-v1")
@@ -169,7 +201,7 @@ def phase_gc_mixed(
         if h1 == h2:
             raise TestFailure("[gc-mixed] v1 and v2 unexpectedly hash-collided")
 
-        git(["reset"], cwd=repo, env=env)               # unstage v2 (now dangling)
+        git(["reset"], cwd=repo, env=env)  # unstage v2 (now dangling)
         git(["checkout", "--", rel], cwd=repo, env=env)  # restore v1; fires gc hook
 
         markers = staged_markers(repo)
@@ -187,12 +219,19 @@ def phase_gc_mixed(
         # v1 still uploads and reconstructs after a cold clone.
         git(["push", "-u", "origin", "main"], cwd=repo, env=env)
         clone, cenv, _cache = init_repo_for_clone(
-            work_root=work_root, client=client, server=server,
-            owner=E2E_OWNER, repo=E2E_REPO_GC3, name="gc-mixed-clone",
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO_GC3,
+            name="gc-mixed-clone",
         )
         git(["checkout", "main"], cwd=clone, env=cenv)
         verify_worktree(
-            clone, rel, expected_sha=sha256_bytes(v1),
-            expected_size=len(v1), label="gc-mixed",
+            clone,
+            rel,
+            expected_sha=sha256_bytes(v1),
+            expected_size=len(v1),
+            label="gc-mixed",
         )
         info("[gc-mixed] live v1 kept, dangling v2 dropped, v1 reconstructs")

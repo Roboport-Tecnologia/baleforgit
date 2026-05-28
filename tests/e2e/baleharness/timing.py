@@ -1,4 +1,5 @@
 """Per-phase timing + throughput report."""
+
 from __future__ import annotations
 
 import time
