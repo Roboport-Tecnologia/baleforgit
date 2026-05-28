@@ -646,13 +646,11 @@ name = "bale-server-authz-http"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
  "bale-server-core",
  "bale-server-tokens",
  "reqwest",
  "serde",
  "serde_json",
- "tokio",
  "tracing",
 ]
 
@@ -664,7 +662,6 @@ dependencies = [
  "async-trait",
  "bale-server-core",
  "bale-server-tokens",
- "tokio",
 ]
 
 [[package]]
@@ -737,8 +734,6 @@ dependencies = [
  "async-trait",
  "bale-server-core",
  "sqlx",
- "tempfile",
- "tokio",
  "tracing",
 ]
 
@@ -747,16 +742,7 @@ name = "bale-server-shard"
 version = "0.1.0"
 dependencies = [
  "bale-server-core",
- "bale-server-shard-testing",
  "thiserror",
- "xet-core-structures",
-]
-
-[[package]]
-name = "bale-server-shard-testing"
-version = "0.1.0"
-dependencies = [
- "bale-server-core",
  "xet-core-structures",
 ]
 
@@ -769,7 +755,6 @@ dependencies = [
  "bale-server-core",
  "bytes",
  "hex",
- "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -797,42 +782,8 @@ dependencies = [
  "bale-server-core",
  "bytes",
  "hex",
- "reqwest",
  "tokio",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "bale-server-tests"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "bale-server-authz-http",
- "bale-server-authz-mem",
- "bale-server-core",
- "bale-server-http",
- "bale-server-meta-sqlite",
- "bale-server-shard",
- "bale-server-shard-testing",
- "bale-server-storage-fs",
- "bale-server-storage-mem",
- "bale-server-tokens",
- "bale-server-wire",
- "base64",
- "blake3",
- "bytes",
- "hex",
- "hmac 0.13.0",
- "http-body-util",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "tokio",
- "tower",
 ]
 
 [[package]]
@@ -1864,8 +1815,6 @@ name = "git-bale"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
- "base64",
  "blake3",
  "bytes",
  "clap",

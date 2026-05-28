@@ -14,6 +14,3 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 bale-server-core.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

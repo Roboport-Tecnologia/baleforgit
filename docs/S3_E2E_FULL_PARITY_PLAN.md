@@ -274,5 +274,6 @@ pass (no Rust changes expected for parity work).
 - fs phases to port: `tests/e2e/run.py` at the line numbers cited above
 - Server-side S3 plumbing: `crates/bale-server-bin/src/main.rs:97-160`
 - S3 trait impl: `crates/bale-server-storage-s3/src/lib.rs`
-- Reference MinIO sidecar in Rust:
-  `crates/bale-server-storage-s3/tests/minio.rs`
+- Reference MinIO sidecar: `tests/e2e/s3lib.py` (the Rust-side
+  `crates/bale-server-storage-s3/tests/minio.rs` it was modeled on has been
+  removed along with all Rust tests)

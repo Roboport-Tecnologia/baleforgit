@@ -44,9 +44,3 @@ xet-data = "=1.5.2"
 xet-core-structures = "=1.5.2"
 xet-client = "=1.5.2"
 xet-runtime = "=1.5.2"
-
-[dev-dependencies]
-axum.workspace = true
-base64 = "0.22"
-tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

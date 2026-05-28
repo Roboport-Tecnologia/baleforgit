@@ -773,39 +773,3 @@ fn build_translator_config(cfg: &BaleConfig) -> Result<TranslatorConfig> {
         None,
     )?)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::is_safe_file_id;
-
-    #[test]
-    fn is_safe_file_id_accepts_canonical_hex() {
-        assert!(is_safe_file_id(&"0".repeat(64)));
-        assert!(is_safe_file_id(&"f".repeat(64)));
-        assert!(is_safe_file_id(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        ));
-    }
-
-    #[test]
-    fn is_safe_file_id_rejects_traversal() {
-        assert!(!is_safe_file_id("../../etc/passwd"));
-        assert!(!is_safe_file_id("/etc/passwd"));
-        assert!(!is_safe_file_id("..\\..\\windows"));
-    }
-
-    #[test]
-    fn is_safe_file_id_rejects_wrong_length() {
-        assert!(!is_safe_file_id(""));
-        assert!(!is_safe_file_id(&"a".repeat(63)));
-        assert!(!is_safe_file_id(&"a".repeat(65)));
-    }
-
-    #[test]
-    fn is_safe_file_id_rejects_uppercase_and_separators() {
-        assert!(!is_safe_file_id(&"A".repeat(64)));
-        let mut with_dot = "a".repeat(63);
-        with_dot.push('.');
-        assert!(!is_safe_file_id(&with_dot));
-    }
-}

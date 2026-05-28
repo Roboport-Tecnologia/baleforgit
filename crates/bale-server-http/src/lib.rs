@@ -427,8 +427,8 @@ where
     // claim: xet-data sets the shard's `num_bytes_on_disk` to 0
     // unconditionally, so without this the owner accounting would collapse
     // to 0 for every real client. Fall back to the shard's value when no
-    // frame layout is on file (covers hand-rolled test shards that pre-set
-    // the field — see `m13_quotas_and_usage`).
+    // frame layout is on file (covers shards that pre-set the field instead
+    // of leaving it 0).
     let xorb_hashes: Vec<XorbHash> = parsed.cas_blocks.iter().map(|cb| cb.xorb).collect();
     let frame_layouts = svc.meta.xorb_frame_layouts(&xorb_hashes).await?;
     for cb in &parsed.cas_blocks {

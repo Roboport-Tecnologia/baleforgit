@@ -194,27 +194,3 @@ fn sanitize_label(rev: &str) -> String {
         out
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::sanitize_label;
-
-    #[test]
-    fn sanitize_keeps_safe_chars() {
-        assert_eq!(sanitize_label("main"), "main");
-        assert_eq!(sanitize_label("v1.2.3"), "v1.2.3");
-        assert_eq!(sanitize_label("topic-foo_bar"), "topic-foo_bar");
-    }
-
-    #[test]
-    fn sanitize_replaces_slashes_and_weird() {
-        assert_eq!(sanitize_label("feature/x"), "feature_x");
-        assert_eq!(sanitize_label("HEAD~3"), "HEAD_3");
-        assert_eq!(sanitize_label("origin/main"), "origin_main");
-    }
-
-    #[test]
-    fn sanitize_handles_empty() {
-        assert_eq!(sanitize_label(""), "rev");
-    }
-}

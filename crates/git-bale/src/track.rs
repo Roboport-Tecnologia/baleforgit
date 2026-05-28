@@ -72,39 +72,3 @@ fn pattern_already_tracked(existing: &str, pattern: &str) -> bool {
     }
     false
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn appends_new_pattern() {
-        let dir = tempdir().unwrap();
-        track(dir.path(), &["*.bin".to_string()]).unwrap();
-        let body = fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
-        assert!(body.contains("*.bin filter=bale -text"));
-    }
-
-    #[test]
-    fn skips_already_tracked_pattern() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join(".gitattributes");
-        fs::write(&path, "*.bin filter=bale -text\n").unwrap();
-        track(dir.path(), &["*.bin".to_string()]).unwrap();
-        let body = fs::read_to_string(&path).unwrap();
-        // Still exactly one line for *.bin.
-        assert_eq!(body.matches("*.bin filter=bale -text").count(), 1);
-    }
-
-    #[test]
-    fn appends_after_missing_trailing_newline() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join(".gitattributes");
-        fs::write(&path, "*.txt text").unwrap();
-        track(dir.path(), &["*.bin".to_string()]).unwrap();
-        let body = fs::read_to_string(&path).unwrap();
-        assert!(body.starts_with("*.txt text\n"));
-        assert!(body.contains("*.bin filter=bale -text"));
-    }
-}

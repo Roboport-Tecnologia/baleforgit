@@ -10,5 +10,3 @@ async-trait.workspace = true
 bytes.workspace = true
 tokio.workspace = true
 bale-server-core.workspace = true
-
-[dev-dependencies]

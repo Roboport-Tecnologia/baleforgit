@@ -82,8 +82,7 @@ MINIO_IMAGE = "quay.io/minio/minio:RELEASE.2025-01-20T14-49-07Z"
 MINIO_ACCESS_KEY = "minioadmin"
 MINIO_SECRET_KEY = "minioadmin"
 MINIO_BUCKET = "bale-e2e"
-# Generous: covers a cold image pull on a fresh runner. Matches the Rust-side
-# minio.rs READY_TIMEOUT.
+# Generous: covers a cold image pull on a fresh runner.
 MINIO_READY_TIMEOUT_S = 180
 MINIO_INTERNAL_PORT = 9000
 
@@ -135,8 +134,7 @@ class Network:
 class MinioGuard:
     """Single-node MinIO container + `mc` introspection helpers.
 
-    Lifecycle mirrors `crates/bale-server-storage-s3/tests/minio.rs`'s
-    MinioGuard: launch, poll `/minio/health/ready`, provision the bucket
+    Lifecycle: launch, poll `/minio/health/ready`, provision the bucket
     via `mc mb -p` (idempotent), tear down on `stop()`.
 
     Two URL forms matter:
@@ -413,8 +411,8 @@ def s3_server_env(
         "BALE_S3_DISABLE_SSE": "1",
         "BALE_S3_ACCESS_KEY_ID": MINIO_ACCESS_KEY,
         "BALE_S3_SECRET_ACCESS_KEY": MINIO_SECRET_KEY,
-        # us-east-1 is what the AWS SDK assumes by default and what
-        # minio.rs uses; either way the actual choice is moot for MinIO.
+        # us-east-1 is what the AWS SDK assumes by default; the actual choice
+        # is moot for MinIO.
         "BALE_S3_REGION": "us-east-1",
         # Per-phase prefix — equivalent to the fs suite's per-phase data_root.
         # Trailing "/" matters: keys become "<prefix>xorbs/aa/bb/<hex>".

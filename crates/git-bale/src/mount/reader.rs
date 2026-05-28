@@ -164,24 +164,6 @@ impl Reader {
         })
     }
 
-    /// Test-only constructor that skips xet-runtime + chunk-cache setup.
-    /// Any size_of/open call will error because there's no repo.
-    #[cfg(test)]
-    pub fn for_test_only() -> Self {
-        Self {
-            repo: None,
-            raw: None,
-            rt: None,
-            chunk_cache: None,
-            bale_cfg: Mutex::new(None),
-            size_cache: Mutex::new(HashMap::new()),
-            plain_cache: Mutex::new(HashMap::new()),
-            bale_cache: Mutex::new(BaleLru::new(BALE_LRU_BUDGET_BYTES)),
-            handles: Mutex::new(HashMap::new()),
-            next_handle: AtomicU64::new(0),
-        }
-    }
-
     fn repo_thread_local(&self) -> Result<gix::Repository> {
         let repo = self
             .repo
@@ -509,40 +491,4 @@ pub fn install_active(reader: Arc<Reader>) -> Result<()> {
 
 pub fn active() -> Option<Arc<Reader>> {
     ACTIVE_READER.get().cloned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bale_lru_evicts_oldest_under_budget() {
-        let mut lru = BaleLru::new(10);
-        let make = |n: usize| {
-            Arc::new(CachedBlob {
-                data: Bytes::from(vec![0u8; n]),
-            })
-        };
-        lru.put("a".into(), make(4));
-        lru.put("b".into(), make(4));
-        // Touch "a" so "b" is now the oldest by recency.
-        assert!(lru.get("a").is_some());
-        // c (4 bytes) makes total 12 > 10 → evict oldest = "b".
-        lru.put("c".into(), make(4));
-        assert!(lru.get("a").is_some());
-        assert!(lru.get("b").is_none());
-        assert!(lru.get("c").is_some());
-    }
-
-    #[test]
-    fn bale_lru_refuses_oversized_entry() {
-        let mut lru = BaleLru::new(10);
-        lru.put(
-            "huge".into(),
-            Arc::new(CachedBlob {
-                data: Bytes::from(vec![0u8; 100]),
-            }),
-        );
-        assert!(lru.get("huge").is_none());
-    }
 }

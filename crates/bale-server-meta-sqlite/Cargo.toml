@@ -11,7 +11,3 @@ async-trait.workspace = true
 sqlx.workspace = true
 tracing.workspace = true
 bale-server-core.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true }
-tempfile.workspace = true

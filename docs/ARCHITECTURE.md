@@ -310,7 +310,7 @@ On `command=smudge` (filter sees a pointer, must reconstruct), git-bale tries th
 2. **Lukewarm path** — staging-dir reconstruction. After `git add` but before `git-bale push-pending`, the xorbs/shards are still under `.git/bale/staging/`. We open a `FileDownloadSession` against `TranslatorConfig::local_config(<git_dir>/bale/staging/)` and call `download_to_writer(info, 0..file_size, dest)`. Any error (missing xorb, missing shard, post-push-pending empty tree) is logged at `debug` and we fall through. This keeps `git add big.bin && rm big.bin && git checkout -- big.bin` working before the user has pushed. Gated on a per-file marker `<staging>/file-index/<file_hex>` written by `clean` — without it, smudges for file hashes we never staged (e.g. `git stash`'s HEAD-restore phase) drop into xet-data's `ReconstructionTermManager`, return zero terms, and trip a `debug_assert_eq!` in its progress tracker that calls `update_item_size(0, true)` after a previous `update_item_size(file_size, true)` already finalized the size. Release builds drop the assert; dev builds panic. `push-pending` clears the markers after a successful drain, and `git-bale gc` drops any marker whose file is no longer reachable, so markers don't outlive the staged bytes they advertise.
 3. **Cold path** — `FileDownloadSession::download_to_writer` against the remote bale server, same code path xet-core uses for HF-Hub-hosted Xet content. As a side effect, it also writes the manifest to `.git/bale/manifests/` so subsequent checkouts go through the hot path. The manifest stores only content-addressed `terms` (xorb hash + chunk-index range), **not** `fetch_info` URLs — those signed URLs expire after `SIGNATURE_TTL_SECS` (10 min) and aren't safe to persist.
 
-Critical detail: the cold path passes `0..file_size` (not `FileRange::full()`, which xet-core defaults to) to `download_to_writer`. baleforgit-server has no Range support on `/v1/reconstructions/*`, and xet-data's prefetcher fans out to up to 256 MiB beyond EOF when given an unbounded range — every prefetched block then re-fetches the full file terms and trips xet-data's `SequentialWriter` contiguity check. The cap keeps the prefetcher quiet. Drives `m11_native_filter`.
+Critical detail: the cold path passes `0..file_size` (not `FileRange::full()`, which xet-core defaults to) to `download_to_writer`. baleforgit-server has no Range support on `/v1/reconstructions/*`, and xet-data's prefetcher fans out to up to 256 MiB beyond EOF when given an unbounded range — every prefetched block then re-fetches the full file terms and trips xet-data's `SequentialWriter` contiguity check. The cap keeps the prefetcher quiet.
 
 ### Auth resolution
 
@@ -423,7 +423,7 @@ Two layers:
 The binary (`bale-server-bin`) picks which `RepoAuthz` impl to wire in at startup:
 
 - `BALE_AUTHZ_HTTP_URL` set → `HttpAuthz` from `bale-server-authz-http`. Token mint/verify stays local; only `check_repo_access` is delegated.
-- Otherwise → `ConfigAuthz` from `bale-server-authz-mem`, populated from the `BALE_GRANTS` env var. Intended for dev and integration tests only — `AlwaysAllow` is the test-only variant.
+- Otherwise → `ConfigAuthz` from `bale-server-authz-mem`, populated from the `BALE_GRANTS` env var. Intended for dev use — `AlwaysAllow` is a permissive variant that grants every request.
 
 The `Service` struct is generic over the trait impls (`Arc<B>`/`Arc<M>`/`Arc<A>`, not `Arc<dyn ...>`) so the chosen impls get monomorphised at link time. The binary builds a separate `Service` per branch for that reason.
 
@@ -451,7 +451,7 @@ Quotas are **soft** — under concurrent uploads two writers can both pass the c
 1. **At `POST /v1/xorbs/{prefix}/{hash}`**: if the xorb already exists in CAS, the call is content-addressed-idempotent and skipped — re-pushes never reject. Otherwise we conservatively check `stored_bytes_for_owner + body.len() ≤ quota` and 413 on miss. This blocks the obvious "upload terabytes" failure mode at the door.
 2. **At `POST /shards`**: after xorb metadata is registered but *before* `register_files` (the atomic batch), we compute the projected post-commit stored bytes — current stored plus the on-disk sizes of xorbs the owner doesn't already reference (`unaccounted_xorb_bytes_for_owner`). 413 on miss, and `register_files` never runs, so no file rows are left behind.
 
-The second check is load-bearing because the first one's "skip if exists" shortcut would otherwise let an owner gain attributable bytes by referencing someone else's xorb without paying. Drives `m13_quotas_and_usage::quota_blocks_at_shard_upload_for_cross_owner_dedup`.
+The second check is load-bearing because the first one's "skip if exists" shortcut would otherwise let an owner gain attributable bytes by referencing someone else's xorb without paying.
 
 ### Configuration
 
@@ -533,7 +533,7 @@ Server side:
 | HTTP metrics middleware + handler counters | `crates/bale-server-http/src/metrics.rs` |
 | OTLP traces + metrics init (gated on env) | `crates/bale-server-bin/src/telemetry.rs` |
 | Binary launcher | `crates/bale-server-bin/src/main.rs` |
-| Cross-crate integration tests | `crates/bale-server-tests/tests/m*.rs` |
+| End-to-end test harness | `tests/e2e/` |
 
 Client side (`crates/git-bale/`):
 

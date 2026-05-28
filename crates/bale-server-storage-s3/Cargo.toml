@@ -16,8 +16,3 @@ hex.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 bale-server-core.workspace = true
-
-[dev-dependencies]
-reqwest = { workspace = true }
-tokio = { workspace = true }
-uuid = { workspace = true }

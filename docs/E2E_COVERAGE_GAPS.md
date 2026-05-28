@@ -5,6 +5,14 @@ production-code coverage, and what would close each gap. Resume work
 from this document — sections are independent and each lists the source
 locations and the proposed e2e change.
 
+> **2026-05-28 — all Rust unit and integration tests were removed.** The
+> project is now verified end-to-end only (`tests/e2e/`). The `--coverage`
+> percentages below were measured from the e2e harness, so they still stand —
+> but every note that calls an item "covered by unit tests" or tags it
+> **TEST-ONLY-PROD-CRATE** now means **covered by nothing**: those paths are
+> reachable only by e2e (or are deletion candidates). Read §4 as a to-do, not
+> a reassurance.
+
 **Snapshot context**: run on macOS (Darwin), `--coverage` mode (so the
 SIGKILL phases `failure-kill`, `failure-conndrop`, `failure-dbbusy`,
 `s3-failure-kill`, `s3-failure-conndrop` auto-skipped). `bale-server-shard`
@@ -43,9 +51,9 @@ Classification tags used below:
 
 - **MISSING-E2E** — real production path that *could* be covered by a
   new/changed e2e phase. The fix is documented.
-- **TEST-ONLY-PROD-CRATE** — code lives in a prod crate but only
-  `#[cfg(test)] mod tests` or a `cargo test` integration test exercises
-  it. The e2e binaries never reach it.
+- **TEST-ONLY-PROD-CRATE** — code lives in a prod crate that was reached
+  only by the now-removed `#[cfg(test)] mod tests` / `cargo test` integration
+  tests. The e2e binaries never reach it, and nothing else does now either.
 - **ERROR-PATH-NOT-INDUCED** — production error branch that exists but
   no e2e phase triggers the precondition (usually because the e2e
   client never sends malformed inputs). Most are reachable only via
@@ -260,11 +268,12 @@ security/safety invariants worth wire-level coverage.
 
 ---
 
-## 4. Production code only reached by `cargo test` (TEST-ONLY-PROD-CRATE)
+## 4. Production code formerly reached only by `cargo test` (TEST-ONLY-PROD-CRATE)
 
-Lives in production crates but reached only by `#[cfg(test)] mod tests`
-or `crates/bale-server-tests/`. None are dead in the cargo-test sense.
-**Deletion candidates** are flagged below.
+Lives in production crates and was reached only by `#[cfg(test)] mod tests`
+or `crates/bale-server-tests/` — both now removed, so nothing reaches these
+paths anymore. The "keep as test helper/ctor" notes below predate the
+removal; re-evaluate each as a deletion candidate.
 
 - `config.rs:90-105` — `BaleConfig::load()` (strict loader).
   **No production caller found**; production uses the resolver path.
