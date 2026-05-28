@@ -13,6 +13,52 @@ locations and the proposed e2e change.
 > reachable only by e2e (or are deletion candidates). Read §4 as a to-do, not
 > a reassurance.
 
+> **2026-05-28 (re-assessment) — the harness was repackaged; every `run.py`
+> line reference below is stale.** The monolithic `tests/e2e/run.py` was
+> sliced into a `baleharness/` package. `run.py` is now a 73-line entry point;
+> phase bodies live under `baleharness/phases/` (`scenario.py`,
+> `coverage_phases.py`, `mount.py`, `gc.py`, `adversarial.py`, `failure.py`)
+> and the phase **registry** is the `REGISTRY` dict in `baleharness/cli.py`.
+> When this doc says "add a phase to `run.py`", read it as "add a phase fn
+> under `baleharness/phases/` and register it in `cli.py`'s `REGISTRY`".
+>
+> **The old monolith survives as `tests/e2e/run_legacy.py` (6188 lines,
+> untracked, imported by nothing).** It is a dead snapshot left over from the
+> split — `grep -rln run_legacy` finds zero importers. **Do not delete dead
+> code yet** (deferred by request); just know that any phase you "find" in
+> `run_legacy.py` may already have been ported into `baleharness/phases/` (or
+> dropped). Confirm against `REGISTRY` in `cli.py`, not against the legacy file.
+>
+> **Re-assessed status of the §2 backlog (verified against `REGISTRY` +
+> `baleharness/phases/`):** items #1–#5 are done (phases `mount-rev` /
+> `mount-diff`, `browser-download`, `spilled-clean`, `https-origin`, `otlp`
+> all present). A new `offline-no-network` phase (not in the original table)
+> also landed. **Items #6–#20 are all still open** — no `admin-quota`,
+> `uninstall`, `track`, env-var-config, scp-URL, or wire-level M12/JWT-mismatch
+> phase exists. The one partial: the `authz-http` coverage phase now fires a
+> direct **401 token-mint probe** with an unknown bearer (`coverage_phases.py`
+> ~L253), which clips a sliver of #10/#11 but not the owner-mismatch branch.
+>
+> **The open items' production code is all still present (verified, with
+> current line numbers — the doc's older refs had drifted):**
+> - #6 admin quota — `PUT /v1/quotas/{owner}` route + `effective_quota` at
+>   `bale-server-http/src/lib.rs:107,262`.
+> - #7 uninstall — `install.rs:66` (`uninstall`), `:79` (`uninstall_all`),
+>   `:133` (`uninstall_managed_hook`); dispatch at `main.rs:142`.
+> - #8 track — `track.rs:14`; dispatch at `main.rs:153`.
+> - #9 M12 cross-repo scope — the load-bearing "404 not 403" checks are at
+>   `bale-server-http/src/lib.rs:516` and `:697`.
+> - #13 scp-style URL — `remote.rs:74-83` (`parse_remote`'s first-`:` branch).
+> - #14 env-var config — `config.rs:51` (`BALE_SERVER_URL`), `:52` (`BALE_TOKEN`),
+>   `:54` (`BALE_TOKEN_EXPIRATION`), `:117` (`BALE_CACHE_DIR`), `:131`
+>   (`XDG_CACHE_HOME`); `env_or_cfg` helper at `:102`.
+>
+> **Every §4 and §5 deletion candidate also still exists** (`config::load`,
+> `pointer::{write,encode,read}_pointer`, `mount::reader::{install_active,
+> active}`, `Default for LibfuseBackend`, `BlobStore::get_shard`). Per request,
+> these stay as-is for now — re-confirm "no production caller" before any
+> future trim, don't act on the §4/§5 lists yet.
+
 **Snapshot context**: run on macOS (Darwin), `--coverage` mode (so the
 SIGKILL phases `failure-kill`, `failure-conndrop`, `failure-dbbusy`,
 `s3-failure-kill`, `s3-failure-conndrop` auto-skipped). `bale-server-shard`
@@ -413,12 +459,18 @@ run for those phases.
      `phase_track` (§2.8).
 6. **Wire-level security probes** (§3 cross-repo M12 scope, JWT-owner
    mismatch, signed-URL tampering). Small in lines, but load-bearing
-   for the invariants called out in CLAUDE.md.
-7. **Trim dead code** (§4 deletion candidates + §5). Improves the
-   coverage signal without writing new tests:
+   for the invariants called out in CLAUDE.md. The `authz-http` coverage
+   phase already added a 401 token-mint probe; the M12 404 check
+   (`bale-server-http/src/lib.rs:516,697`) and the JWT owner-mismatch
+   (`lib.rs:1111`) are the highest-value remaining ones.
+7. **Trim dead code** (§4 deletion candidates + §5) — **DEFERRED, do not
+   act yet** (per request, 2026-05-28 re-assessment). All candidates still
+   exist; re-confirm "no production caller" before any future removal. Listed
+   here only so the next pass knows where to look:
    - `config::BaleConfig::load`
    - `pointer::{write_pointer, encode_pointer, read_pointer}`
    - `PktReader::{Read, BufRead, into_inner}`, `PktWriter::Write`
    - `mount::reader::{install_active, active}`
    - `Default for LibfuseBackend`
    - `BlobStore::get_shard` (if it really has no production caller)
+   - `tests/e2e/run_legacy.py` (the pre-split monolith; imported by nothing)
