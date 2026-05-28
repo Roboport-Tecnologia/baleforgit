@@ -7,7 +7,7 @@ use bale_server_core::{
 use bale_server_http::{router, Service};
 use bale_server_meta_sqlite::SqliteMetadataStore;
 use bale_server_shard::parse as parse_shard;
-use bale_server_shard::xorb::build_uncompressed_xorb_body;
+use bale_server_shard_testing::build_uncompressed_xorb_body;
 use bale_server_storage_fs::FsBlobStore;
 use bale_server_wire::encode_hash;
 use bytes::Bytes;

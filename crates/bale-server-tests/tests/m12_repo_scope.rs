@@ -12,9 +12,11 @@ use bale_server_core::{ChunkHash, FileHash, Hash32, Scope, XorbHash};
 use bale_server_http::{router, Service};
 use bale_server_meta_sqlite::SqliteMetadataStore;
 use bale_server_shard::{
-    build_uncompressed_xorb_body, serialize, xorb_hash_for_uncompressed_chunks, CasChunkEntry,
-    FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader, FLAG_WITH_VERIFICATION,
+    serialize, CasChunkEntry, FileTermEntry, ParsedCasBlock, ParsedFile, ParsedShard, ShardHeader,
     MDB_SHARD_HEADER_TAG, MDB_SHARD_HEADER_VERSION,
+};
+use bale_server_shard_testing::{
+    build_uncompressed_xorb_body, xorb_hash_for_uncompressed_chunks, FLAG_WITH_VERIFICATION,
 };
 use bale_server_storage_fs::FsBlobStore;
 use bale_server_wire::{encode_hash, XetTokenResponse};

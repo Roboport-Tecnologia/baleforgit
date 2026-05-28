@@ -7,6 +7,7 @@ members = [
     "crates/bale-server-core",
     "crates/bale-server-wire",
     "crates/bale-server-shard",
+    "crates/bale-server-shard-testing",
     "crates/bale-server-storage-fs",
     "crates/bale-server-storage-mem",
     "crates/bale-server-storage-s3",
@@ -64,6 +65,7 @@ tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 bale-server-core = { path = "crates/bale-server-core" }
 bale-server-wire = { path = "crates/bale-server-wire" }
 bale-server-shard = { path = "crates/bale-server-shard" }
+bale-server-shard-testing = { path = "crates/bale-server-shard-testing" }
 bale-server-storage-fs = { path = "crates/bale-server-storage-fs" }
 bale-server-storage-mem = { path = "crates/bale-server-storage-mem" }
 bale-server-storage-s3 = { path = "crates/bale-server-storage-s3" }

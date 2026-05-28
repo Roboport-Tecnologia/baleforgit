@@ -27,6 +27,7 @@ tower.workspace = true
 bale-server-core.workspace = true
 bale-server-wire.workspace = true
 bale-server-shard.workspace = true
+bale-server-shard-testing.workspace = true
 bale-server-storage-fs.workspace = true
 bale-server-storage-mem.workspace = true
 bale-server-meta-sqlite.workspace = true

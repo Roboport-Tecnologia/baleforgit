@@ -242,38 +242,12 @@ pub fn decompress_xorb_chunks_into(body: &[u8], out: &mut Vec<u8>) -> Result<(),
     Ok(())
 }
 
-/// Compute the xorb merkle hash for the same chunks `build_uncompressed_xorb_body`
-/// would serialize. Tests that hand-roll xorb uploads use this to produce a URL
-/// hash that passes `verify_xorb_body`.
-pub fn xorb_hash_for_uncompressed_chunks(chunks: &[&[u8]]) -> XorbHash {
-    let entries: Vec<(xet_core_structures::merklehash::MerkleHash, u64)> = chunks
-        .iter()
-        .map(|c| (compute_data_hash(c), c.len() as u64))
-        .collect();
-    let merkle = compute_xorb_merkle_hash(&entries);
-    let bytes: [u8; 32] = merkle.into();
-    XorbHash::from_bytes(bytes)
-}
-
-/// Build a minimal valid xorb body whose chunks are stored uncompressed
-/// (compression scheme 0). Useful for tests that need bytes the production
-/// xorb parser will accept without pulling in a real LZ4 encoder.
-pub fn build_uncompressed_xorb_body(chunks: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for c in chunks {
-        let clen = c.len() as u32;
-        out.push(0); // version
-        out.extend_from_slice(&clen.to_le_bytes()[0..3]); // compressed_length
-        out.push(0); // compression_scheme = None
-        out.extend_from_slice(&clen.to_le_bytes()[0..3]); // uncompressed_length
-        out.extend_from_slice(c);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bale_server_shard_testing::{
+        build_uncompressed_xorb_body, xorb_hash_for_uncompressed_chunks,
+    };
 
     fn make_frame(scheme: u8, payload: &[u8], uncompressed_len: u32) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + payload.len());

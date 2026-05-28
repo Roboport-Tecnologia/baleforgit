@@ -747,8 +747,16 @@ name = "bale-server-shard"
 version = "0.1.0"
 dependencies = [
  "bale-server-core",
- "bytes",
+ "bale-server-shard-testing",
  "thiserror",
+ "xet-core-structures",
+]
+
+[[package]]
+name = "bale-server-shard-testing"
+version = "0.1.0"
+dependencies = [
+ "bale-server-core",
  "xet-core-structures",
 ]
 
@@ -808,6 +816,7 @@ dependencies = [
  "bale-server-http",
  "bale-server-meta-sqlite",
  "bale-server-shard",
+ "bale-server-shard-testing",
  "bale-server-storage-fs",
  "bale-server-storage-mem",
  "bale-server-tokens",

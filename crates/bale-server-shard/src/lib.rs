@@ -8,24 +8,25 @@
 //! ```
 
 use bale_server_core::{ChunkHash, FileHash, Hash32, XorbHash, HASH_LEN};
-use bytes::Bytes;
 use thiserror::Error;
 
 pub mod xorb;
 pub use xorb::{
-    build_uncompressed_xorb_body, decompress_xorb_chunks_into, parse_xorb_frames, verify_xorb_body,
-    xorb_hash_for_uncompressed_chunks, XorbChunkFrame, XorbParseError, XorbVerifyError,
+    decompress_xorb_chunks_into, parse_xorb_frames, verify_xorb_body, XorbChunkFrame,
+    XorbParseError, XorbVerifyError,
 };
 
-pub const ENTRY_SIZE: usize = 48;
-pub const HEADER_SIZE: usize = 48;
+const ENTRY_SIZE: usize = 48;
+const HEADER_SIZE: usize = 48;
 pub const FOOTER_SIZE: usize = 200;
 
 pub const MDB_SHARD_HEADER_VERSION: u64 = 2;
 pub const MDB_SHARD_FOOTER_VERSION: u64 = 1;
 
-pub const FLAG_WITH_VERIFICATION: u32 = 1 << 31; // 0x8000_0000
-pub const FLAG_WITH_METADATA_EXT: u32 = 1 << 30; // 0x4000_0000
+// Mirrored as a pub const in `bale-server-shard-testing` so test code that
+// authors shards can name it; production paths only read it internally.
+const FLAG_WITH_VERIFICATION: u32 = 1 << 31; // 0x8000_0000
+const FLAG_WITH_METADATA_EXT: u32 = 1 << 30; // 0x4000_0000
 
 /// The canonical 32-byte magic that prefixes every MDB shard. Lifted verbatim
 /// from xet-core's `mdb_shard::shard_format::MDB_SHARD_HEADER_TAG` (see
@@ -171,7 +172,7 @@ impl<'a> Cursor<'a> {
 /// `[u64; 4]`) as 32 little-endian bytes per u64; the same shape is reused
 /// for `FileMetadataExt.sha256`, so to round-trip a sha256 between the
 /// standard byte order and the on-disk layout we apply this swap.
-pub fn swap_u64_groups(input: [u8; HASH_LEN]) -> [u8; HASH_LEN] {
+fn swap_u64_groups(input: [u8; HASH_LEN]) -> [u8; HASH_LEN] {
     let mut out = [0u8; HASH_LEN];
     for group in 0..4 {
         for i in 0..8 {
@@ -449,10 +450,6 @@ pub fn serialize(s: &ParsedShard) -> Vec<u8> {
     }
 
     out
-}
-
-pub fn serialize_to_bytes(s: &ParsedShard) -> Bytes {
-    Bytes::from(serialize(s))
 }
 
 #[cfg(test)]
