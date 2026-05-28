@@ -1,16 +1,23 @@
-//! A transient, single-line upload progress indicator for `push-pending`.
+//! A single-line upload progress indicator for `push-pending`.
 //!
-//! Spawns a background thread that polls a snapshot of the upload's transfer
-//! bytes and redraws a `\r`-style line on stderr. Two deliberate constraints:
+//! The line mimics git's own progress style so it reads as one with the push
+//! output it precedes (`Uploading bales: 100% (8/8), 32.0 MiB, done.` sitting
+//! above `Enumerating objects: …`). Behaviour splits on whether stderr is a
+//! terminal:
 //!
-//!   * It stays silent for the first 200ms — a push that uploads nothing new
-//!     (full dedup) or finishes near-instantly never flashes a bar.
-//!   * It draws only when stderr is an interactive terminal. Under the e2e
-//!     harness (and any piped/redirected stderr, e.g. a CI log) it's a no-op,
-//!     so captured output and the harness's assertions are unaffected.
+//!   * On a TTY it redraws a `\r`-style line — `Uploading bales: 47% (4/8),
+//!     14.5 MiB | 3.0 MiB/s` — held back for the first 200ms so a fast or
+//!     fully-deduped push doesn't flash one, then on success finalizes it *in
+//!     place* by appending `, done.` and a `\n`, so it persists above git's own
+//!     "Enumerating objects…" output instead of being overwritten.
+//!   * Off a TTY (piped/redirected stderr — CI, the e2e harness) it draws no
+//!     live line and emits no escape codes: just the same final summary on
+//!     success. Harness assertions key on exit status and error substrings, not
+//!     on an empty stderr, so the extra line is harmless.
 //!
-//! The handle stops the thread and clears the line on drop, so an upload that
-//! errors out via `?` doesn't leave a half-drawn line behind.
+//! The summary prints only on a successful `finish()`. On the error path the
+//! handle's `Drop` prints nothing (and clears the line if one was drawn), so a
+//! failed upload leaves neither a stale line nor a misleading summary.
 
 use std::io::{IsTerminal, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -19,7 +26,6 @@ use std::time::Duration;
 
 const SHOW_AFTER: Duration = Duration::from_millis(200);
 const REFRESH: Duration = Duration::from_millis(100);
-const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
 
 #[derive(Clone, Copy, Default)]
 pub struct UploadSnapshot {
@@ -30,87 +36,150 @@ pub struct UploadSnapshot {
 }
 
 pub struct UploadProgress {
-    stop: Option<mpsc::Sender<()>>,
+    // `true` = finished successfully (print persistent summary); `false`/dropped
+    // = aborted (clear the line).
+    stop: Option<mpsc::Sender<bool>>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl UploadProgress {
-    /// Start polling `poll` on a background thread. The closure is called
-    /// repeatedly (~10 Hz) once the work passes the 200ms threshold. Returns a
-    /// no-op handle when stderr isn't a terminal.
-    pub fn start<F>(poll: F) -> Self
+    /// Start polling `poll` on a background thread. On a TTY the closure is
+    /// called repeatedly (~10 Hz) once the work passes the 200ms threshold; off
+    /// a TTY it's called once, at finish, for the summary. `file_count` is the
+    /// number of bale files in this push, reported in the completion summary.
+    pub fn start<F>(file_count: usize, poll: F) -> Self
     where
         F: Fn() -> UploadSnapshot + Send + 'static,
     {
-        if !std::io::stderr().is_terminal() {
-            return Self {
-                stop: None,
-                handle: None,
-            };
-        }
-        let (tx, rx) = mpsc::channel::<()>();
-        let handle = std::thread::spawn(move || run_reporter(&rx, poll));
+        let tty = std::io::stderr().is_terminal();
+        let (tx, rx) = mpsc::channel::<bool>();
+        let handle = std::thread::spawn(move || run_reporter(&rx, poll, file_count, tty));
         Self {
             stop: Some(tx),
             handle: Some(handle),
         }
     }
 
-    /// Stop the reporter and clear the line, blocking until it has done so.
-    /// Call this on the success path before any further stderr output; the
-    /// `Drop` impl is the safety net for the error path.
-    pub fn finish(self) {}
-}
+    /// Stop the reporter and print the persistent completion summary, blocking
+    /// until it has done so. Call this only on the success path, before any
+    /// further stderr output; the `Drop` impl clears the line on the error path.
+    pub fn finish(mut self) {
+        self.stop_with(true);
+    }
 
-impl Drop for UploadProgress {
-    fn drop(&mut self) {
-        // Dropping the sender disconnects the channel, waking the reporter out
-        // of its recv_timeout; the join waits for the line to be cleared.
-        self.stop.take();
+    fn stop_with(&mut self, success: bool) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(success);
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
 }
 
-fn run_reporter<F: Fn() -> UploadSnapshot>(rx: &mpsc::Receiver<()>, poll: F) {
-    // Quiet until the threshold: a fast push shows nothing at all.
-    match rx.recv_timeout(SHOW_AFTER) {
-        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
-        Err(RecvTimeoutError::Timeout) => {}
+impl Drop for UploadProgress {
+    fn drop(&mut self) {
+        // Reached only when finish() wasn't called (early `?` return) — treat
+        // as an abort and clear the line.
+        self.stop_with(false);
+    }
+}
+
+fn run_reporter<F: Fn() -> UploadSnapshot>(
+    rx: &mpsc::Receiver<bool>,
+    poll: F,
+    file_count: usize,
+    tty: bool,
+) {
+    let mut err = std::io::stderr();
+
+    if !tty {
+        // No live bar off a terminal — escape codes would garble captured logs.
+        // Just the plain summary line on success once the upload finishes.
+        if rx.recv().unwrap_or(false) {
+            let _ = writeln!(err, "{}", summary(&poll(), file_count));
+            let _ = err.flush();
+        }
+        return;
     }
 
-    let mut err = std::io::stderr();
-    let mut frame = 0usize;
-    loop {
-        let _ = write!(err, "\r{}\x1b[K", render(&poll(), frame));
-        let _ = err.flush();
-        frame = frame.wrapping_add(1);
-        match rx.recv_timeout(REFRESH) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {}
+    // Hold the bar back for the first 200ms so a fast push doesn't flash one —
+    // but unlike the bar, the summary always prints on success below.
+    let success = match rx.recv_timeout(SHOW_AFTER) {
+        Ok(s) => s,
+        Err(RecvTimeoutError::Disconnected) => false,
+        Err(RecvTimeoutError::Timeout) => {
+            // Past the threshold: redraw the live line until we're told to stop.
+            loop {
+                let _ = write!(err, "\r{}\x1b[K", render(&poll(), file_count));
+                let _ = err.flush();
+                match rx.recv_timeout(REFRESH) {
+                    Ok(s) => break s,
+                    Err(RecvTimeoutError::Disconnected) => break false,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
         }
+    };
+
+    if success {
+        // Finalize the line in place: ", done." appended to the same git-style
+        // line, ending in `\n` so it persists above git's subsequent output.
+        // The leading `\r…\x1b[K` overwrites the live line when one was drawn,
+        // and is harmless when it wasn't.
+        let _ = write!(err, "\r{}\x1b[K\n", summary(&poll(), file_count));
+    } else {
+        let _ = write!(err, "\r\x1b[K");
     }
-    // We always drew at least once above; erase it.
-    let _ = write!(err, "\r\x1b[K");
     let _ = err.flush();
 }
 
-fn render(s: &UploadSnapshot, frame: usize) -> String {
-    let spin = SPINNER[frame % SPINNER.len()];
+// git-flavoured: "Uploading bales: 47% (4/8), 14.5 MiB | 3.0 MiB/s", mirroring
+// git's own "Writing objects: 47% (4/8), 12.00 MiB | 3.00 MiB/s". The (n/N)
+// count is the bale files; n is derived from the byte fraction so it advances
+// with the transfer (we only get byte-level progress, not per-file completion).
+fn render(s: &UploadSnapshot, file_count: usize) -> String {
     if s.bytes_total == 0 {
-        return format!("{spin} Uploading to bale…");
+        return format!("Uploading bales: 0% (0/{file_count})");
     }
-    let pct = (s.bytes_uploaded as f64 / s.bytes_total as f64 * 100.0).clamp(0.0, 100.0);
+    let frac = (s.bytes_uploaded as f64 / s.bytes_total as f64).clamp(0.0, 1.0);
+    let pct = (frac * 100.0).round() as u64;
+    let n = files_done(s, file_count);
     let rate = match s.rate_bytes_per_sec {
-        Some(r) if r >= 1.0 => format!("  {}/s", fmt_bytes(r as u64)),
+        Some(r) if r >= 1.0 => format!(" | {}/s", fmt_bytes(r as u64)),
         _ => String::new(),
     };
     format!(
-        "{spin} Uploading to bale  {} / {}  {pct:.0}%{rate}",
+        "Uploading bales: {pct}% ({n}/{file_count}), {}{rate}",
         fmt_bytes(s.bytes_uploaded),
-        fmt_bytes(s.bytes_total),
     )
+}
+
+fn summary(s: &UploadSnapshot, file_count: usize) -> String {
+    if s.bytes_uploaded == 0 {
+        // Nothing new transferred (full dedup) — no size clause, like git's
+        // "Counting objects: 100% (13/13), done.".
+        format!("Uploading bales: 100% ({file_count}/{file_count}), done.")
+    } else {
+        format!(
+            "Uploading bales: 100% ({file_count}/{file_count}), {}, done.",
+            fmt_bytes(s.bytes_uploaded),
+        )
+    }
+}
+
+// Files completed, approximated from the byte fraction. Capped at N-1 until the
+// bytes are fully sent so the live line never shows N/N before it's actually
+// done (the finalized summary is what prints N/N).
+fn files_done(s: &UploadSnapshot, file_count: usize) -> usize {
+    if file_count == 0 || s.bytes_total == 0 {
+        return 0;
+    }
+    if s.bytes_uploaded >= s.bytes_total {
+        return file_count;
+    }
+    let frac = s.bytes_uploaded as f64 / s.bytes_total as f64;
+    ((frac * file_count as f64) as usize).min(file_count.saturating_sub(1))
 }
 
 fn fmt_bytes(n: u64) -> String {

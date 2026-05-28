@@ -75,7 +75,7 @@ pub fn run() -> Result<()> {
     // through a shared slot (empty = "preparing", before the session exists).
     let session_slot: Arc<Mutex<Option<Arc<FileUploadSession>>>> = Arc::new(Mutex::new(None));
     let slot_for_poll = session_slot.clone();
-    let progress = UploadProgress::start(move || {
+    let progress = UploadProgress::start(staged_files.len(), move || {
         let session = slot_for_poll.lock().unwrap().clone();
         let Some(session) = session else {
             return UploadSnapshot::default();

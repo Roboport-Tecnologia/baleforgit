@@ -123,8 +123,11 @@ python3 tests/e2e/run.py [--git-bale PATH] [--image-tag TAG] [--no-build]
 `progress-demo` is a **manual-only** phase: it's in the registry but never
 runs in a normal sweep — only when you ask for it by name, and only via
 `--only` (it's gated so a plain run or a different `--only` set skips it
-silently). It exists to *show* git-bale's upload progress indicator, which
-the pre-push hook draws on stderr once an upload runs past ~200 ms.
+silently). It exists to *show* git-bale's upload progress indicator: the
+pre-push hook draws a live, git-styled `Uploading bales: 47% (4/8), … | …/s`
+line on stderr once an upload runs past ~200 ms, then finalizes it in place
+to `Uploading bales: 100% (N/N), <size>, done.` (which prints even when the
+push was too fast to ever show the live line).
 
 ```bash
 cargo build --release -p git-bale
@@ -133,9 +136,10 @@ python3 tests/e2e/run.py --only progress-demo --no-build
 
 Run it **from an interactive terminal**: the phase pushes with the
 harness's output capture turned off, so the hook inherits your TTY — the
-condition git-bale checks before drawing the bar. Piped/redirected (CI,
-captured) runs stay silent by design, which is why no normal phase asserts
-on it.
+condition git-bale checks before drawing the live line. Piped/redirected
+(CI, captured) runs draw no live line — they emit only the final one-line
+`Uploading bales: 100% (N/N), …, done.` summary (no escape codes), which no
+phase's assertions depend on.
 
 Two env knobs:
 
@@ -143,8 +147,8 @@ Two env knobs:
   "take" per file, realised as a client→server byte throttle in front of
   the CAS port so the upload (and the bar) stretches over ~`FILE_TIMER`s
   per file. Set it under ~`0.2` to watch the 200 ms threshold *suppress*
-  the bar; set it to `3`–`5` to watch the bar climb slowly. `0` = no
-  throttle (instant server).
+  the live line (the final summary still prints); set it to `3`–`5` to watch
+  it climb slowly. `0` = no throttle (instant server).
 - `FILE_COUNT` (default `5`) — how many distinct files to add + push; each
   is 4 MiB of unique (incompressible) content, so none dedup away.
 
