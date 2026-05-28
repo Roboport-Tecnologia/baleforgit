@@ -43,6 +43,7 @@ found" error until that's fixed; the harness logic itself is portable.
 | Phase           | What it verifies                                                                                    |
 |-----------------|-----------------------------------------------------------------------------------------------------|
 | `basic`         | Stage / unstage / re-stage (pointer cache hit) / stash / pop / commit / push on a 8 KiB file.       |
+| `offline-no-network` | A counting TCP proxy in front of the CAS server proves add/status/diff/commit/checkout/stash/pop/unstage/gc make **zero** server connections; `git push` (positive control) MUST make the count non-zero. |
 | `bigfile`       | 35 MB binary pushed at three revisions; storage growth per push matches the *actual* edit size.     |
 | `usage`         | `GET /v1/usage/{owner}` and `GET /v1/usage/repo/{owner}/{repo}` numbers agree with on-disk bytes.   |
 | `dedup`         | A *second file* with bit-identical content adds zero new xorb bytes.                                |

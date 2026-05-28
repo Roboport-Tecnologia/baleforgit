@@ -71,6 +71,9 @@ E2E_REPO = "repo"
 E2E_REPO_2 = "repo2"
 E2E_REPO_3 = "mixed-files"
 E2E_REPO_SPILL = "spilled-clean"
+# The offline-no-network phase routes git-bale's CAS traffic through a counting
+# proxy and asserts only push/pull cross it; it pushes its own `main`.
+E2E_REPO_OFFLINE = "offline-net"
 # Dedicated repos for the gc staging-reconciliation phases. Each gc phase
 # pushes its own `main`, so they can't share a bare repo with the push-side
 # phases above (or each other) without a non-fast-forward collision.
@@ -1599,11 +1602,25 @@ class TcpProxy:
         self._accept_thread: Optional[threading.Thread] = None
         self._stopped = True
         self._bytes_forwarded = 0
+        self._connections = 0
 
     @property
     def bytes_forwarded(self) -> int:
         with self._lock:
             return self._bytes_forwarded
+
+    @property
+    def connections(self) -> int:
+        """Count of inbound TCP connections accepted since the last
+        reset_counters(). The offline-no-network phase asserts this stays
+        0 across operations that must never touch the CAS server."""
+        with self._lock:
+            return self._connections
+
+    def reset_counters(self) -> None:
+        with self._lock:
+            self._bytes_forwarded = 0
+            self._connections = 0
 
     def start(self) -> None:
         with self._lock:
@@ -1630,6 +1647,8 @@ class TcpProxy:
                 client_sock, _ = ls.accept()
             except OSError:
                 return
+            with self._lock:
+                self._connections += 1
             upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 upstream_sock.connect(self.upstream)
@@ -2233,6 +2252,157 @@ def phase_basic_user_ops(
             expected_sha=payload_sha, expected_size=SMALL_FILE_BYTES,
             label="basic:hot-resmudge-after-push",
         )
+
+
+def phase_offline_no_network(
+    *,
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+    jwt_secret_hex: str,
+) -> None:
+    """Lock down the contract that *only* push/pull touch the CAS server.
+
+    A counting TcpProxy sits between git-bale and the server. The resolver
+    fast-path (`bale.serverUrl` + `bale.token` both set) routes every CAS
+    round-trip through the proxy and skips the SSH forge handshake entirely,
+    so `proxy.connections` is an exact count of server contact attempts.
+
+    We assert it stays 0 across the full set of local operations — clean
+    (`git add`), `git status`/`git diff`, `git commit`, smudge
+    (`git checkout`), `git stash`/`pop`, unstage, and `git-bale gc` — then
+    flip to a positive control: `git push` MUST make the count non-zero,
+    proving the proxy is a working detector rather than a dead listener.
+
+    The token is self-minted with the server's JWT secret (write scope,
+    `repo_id = e2e/offline-net`), which the server's auth middleware accepts
+    by signature alone — no SSH handshake needed to obtain it."""
+    repo, env = init_repo_for_push(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_OFFLINE,
+        name="offline",
+    )
+    token = mint_bale_jwt(
+        secret=bytes.fromhex(jwt_secret_hex),
+        sub=E2E_USER,
+        repo_type="model",
+        repo_id=f"{E2E_OWNER}/{E2E_REPO_OFFLINE}",
+        revision="main",
+        scope="write",
+        ttl_secs=JWT_TTL_YEARS * 365 * 24 * 3600,
+    )
+    proxy = TcpProxy(pick_free_port(), "127.0.0.1", server.cas_port)
+    proxy.start()
+    try:
+        git(
+            ["config", "--local", "bale.serverUrl",
+             f"http://127.0.0.1:{proxy.listen_port}"],
+            cwd=repo, env=env,
+        )
+        git(["config", "--local", "bale.token", token], cwd=repo, env=env)
+
+        payload = deterministic_payload(GC_PAYLOAD_BYTES, seed=b"offline-net")
+        payload_sha = sha256_bytes(payload)
+        (repo / "data.bin").write_bytes(payload)
+
+        def assert_offline(after: str) -> None:
+            n = proxy.connections
+            if n != 0:
+                raise TestFailure(
+                    f"[offline:{after}] git-bale opened {n} CAS connection(s) "
+                    "during an operation that must be fully offline — only "
+                    "push/pull may contact the server"
+                )
+
+        proxy.reset_counters()
+        with timings.measure("offline: local ops make zero CAS connections"):
+            git(["add", "data.bin"], cwd=repo, env=env)
+            assert_offline("add")
+            verify_pointer_at(
+                repo, env, spec=":data.bin",
+                expected_sha=payload_sha, expected_size=GC_PAYLOAD_BYTES,
+                label="offline:add",
+            )
+
+            git(["status"], cwd=repo, env=env)
+            git(["diff", "--cached"], cwd=repo, env=env)
+            assert_offline("status+diff")
+
+            git(["commit", "-m", "add data.bin"], cwd=repo, env=env)
+            assert_offline("commit")
+
+            # checkout = smudge. The file is committed but unpushed, so the
+            # filter must reconstruct from `.git/bale/staging/` (lukewarm),
+            # never the wire.
+            (repo / "data.bin").unlink()
+            git(["checkout", "--", "data.bin"], cwd=repo, env=env)
+            verify_worktree(
+                repo, "data.bin",
+                expected_sha=payload_sha, expected_size=GC_PAYLOAD_BYTES,
+                label="offline:checkout",
+            )
+            assert_offline("checkout-smudge")
+
+            # A second revision driven through stash/pop and then abandoned.
+            payload2 = replace_region(
+                payload, offset=4096, length=4096, seed=b"offline-v2"
+            )
+            payload2_sha = sha256_bytes(payload2)
+            (repo / "data.bin").write_bytes(payload2)
+            git(["add", "data.bin"], cwd=repo, env=env)
+            assert_offline("re-add-v2")
+            git(["stash", "push", "-m", "offline-stash"], cwd=repo, env=env)
+            assert_offline("stash")
+            git(["stash", "pop"], cwd=repo, env=env)
+            verify_worktree(
+                repo, "data.bin",
+                expected_sha=payload2_sha, expected_size=GC_PAYLOAD_BYTES,
+                label="offline:stash-pop",
+            )
+            assert_offline("stash-pop")
+
+            # Stage v2, then unstage it (fires the post-checkout gc hook) and
+            # run gc explicitly — all of which reconcile local staging only.
+            git(["add", "data.bin"], cwd=repo, env=env)
+            git(["restore", "--staged", "data.bin"], cwd=repo, env=env)
+            assert_offline("unstage")
+            run([str(client.git_bale_bin), "gc"], cwd=repo, env=env)
+            assert_offline("gc")
+
+        info(
+            f"  all local ops complete with {proxy.connections} CAS "
+            "connection(s) — fully offline"
+        )
+
+        # ---- positive control: push MUST hit the server -------------------
+        # Without this, a misconfigured proxy that never sees traffic would
+        # make every assertion above pass vacuously. Re-stage + commit v2 so
+        # push-pending has xorbs to upload, then push (its pre-push hook runs
+        # `git-bale push-pending`) and assert the proxy saw the upload.
+        git(["add", "data.bin"], cwd=repo, env=env)
+        git(["commit", "-m", "offline v2"], cwd=repo, env=env)
+        proxy.reset_counters()
+        with timings.measure(
+            "offline: push (positive control — MUST hit CAS)",
+            bytes_moved=GC_PAYLOAD_BYTES,
+        ):
+            git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+        if proxy.connections == 0:
+            raise TestFailure(
+                "push made zero CAS connections through the proxy — the "
+                "no-network detector is dead, so the offline assertions above "
+                "prove nothing"
+            )
+        info(
+            f"  push opened {proxy.connections} CAS connection(s) — "
+            "detector confirmed live"
+        )
+    finally:
+        proxy.kill()
 
 
 def phase_spilled_clean(
@@ -5235,6 +5405,7 @@ def main() -> int:
                     f"{E2E_OWNER}/{E2E_REPO_2}",
                     f"{E2E_OWNER}/{E2E_REPO_3}",
                     f"{E2E_OWNER}/{E2E_REPO_SPILL}",
+                    f"{E2E_OWNER}/{E2E_REPO_OFFLINE}",
                     f"{E2E_OWNER}/{E2E_REPO_GC1}",
                     f"{E2E_OWNER}/{E2E_REPO_GC2}",
                     f"{E2E_OWNER}/{E2E_REPO_GC3}",
@@ -5258,6 +5429,12 @@ def main() -> int:
         def _phase_wrong_token() -> None:
             phase_adversarial_wrong_token(
                 timings=timings, server=server, client=client, work_root=work_root,
+            )
+
+        def _phase_offline_net() -> None:
+            phase_offline_no_network(
+                timings=timings, server=server, client=client,
+                work_root=work_root, jwt_secret_hex=jwt_secret_hex,
             )
 
         def _phase_spilled() -> None:
@@ -5388,6 +5565,9 @@ def main() -> int:
         REGISTRY: dict[str, tuple[str, bool, Callable[[], None]]] = {
             "basic":           ("g1",      False, _phase_basic),
             "wrong-token":     ("g1",      False, _phase_wrong_token),
+            # Routes git-bale's CAS traffic through a counting proxy and asserts
+            # only push/pull cross it. Own repo + commits, so g1 (independent).
+            "offline-no-network": ("g1",   False, _phase_offline_net),
             "bigfile":         ("g2-head", False, _phase_bigfile),
             "usage":           ("g2-tail", True,  _phase_usage),
             # Dereferences rev_state["repo_path"]/["env"] (the live bigfile
