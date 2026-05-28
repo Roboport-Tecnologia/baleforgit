@@ -10,7 +10,7 @@ use thiserror::Error;
 
 pub const HASH_LEN: usize = 32;
 
-/// 32-byte content-addressed hash. The newtypes below carry the semantic.
+/// 32-byte content-addressed hash; the newtypes below add the semantic.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Hash32(pub [u8; HASH_LEN]);
 
@@ -86,9 +86,8 @@ pub struct RepoRef {
 }
 
 impl RepoRef {
-    /// Owner slice of `repo_id` — the namespace before `/`. Used as the unit of
-    /// storage accounting and quota enforcement. Falls back to the whole
-    /// `repo_id` if no `/` is present (defensive; forge tokens always include one).
+    /// Namespace before `/` — the unit of storage accounting and quotas.
+    /// Falls back to the whole `repo_id` defensively; forge tokens always have one.
     pub fn owner(&self) -> &str {
         match self.repo_id.split_once('/') {
             Some((owner, _)) => owner,
@@ -108,8 +107,6 @@ pub struct TokenClaims {
     pub scope: Scope,
     pub expires_at: u64, // unix seconds
 }
-
-// ---- Indexer / metadata domain types --------------------------------------
 
 /// One term of a file reconstruction: a chunk-index range inside a xorb.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,10 +144,8 @@ pub struct ChunkLocation {
     pub unpacked_segment_bytes: u32,
 }
 
-/// Per-chunk byte offsets inside one xorb, used to build global-dedup
-/// responses. `byte_start` / `unpacked_segment_bytes` live in *uncompressed*
-/// coordinate space — they are NOT on-disk offsets and must NOT be used to
-/// build HTTP byte ranges. Use [`XorbFrameRow`] for that.
+/// `byte_start` / `unpacked_segment_bytes` are *uncompressed* coordinates —
+/// NOT on-disk offsets; never build HTTP byte ranges from them. Use [`XorbFrameRow`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkOffsetRow {
     pub chunk_hash: ChunkHash,
@@ -159,9 +154,8 @@ pub struct ChunkOffsetRow {
     pub unpacked_segment_bytes: u32,
 }
 
-/// One chunk frame's on-disk layout inside a xorb body, recorded at upload
-/// time. `on_disk_start` points at the frame's 8-byte header; `on_disk_len`
-/// covers header + compressed payload.
+/// `on_disk_start` points at the frame's 8-byte header; `on_disk_len` covers
+/// header + compressed payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XorbFrameRow {
     pub frame_index: u32,
@@ -169,8 +163,6 @@ pub struct XorbFrameRow {
     pub on_disk_len: u32,
     pub uncompressed_len: u32,
 }
-
-// ---- Errors ---------------------------------------------------------------
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -189,8 +181,6 @@ pub enum CoreError {
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
-
-// ---- Pluggable traits ------------------------------------------------------
 
 /// Raw-blob storage for xorbs (immutable, content-addressed, ≤64 MiB) and
 /// shards (also content-addressed; kept for archival / re-indexing).
@@ -227,12 +217,9 @@ pub trait MetadataStore: Send + Sync {
         terms: &[FileTerm],
     ) -> CoreResult<()>;
 
-    /// Atomically register many files in a single commit. The shard upload
-    /// handler uses this so a partial fault doesn't leak an orphan file row
-    /// that the client thinks didn't get uploaded. Default impl loops over
-    /// [`Self::register_file`] (non-atomic — for in-memory test stores where
-    /// no partial state is observable mid-loop anyway); SQL-backed stores
-    /// should override with a single transaction.
+    /// Register many files atomically so a partial fault can't leak an orphan
+    /// file row the client thinks didn't upload. Default impl is a non-atomic
+    /// loop (fine for in-memory stores); SQL stores must override with one txn.
     async fn register_files(
         &self,
         repo: &RepoRef,
@@ -244,20 +231,15 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
-    /// Record a xorb's on-disk frame layout. Required for
-    /// [`Self::xorb_frame_layout`] to return anything.
     async fn register_xorb_layout(
         &self,
         xorb: &XorbHash,
         frames: &[XorbFrameRow],
     ) -> CoreResult<()>;
-    /// Frame layout ordered by `frame_index`. Empty if no layout was registered
-    /// (e.g. test fixture that only populated chunk-level metadata).
+    /// Ordered by `frame_index`; empty if no layout was registered.
     async fn xorb_frame_layout(&self, xorb: &XorbHash) -> CoreResult<Vec<XorbFrameRow>>;
-    /// Batched form of [`Self::xorb_frame_layout`]: looks up layouts for many
-    /// xorbs in one round-trip. Default impl loops over `xorb_frame_layout`
-    /// — backends should override for SQL-like stores. Returned map omits
-    /// xorbs with no recorded layout.
+    /// Default impl loops over `xorb_frame_layout`; SQL stores should batch.
+    /// Returned map omits xorbs with no recorded layout.
     async fn xorb_frame_layouts(
         &self,
         xorbs: &[XorbHash],
@@ -274,9 +256,9 @@ pub trait MetadataStore: Send + Sync {
 
     async fn xorb_exists(&self, xorb: &XorbHash) -> CoreResult<bool>;
     async fn lookup_file(&self, file_hash: &FileHash) -> CoreResult<Option<Vec<FileTerm>>>;
-    /// Reconstruction-scope check: `true` iff `file_hash` has been registered
-    /// in `repo_id`. Same `file_hash` may be registered in multiple repos
-    /// (cross-repo dedup) and each registration independently grants read.
+    /// Reconstruction-scope check: `true` iff `file_hash` is registered in
+    /// `repo_id`. The same hash can be registered in many repos (cross-repo
+    /// dedup); each registration independently grants read.
     async fn file_in_repo(&self, file_hash: &FileHash, repo_id: &str) -> CoreResult<bool>;
     async fn lookup_chunk(&self, chunk_hash: &ChunkHash) -> CoreResult<Option<ChunkLocation>>;
     async fn xorbs_near_chunk(
@@ -286,37 +268,32 @@ pub trait MetadataStore: Send + Sync {
     ) -> CoreResult<Vec<XorbInfo>>;
     async fn xorb_chunk_offsets(&self, xorb: &XorbHash) -> CoreResult<Vec<ChunkOffsetRow>>;
 
-    /// Total uncompressed bytes the owner's files would occupy without dedup
-    /// (`SUM(files.total_bytes)` for that owner). Used for the
+    /// Uncompressed bytes the owner's files would occupy without dedup. For the
     /// dedup-savings display, never for quota enforcement.
     async fn raw_bytes_for_owner(&self, owner: &str) -> CoreResult<u64>;
 
-    /// On-disk bytes attributable to the owner: sum of `num_bytes_on_disk` for
-    /// the distinct xorbs that any of the owner's files reference. Each owner
-    /// is accounted independently — a xorb referenced by two owners is counted
-    /// once per owner ("no cross-owner dedup accounting").
+    /// On-disk bytes of the distinct xorbs the owner's files reference. Accounted
+    /// per owner — a xorb shared by two owners counts once each (no cross-owner
+    /// dedup accounting).
     async fn stored_bytes_for_owner(&self, owner: &str) -> CoreResult<u64>;
 
     async fn get_owner_quota(&self, owner: &str) -> CoreResult<Option<u64>>;
     /// `None` clears the override and falls back to the server default.
     async fn set_owner_quota(&self, owner: &str, limit_bytes: Option<u64>) -> CoreResult<()>;
 
-    /// Of the input `candidates`, returns the total `num_bytes_on_disk` of the
-    /// xorbs that `owner` does NOT already reference. Used by the shard upload
-    /// quota check to project what `stored_bytes_for_owner` would become *if*
-    /// the pending file registrations were committed — without actually
-    /// committing them. Unknown / not-yet-registered xorbs contribute 0.
+    /// `num_bytes_on_disk` of the `candidates` the owner does NOT already
+    /// reference — lets the upload quota check project the post-commit total
+    /// without committing. Unknown xorbs contribute 0.
     async fn unaccounted_xorb_bytes_for_owner(
         &self,
         owner: &str,
         candidates: &[XorbHash],
     ) -> CoreResult<u64>;
 
-    /// Same shape as [`Self::raw_bytes_for_owner`] but keyed by full `repo_id`
-    /// (e.g. `"alice/big-model"`). Powers per-repo size display.
+    /// [`Self::raw_bytes_for_owner`] keyed by full `repo_id` (e.g. `"alice/big-model"`).
     async fn raw_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
-    /// Same shape as [`Self::stored_bytes_for_owner`] but per-repo. Cross-repo
-    /// dedup within the same owner can make this smaller than `raw_bytes_for_repo`.
+    /// [`Self::stored_bytes_for_owner`] per-repo. Cross-repo dedup within an
+    /// owner can make this smaller than `raw_bytes_for_repo`.
     async fn stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
 }
 
@@ -327,7 +304,6 @@ pub trait MetadataStore: Send + Sync {
 pub trait RepoAuthz: Send + Sync {
     async fn verify_xet_token(&self, bearer: &str) -> CoreResult<TokenClaims>;
 
-    /// Used by the mock-HF token endpoint to decide whether to issue a token.
     /// `hub_bearer` is the upstream credential the client sent.
     async fn check_repo_access(
         &self,
@@ -336,8 +312,8 @@ pub trait RepoAuthz: Send + Sync {
         scope: Scope,
     ) -> CoreResult<UserId>;
 
-    /// Returns `(token, absolute_expiry_unix_seconds)`. Tokens minted here
-    /// must be accepted by this impl's [`Self::verify_xet_token`].
+    /// Returns `(token, absolute_expiry_unix_seconds)`; tokens minted here must
+    /// verify via this impl's [`Self::verify_xet_token`].
     async fn mint_xet_token(
         &self,
         user: &UserId,

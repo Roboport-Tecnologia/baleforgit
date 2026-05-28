@@ -1,23 +1,15 @@
-//! Per-repo staging area for pending uploads.
+//! Per-repo staging area for pending uploads. `git add` writes xorbs/shards
+//! here via `TranslatorConfig::local_config`; `git-bale push-pending` (pre-push
+//! hook) re-translates and drains them. See [`crate::push_pending`].
 //!
-//! `git add` writes xorbs/shards under `<git_dir>/bale/staging/` via xet-data's
-//! `TranslatorConfig::local_config`. `git push` (driven by a pre-push hook
-//! that runs `git-bale push-pending`) reconstructs each staged file via that
-//! same local config, then re-translates it through an online
-//! `FileUploadSession` so xet-data's global-dedup query path runs against the
-//! real bale server before any new xorbs leave the host. The original staged
-//! files are then deleted.
-//!
-//! Layout mirrors xet-data's `LocalClient`, with an extra sidecar directory:
+//! Layout mirrors xet-data's `LocalClient`, with a sidecar index:
 //!   `<staging>/xet/xorbs/xorbs/default.<merkle_hex>`     # xorbs
 //!   `<staging>/xet/xorbs/shards/<merkle_hex>.mdb`        # shards
 //!   `<staging>/file-index/<file_hex>`                    # per-file markers
 //!
-//! The marker stores the file's size (decimal ASCII) so push-pending can hand
-//! it to `FileDownloadSession::download_to_writer` (which needs an explicit
-//! byte range) without re-parsing the shard's File Info. The lukewarm smudge
-//! fallback only needs the existence check, so empty/legacy markers are still
-//! accepted on read.
+//! The marker body is the file size (decimal ASCII) so push-pending can give
+//! `download_to_writer` a byte range without re-parsing the shard. Readers
+//! tolerate empty/legacy markers (smudge only needs the existence check).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -34,11 +26,8 @@ fn file_marker_path(git_dir: &Path, file_hex: &str) -> PathBuf {
     file_index_dir(git_dir).join(file_hex)
 }
 
-/// Best-effort: writes `<staging>/file-index/<file_hex>` after `clean` so the
-/// lukewarm smudge knows this file's bytes are stageable locally AND
-/// push-pending knows how big a byte range to ask the local reconstructor
-/// for. Content is the file size in decimal ASCII; readers tolerate empty
-/// markers for backward compat.
+/// Write the `<file_hex>` marker (body = file size, decimal ASCII) after clean,
+/// gating the lukewarm smudge and giving push-pending the reconstruct range.
 pub fn mark_file_staged(git_dir: &Path, file_hex: &str, file_size: u64) -> std::io::Result<()> {
     crate::fs_util::create_bale_subdir(git_dir, "staging/file-index")?;
     let path = file_marker_path(git_dir, file_hex);
@@ -51,10 +40,8 @@ pub fn file_is_staged(git_dir: &Path, file_hex: &str) -> bool {
     file_marker_path(git_dir, file_hex).exists()
 }
 
-/// Returns every `(file_hex, file_size)` pair currently in `file-index/`. A
-/// marker with an empty or malformed body yields `file_size = None`, so
-/// push-pending can decide what to do (typically: skip it and warn — without
-/// a size, FileDownloadSession can't be primed).
+/// Every `(file_hex, file_size)` in `file-index/`; an empty/malformed body
+/// yields `None` (push-pending can't prime FileDownloadSession, so it warns).
 pub fn list_staged_files(git_dir: &Path) -> std::io::Result<Vec<(String, Option<u64>)>> {
     let dir = file_index_dir(git_dir);
     let rd = match std::fs::read_dir(&dir) {
@@ -90,8 +77,8 @@ fn is_64_lower_hex(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Drop the entire `file-index/` directory. `push-pending` calls this after a
-/// successful drain so markers don't outlive the bytes they advertise.
+/// Drop `file-index/`. push-pending calls this after a drain so markers don't
+/// outlive the bytes they advertise.
 pub fn clear_file_markers(git_dir: &Path) -> std::io::Result<()> {
     let dir = file_index_dir(git_dir);
     match std::fs::remove_dir_all(&dir) {
@@ -101,9 +88,8 @@ pub fn clear_file_markers(git_dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Forget a single `<file_hex>` marker. `git-bale gc` calls this when a staged
-/// file is no longer referenced by the index or any unpushed commit. NotFound
-/// is fine (concurrent push-pending may have already cleared it).
+/// Forget one `<file_hex>` marker (gc). NotFound is fine — concurrent
+/// push-pending may have cleared it.
 pub fn remove_marker(git_dir: &Path, file_hex: &str) -> std::io::Result<()> {
     match std::fs::remove_file(file_marker_path(git_dir, file_hex)) {
         Ok(()) => Ok(()),
@@ -113,9 +99,8 @@ pub fn remove_marker(git_dir: &Path, file_hex: &str) -> std::io::Result<()> {
 }
 
 /// Recursively delete every `default.<hex>` (xorb) and `<hex>.mdb` (shard) leaf
-/// under `staging`. The `file-index/` dir and the now-empty `xet/` tree are
-/// left for [`remove_empty_dirs`]. Shared by `push-pending` (after a drain) and
-/// `git-bale gc` (when no markers remain, so nothing references these xorbs).
+/// under `staging`; empty dirs are left for [`remove_empty_dirs`]. Called once
+/// nothing references these xorbs (push-pending drain / gc with no markers).
 pub fn remove_all_staged_objects(staging: &Path) -> std::io::Result<()> {
     let rd = match std::fs::read_dir(staging) {
         Ok(rd) => rd,

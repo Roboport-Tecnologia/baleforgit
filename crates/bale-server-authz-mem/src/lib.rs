@@ -1,5 +1,4 @@
-//! In-memory `RepoAuthz` implementations: [`AlwaysAllow`] for tests,
-//! [`ConfigAuthz`] for static hub-token → repo-scope configs.
+//! In-memory `RepoAuthz` implementations.
 
 use async_trait::async_trait;
 use bale_server_core::{CoreError, CoreResult, RepoAuthz, RepoRef, Scope, TokenClaims, UserId};
@@ -92,9 +91,7 @@ impl ConfigAuthz {
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 3600;
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    // Folds the length difference into the accumulator: hub bearers in the
-    // grants table can be different lengths and we don't want a presented
-    // token's length to be exfiltrated via the timing of the length mismatch.
+    // Fold the length diff in so a presented token's length isn't leaked via timing.
     let mut acc: u32 = (a.len() ^ b.len()) as u32;
     for (x_a, x_b) in a.iter().zip(b.iter()) {
         acc |= (x_a ^ x_b) as u32;
@@ -114,8 +111,7 @@ impl RepoAuthz for ConfigAuthz {
         repo: &RepoRef,
         requested: Scope,
     ) -> CoreResult<UserId> {
-        // Trust boundary: avoid a HashMap-keyed lookup so the hub bearer
-        // comparison doesn't leak length/prefix via timing.
+        // Iterate + ct_eq instead of a HashMap lookup so the hub bearer match doesn't leak via timing.
         let mut found: Option<&ConfigUser> = None;
         for (k, v) in &self.users {
             if ct_eq(k.as_bytes(), hub_bearer.as_bytes()) {

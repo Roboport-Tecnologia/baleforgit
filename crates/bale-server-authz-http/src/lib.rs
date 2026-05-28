@@ -14,8 +14,8 @@
 //! 403 Forbidden      — known user, insufficient access
 //! ```
 //!
-//! `hub_bearer` is opaque to baleforgit-server — typically a short-lived JWT minted
-//! by the upstream so no long-lived credential reaches baleforgit-server.
+//! `hub_bearer` is opaque to baleforgit-server, so no long-lived credential
+//! reaches it.
 
 use async_trait::async_trait;
 use bale_server_core::{CoreError, CoreResult, RepoAuthz, RepoRef, Scope, TokenClaims, UserId};
@@ -26,9 +26,7 @@ use std::time::Duration;
 
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 3600;
 
-/// Cap on the upstream `check_access` response body. The contract returns a
-/// tiny JSON like `{"user_id": "alice"}`; anything materially larger is either
-/// a misconfigured upstream or a hostile one trying to OOM us.
+/// Caps a hostile upstream that streams gigabytes; the real body is tiny JSON.
 const MAX_UPSTREAM_RESPONSE_BYTES: u64 = 64 * 1024;
 
 pub struct HttpAuthz {
@@ -37,9 +35,7 @@ pub struct HttpAuthz {
     jwt_secret: Vec<u8>,
 }
 
-// Parsing the base URL up front rejects misconfiguration (relative URLs, junk
-// schemes) before any request fires, and `Url::join` composes the path safely
-// regardless of query/fragment in the base.
+// Reject misconfiguration (relative URLs, junk schemes) before any request fires.
 fn build_check_access_url(base_url: &str) -> CoreResult<Url> {
     let trimmed = base_url.trim_end_matches('/');
     let mut base = Url::parse(trimmed)
@@ -121,12 +117,8 @@ impl RepoAuthz for HttpAuthz {
             .map_err(|e| CoreError::Internal(format!("upstream call: {e}")))?;
         match resp.status() {
             s if s.is_success() => {
-                // Reject obviously-oversized responses up front via content_length;
-                // for a streamed/unknown-length body, the bytes() call below uses
-                // reqwest's internal accumulator which is itself bounded by the
-                // client's response_body_limit setting if configured. The hard
-                // cap here is defense-in-depth against an upstream that lies in
-                // Content-Length and then streams gigabytes.
+                // Cap before buffering; the post-read check catches an upstream
+                // that lies in Content-Length then streams more.
                 if let Some(len) = resp.content_length() {
                     if len > MAX_UPSTREAM_RESPONSE_BYTES {
                         return Err(CoreError::Internal("upstream response too large".into()));
@@ -139,9 +131,8 @@ impl RepoAuthz for HttpAuthz {
                 if bytes.len() as u64 > MAX_UPSTREAM_RESPONSE_BYTES {
                     return Err(CoreError::Internal("upstream response too large".into()));
                 }
-                // Decode-error message intentionally generic: reqwest's JSON-decode
-                // error can echo a body snippet, which is risky if a misbehaving
-                // upstream ever reflects the bearer back to us.
+                // Generic message: reqwest's decode error can echo a body snippet,
+                // which could leak a bearer reflected back by the upstream.
                 let parsed: CheckAccessResponse = serde_json::from_slice(&bytes)
                     .map_err(|_| CoreError::Internal("upstream body decode failed".into()))?;
                 Ok(UserId(parsed.user_id))

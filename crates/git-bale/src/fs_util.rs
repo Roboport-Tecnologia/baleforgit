@@ -3,10 +3,8 @@
 use std::io;
 use std::path::Path;
 
-/// Create `<git_dir>/bale/<subdir>` (and parents) and, on Unix, tighten
-/// `<git_dir>/bale/` to 0o700 so cache contents (pathname-keyed content
-/// hashes, file-id markers, in-flight xorbs) aren't world-readable.
-/// Idempotent and cheap to call from any cache-write entry point.
+/// Create `<git_dir>/bale/<subdir>` and tighten `bale/` to 0o700 on Unix so
+/// cache contents aren't world-readable. Idempotent.
 pub fn create_bale_subdir(git_dir: &Path, subdir: &str) -> io::Result<()> {
     let bale = git_dir.join("bale");
     let sub = bale.join(subdir);
@@ -26,10 +24,8 @@ fn restrict_bale_perms(bale: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Tighten `dir` (and its parent named `bale`, if present) to 0o700.
-/// Used for the user-wide chunk cache `~/.cache/bale/chunks`, which is
-/// created by `xet-client` rather than by us — we only get to lock it
-/// down after the fact. No-op on non-Unix.
+/// Tighten `dir` (and a parent named `bale`) to 0o700. The user-wide chunk
+/// cache is created by `xet-client`, so we can only lock it down after the fact.
 pub fn restrict_user_cache_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {

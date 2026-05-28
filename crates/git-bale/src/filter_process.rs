@@ -1,9 +1,5 @@
 //! `git-bale filter-process` — Git's long-running filter protocol over
 //! pkt-line, wired to xet-core's `FileUploadSession` / `FileDownloadSession`.
-//!
-//! On `command=clean`, the payload is file content and we respond with the
-//! pointer. On `command=smudge`, the payload is the pointer and we respond
-//! with the reconstructed file content.
 
 use std::io::{stdin, stdout, Read, Write};
 use std::path::Path;
@@ -23,9 +19,8 @@ use crate::local_reconstruct::{try_reconstruct_from_cache, CacheReconstructOutco
 use crate::manifest_cache;
 use crate::pktline::{PktReader, PktWriter, MAX_PKT_PAYLOAD};
 
-// Per-callsite caps on `read_binary_to`. Defense-in-depth against a
-// misbehaving peer pushing us into unbounded heap growth. Numbers are
-// well above any real bale workload, not tuned to a protocol limit.
+// Per-callsite `read_binary_to` caps: defense against a peer forcing unbounded
+// heap growth. Well above any real workload, not a protocol limit.
 const SMUDGE_PAYLOAD_CAP: u64 = (pointer::POINTER_MAX_BYTES as u64) + 4096;
 const CLEAN_PAYLOAD_CAP: u64 = 128 * 1024 * 1024 * 1024;
 const DRAIN_PAYLOAD_CAP: u64 = 64 * 1024 * 1024;
@@ -49,15 +44,12 @@ pub fn run() -> Result<()> {
     handshake(&mut reader, &mut writer)?;
     negotiate_capabilities(&mut reader, &mut writer)?;
 
-    // XetRuntime startup allocates worker-thread stacks (8 MiB each by default).
-    // Cache-hit cleans don't need it, and `git diff` paying that cost on every
-    // invocation is what makes pointer-cache-hit cleans feel sluggish. Defer
-    // construction to the first caller that actually needs it.
+    // XetRuntime startup allocates 8 MiB worker stacks; cache-hit cleans don't
+    // need it. Defer construction so pointer-cache hits stay fast.
     let mut rt_slot: Option<Arc<XetRuntime>> = None;
 
-    // Smudge auth is cached for the life of this filter-process. Clean no
-    // longer needs auth — it writes to <git_dir>/bale/staging/ and the actual
-    // upload happens later via `git-bale push-pending`.
+    // Clean no longer needs auth — it writes to staging; upload is deferred to
+    // `git-bale push-pending`. Only smudge resolves auth, cached for the process.
     let mut smudge_cfg: Option<BaleConfig> = None;
 
     loop {
@@ -67,7 +59,6 @@ pub fn run() -> Result<()> {
             Err(e) => return Err(e.into()),
         };
         if headers.is_empty() {
-            // Git closes its side of the pipe with no more headers — done.
             return Ok(());
         }
         let map = parse_headers(&headers);
@@ -82,9 +73,8 @@ pub fn run() -> Result<()> {
             .map(|(_, v)| v.as_str())
             .unwrap_or("<unknown>");
 
-        // A panic or `?`-propagated error here would tank the whole git
-        // operation. Report per-request failures as `status=error` pktlines so
-        // Git can surface them and continue with the next entry.
+        // Per-request failures go out as `status=error` pktlines; a propagated
+        // error would tear down the filter-process and tank the whole git op.
         match command {
             "clean" => {
                 if let Err(e) = do_clean(&mut rt_slot, &raw, &mut reader, &mut writer, pathname) {
@@ -186,14 +176,10 @@ fn drain_payload<R: Read>(reader: &mut PktReader<R>) -> Result<()> {
     Ok(())
 }
 
-/// Report a per-request failure as a trailing `status=error` so Git rejects
-/// this entry without us tearing down the whole filter-process. The error
-/// chain is sent verbatim via `{e:#}`; callers must not put secrets in the
-/// `anyhow::Error` chain (passwords, JWTs, the bale token).
-///
-/// `_reader` is held to make it clear at the call sites that the input
-/// payload has already been consumed by the failing handler — re-draining
-/// here would either block (input already at flush) or desync the stream.
+/// Error chain is sent verbatim via `{e:#}`; callers must not put secrets
+/// (passwords, JWTs, the bale token) in the `anyhow::Error` chain. `_reader`
+/// is held only to signal the payload was already consumed — re-draining would
+/// block or desync the stream.
 fn report_request_error<R: Read, W: Write>(
     _reader: &mut PktReader<R>,
     writer: &mut PktWriter<W>,
@@ -215,17 +201,13 @@ fn ensure_runtime(slot: &mut Option<Arc<XetRuntime>>) -> Result<&Arc<XetRuntime>
     Ok(slot.as_ref().unwrap())
 }
 
-/// Above this size we spill the pkt-line payload to a tmp file instead of
-/// holding the full file in RAM. Picked to keep peak RSS bounded for the
-/// common bale workloads (single-digit GiB binaries) while still being big
-/// enough that essentially every realistic file stays in-memory and avoids
-/// the disk round-trip that previously cost ~250 ms on a 350 MiB file.
+/// Above this size, spill the pkt-line clean payload to a tmp file instead of
+/// holding the whole file in RAM. Bounds peak RSS while keeping realistic files
+/// in-memory to avoid the disk round-trip (~250 ms on a 350 MiB file).
 const MAX_INLINE_CLEAN: usize = 4 * 1024 * 1024 * 1024;
 
-/// Resolve the in-memory/spill threshold. `BALE_MAX_INLINE_CLEAN` (a byte
-/// count) overrides the default so tests can exercise the spilled-clean path
-/// without staging a multi-GiB file; an unset or unparseable value falls back
-/// to [`MAX_INLINE_CLEAN`].
+/// `BALE_MAX_INLINE_CLEAN` overrides the threshold so tests can hit the spilled
+/// path without a multi-GiB file.
 fn max_inline_clean() -> usize {
     std::env::var("BALE_MAX_INLINE_CLEAN")
         .ok()
@@ -233,18 +215,11 @@ fn max_inline_clean() -> usize {
         .unwrap_or(MAX_INLINE_CLEAN)
 }
 
-/// Holds the clean payload either entirely in memory or spilled to a tmp file.
-/// Whichever branch we take, downstream cache-verify and xet-pipeline calls
-/// pick the matching code path.
 enum CleanPayload {
     InMemory(Vec<u8>),
     Spilled(NamedTempFile),
 }
 
-/// Drain the pkt-line clean payload. Stays in `Vec<u8>` until it would exceed
-/// `MAX_INLINE_CLEAN`, at which point we transfer accumulated bytes to a tmp
-/// file and continue spilling there. Bytes received are unchanged either way
-/// — the choice is purely about where they live.
 fn drain_clean_payload<R: Read>(
     reader: &mut PktReader<R>,
     max_inline: usize,
@@ -306,9 +281,8 @@ fn do_clean<R: Read, W: Write>(
     })?;
     let cache_key = clean_cache::path_key(pathname);
 
-    // Pointer cache: `git status` / `git diff` re-invoke clean on every
-    // command for any modified bale-filtered file. Look up the per-path
-    // entry, short-circuit on size mismatch, then sample-verify chunks.
+    // `git status`/`git diff` re-invoke clean on every command for a modified
+    // bale file; short-circuit on size, then sample-verify chunks.
     match clean_cache::load(git_dir, &cache_key) {
         Ok(Some(entry)) => {
             if entry.size != file_size {
@@ -354,11 +328,9 @@ fn do_clean<R: Read, W: Write>(
     }
 }
 
-/// In-memory variant of [`handle_clean`] used when the pkt-line payload fits
-/// in `MAX_INLINE_CLEAN` and we never spilled to disk. Saves both the tmp-file
-/// write and the second full read that `clean_file` would do, plus the third
-/// read that `compute_chunks` would do — the chunk index is built from the
-/// same buffer that already lives in RAM.
+/// In-memory variant of [`handle_clean`]: avoids the tmp-file write plus the
+/// re-reads `clean_file`/`compute_chunks` would do, building the chunk index
+/// from the buffer already in RAM.
 fn handle_clean_in_memory<W: Write>(
     rt: &Arc<XetRuntime>,
     git_dir: &Path,
@@ -373,8 +345,7 @@ fn handle_clean_in_memory<W: Write>(
     let staging = staging_root(git_dir);
     let translator =
         TranslatorConfig::local_config(&staging).context("building local TranslatorConfig")?;
-    // Build the cache index from the in-memory buffer BEFORE handing ownership
-    // of the Vec to xet-data — clean_bytes consumes it.
+    // Build the index before clean_bytes consumes the Vec.
     let chunks = clean_cache::compute_chunks_from_slice(&bytes);
     let (pointer_string, file_hex) = rt
         .bridge_sync(async move {
@@ -422,17 +393,15 @@ fn handle_clean<W: Write>(
     cache_key: &PathKey,
     file_size: u64,
 ) -> Result<()> {
-    // Stage chunks/xorbs/shards under <git_dir>/bale/staging/ via xet-data's
-    // LocalClient instead of uploading. `git-bale push-pending` (driven by a
-    // pre-push hook) drains the staging dir at push time.
+    // Stage chunks/xorbs/shards locally via xet-data's LocalClient instead of
+    // uploading; `git-bale push-pending` drains staging at push time.
     crate::fs_util::create_bale_subdir(git_dir, "staging")
         .with_context(|| format!("creating staging dir under {}", git_dir.display()))?;
     let staging = staging_root(git_dir);
     let translator =
         TranslatorConfig::local_config(&staging).context("building local TranslatorConfig")?;
-    // Keep `tmp` alive across the bridge_sync — moving it into the async
-    // closure would drop (and unlink) the temp file before `compute_chunks`
-    // runs below. Pass only the path into the closure.
+    // Moving `tmp` into the closure would unlink it before compute_chunks below;
+    // pass only the path and keep `tmp` owned out here.
     let tmp_path = tmp.path().to_path_buf();
     let tmp_path_for_xet = tmp_path.clone();
     let (pointer_string, file_hex) = rt
@@ -451,27 +420,22 @@ fn handle_clean<W: Write>(
         })
         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 
-    // Marker tells the lukewarm smudge fallback that this file_hash is
-    // reconstructable from staging. Without it, smudges for other file_hashes
-    // (e.g. `git stash`'s HEAD-restore phase, where staging holds the modified
-    // version's chunks but smudge wants the HEAD version) drop into xet-data's
-    // term-prefetch loop, return zero terms, and trip a `debug_assert_eq!` in
-    // its progress tracker. Best-effort: a failed marker write is a perf
-    // regression on the next checkout-after-add, not a correctness issue.
+    // Marker gates the lukewarm smudge fallback. Without it, a smudge for a
+    // not-staged file_hash (e.g. `git stash`'s HEAD-restore) returns zero terms
+    // and trips a `debug_assert_eq!` in xet-data's progress tracker. Best-effort:
+    // a failed write only costs a cache miss on the next checkout-after-add.
     if let Err(e) = mark_file_staged(git_dir, &file_hex, file_size) {
         tracing::warn!("failed to mark {file_hex} staged: {e}");
     }
 
-    // Respond to git first so the pipeline keeps moving; cache population
-    // below is best-effort and shouldn't delay the pointer landing in the
-    // index.
+    // Respond before populating the cache so the pointer lands in the index
+    // without waiting on best-effort cache work.
     writer.write_text_list(&["status=success"])?;
     writer.write_all_then_flush(pointer_string.as_bytes())?;
     writer.write_text_list(&["status=success"])?;
 
-    // Build the chunk index for next time. Failures here only sacrifice
-    // future cache hits, not this clean's correctness. `tmp` is still owned
-    // here, so the temp file is still on disk.
+    // Best-effort chunk index for next time; `tmp` is still owned, so the file
+    // is still on disk.
     match clean_cache::compute_chunks(&tmp_path, file_size) {
         Ok(chunks) => {
             let entry = clean_cache::CacheEntry {
@@ -506,12 +470,9 @@ fn handle_smudge<R: Read, W: Write>(
     let file_size = info
         .file_size()
         .ok_or_else(|| anyhow!("bale pointer missing file_size"))?;
-    // The pointer's `hash` field is a free-form String in xet-data with no
-    // deserialization-time validation. Constraining it to lowercase hex here
-    // keeps it safe to interpolate into the manifest cache path
-    // (`<git-dir>/bale/manifests/<file_id_hex>.json`) — otherwise a crafted
-    // pointer like `{"hash":"../../etc/passwd"}` would read/write outside the
-    // git dir.
+    // The pointer's `hash` is a free-form String in xet-data; constrain it to
+    // lowercase hex before interpolating into the manifest cache path, or a
+    // crafted `{"hash":"../../etc/passwd"}` escapes the git dir.
     let file_id_hex = info.hash().to_string();
     if !is_safe_file_id(&file_id_hex) {
         return Err(anyhow!(
@@ -520,8 +481,7 @@ fn handle_smudge<R: Read, W: Write>(
         ));
     }
 
-    // Built from raw config so cache initialization never triggers auth
-    // resolution (the hot path stays purely local).
+    // From raw config so the hot path stays local — no auth resolution.
     let cache_cfg = CacheConfig {
         cache_directory: raw.cache_dir.clone(),
         cache_size: rt.config().chunk_cache.size_bytes,
@@ -532,13 +492,13 @@ fn handle_smudge<R: Read, W: Write>(
         tracing::debug!("tightening perms on {}: {e}", raw.cache_dir.display());
     }
 
-    // ---- Hot path: cache-only reconstruction ----------------------------
+    // Hot path: cache-only reconstruction.
     let tmp = NamedTempFile::new()?;
     let cache_hit = if let Some(git_dir) = raw.git_dir.as_deref() {
         match manifest_cache::load(git_dir, &file_id_hex) {
             Ok(Some(manifest)) => {
-                // Reopen by path so the async block owns its own File handle
-                // and `tmp` stays usable for the byte-streaming below.
+                // Reopen so the async block owns its own handle and `tmp` stays
+                // usable for the byte-streaming below.
                 let dest_file = tmp.reopen()?;
                 let rt_for_cache = rt.clone();
                 let cache_for_cache = chunk_cache.clone();
@@ -569,11 +529,9 @@ fn handle_smudge<R: Read, W: Write>(
         false
     };
 
-    // ---- Lukewarm path: bytes still staged locally, not yet pushed ------
-    // Gated on a per-file marker the clean filter wrote when it staged the
-    // file. Without the marker, attempting reconstruction tickles a
-    // `debug_assert_eq!` panic in xet-data's `ReconstructionTermManager` when
-    // the term list is empty (see the comment in `staging::mark_file_staged`).
+    // Lukewarm path: bytes still staged locally, not yet pushed. Gated on the
+    // per-file marker — reconstructing without it trips a `debug_assert_eq!` in
+    // xet-data on an empty term list (see `staging::mark_file_staged`).
     let staging_hit = if !cache_hit
         && raw
             .git_dir
@@ -592,7 +550,7 @@ fn handle_smudge<R: Read, W: Write>(
         false
     };
 
-    // ---- Cold / lukewarm path: delegate to xet-data ---------------------
+    // Cold path: delegate to xet-data.
     if !cache_hit && !staging_hit {
         // Discard any partial bytes from a failed hot-path attempt.
         let mut trunc = tmp.reopen()?;
@@ -602,16 +560,13 @@ fn handle_smudge<R: Read, W: Write>(
 
         let cfg = resolve_cached(auth_slot, raw, rt, resolver::Scope::Read)?;
 
-        // The `0..file_size` range cap is load-bearing. xet-data's
-        // `download_file` passes `FileRange::full()` (0..u64::MAX) into
-        // `FileReconstructor`, and `ReconstructionTermManager` prefetches
-        // up to `min_reconstruction_fetch_size` (default 256 MiB) past EOF.
-        // baleforgit-server has no Range support on `/v1/reconstructions/*` (see
-        // docs/ARCHITECTURE.md), so every prefetched block re-receives the
-        // full-file terms — xet-data accumulates them, shifting
-        // `cur_file_byte_offset` forward by 256 MiB each round and tripping
-        // the SequentialWriter's contiguity check. Capping the range at
-        // `file_size` skips the speculative prefetch entirely.
+        // The `0..file_size` range cap is load-bearing (do not pass
+        // `FileRange::full()`). With full(), `ReconstructionTermManager`
+        // prefetches up to 256 MiB past EOF, but baleforgit-server has no Range
+        // support on `/v1/reconstructions/*` (see docs/ARCHITECTURE.md), so each
+        // prefetch re-receives full-file terms, shifting `cur_file_byte_offset`
+        // 256 MiB per round and tripping SequentialWriter's contiguity check.
+        // Capping at `file_size` skips the speculative prefetch entirely.
         let translator = build_translator_config(cfg)?;
         let dest_file = tmp.reopen()?;
         let info_for_dl = info.clone();
@@ -626,9 +581,8 @@ fn handle_smudge<R: Read, W: Write>(
         })
         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 
-        // One extra small request per cold-path file; subsequent checkouts
-        // hit the hot path. Best-effort — failure here only keeps the cache
-        // cold, it doesn't fail the smudge.
+        // Best-effort manifest fetch so subsequent checkouts hit the hot path;
+        // failure only keeps the cache cold.
         if let Some(git_dir) = raw.git_dir.as_deref() {
             let merkle = match info.merkle_hash() {
                 Ok(h) => h,
@@ -656,12 +610,9 @@ fn handle_smudge<R: Read, W: Write>(
         }
     }
 
-    // Populate the clean cache from the smudge result. We have both inputs
-    // to the clean(content)→pointer mapping (the pointer git just gave us,
-    // and the bytes we just reconstructed), so future `git status`/`git diff`
-    // calls on the same path can hit without re-running CDC. This is what
-    // makes `git checkout -- foo` fast on the next status: HEAD's content
-    // gets back to disk and the cache simultaneously learns its fingerprint.
+    // We hold both sides of the content→pointer mapping (the pointer git gave
+    // us, the bytes we reconstructed), so seed the clean cache to make the next
+    // `git status`/`git diff` on this path hit without re-running CDC.
     if let Some(git_dir) = raw.git_dir.as_deref() {
         populate_clean_cache_from_smudge(git_dir, pathname, tmp.path(), &pointer_buf, file_size);
     }
@@ -676,9 +627,6 @@ fn populate_clean_cache_from_smudge(
     pointer_bytes: &[u8],
     file_size: u64,
 ) {
-    // `pointer_bytes` was already validated as UTF-8 by `parse_pointer`
-    // upstream, so this clones once into an owned String without
-    // re-allocating for the lossy ASCII path.
     let pointer = match std::str::from_utf8(pointer_bytes) {
         Ok(s) => s.to_string(),
         Err(_) => {
@@ -708,10 +656,8 @@ fn populate_clean_cache_from_smudge(
     }
 }
 
-/// Try reconstruct the file from `<git_dir>/bale/staging/`. Returns `Ok(true)`
-/// when bytes were written, `Ok(false)` when there is no usable staging dir
-/// (no git dir, or it's missing). Network and on-disk errors propagate so the
-/// caller logs them and falls through to the normal cold path.
+/// Reconstruct from staging. `Ok(false)` means no usable staging dir; on-disk
+/// errors propagate so the caller falls through to the cold path.
 fn try_smudge_from_staging(
     rt: &Arc<XetRuntime>,
     raw: &crate::config::RawConfig,
@@ -757,8 +703,7 @@ fn finish_smudge<W: Write>(writer: &mut PktWriter<W>, tmp_path: &Path) -> Result
     Ok(())
 }
 
-/// MerkleHash is 32 bytes → 64 hex chars. We accept the canonical length only;
-/// anything else is treated as a malformed/hostile pointer.
+/// MerkleHash is 32 bytes → 64 hex chars; reject any other length as hostile.
 fn is_safe_file_id(s: &str) -> bool {
     s.len() == 64
         && s.bytes()

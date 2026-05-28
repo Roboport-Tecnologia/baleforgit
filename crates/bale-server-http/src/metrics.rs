@@ -1,10 +1,6 @@
-//! OpenTelemetry instrumentation for the HTTP layer.
-//!
-//! Every instrument is fetched from `opentelemetry::global` — when no provider
-//! is installed (the default, e.g. when the binary was launched without
-//! `OTEL_EXPORTER_OTLP_ENDPOINT`) the global no-op provider just drops the
-//! samples on the floor. So this module is safe to wire in unconditionally;
-//! the bin opts in by initialising the SDK side.
+//! OpenTelemetry instrumentation for the HTTP layer. Safe to wire in
+//! unconditionally: with no provider installed (no `OTEL_EXPORTER_OTLP_ENDPOINT`)
+//! the global no-op provider drops every sample. The bin opts in via the SDK.
 
 use axum::extract::{MatchedPath, Request};
 use axum::middleware::Next;
@@ -60,10 +56,8 @@ pub(crate) static RECONSTRUCTIONS_SERVED: LazyLock<Counter<u64>> = LazyLock::new
         .build()
 });
 
-/// Per-request middleware. Reads the axum-matched route pattern out of the
-/// request extensions so labels stay low-cardinality — falling back to a
-/// literal "unmatched" rather than the raw URI (which would carry hashes /
-/// owner names and blow the cardinality budget on Prometheus / Tempo).
+// Labels with the axum-matched route pattern, not the raw URI: the URI carries
+// hashes / owner names that would blow the metric cardinality budget.
 pub async fn middleware(req: Request, next: Next) -> Response {
     let start = Instant::now();
     let method = req.method().as_str().to_string();

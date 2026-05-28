@@ -1,7 +1,6 @@
-//! Cache-only reconstruction: given a [`CachedManifest`] and a populated
-//! local chunk cache, write the file's bytes to `out` without touching the
-//! network. Any missing chunk → `Miss`, and the caller falls back to
-//! `FileDownloadSession` (which also repopulates the cache).
+//! Cache-only reconstruction from a [`CachedManifest`] + local chunk cache, no
+//! network. Any missing chunk → `Miss`; the caller falls back to
+//! `FileDownloadSession` (which repopulates the cache).
 
 use std::io::Write;
 use std::sync::Arc;
@@ -14,13 +13,11 @@ use xet_runtime::core::XetRuntime;
 
 use crate::manifest_cache::CachedManifest;
 
-/// Distinguishing miss from error lets the caller fall back on misses while
-/// still propagating real failures.
+/// Miss is distinct from error so the caller falls back on misses but still
+/// propagates real failures.
 pub enum CacheReconstructOutcome {
-    /// All chunks were available; `expected_size` bytes written to `out`.
     Wrote(u64),
-    /// A chunk was missing. `out` may have been partially written and should
-    /// be reset before the caller retries.
+    /// A chunk was missing; `out` may be partially written, reset before retry.
     Miss,
 }
 

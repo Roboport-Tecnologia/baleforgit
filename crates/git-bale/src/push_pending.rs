@@ -1,31 +1,16 @@
 //! `git-bale push-pending` — drains the per-repo staging area to the bale
 //! server.
 //!
-//! Instead of POSTing the locally-staged xorbs/shards verbatim (which would
-//! miss xet-data's global-dedup query path entirely — the whole staging dir
-//! was produced by `TranslatorConfig::local_config`, which uses a
-//! filesystem-backed dedup table that knows nothing about the server), we
-//! reconstruct each staged file from local staging via a download session,
-//! then **re-translate** it through an online `FileUploadSession`. The
-//! online session does the proper dedup dance:
+//! POSTing staged xorbs/shards verbatim would bypass the server's global dedup
+//! (staging's dedup table is filesystem-local and knows nothing about the
+//! server), re-uploading ~35 MiB of dupes for an 8-byte edit. Instead we
+//! reconstruct each staged file from staging and re-translate it through an
+//! online `FileUploadSession`, which queries server-known chunks and only POSTs
+//! genuinely new xorbs/shards. Clean stays offline; the contract holds.
 //!
-//!   - for chunks already known to the server (via the eligibility-gated
-//!     `GET /v1/chunks/{prefix}/{hash}` query), reuse the existing xorb
-//!     terms — no new bytes uploaded;
-//!   - for chunks the server doesn't know, pack them into new xorbs and
-//!     `POST /v1/xorbs/default/{hash}` them;
-//!   - shards built from the resulting per-file terms get `POST`ed to
-//!     `/shards`.
-//!
-//! That keeps the "defer-uploads" contract intact (clean is still offline)
-//! while preventing the bug where editing 8 bytes in a 35 MiB file uploads
-//! ~35 MiB of duplicate xorbs every push.
-//!
-//! Re-translation is safe because xet's CDC is deterministic: the merkle
-//! file hash that comes out of the online session must equal the file_hex
-//! the clean filter recorded in the marker. We assert that and bail
-//! loudly on mismatch — a divergence would indicate either xet-data version
-//! skew between clean and push-pending or staging-side corruption.
+//! Safe because xet's CDC is deterministic: the merkle hash out of the online
+//! session must equal the marker's `file_hex`. We assert that and bail on
+//! mismatch (version skew between clean and push-pending, or staging corruption).
 
 use std::sync::Arc;
 
@@ -58,9 +43,7 @@ pub fn run() -> Result<()> {
     let staged_files = list_staged_files(&git_dir)
         .with_context(|| format!("listing staged files in {}", staging.display()))?;
     if staged_files.is_empty() {
-        // No marker files → either nothing was cleaned, or a previous run
-        // already drained the markers but left behind orphan objects. Clean
-        // the empty tree as best-effort and exit.
+        // No markers → nothing cleaned, or a prior run drained but left orphans.
         let _ = remove_empty_dirs(&staging);
         return Ok(());
     }
@@ -71,9 +54,8 @@ pub fn run() -> Result<()> {
         .bridge_sync(async move { resolver::resolve(&raw_for_auth, resolver::Scope::Write).await })
         .map_err(|e| anyhow!("xet runtime error during Bale auth resolution: {e:?}"))??;
 
-    // Online config drives the upload session (real RemoteClient — global
-    // dedup query path + POSTs to /v1/xorbs and /shards). Local config
-    // drives the download session (reads from staging/).
+    // Online config = upload session (server dedup + POSTs); local config =
+    // download session reading from staging/.
     let online_cfg = default_config(
         auth.server_url.trim_end_matches('/').to_string(),
         Some((auth.token.clone(), auth.token_expiration)),
@@ -110,8 +92,7 @@ pub fn run() -> Result<()> {
     })
     .map_err(|e| anyhow!("xet runtime error during push-pending: {e:?}"))??;
 
-    // Past this point the server holds (at minimum) the file's
-    // reconstruction info. Safe to drop staging.
+    // Server now holds the reconstruction info; safe to drop staging.
     if let Err(e) = clear_file_markers(&git_dir) {
         tracing::warn!("clearing file markers in {}: {e}", staging.display());
     }
@@ -129,12 +110,9 @@ async fn re_translate_one(
     file_hex: &str,
     file_size: u64,
 ) -> Result<()> {
-    // Reconstruct from the local staging into a temp file, then feed the
-    // temp file to the online upload session. We can't stream straight from
-    // download to upload because `clean_file` takes a path (it reads the
-    // file twice — once for hashing, once for chunking — and needs random
-    // access). For typical bale workloads (large opaque binaries) the
-    // tempfile round-trip is cheap relative to the actual chunking.
+    // Via a temp file because `clean_file` takes a path (it reads twice —
+    // hashing then chunking — and needs random access), so we can't stream
+    // download straight into upload.
     let tmp = NamedTempFile::new().context("creating temp file for re-translation")?;
     let info_for_dl = XetFileInfo::new(file_hex.to_string(), file_size);
     let writer = tmp
@@ -149,10 +127,9 @@ async fn re_translate_one(
         .await
         .with_context(|| format!("re-cleaning {file_hex} through online session"))?;
 
-    // Deterministic CDC means the hash must round-trip. A mismatch points
-    // at a real corruption (or xet-data version skew between clean and
-    // push-pending) — abort before uploading a shard that disagrees with
-    // the pointer Git already committed.
+    // Deterministic CDC means the hash must round-trip; a mismatch (corruption
+    // or version skew) means aborting before uploading a shard that disagrees
+    // with the committed pointer.
     if new_info.hash() != file_hex {
         bail!(
             "re-translation produced file_hash {} but staged pointer said {} \

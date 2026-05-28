@@ -1,7 +1,5 @@
-//! Parse a `git remote get-url origin` value into the parts we need for
-//! discovery and auth: protocol, host, optional port, repo path.
-//!
-//! Recognized shapes (the standard set git-lfs and most forges accept):
+//! Parse an `origin` URL into protocol/host/port/repo-path for discovery and
+//! auth. Recognized shapes (`.git` suffix optional, stripped):
 //!
 //! ```text
 //!   https://git.example.com/alice/repo.git
@@ -9,8 +7,6 @@
 //!   git@git.example.com:alice/repo.git             (scp-style SSH)
 //!   ssh://git@git.example.com:2222/alice/repo.git
 //! ```
-//!
-//! The `.git` suffix on the path is optional and stripped if present.
 
 use std::path::Path;
 
@@ -52,11 +48,9 @@ impl RemoteUrl {
         Ok((owner, repo))
     }
 
-    /// Reconstruct the base URL the forge's Bale endpoints live under for
-    /// this remote, regardless of which scheme the remote actually uses. For
-    /// SSH remotes we assume https on the same host on the default port —
-    /// the caller can override via `bale.serverUrl` if the deployment splits
-    /// the forge's HTTP and SSH onto different hosts.
+    /// Base URL for the forge's Bale endpoints. SSH remotes assume https on the
+    /// same host/default port; override via `bale.serverUrl` if HTTP and SSH
+    /// live on different hosts.
     pub fn https_base(&self) -> String {
         match self.scheme {
             RemoteScheme::Http => format!("http://{}", self.host_with_port(80)),
@@ -147,9 +141,7 @@ fn strip_dot_git(p: &str) -> &str {
         .unwrap_or(p.trim_start_matches('/'))
 }
 
-/// Look up `origin`'s fetch URL via gix and parse it. Replaces a
-/// `git remote get-url origin` subprocess on the smudge cold path / push-pending
-/// auth resolution.
+/// Look up and parse `origin`'s fetch URL via gix (no `git remote` subprocess).
 pub fn parse_origin(repo: Option<&Path>) -> Result<RemoteUrl> {
     let start_dir = repo
         .map(|p| p.to_path_buf())

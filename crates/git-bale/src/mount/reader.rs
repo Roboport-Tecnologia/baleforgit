@@ -1,16 +1,7 @@
-//! Byte-source for virtual files. Two kinds of blob:
-//!
-//! 1. A plain git blob — fetched from the repo's object database via gix.
-//! 2. A Bale pointer — parsed to a `XetFileInfo`, then reconstructed from the
-//!    chunk cache (fast path) with a `FileDownloadSession` fallback that also
-//!    repopulates the cache (cold path). The decompressed body is held in a
-//!    bounded in-memory LRU so repeat reads don't re-decompress.
-//!
-//! Caching strategy:
-//! - Plain blobs: cached in their entirety on first read (cap each at 16 MiB
-//!   — anything larger should have been Bale-tracked at commit time).
-//! - Bale-tracked blobs: cached as a decompressed `Bytes` in an LRU sized by
-//!   total bytes (default 1 GiB).
+//! Byte-source for virtual files. Plain git blobs come from the ODB (cached
+//! whole, capped at 16 MiB — bigger should've been Bale-tracked). Bale pointers
+//! reconstruct from the chunk cache (fast) with a `FileDownloadSession` fallback
+//! that repopulates it (cold), and are held in a byte-budgeted LRU (default 1 GiB).
 
 use std::collections::HashMap;
 use std::os::unix::fs::FileExt;
@@ -33,54 +24,43 @@ use crate::remote_manifest::fetch_manifest;
 use crate::resolver;
 
 const PLAIN_BLOB_MAX_BYTES: usize = 16 * 1024 * 1024;
-/// Total cache budget for decompressed Bale file bodies. Sized for "a few
-/// big files in flight"; smaller than typical RAM so the OS still has room.
 const BALE_LRU_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Identifies a blob's source in git's ODB. The reader resolves this to bytes
-/// either directly (small plain blobs) or via the Bale reconstruction path
-/// (pointer blobs).
 #[derive(Clone, Debug)]
 pub struct BlobSource {
-    /// Hex string. Length is 40 (SHA-1) or 64 (SHA-256), validated by gix.
+    /// Hex OID, 40 (SHA-1) or 64 (SHA-256) chars, validated by gix.
     pub oid: String,
 }
 
-/// In-memory cache entry. Holding `Bytes` lets us hand out `clone`s without
-/// re-allocating on every read (it's an Arc-backed slice).
+/// `Bytes` (Arc-backed) so reads clone without re-allocating.
 struct CachedBlob {
     data: Bytes,
 }
 
 pub struct Reader {
-    /// Opened once at mount time, reused for every getattr/read. None only in
-    /// `for_test_only` builds, where any code path that needs git will error.
+    /// `None` only in `for_test_only` builds, where any git path errors.
     repo: Option<Arc<gix::ThreadSafeRepository>>,
     raw: Option<RawConfig>,
     rt: Option<Arc<XetRuntime>>,
     chunk_cache: Option<Arc<dyn ChunkCache>>,
-    /// Lazily-resolved (server_url, token). Read-scope only.
+    /// Lazily-resolved, read-scope only.
     bale_cfg: Mutex<Option<BaleConfig>>,
-    /// `oid → decompressed file size`. Populated by `size_of` (cheap, no
-    /// reconstruction). Lets `getattr` answer `stat` in O(1) after the first
-    /// call without ever decompressing chunks.
+    /// `oid → file size`, so `getattr` answers `stat` without decompressing.
     size_cache: Mutex<HashMap<String, u64>>,
     plain_cache: Mutex<HashMap<String, Arc<CachedBlob>>>,
-    /// Bale file body cache keyed by xet file id (the pointer's `hash`).
+    /// Keyed by xet file id (the pointer's `hash`).
     bale_cache: Mutex<BaleLru>,
-    /// Per-open resources. `op_open` inserts; `op_release` removes. Keys are
-    /// the `fi.fh` values libfuse round-trips for us.
+    /// Per-open resources keyed by the `fi.fh` libfuse round-trips.
     handles: Mutex<HashMap<u64, Arc<HandleData>>>,
     next_handle: AtomicU64,
 }
 
-/// Backing storage behind an open file handle. Bytes for cache hits and
-/// anything small enough to fit the LRU; an on-disk tempfile for Bale files
-/// too large to cache so we don't re-reconstruct on every 128 KiB FUSE read.
+/// Bytes for cache hits / LRU-sized files; an on-disk tempfile for Bale files
+/// too large to cache, so a 128 KiB FUSE read loop doesn't re-reconstruct.
 enum HandleData {
     Bytes(Bytes),
     Tempfile {
-        /// Owns the path; unlinks on drop after `release`.
+        /// Owns the path; unlinks on drop.
         _tmp: tempfile::NamedTempFile,
         file: std::fs::File,
         size: u64,
@@ -89,8 +69,7 @@ enum HandleData {
 
 struct BaleLru {
     map: HashMap<String, Arc<CachedBlob>>,
-    /// Insertion order; oldest at the front. Tiny VFS sizes mean we can
-    /// afford a Vec — the LRU semantics matter more than O(1) push/pop.
+    /// Oldest at front. A Vec suffices — VFS sizes are tiny.
     order: Vec<String>,
     bytes_used: u64,
     budget: u64,
@@ -108,7 +87,7 @@ impl BaleLru {
 
     fn get(&mut self, key: &str) -> Option<Arc<CachedBlob>> {
         let v = self.map.get(key).cloned()?;
-        // Touch: move to back. Cheap because Vec is small.
+        // Touch: move to back.
         if let Some(idx) = self.order.iter().position(|k| k == key) {
             let s = self.order.remove(idx);
             self.order.push(s);
@@ -119,7 +98,7 @@ impl BaleLru {
     fn put(&mut self, key: String, blob: Arc<CachedBlob>) {
         let size = blob.data.len() as u64;
         if size > self.budget {
-            // Single entry busts the budget; don't cache it. Still serve the bytes.
+            // One entry busts the budget; serve it but don't cache.
             return;
         }
         while self.bytes_used + size > self.budget {
@@ -172,10 +151,8 @@ impl Reader {
         Ok(repo.to_thread_local())
     }
 
-    /// Decompressed logical size of the file. Cheap: for a Bale pointer this
-    /// just reads the pointer JSON from the ODB and returns `file_size`; for a
-    /// plain blob it returns the ODB blob length. Never triggers chunk
-    /// reconstruction.
+    /// Logical file size without reconstructing: pointer `file_size` from the
+    /// JSON, or the plain blob's ODB length.
     pub fn size_of(&self, source: &BlobSource) -> Result<u64> {
         if let Some(&s) = self.size_cache.lock().unwrap().get(&source.oid) {
             return Ok(s);
@@ -198,8 +175,8 @@ impl Reader {
                 Ok(info) => info
                     .file_size()
                     .ok_or_else(|| anyhow!("bale pointer {} missing file_size", source.oid))?,
-                // Sentinel matched but JSON parse failed — it's a plain blob
-                // that happens to contain the `"hash"` token. Fall back.
+                // Sentinel matched but parse failed: a plain blob containing the
+                // `"hash"` token. Fall back to its byte length.
                 Err(_) => obj.data.len() as u64,
             }
         } else {
@@ -212,10 +189,8 @@ impl Reader {
         Ok(size)
     }
 
-    /// Allocates a per-open handle backing the next `pread` calls. Bale files
-    /// that exceed the LRU budget are reconstructed to an on-disk tempfile
-    /// held for the life of the open, so a kernel readahead loop doesn't
-    /// re-run the chunk pipeline for every 128 KiB request.
+    /// Per-open handle backing the next `pread`s. Over-budget Bale files go to a
+    /// tempfile held for the open so a readahead loop doesn't re-run the pipeline.
     pub fn open(&self, source: &BlobSource) -> Result<u64> {
         let data = self.materialize(source)?;
         // 0 is reserved as "uninitialized fh" by the FUSE callbacks.
@@ -224,8 +199,8 @@ impl Reader {
         Ok(id)
     }
 
-    /// Reads from a handle previously returned by `open`. Returns fewer than
-    /// `len` only at EOF or for an unknown handle (caller maps that to EBADF).
+    /// Read from a handle from `open`. Short read only at EOF or unknown handle
+    /// (caller maps that to EBADF).
     pub fn pread(&self, fh: u64, offset: u64, len: usize) -> Result<Bytes> {
         let handle = self
             .handles
@@ -260,8 +235,7 @@ impl Reader {
         }
     }
 
-    /// Drops the handle's resources (closing files / unlinking tempfiles via
-    /// Drop). Returns false if the handle was already absent.
+    /// Drop the handle's resources. False if it was already absent.
     pub fn close(&self, fh: u64) -> bool {
         self.handles.lock().unwrap().remove(&fh).is_some()
     }
@@ -297,7 +271,7 @@ impl Reader {
                     .ok_or_else(|| anyhow!("bale pointer missing file_size"))?;
                 let tmp = self.reconstruct_bale_to_tempfile(&info)?;
                 if file_size <= BALE_LRU_BUDGET_BYTES {
-                    // Fits the LRU — slurp once, cache, and serve from RAM.
+                    // Fits the LRU: slurp, cache, serve from RAM.
                     let buf = std::fs::read(tmp.path())?;
                     let bytes = Bytes::from(buf);
                     let blob = Arc::new(CachedBlob {
@@ -363,9 +337,8 @@ impl Reader {
             ));
         }
 
-        // xet-data's download API takes its writer by value as `'static`, so
-        // we materialize through a tempfile. The caller decides whether to
-        // slurp it into Bytes or keep the on-disk handle for pread.
+        // xet-data's download writer is by-value `'static`, so we go through a
+        // tempfile; the caller slurps it or keeps the on-disk handle.
         let tmp = tempfile::NamedTempFile::new()?;
 
         let cache_hit = if let Some(git_dir) = raw.git_dir.as_deref() {
@@ -479,8 +452,8 @@ fn is_safe_file_id(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Process-wide handle to the active reader, so libfuse C callbacks (which
-/// don't get user_data on every call) can find it. Set once per mount.
+/// Process-wide active reader so libfuse C callbacks (no per-call user_data) can
+/// reach it. Set once per mount.
 static ACTIVE_READER: OnceLock<Arc<Reader>> = OnceLock::new();
 
 pub fn install_active(reader: Arc<Reader>) -> Result<()> {

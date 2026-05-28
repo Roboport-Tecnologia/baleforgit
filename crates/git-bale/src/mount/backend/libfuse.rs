@@ -1,29 +1,20 @@
 //! libfuse high-level (`fuse_main_real`) backend.
 //!
-//! libfuse is loaded dynamically via `libloading`, not linked at build time —
-//! so the workspace still builds on machines without libfuse installed; only
-//! `mount` / `mount-diff` at runtime need it. On Linux that's `libfuse.so.2`;
-//! on macOS that's `libfuse-t.dylib` (the fuse-t userspace shim).
+//! libfuse is dlopened via `libloading`, not linked, so the workspace builds
+//! without it installed — only `mount`/`mount-diff` need it at runtime
+//! (`libfuse.so.2` on Linux, `libfuse-t.dylib` / fuse-t on macOS).
 //!
-//! ABI notes:
-//! - We target the libfuse **2.x** `fuse_main_real` signature. fuse-t on macOS
-//!   advertises libfuse 2.9.x ABI compatibility (its `fuse_main_real` reads a
-//!   2.x-shaped `fuse_operations` struct), so we pick the 2.x layout for both
-//!   platforms — that way one set of struct definitions works everywhere
-//!   instead of forking by OS.
-//! - libfuse 2 differs from 3: it has `getdir` (slot 2) and `utime` (slot 13)
-//!   that 3 dropped, `getattr` takes 2 args (no fi), `init` takes 1 arg (no
-//!   cfg), and `readdir` takes 5 args (no flags). Get any of those wrong and
-//!   the rest of the operations table is shifted into the wrong slots —
-//!   reads silently return EIO from libfuse's default no-op handler because
-//!   our `open` ends up where libfuse expects `truncate`.
-//! - The high-level API uses *path-based* callbacks: each request gives us a
-//!   `const char *path`, and we have to walk it to an inode ourselves. That's
-//!   slightly slower than the low-level (inode) API for deep trees, but the
-//!   API is far simpler to bind to and the diff trees we mount are usually
-//!   tiny anyway.
-//! - We don't get user-data on every callback. Instead we stash an
-//!   `Arc<DiffVfs>` in a process-wide `OnceLock` set right before `fuse_main`.
+//! ABI notes (load-bearing):
+//! - Target the libfuse **2.x** ABI, not 3: fuse-t advertises 2.9.x compat, so
+//!   one 2.x struct layout works on both platforms.
+//! - 2.x vs 3 differences: `getdir` (slot 2) and `utime` (slot 13) exist,
+//!   `getattr` has no `fi`, `init` has no cfg, `readdir` has no flags. Get any
+//!   wrong and every later slot shifts — reads silently return EIO because our
+//!   `open` lands where libfuse expects `truncate`.
+//! - The high-level API is *path-based* (we walk `const char *path` to an inode
+//!   ourselves) — slower for deep trees but far simpler, and our trees are tiny.
+//! - No per-callback user-data: the live `Arc<DiffVfs>` lives in a process-wide
+//!   `OnceLock` set right before `fuse_main`.
 
 #![allow(non_camel_case_types, non_snake_case)]
 
@@ -38,21 +29,15 @@ use libc::{mode_t, off_t, size_t, stat as libc_stat};
 use crate::mount::backend::MountBackend;
 use crate::mount::vfs::{DiffVfs, Node, NodeKind, ROOT_INODE};
 
-/// Holds the live VFS for the running mount. The high-level libfuse API
-/// doesn't thread user-data through path callbacks, so we keep one
-/// process-wide reference. Set right before `fuse_main_real`, never cleared.
+/// Live VFS for the running mount (path callbacks get no user-data). Set right
+/// before `fuse_main_real`, never cleared.
 static ACTIVE_VFS: OnceLock<Arc<DiffVfs>> = OnceLock::new();
 
-// macOS fuse-t kills the mount process by SIGPIPE from *inside*
-// fuse_main_real during unmount teardown (the FUSE channel fd is closed
-// while fuse-t is still writing to it). The signal never returns control to
-// our code, so under `-C instrument-coverage` the atexit-registered profile
-// flush never fires and every `.profraw` from a mount session is lost —
-// leaving mount/reader.rs and mount/vfs.rs at 0% even though their callbacks
-// ran. The handler flushes the profile via __llvm_profile_write_file (linked
-// only under the `coverage` feature) then _exit(0)s; both calls are
-// async-signal-safe. Armed only for the fuse_main_real window, so normal
-// Rust SIGPIPE semantics hold everywhere else.
+// fuse-t SIGPIPEs the process from inside fuse_main_real during unmount, which
+// never returns to us — so under `-C instrument-coverage` the atexit profile
+// flush never runs and every mount-session `.profraw` is lost. This handler
+// flushes via __llvm_profile_write_file (coverage feature only) then _exit(0)s;
+// both are async-signal-safe. Armed only for the fuse_main_real window.
 #[cfg(feature = "coverage")]
 extern "C" {
     fn __llvm_profile_write_file() -> c_int;
@@ -115,7 +100,7 @@ impl MountBackend for LibfuseBackend {
             .map_err(|_| anyhow!("mount: another mount is already active in this process"))?;
 
         let lib = load_libfuse().context("loading libfuse / fuse-t")?;
-        // SAFETY: signature matches libfuse 3.x's `fuse_main_real` exactly.
+        // SAFETY: signature matches libfuse 2.x's `fuse_main_real` exactly.
         let fuse_main_real: libloading::Symbol<FuseMainRealFn> = unsafe {
             lib.get(b"fuse_main_real\0")
                 .context("looking up fuse_main_real in libfuse")?
@@ -125,16 +110,11 @@ impl MountBackend for LibfuseBackend {
             .to_str()
             .ok_or_else(|| anyhow!("mount point path is not UTF-8: {}", mount_point.display()))?;
 
-        // Argv we pass to libfuse: it parses these like a CLI tool. `-f`
-        // keeps the daemon in the foreground (we want to block until ^C),
-        // `-o ro` enforces read-only at the kernel, and the cache hints
-        // (`use_ino,kernel_cache,attr_timeout=30,entry_timeout=30`) keep
-        // stat-heavy tools from re-hitting our callbacks per syscall —
-        // in libfuse 3 these would be set via `fuse_config` in `init`, but
-        // 2.x exposes them only via mount options. Multi-threaded — `Reader`
-        // holds its handles / caches behind `Mutex`/`Arc` and the per-open
-        // tempfile path makes parallel reads of the same big file serve
-        // from one reconstruction.
+        // libfuse parses this argv like a CLI. `-f` blocks in the foreground;
+        // `-o ro` enforces read-only; the cache hints cut stat-heavy callback
+        // traffic. 2.x exposes these only as mount options (3.x uses
+        // `fuse_config`). Multi-threaded is safe — `Reader` guards its state
+        // behind `Mutex`/`Arc`.
         let argv_strings = [
             CString::new("git-bale-mount").unwrap(),
             CString::new(mount_str).context("CString for mount point")?,
@@ -219,9 +199,7 @@ fn libfuse_candidates() -> &'static [&'static str] {
     }
 }
 
-/// Returned by [`ensure_available`] when libfuse can't be loaded. `Display`
-/// formats a multi-line, user-friendly message — `mount::run` prints it as-is
-/// and exits, so the user sees install hints rather than an anyhow chain.
+/// `Display` formats install hints; `mount::run` prints it as-is and exits.
 #[derive(Debug)]
 pub struct LibfuseUnavailable {
     tried: Vec<(String, String)>,
@@ -258,9 +236,8 @@ impl std::fmt::Display for LibfuseUnavailable {
 
 impl std::error::Error for LibfuseUnavailable {}
 
-/// Probe for libfuse without retaining the handle. Cheap — used as a
-/// fail-fast check at the top of `mount::run` so we never surprise the user
-/// with a load failure halfway through a diff.
+/// Fail-fast probe (handle dropped) at the top of `mount::run`, so a missing
+/// libfuse surfaces before the diff runs.
 pub fn ensure_available() -> std::result::Result<(), LibfuseUnavailable> {
     let mut tried = Vec::new();
     for name in libfuse_candidates() {
@@ -284,17 +261,12 @@ fn load_libfuse() -> Result<libloading::Library> {
             Err(e) => errs.push(format!("{name}: {e}")),
         }
     }
-    // ensure_available should have caught this earlier; if we get here the
-    // environment changed between the check and the mount.
+    // ensure_available passed earlier, so the environment changed since.
     Err(anyhow!(
         "libfuse disappeared between availability check and mount. Tried: {}",
         errs.join("; ")
     ))
 }
-
-// ---------------------------------------------------------------------------
-// FFI type definitions for libfuse 2.x
-// ---------------------------------------------------------------------------
 
 /// libfuse 2.x `fuse_file_info`. Differs from libfuse 3 most importantly in
 /// the position of `fh`: 24 here vs 16 in libfuse 3, because 2.x carries an
@@ -472,14 +444,8 @@ fn build_operations() -> fuse_operations {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Callback implementations
-// ---------------------------------------------------------------------------
-
 unsafe extern "C" fn op_init(_conn: *mut fuse_conn_info) -> *mut c_void {
-    // The cache hints (use_ino, kernel_cache, attr_timeout, entry_timeout)
-    // are passed via `-o` to fuse_main_real instead of through a config
-    // struct — libfuse 2.x's init has no `fuse_config` argument.
+    // Cache hints come via `-o`; 2.x's init has no `fuse_config` argument.
     std::ptr::null_mut()
 }
 
@@ -494,8 +460,7 @@ fn cstr_to_path(p: *const c_char) -> Option<String> {
     s.to_str().ok().map(|s| s.to_string())
 }
 
-/// Walk a slash-delimited path from the root, returning the resolved node.
-/// The empty string and `/` both resolve to the root.
+/// Walk a slash-delimited path from the root; `""` and `/` resolve to the root.
 fn lookup_path(vfs: &DiffVfs, path: &str) -> Option<Node> {
     let mut current = vfs.lookup_by_inode(ROOT_INODE)?.clone();
     for component in path.split('/').filter(|c| !c.is_empty()) {
@@ -531,9 +496,7 @@ unsafe extern "C" fn op_getattr(path: *const c_char, stbuf: *mut libc_stat) -> c
         }
         NodeKind::File { ref source, .. } => {
             (*stbuf).st_mode = (libc::S_IFREG | 0o444) as mode_t;
-            // Determine size on demand. For Bale pointers this triggers
-            // reconstruction the first time — which is what `stat` callers
-            // generally want anyway.
+            // size_of never reconstructs — it reads the pointer's file_size.
             let reader = vfs.reader();
             match reader.size_of(source) {
                 Ok(n) => (*stbuf).st_size = n as off_t,
@@ -563,8 +526,7 @@ unsafe extern "C" fn op_open(path: *const c_char, fi: *mut fuse_file_info) -> c_
     if fi.is_null() {
         return -libc::EIO;
     }
-    // Only read flags allowed; libfuse already rejects writes due to the
-    // `-o ro` mount option but a defensive check is cheap.
+    // `-o ro` already rejects writes; this is a cheap defensive check.
     let mode = (*fi).flags & libc::O_ACCMODE;
     if mode != libc::O_RDONLY {
         return -libc::EROFS;
@@ -656,9 +618,8 @@ unsafe extern "C" fn op_readdir(
     };
     for (name, _child) in children {
         let Ok(c) = CString::new(name) else { continue };
-        // stbuf = NULL → kernel issues getattr for each. Cheaper than
-        // computing every size eagerly here (Bale entries would trigger
-        // reconstruction just to list a directory).
+        // NULL stbuf → kernel getattrs lazily, so listing a dir doesn't size
+        // every entry up front.
         let _ = filler(buf, c.as_ptr(), std::ptr::null(), 0);
     }
     0

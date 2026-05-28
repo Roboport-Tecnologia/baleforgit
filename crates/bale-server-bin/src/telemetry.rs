@@ -1,22 +1,11 @@
-//! Optional OpenTelemetry export. Without `OTEL_EXPORTER_OTLP_ENDPOINT`
-//! (or its `_TRACES_` / `_METRICS_` siblings) the SDK is never initialised,
-//! no provider is installed globally, and every instrument in the rest of
-//! the workspace becomes a no-op — that's how the "do nothing when no
-//! collector is running" contract is honoured.
-//!
-//! When the env var IS set we install a `BatchSpanProcessor` and a
-//! `PeriodicReader` against the OTLP HTTP/protobuf exporter (port 4318
-//! by convention). `tracing` spans flow into the OTel pipeline via the
-//! `tracing-opentelemetry` bridge, so existing `tracing::info_span!` /
-//! `#[tracing::instrument]` call-sites become OTel spans for free.
+//! Without `OTEL_EXPORTER_OTLP_ENDPOINT` (or its `_TRACES_` / `_METRICS_`
+//! siblings) no provider is installed globally and every instrument in the
+//! workspace becomes a no-op — that's the "do nothing without a collector" contract.
 //!
 //! The exporter uses the **blocking** reqwest client (see the `opentelemetry-otlp`
-//! features in the root `Cargo.toml`), not the async one. Both the
-//! `BatchSpanProcessor` and `PeriodicReader` export from their own dedicated OS
-//! thread, which has no Tokio reactor — the async client panics there with "no
-//! reactor running", silently dropping every span/metric. Export is off the
-//! request path on those threads anyway, so blocking I/O there is correct and
-//! never stalls request handling.
+//! features in the root `Cargo.toml`): the batch processor and reader export from
+//! a dedicated OS thread with no Tokio reactor, where the async client would panic
+//! with "no reactor running" and silently drop every span/metric.
 
 use anyhow::{Context, Result};
 use opentelemetry::global;
@@ -30,8 +19,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
-/// Returned from [`init`]; flushes and shuts down the providers on drop so
-/// in-flight spans/metrics make it to the collector before process exit.
+/// Flushes the providers on drop so in-flight spans/metrics reach the collector.
 #[must_use = "drop this at process exit to flush OTLP exporters"]
 pub struct Guard {
     tracer_provider: Option<SdkTracerProvider>,
@@ -56,8 +44,7 @@ pub fn init(service_name: &str) -> Result<Guard> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
     let fmt_layer = tracing_subscriber::fmt::layer();
 
-    // Per OTel spec: a per-signal var beats the generic one; either presence
-    // enables that signal. Empty values count as unset.
+    // Per OTel spec: a per-signal var beats the generic one; empty counts as unset.
     let traces_endpoint = signal_endpoint("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "/v1/traces");
     let metrics_endpoint = signal_endpoint("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "/v1/metrics");
 
@@ -75,8 +62,8 @@ pub fn init(service_name: &str) -> Result<Guard> {
         });
     }
 
-    // OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES (read by the SDK
-    // Resource builder) win over the hardcoded fallback below.
+    // OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES (read by the Resource builder)
+    // win over this fallback.
     let resource = Resource::builder()
         .with_service_name(service_name.to_string())
         .build();
@@ -117,8 +104,7 @@ pub fn init(service_name: &str) -> Result<Guard> {
         guard.meter_provider = Some(provider);
     }
 
-    // Bridge tracing → OTel only if a tracer provider was installed; without
-    // one the bridge has nothing to feed into.
+    // Bridge tracing → OTel only when a tracer provider was installed.
     let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
     if let Some(tp) = guard.tracer_provider.as_ref() {
         let tracer = tp.tracer(service_name.to_string());
@@ -138,12 +124,7 @@ pub fn init(service_name: &str) -> Result<Guard> {
     Ok(guard)
 }
 
-/// Resolve the URL we should POST a signal to:
-///   - if the per-signal var is set, use it verbatim;
-///   - else if `OTEL_EXPORTER_OTLP_ENDPOINT` is set, append `signal_path`;
-///   - else `None`.
-///
-/// Matches the OTLP/HTTP exporter URL rules in the spec.
+/// Per-signal var verbatim, else the base endpoint + `signal_path`, per the OTLP/HTTP spec.
 fn signal_endpoint(per_signal_var: &str, signal_path: &str) -> Option<String> {
     if let Ok(v) = env::var(per_signal_var) {
         let v = v.trim();

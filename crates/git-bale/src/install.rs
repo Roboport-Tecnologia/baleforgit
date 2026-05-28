@@ -1,17 +1,12 @@
 //! Install / uninstall the `bale` filter driver in git config.
 //!
-//! We only set `filter.bale.process` (not `clean`/`smudge`): Git prefers the
-//! long-running process when present, and it's faster than spawning a fresh
-//! `clean`/`smudge` subprocess per file.
+//! Sets only `filter.bale.process` (not `clean`/`smudge`): Git prefers the
+//! long-running process and skips a per-file subprocess spawn.
 //!
-//! Local-scope install also writes git hooks:
-//!   - `pre-push` runs `git-bale push-pending` so xorbs/shards staged by
-//!     `clean` (`git add`) actually reach the server before `git push`
-//!     advertises pointers that reference them.
-//!   - `post-checkout` / `post-commit` / `post-merge` run `git-bale gc` so
-//!     staging for changes that were unstaged or discarded gets reclaimed
-//!     (clean only ever *adds* to staging; without gc, abandoned bytes would
-//!     linger until the next push).
+//! Local-scope install also writes hooks: `pre-push` runs `git-bale
+//! push-pending` (xorbs/shards reach the server before push advertises pointers
+//! to them), and `post-checkout`/`-commit`/`-merge` run `git-bale gc` (clean
+//! only adds to staging; without gc, abandoned bytes linger until next push).
 
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -30,22 +25,16 @@ pub enum Scope {
 const SECTION: &str = "filter.bale";
 const PROCESS_VALUE: &str = "git-bale filter-process";
 
-/// Identifies a hook we wrote so `uninstall` can remove it (and `install` can
-/// re-write it) without clobbering a user-authored hook.
+/// Marks a hook as ours so uninstall/re-install don't clobber a user's hook.
 const HOOK_MARKER: &str = "# bale-marker: managed-by-git-bale-do-not-edit";
 
-/// Hooks that trigger staging reconciliation. Each fires when the worktree or
-/// HEAD may have moved off content that `git add` had staged.
 const GC_HOOKS: [&str; 3] = ["post-checkout", "post-commit", "post-merge"];
 
-/// What to do when a hook file already exists and isn't ours.
 #[derive(Clone, Copy)]
 enum OnConflict {
-    /// Abort the install — the hook is load-bearing (pre-push gates upload
-    /// correctness), so silently skipping it would be dangerous.
+    /// Abort: pre-push gates upload correctness, so skipping it is dangerous.
     Fail,
-    /// Leave the user's hook alone and warn — gc is best-effort cleanup, not
-    /// correctness-critical, so it's not worth blocking an install over.
+    /// Warn and leave the user's hook: gc is best-effort, not worth blocking on.
     Skip,
 }
 
@@ -75,7 +64,7 @@ pub fn install(scope: Scope, repo: Option<&Path>) -> Result<()> {
 }
 
 pub fn uninstall(scope: Scope, repo: Option<&Path>) -> Result<()> {
-    // --unset-all clears duplicated entries from older installs in one pass.
+    // --unset-all clears duplicate entries from older installs in one pass.
     let _ = unset_config(scope, repo, "process");
     let _ = unset_config(scope, repo, "required");
     if matches!(scope, Scope::Local) {
@@ -157,9 +146,8 @@ fn uninstall_managed_hook(repo: Option<&Path>, hook_name: &str) -> Result<()> {
 }
 
 fn resolve_hook_path(repo: Option<&Path>, hook_name: &str) -> Result<PathBuf> {
-    // gix gives us the git dir directly, including for worktrees. `core.hooksPath`
-    // is honoured if the config has it set (we read the merged snapshot the same
-    // way git does).
+    // gix resolves the git dir (incl. worktrees) and honours `core.hooksPath`
+    // from the merged config snapshot.
     let start_dir = repo
         .map(|p| p.to_path_buf())
         .or_else(|| std::env::current_dir().ok())

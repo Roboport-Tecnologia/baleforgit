@@ -46,12 +46,11 @@ CREATE TABLE IF NOT EXISTS files (
     revision     TEXT    NOT NULL,
     total_bytes  INTEGER NOT NULL,
     created_at   INTEGER NOT NULL,
-    -- Namespace before `/` in repo_id, denormalized so quota aggregation is
-    -- an indexed scan rather than a LIKE prefix match.
+    -- Denormalized namespace before `/` in repo_id so quota aggregation is an
+    -- indexed scan, not a LIKE prefix match.
     owner        TEXT    NOT NULL,
-    -- Composite PK: same file_hash can live in multiple repos (cross-repo
-    -- dedup), and the reconstruction handler authorizes reads by requiring a
-    -- (file_hash, repo_id=token.repo) row to exist.
+    -- Composite PK: same file_hash lives in multiple repos (cross-repo dedup),
+    -- and reconstruction authorizes reads by requiring a (file_hash, token.repo) row.
     PRIMARY KEY (file_hash, repo_id)
 );
 CREATE INDEX IF NOT EXISTS files_by_repo ON files(repo_id);
@@ -72,14 +71,11 @@ CREATE TABLE IF NOT EXISTS file_terms (
     verification    BLOB,
     PRIMARY KEY (file_hash, term_index)
 );
--- stored_bytes_for_{owner,repo} and unaccounted_xorb_bytes_for_owner scan
--- file_terms by xorb_hash. Without this index every quota check is a full
--- table scan over file_terms.
+-- Quota checks join file_terms by xorb_hash; without this index each is a full scan.
 CREATE INDEX IF NOT EXISTS file_terms_by_xorb ON file_terms(xorb_hash);
 "#;
 
-/// Rows per batched INSERT — SQLite caps bound parameters at ~32k; biggest
-/// row binds 7 params, so 500 rows = 3500 params, well under the limit.
+// SQLite caps bound params at ~32k; biggest row binds 7, so 500 rows stays well under.
 const CHUNK_INSERT_BATCH: usize = 500;
 
 pub struct SqliteMetadataStore {
@@ -87,7 +83,7 @@ pub struct SqliteMetadataStore {
 }
 
 impl SqliteMetadataStore {
-    /// Test/diagnostics helper — kept off the trait since no request path needs it.
+    // Test/diagnostics only — off the trait since no request path needs it.
     pub async fn count_xorbs(&self) -> CoreResult<u64> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM xorbs")
             .fetch_one(&self.pool)
@@ -106,8 +102,7 @@ impl SqliteMetadataStore {
         Ok(n as u64)
     }
 
-    /// Pass `":memory:"` for an in-memory test database — pool size is then
-    /// forced to 1 so the schema survives between calls.
+    // `":memory:"` forces pool size to 1 so the schema survives between calls.
     pub async fn open_path(path: impl AsRef<Path>) -> CoreResult<Self> {
         let p = path.as_ref().to_string_lossy().to_string();
         let url = if p == ":memory:" {
@@ -157,10 +152,8 @@ fn hash_to_blob(h: &Hash32) -> Vec<u8> {
     h.as_bytes().to_vec()
 }
 
-/// Shared body between [`SqliteMetadataStore::register_file`] and the
-/// batch [`SqliteMetadataStore::register_files`] — both want the same per-file
-/// writes but inside different transaction scopes (one tx per file vs one
-/// tx for the whole shard).
+// Shared per-file writes for register_file (one tx per file) and register_files
+// (one tx per shard) — same writes, different transaction scopes.
 async fn write_file_in_tx(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     file_hash: &FileHash,
@@ -184,9 +177,9 @@ async fn write_file_in_tx(
     .await
     .map_err(|e| CoreError::Internal(format!("insert file: {e}")))?;
 
-    // Terms are content-addressed by file_hash, so a re-register carries
-    // identical terms — IGNORE the duplicate rather than DELETE+INSERT,
-    // which would briefly expose an empty term list to a concurrent reader.
+    // Terms are content-addressed by file_hash, so re-register carries identical
+    // terms — IGNORE, not DELETE+INSERT, which would briefly expose an empty term
+    // list to a concurrent reader.
     let indexed: Vec<(usize, &FileTerm)> = terms.iter().enumerate().collect();
     for batch in indexed.chunks(CHUNK_INSERT_BATCH) {
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
@@ -210,10 +203,8 @@ async fn write_file_in_tx(
     Ok(())
 }
 
-/// SQLite `SUM(INTEGER)` returns i64. A negative result implies overflow —
-/// `.max(0) as u64` would silently mask that to 0, which is the worst possible
-/// behavior for quota accounting (limits effectively vanish). Surface it as
-/// `CoreError::Internal` instead so an operator notices.
+// A negative SUM means i64 overflow; `.max(0)` would mask it to 0 and quietly
+// vanish the quota limit, so error instead.
 fn nonneg_i64_to_u64(n: i64, label: &'static str) -> CoreResult<u64> {
     if n < 0 {
         return Err(CoreError::Internal(format!(
@@ -258,8 +249,6 @@ impl MetadataStore for SqliteMetadataStore {
         .await
         .map_err(|e| CoreError::Internal(format!("insert xorb: {e}")))?;
 
-        // Batched in chunks of CHUNK_INSERT_BATCH so we don't blow past
-        // SQLite's parameter limit (~32k for stock builds; we keep slack).
         for batch in chunks.chunks(CHUNK_INSERT_BATCH) {
             let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 "INSERT OR IGNORE INTO chunks
@@ -421,7 +410,7 @@ impl MetadataStore for SqliteMetadataStore {
         if xorbs.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        // Deduplicate first; one IN query replaces N round-trips.
+        // One IN query instead of N round-trips.
         let mut uniq: Vec<XorbHash> = xorbs.to_vec();
         uniq.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         uniq.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
@@ -516,8 +505,7 @@ impl MetadataStore for SqliteMetadataStore {
         chunk_hash: &ChunkHash,
         limit: usize,
     ) -> CoreResult<Vec<XorbInfo>> {
-        // Prototype: just the containing xorb. Real neighborhood expansion (e.g.
-        // xorbs sharing chunks with this one's xorb) is future work.
+        // Prototype: only the containing xorb; neighborhood expansion is future work.
         let row = sqlx::query("SELECT xorb_hash FROM chunks WHERE chunk_hash = ? LIMIT 1")
             .bind(hash_to_blob(&chunk_hash.0))
             .fetch_optional(&self.pool)
@@ -562,9 +550,8 @@ impl MetadataStore for SqliteMetadataStore {
     }
 
     async fn stored_bytes_for_owner(&self, owner: &str) -> CoreResult<u64> {
-        // Distinct xorbs the owner's files reference, summed by on-disk size.
-        // Per the design: each owner is accounted independently — a xorb that's
-        // also referenced by another owner is still counted for this owner.
+        // Owners are accounted independently: a xorb also referenced by another
+        // owner still counts in full for this one.
         let row = sqlx::query(
             "SELECT COALESCE(SUM(num_bytes_on_disk), 0) AS n
              FROM xorbs
@@ -656,7 +643,7 @@ impl MetadataStore for SqliteMetadataStore {
         if candidates.is_empty() {
             return Ok(0);
         }
-        // Deduplicate by raw bytes so the IN clause stays compact.
+        // Dedup so the IN clause stays compact.
         let mut uniq: Vec<&XorbHash> = candidates.iter().collect();
         uniq.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         uniq.dedup_by(|a, b| a.as_bytes() == b.as_bytes());

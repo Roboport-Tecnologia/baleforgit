@@ -1,7 +1,3 @@
-// `BALE_AUTHZ_HTTP_URL` wins over `BALE_GRANTS` when both are set.
-// `BALE_S3_BUCKET` switches the blob backend from filesystem to S3-compatible.
-// See README for full env-var table.
-
 mod telemetry;
 
 use anyhow::{bail, Context, Result};
@@ -30,10 +26,8 @@ async fn main() -> Result<()> {
     let public_url = match env::var("BALE_PUBLIC_URL") {
         Ok(v) => v,
         Err(_) => {
-            // Default is only sensible for local dev; warn loudly when the
-            // server binds beyond loopback because clients accessing the
-            // service through a TLS proxy will receive http:// presigned URLs
-            // that no longer resolve.
+            // Beyond loopback the http:// default leaks into presigned URLs that
+            // won't resolve behind a TLS proxy — warn so it's set explicitly.
             let host = listen.split(':').next().unwrap_or("");
             if !is_loopback(host) {
                 tracing::warn!(
@@ -59,7 +53,6 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    // Optional: per-owner storage cap applied when no per-owner override is set.
     let default_quota_bytes = match env::var("BALE_DEFAULT_QUOTA_BYTES") {
         Ok(s) => Some(
             s.trim()
@@ -94,9 +87,6 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
 
-    // S3 backend opts in via BALE_S3_BUCKET; otherwise the local-filesystem
-    // store is used. Logging both branches makes the active backend obvious
-    // in production logs.
     if let Ok(bucket) = env::var("BALE_S3_BUCKET") {
         if bucket.is_empty() {
             bail!("BALE_S3_BUCKET is set but empty");
@@ -247,8 +237,8 @@ where
 
 async fn shutdown_signal() {
     use tokio::signal;
-    // Both expects fire only if the kernel refuses to install a signal handler
-    // (e.g. SIGTERM is masked) — startup-time invariant, not a network input.
+    // Both expects fire only if the kernel refuses a signal handler at startup —
+    // not a network input.
     let ctrl_c = async {
         signal::ctrl_c().await.expect("install Ctrl+C handler");
     };

@@ -1,11 +1,6 @@
-//! Runtime configuration: where to send xorbs/shards, what bearer to use, and
-//! where to keep the local chunk cache.
-//!
-//! Sources, in priority order:
-//!   1. Environment variables (`BALE_*`).
-//!   2. Git config keys under `bale.*` (read via `gix::discover` + merged
-//!      config snapshot — no `git` subprocess).
-//!   3. Built-in defaults (XDG cache dir; no default server URL or token).
+//! Runtime configuration. Sources in priority order: `BALE_*` env vars, then
+//! `bale.*` git config (via `gix::discover` — no subprocess), then defaults
+//! (XDG cache dir; no default server URL or token).
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -18,13 +13,12 @@ pub struct BaleConfig {
     pub token: String,
     pub token_expiration: u64,
     pub cache_dir: PathBuf,
-    /// Resolved git directory (the path `.git` points at). `None` outside a
-    /// git context (e.g. unit tests); per-repo caches are disabled then.
+    /// `None` outside a git context; per-repo caches are disabled then.
     pub git_dir: Option<PathBuf>,
 }
 
-/// Local-config-only fields. Produced synchronously at startup, then handed
-/// to [`crate::resolver::resolve`] to fill in any missing pieces.
+/// Local-config-only fields, handed to [`crate::resolver::resolve`] to fill in
+/// anything missing.
 #[derive(Clone, Debug)]
 pub struct RawConfig {
     pub server_url: Option<String>,
@@ -35,14 +29,10 @@ pub struct RawConfig {
 }
 
 impl RawConfig {
-    /// Server URL and token are optional — the resolver auto-discovers them
-    /// from `git remote` + a forge auth roundtrip when absent.
-    ///
-    /// Uses `gix::discover` to find the repo and load merged config in one
-    /// shot — no `git rev-parse` / `git config` subprocesses. This is the
-    /// hot path: every `git status` / `git diff` invokes the filter-process,
-    /// which calls `load()` once at startup. Fork+exec on macOS is ~5–15 ms
-    /// per call and was adding up.
+    /// Server URL and token are optional — the resolver auto-discovers them via
+    /// `git remote` + a forge roundtrip. Uses `gix::discover` (not `git`
+    /// subprocesses): this runs on every `git status`/`git diff`, and fork+exec
+    /// is ~5–15 ms per call on macOS.
     pub fn load(repo: Option<&Path>) -> Result<Self> {
         let start_dir = repo
             .map(|p| p.to_path_buf())
@@ -51,7 +41,6 @@ impl RawConfig {
         let gix_repo = match gix::discover(&start_dir) {
             Ok(r) => Some(r),
             Err(e) => {
-                // No git context (e.g. unit tests): per-repo features off.
                 tracing::debug!("gix::discover({}) failed: {e}", start_dir.display());
                 None
             }
@@ -84,9 +73,9 @@ impl RawConfig {
 }
 
 impl BaleConfig {
-    /// Strict loader: requires `server_url` + `token` to be locally configured.
-    /// Errors (rather than auto-resolving) so callers that want the fast path
-    /// can tell "config missing" from "real failure".
+    /// Strict loader: errors (rather than auto-resolving) when `server_url` /
+    /// `token` aren't locally configured, so callers can tell "config missing"
+    /// from "real failure".
     pub fn load(repo: Option<&Path>) -> Result<Self> {
         let raw = RawConfig::load(repo)?;
         let server_url = raw

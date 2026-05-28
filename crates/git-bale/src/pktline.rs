@@ -55,8 +55,7 @@ impl<R: Read> PktReader<R> {
         }
     }
 
-    /// Read a single text packet. Strips a trailing `\n` if present. Errors
-    /// if the next packet is a control packet (flush/delim/response-end).
+    /// Single text packet, trailing `\n` stripped. Errors on a control packet.
     pub fn read_text(&mut self) -> io::Result<String> {
         match self.read_packet()? {
             Packet::Data(mut bytes) => {
@@ -72,8 +71,7 @@ impl<R: Read> PktReader<R> {
         }
     }
 
-    /// Read text packets until a flush packet, returning the list with any
-    /// trailing newlines stripped.
+    /// Text packets until flush, trailing newlines stripped.
     pub fn read_text_list(&mut self) -> io::Result<Vec<String>> {
         let mut out = Vec::new();
         loop {
@@ -98,10 +96,8 @@ impl<R: Read> PktReader<R> {
         }
     }
 
-    /// Read binary data packets until a flush packet, copying each payload
-    /// into `out`. Returns the total bytes copied. Errors with `InvalidData`
-    /// if the cumulative payload would exceed `max_total_bytes` — guards
-    /// against a misbehaving peer pushing us into unbounded heap growth.
+    /// Binary data packets until flush, copied into `out`. Errors if the total
+    /// exceeds `max_total_bytes` (guards against unbounded heap growth).
     pub fn read_binary_to<W: Write>(
         &mut self,
         out: &mut W,
@@ -169,8 +165,7 @@ impl<W: Write> PktWriter<W> {
     }
 
     pub fn write_text(&mut self, line: &str) -> io::Result<()> {
-        // Append \n so payloads round-trip through both newline-aware and
-        // not-aware peers (git-lfs does the same).
+        // Append \n so payloads round-trip through newline-aware peers (as git-lfs does).
         let bytes = line.as_bytes();
         if bytes.len() + 1 > MAX_PKT_PAYLOAD {
             return Err(io::Error::new(
@@ -184,7 +179,6 @@ impl<W: Write> PktWriter<W> {
         self.inner.write_all(b"\n")
     }
 
-    /// Write each entry as a text packet, terminated by a flush.
     pub fn write_text_list(&mut self, lines: &[&str]) -> io::Result<()> {
         for line in lines {
             self.write_text(line)?;
@@ -192,8 +186,7 @@ impl<W: Write> PktWriter<W> {
         self.flush_packet()
     }
 
-    /// Write a binary blob as one or more data packets capped at `MAX_PKT_PAYLOAD`.
-    /// Does NOT emit a trailing flush; call [`flush_packet`] when the stream is done.
+    /// Binary blob as data packets; no trailing flush — call [`flush_packet`] when done.
     pub fn write_binary(&mut self, mut data: &[u8]) -> io::Result<()> {
         while !data.is_empty() {
             let n = data.len().min(MAX_PKT_PAYLOAD);

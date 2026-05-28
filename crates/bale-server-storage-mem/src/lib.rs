@@ -1,5 +1,4 @@
-//! In-memory `BlobStore`. Validates the trait seam: the full HTTP stack runs
-//! against this with zero handler changes. Tests only.
+//! In-memory `BlobStore` for tests and the trait seam.
 
 use async_trait::async_trait;
 use bale_server_core::{BlobStore, CoreError, CoreResult, ShardHash, XorbHash};
@@ -13,10 +12,9 @@ use tokio::sync::RwLock;
 pub struct MemBlobStore {
     xorbs: RwLock<HashMap<[u8; 32], Bytes>>,
     shards: RwLock<HashMap<[u8; 32], Bytes>>,
-    /// Cumulative bytes across xorbs + shards. Tracked separately so we can
-    /// reject puts before grabbing the write lock if the cap is already blown.
+    // Counted outside the maps so a put can be rejected before taking the write lock.
     stored_bytes: AtomicU64,
-    /// `None` = unbounded (the original behavior; suitable for tests).
+    // None = unbounded.
     max_bytes: Option<u64>,
 }
 
@@ -25,9 +23,7 @@ impl MemBlobStore {
         Self::default()
     }
 
-    /// Cap on cumulative bytes the store will hold. New puts past this return
-    /// `CoreError::BadRequest`. Useful for fuzz/exploration deployments where
-    /// the in-memory store is exposed; tests should leave it unset.
+    /// Puts past this cumulative byte cap return `CoreError::BadRequest`.
     pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
         self.max_bytes = Some(max_bytes);
         self
@@ -37,8 +33,7 @@ impl MemBlobStore {
         let Some(max) = self.max_bytes else {
             return Ok(());
         };
-        // Compare-and-swap loop so two concurrent puts can't both observe
-        // headroom before either commits the increment.
+        // CAS loop: two concurrent puts must not both observe headroom before either commits.
         loop {
             let cur = self.stored_bytes.load(Ordering::Acquire);
             let next = cur
@@ -62,7 +57,7 @@ impl MemBlobStore {
 impl BlobStore for MemBlobStore {
     async fn put_xorb(&self, hash: &XorbHash, body: Bytes) -> CoreResult<bool> {
         let mut g = self.xorbs.write().await;
-        // Idempotent: don't overwrite an existing entry under the same hash.
+        // Idempotent: re-put of an existing hash is a no-op, not an overwrite.
         if g.contains_key(hash.as_bytes()) {
             return Ok(false);
         }

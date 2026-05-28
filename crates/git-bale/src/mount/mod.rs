@@ -1,10 +1,7 @@
-//! `git-bale mount-diff` — mounts a read-only virtual filesystem that exposes
-//! both sides of a `git diff <revA> <revB>` as files named with the revision
-//! label embedded in the basename (`foo__<labelA>.ext` / `foo__<labelB>.ext`).
-//!
-//! No bytes are copied to disk: each `read` call hits git's object database
-//! (for non-Bale blobs) or the chunk cache + network reconstruction (for Bale
-//! pointers).
+//! `git-bale mount-diff` / `git-bale mount` — read-only virtual filesystems.
+//! mount-diff exposes both sides of a `git diff` as `foo__<label>.ext`; mount
+//! exposes one revision under original names. No bytes hit disk: each `read`
+//! goes to git's ODB (plain blobs) or chunk cache + reconstruction (pointers).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,10 +59,8 @@ pub fn run_rev(args: MountRevArgs) -> Result<()> {
         reader,
     ));
 
-    // Single eager probe of the root so an empty or mis-targeted mount fails
-    // here with a clear message rather than mounting silently empty. Costs
-    // one tree-object read; the populated children stay cached for the real
-    // readdir later.
+    // Eager root probe so an empty/mis-targeted mount fails loudly here instead
+    // of mounting silently empty; the populated children stay cached.
     if vfs
         .readdir(ROOT_INODE)
         .map(|e| e.is_empty())
@@ -114,8 +109,7 @@ fn resolve_commit_and_tree(
 }
 
 pub fn run(args: MountDiffArgs) -> Result<()> {
-    // Fail fast with a friendly install hint if libfuse / fuse-t isn't on the
-    // machine — don't validate refs and run the diff just to die at mount time.
+    // Fail fast with an install hint before doing the diff, not at mount time.
     if let Err(e) = backend::libfuse::ensure_available() {
         eprintln!("{e}");
         std::process::exit(2);
@@ -171,14 +165,12 @@ pub fn run(args: MountDiffArgs) -> Result<()> {
         args.mount_point.display(),
     );
 
-    // For now we only have one backend; later this becomes a selector.
     let backend = LibfuseBackend::new();
     backend.mount(&args.mount_point, vfs)
 }
 
-/// Conservative filesystem-safe label: keep alnum / `_`/`-`/`.`, replace the
-/// rest with `_`. Avoids `/`, NUL, and anything weird in branch names like
-/// `feature/x` (would otherwise create a directory in the filename).
+/// Filesystem-safe label: keep alnum / `_`/`-`/`.`, replace the rest with `_`
+/// so `feature/x` doesn't create a directory in the filename.
 fn sanitize_label(rev: &str) -> String {
     let mut out = String::with_capacity(rev.len());
     for c in rev.chars() {

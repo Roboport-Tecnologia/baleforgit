@@ -1,15 +1,10 @@
 //! Per-repo cache of reconstruction *terms* under
 //! `<git-dir>/bale/manifests/<file_id_hex>.json`.
 //!
-//! Stores only `terms` (xorb hash + chunk-index-range), not the full
-//! reconstruction response. The `fetch_info` URLs have a 10-minute TTL
-//! (`SIGNATURE_TTL_SECS` in bale-server-http) and aren't safe to persist; the
-//! terms list is content-addressed by `file_id` and immutable, so it stays
-//! valid forever. Cache misses fall back to the server, which re-issues
-//! fresh URLs.
-//!
-//! Writes are atomic (temp + rename) so a partial write never poisons the
-//! cache for the next checkout.
+//! Stores only `terms` (xorb hash + chunk range), not the full reconstruction
+//! response: the `fetch_info` URLs have a 10-minute TTL (`SIGNATURE_TTL_SECS`)
+//! and aren't safe to persist, but the terms are content-addressed by `file_id`
+//! and immutable. Misses fall back to the server for fresh URLs.
 
 use std::fs;
 use std::io::{self, Write};
@@ -26,8 +21,6 @@ pub struct CachedTerm {
     pub unpacked_length: u64,
 }
 
-/// `v` is the on-disk schema version; clients ignore manifests they don't
-/// understand and overwrite them on the next cold path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedManifest {
     pub v: u32,
@@ -63,9 +56,8 @@ pub fn load(git_dir: &Path, file_id_hex: &str) -> io::Result<Option<CachedManife
     Ok(Some(manifest))
 }
 
-/// Atomic write via temp + rename. The hand-rolled `<final>.tmp.<pid>` (over
-/// `tempfile::NamedTempFile`) keeps the temp file in the target directory,
-/// which is required for `rename` to be atomic on the same fs.
+/// Atomic temp + rename. Hand-rolled `<final>.tmp.<pid>` keeps the temp in the
+/// target dir, required for `rename` to be atomic on the same fs.
 pub fn save(git_dir: &Path, file_id_hex: &str, manifest: &CachedManifest) -> io::Result<()> {
     crate::fs_util::create_bale_subdir(git_dir, "manifests")?;
     let dir = manifest_dir(git_dir);

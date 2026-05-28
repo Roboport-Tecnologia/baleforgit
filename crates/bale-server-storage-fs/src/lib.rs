@@ -1,13 +1,5 @@
-//! Filesystem-backed `BlobStore` implementation.
-//!
-//! Layout under `data_root`:
-//! ```text
-//! xorbs/<aa>/<bb>/<full-hex>     # immutable xorb blobs
-//! shards/<aa>/<bb>/<full-hex>    # immutable shards
-//! tmp/<uuid>                     # staging for atomic rename
-//! ```
-//! `<aa>`/`<bb>` are bytes 0/1 of the hash in lowercase hex. Plain hex is used
-//! here — the Xet hex encoding is only relevant on the wire.
+//! Filesystem-backed `BlobStore`. Fanout dirs use plain lowercase hex of the
+//! hash — the Xet hex encoding is only relevant on the wire, not on disk.
 
 use async_trait::async_trait;
 use bale_server_core::{BlobStore, CoreError, CoreResult, Hash32, ShardHash, XorbHash};
@@ -84,8 +76,7 @@ impl FsBlobStore {
                 .map_err(|e| CoreError::Internal(format!("mkdir {}: {e}", parent.display())))?;
         }
         let tmp = self.tmp_path();
-        // fsync the temp file before rename so a crash can't leave a
-        // zero/short blob at the final content-addressed path.
+        // fsync tmp before rename so a crash can't leave a short blob at the content-addressed path.
         let mut f = open_private(&tmp)
             .await
             .map_err(|e| CoreError::Internal(format!("create tmp: {e}")))?;
@@ -102,9 +93,7 @@ impl FsBlobStore {
         let rename_result = fs::rename(&tmp, dst).await;
         match rename_result {
             Ok(()) => {
-                // fsync the parent directory so the rename itself is durable
-                // — without this, a crash after rename can lose the new entry
-                // even though the file's data was synced.
+                // fsync the parent dir so the rename is durable — else a crash can lose the entry.
                 if let Some(parent) = parent {
                     if let Ok(dir) = fs::File::open(parent).await {
                         let _ = dir.sync_all().await;
@@ -113,7 +102,7 @@ impl FsBlobStore {
                 Ok(true)
             }
             Err(_) if fs::metadata(dst).await.is_ok() => {
-                // A racing writer beat us to it; tmp is garbage, drop it.
+                // A racing writer beat us to it; content-addressed, so drop our tmp.
                 let _ = fs::remove_file(&tmp).await;
                 Ok(false)
             }

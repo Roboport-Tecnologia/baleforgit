@@ -26,8 +26,7 @@ pub struct S3Config {
     pub bucket: String,
     pub region: Option<String>,
     pub endpoint_url: Option<String>,
-    /// Required for MinIO and similar backends that don't do virtual-host
-    /// addressing.
+    /// Required for MinIO and similar backends that don't do virtual-host addressing.
     pub force_path_style: bool,
     pub prefix: String,
     pub access_key_id: Option<String>,
@@ -78,8 +77,7 @@ impl S3BlobStore {
             sse_enabled: !cfg.disable_sse,
         };
 
-        // Non-fatal startup probe — lets dev loops boot against a bucket the
-        // operator hasn't pre-created.
+        // Non-fatal: lets dev loops boot against a bucket not yet created.
         if let Err(e) = store
             .client
             .head_bucket()
@@ -270,8 +268,7 @@ fn is_not_found_get<T>(
     matches!(err, SdkError::ServiceError(svc) if matches!(svc.err(), GetObjectError::NoSuchKey(_)))
 }
 
-/// SdkError's own Display is a generic blurb; the inner service error has
-/// the real "AccessDenied" / "NoSuchBucket" text.
+/// SdkError's Display is generic; the inner service error has the real "AccessDenied" text.
 fn display_sdk_error<E: std::fmt::Display, R>(err: &SdkError<E, R>) -> String {
     match err {
         SdkError::ServiceError(svc) => format!("service error: {}", svc.err()),

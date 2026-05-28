@@ -35,9 +35,8 @@ pub fn encode_pointer(info: &XetFileInfo) -> Result<Vec<u8>, PointerError> {
     Ok(encode_pointer_string(info)?.into_bytes())
 }
 
-/// Like `encode_pointer` but skips the `String → bytes → String` round-trip
-/// when the caller wants both representations (e.g. to stream over pkt-line
-/// *and* stash in the clean cache without a `from_utf8` revalidation).
+/// String form, avoiding the bytes round-trip when the caller wants both (stream
+/// over pkt-line *and* stash in the clean cache without a `from_utf8` recheck).
 pub fn encode_pointer_string(info: &XetFileInfo) -> Result<String, PointerError> {
     let mut s = serde_json::to_string_pretty(info)?;
     s.push('\n');

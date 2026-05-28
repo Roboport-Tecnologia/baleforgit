@@ -1,25 +1,16 @@
-//! Auto-resolve the `(server_url, token)` pair that the xet-core client
-//! needs, when one or both are absent from local config.
+//! Auto-resolve `(server_url, token)` when local config lacks one or both.
+//! See `docs/BALE_FORGE_PROTOCOL.md` for the wire shape. Three steps, each
+//! skipped once its output is known:
 //!
-//! The resolution chains together three steps; each is skipped when its
-//! output is already known:
-//!
-//! 1. **Remote parse** — `git remote get-url origin` → HTTPS or SSH URL.
-//! 2. **Obtain a forge-minted JWT** (also yields the baleforgit-server URL). See
-//!    `docs/BALE_FORGE_PROTOCOL.md` for the wire shape any forge must speak.
-//!    - HTTPS: `git credential fill` → username + password (or PAT). POST
-//!      `<forge>/<owner>/<repo>.git/info/bale/authenticate?op=<op>` with
-//!      HTTPS Basic auth. The forge verifies the credentials locally and
-//!      returns `{href, header.Authorization=Bearer <jwt>}`. The user's
-//!      password never leaves the forge.
-//!    - SSH: `ssh git@host git-bale-authenticate <repo> <op>` returns the
-//!      same shape over the existing SSH session.
-//! 3. **Token exchange** — `GET <baleforgit-server>/api/models/<owner>/<repo>/bale-{rw}-token/<rev>`
-//!    with `Authorization: Bearer <forge-jwt>` → final bale token.
-//!
-//! Step 3 is skipped when the caller's local config already holds a literal
-//! bale token (the m11 test path; manual `git config bale.token` setups).
-//! Step 2's URL output is overridden when local config sets `bale.serverUrl`.
+//! 1. Parse `origin` → HTTPS or SSH URL.
+//! 2. Obtain a forge-minted JWT (+ baleforgit-server URL, unless overridden by
+//!    `bale.serverUrl`):
+//!    - HTTPS: `git credential fill`, then POST
+//!      `.../info/bale/authenticate?op=<op>` with Basic auth; the forge verifies
+//!      locally and returns `{href, header.Authorization=Bearer <jwt>}`.
+//!    - SSH: `ssh git@host git-bale-authenticate <repo> <op>` returns the same.
+//! 3. Token exchange: `GET .../bale-{rw}-token/<rev>` with the forge JWT →
+//!    final bale token. Skipped when local config holds a literal token.
 
 use std::io::Write;
 use std::path::Path;
@@ -32,8 +23,6 @@ use serde::Deserialize;
 use crate::config::RawConfig;
 use crate::remote::{parse_origin, RemoteScheme, RemoteUrl};
 
-/// Token scope, matching baleforgit-server's `Scope` enum (lowercase JSON / URL
-/// segment values).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     Read,
@@ -41,7 +30,6 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// The URL segment baleforgit-server's HF endpoint expects.
     fn url_segment(self) -> &'static str {
         match self {
             Scope::Read => "bale-read-token",
@@ -57,9 +45,8 @@ pub struct ResolvedAuth {
     pub token_expiration: u64,
 }
 
-/// Run the full resolution. Network IO and subprocess calls happen here.
 pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
-    // Fast path: m11 mode (both pieces locally configured).
+    // Fast path: both pieces locally configured.
     if let (Some(url), Some(tok)) = (raw.server_url.as_ref(), raw.token.as_ref()) {
         return Ok(ResolvedAuth {
             server_url: url.clone(),
@@ -68,18 +55,15 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
         });
     }
 
-    // Use the git_dir's parent as the repo cwd for `git remote` invocations.
-    // When the filter is running outside a real repo we just rely on cwd.
     let repo_cwd = raw.git_dir.as_deref().and_then(|p| p.parent());
     let remote = parse_origin(repo_cwd)
         .context("auto-resolving Bale auth: failed to read git remote 'origin'")?;
     let (owner, repo_name) = remote.owner_and_repo()?;
-    // `owner` and `repo` get interpolated into a URL and into the ssh remote
-    // command string (which the server re-shell-parses), so reject anything
-    // outside a safe alphabet before we hand them off.
+    // Interpolated into a URL and into the ssh command (re-shell-parsed by the
+    // server), so reject anything outside a safe alphabet first.
     validate_segment("owner", owner)?;
     validate_segment("repo", repo_name)?;
-    let revision = "main"; // TODO: derive from HEAD when we want branch-scoped tokens.
+    let revision = "main"; // TODO: derive from HEAD for branch-scoped tokens.
 
     let (server_url, forge_bearer) = match remote.scheme {
         RemoteScheme::Ssh => {
@@ -87,17 +71,12 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
             let bearer = strip_bearer(&auth.authorization)
                 .ok_or_else(|| anyhow!("git-bale-authenticate returned non-Bearer Authorization"))?
                 .to_string();
-            // If user explicitly set a server URL, prefer it over the SSH-supplied one.
             let url = raw.server_url.clone().unwrap_or(auth.href);
             (url, bearer)
         }
         RemoteScheme::Http | RemoteScheme::Https => {
-            // POST the forge's /info/bale/authenticate with HTTPS Basic auth
-            // from git-credential. The forge verifies the password locally
-            // and returns a short-lived JWT plus the baleforgit-server URL. The
-            // password never leaves the forge — that's the whole point of
-            // going through this endpoint instead of forwarding the password
-            // to baleforgit-server.
+            // The forge verifies the password locally and returns a JWT — the
+            // password never reaches baleforgit-server (the point of this hop).
             let (username, password) = git_credential_fill(&remote, repo_cwd)?;
             let auth =
                 authenticate_http(&remote, owner, repo_name, scope, &username, &password).await?;
@@ -109,7 +88,7 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
         }
     };
 
-    // Caller already has a final bale token (e.g. m11 partial-config) — skip exchange.
+    // Caller already has a final bale token — skip exchange.
     if let Some(tok) = raw.token.clone() {
         return Ok(ResolvedAuth {
             server_url,
@@ -136,10 +115,8 @@ struct AuthenticateHTTPResponse {
     header: std::collections::HashMap<String, String>,
 }
 
-/// POST the forge's `/<owner>/<repo>.git/info/bale/authenticate?op=...` with
-/// HTTPS Basic auth. Returns the forge-minted JWT plus the baleforgit-server URL.
-/// The user's password is verified inside the forge and never forwarded to
-/// baleforgit-server. See `docs/BALE_FORGE_PROTOCOL.md` for the wire shape.
+/// POST `.../info/bale/authenticate?op=...` with Basic auth → forge JWT +
+/// baleforgit-server URL. See `docs/BALE_FORGE_PROTOCOL.md`.
 async fn authenticate_http(
     remote: &RemoteUrl,
     owner: &str,
@@ -194,8 +171,8 @@ struct SshAuthenticateResponse {
     href: String,
     #[serde(rename = "Authorization", default)]
     authorization: String,
-    // Mirror the protocol's shape: `header` is the canonical place; we
-    // keep `Authorization` as a fallback for tools that flatten it.
+    // `header` is canonical; top-level `Authorization` is a fallback for tools
+    // that flatten it.
     #[serde(default)]
     header: std::collections::HashMap<String, String>,
 }
@@ -249,9 +226,7 @@ async fn ssh_authenticate(
         ));
     }
 
-    // Don't include the raw body — on success it contains the forge-minted
-    // bearer token, and we don't get to know whether a parse failure is
-    // structural (safe to dump) or partial (still includes the bearer).
+    // Never log the raw body — it carries the forge-minted bearer token.
     let parsed: SshAuthenticateResponse =
         serde_json::from_slice(&out.stdout).with_context(|| {
             format!(
@@ -271,19 +246,14 @@ async fn ssh_authenticate(
     })
 }
 
-/// Run `git credential fill` to pull the user's stored credential for the
-/// remote's host. Returns `(username, password)`. The password is held
-/// briefly in memory by this process and then handed to the forge's HTTPS
-/// authenticate endpoint via standard Basic auth — it never travels beyond
-/// the forge (baleforgit-server only ever sees the JWT the forge mints in response).
-/// `cwd` is the repo path so the repo's local `credential.helper` setting
-/// is honored (otherwise only `--global` / system helpers apply).
+/// `git credential fill` → `(username, password)` for the remote's host. The
+/// password goes only to the forge's authenticate endpoint (never to
+/// baleforgit-server). `cwd` is the repo so its local `credential.helper` applies.
 fn git_credential_fill(remote: &RemoteUrl, cwd: Option<&Path>) -> Result<(String, String)> {
     let protocol = match remote.scheme {
         RemoteScheme::Http => "http",
         RemoteScheme::Https => "https",
         RemoteScheme::Ssh => {
-            // Caller should've taken the SSH branch; defensive guard.
             return Err(anyhow!("git_credential_fill called on SSH remote"));
         }
     };
@@ -405,10 +375,9 @@ fn strip_bearer(authz: &str) -> Option<&str> {
     authz.strip_prefix("Bearer ").map(str::trim)
 }
 
-/// Accept only `[A-Za-z0-9._-]+`, no leading dot, length 1..=100.
-/// Rejects path traversal (`..`, `/`), shell metacharacters, and other
-/// payloads that could survive ssh-argv quoting only to be re-parsed on
-/// the server side.
+/// Accept only `[A-Za-z0-9._-]+`, no leading dot, length 1..=100 — rejects path
+/// traversal and shell metacharacters that could survive ssh-argv quoting and be
+/// re-parsed server-side.
 fn validate_segment(label: &str, s: &str) -> Result<()> {
     if s.is_empty() || s.len() > 100 {
         return Err(anyhow!("{label} {s:?} has invalid length"));

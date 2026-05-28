@@ -1,6 +1,4 @@
-//! Xorb body parser.
-//!
-//! A xorb is a sequence of chunk frames concatenated with no separator:
+//! Xorb body parser. Chunk frames concatenated with no separator:
 //!
 //! ```text
 //! frame_0 | frame_1 | ... | frame_N | optional footer
@@ -15,12 +13,10 @@
 //! offset 5 : uncompressed_length(u24)
 //! ```
 //!
-//! We don't decompress here — this only walks the on-disk frame boundaries so
-//! the server can compute correct HTTP byte ranges for downstream reconstruction.
-//! Compression scheme `99` (Auto) is sentinel-only and must never appear on the
-//! wire; we reject it. Any header whose `version` byte is non-zero is treated
-//! as the start of the footer (xet-core's footer magic strings all begin with
-//! ASCII bytes well outside the version-0 range, e.g. `XETBLOB`).
+//! Frame boundaries only, no decompression — the server needs them to compute
+//! HTTP byte ranges for reconstruction. A non-zero `version` byte marks the
+//! footer start (xet-core footer magics like `XETBLOB` are ASCII, outside the
+//! version-0 range). Scheme `99` (Auto) is sentinel-only and rejected.
 
 use bale_server_core::XorbHash;
 use thiserror::Error;
@@ -30,7 +26,7 @@ use xet_core_structures::xorb_object::CompressionScheme;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XorbChunkFrame {
     pub on_disk_start: u32,
-    /// 8-byte header + compressed_length payload.
+    /// 8-byte header + compressed payload.
     pub on_disk_len: u32,
     pub uncompressed_len: u32,
     pub compression_scheme: u8,
@@ -76,13 +72,9 @@ fn u24_le(b: &[u8]) -> u32 {
     (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16)
 }
 
-/// Walk every chunk frame in `body`. Stops at the first header whose version
-/// byte is non-zero (treated as the footer marker) or at EOF, whichever comes
-/// first. Returns at least one frame or an error.
-///
-/// `XorbChunkFrame` stores offsets as u32, so bodies larger than u32::MAX are
-/// rejected up front. Production xorbs are capped at 64 MiB by the upload
-/// handler, so this is a defense-in-depth check.
+/// Stops at the first non-zero version byte (footer marker) or EOF. Bodies over
+/// u32::MAX are rejected since `XorbChunkFrame` offsets are u32 (defense in
+/// depth — the upload handler already caps xorbs at 64 MiB).
 pub fn parse_xorb_frames(body: &[u8]) -> Result<Vec<XorbChunkFrame>, XorbParseError> {
     if body.len() > u32::MAX as usize {
         return Err(XorbParseError::TooLarge {
@@ -138,17 +130,10 @@ pub fn parse_xorb_frames(body: &[u8]) -> Result<Vec<XorbChunkFrame>, XorbParseEr
     Ok(frames)
 }
 
-/// Recompute the xorb content hash from `body` and compare it to `expected`.
-///
-/// Walks every chunk frame, decompresses it via xet-core's `CompressionScheme`
-/// (so BG4-LZ4 / LZ4-frame / None all match the client byte-for-byte),
-/// computes each chunk's `compute_data_hash`, then aggregates with xet-core's
-/// `xorb_hash`. The expected hash arrives in natural-byte order (as decoded
-/// from the URL by `bale_server_wire::decode_hash`), which is exactly the
-/// layout `DataHash::from([u8; 32])` consumes.
-///
-/// Returns `Ok(())` on match; any decompression, length, or hash mismatch is
-/// surfaced so callers can reject the upload before persisting.
+/// Recompute the xorb content hash and compare to `expected` so a bad upload is
+/// rejected before persisting. `expected` is natural-byte order (from
+/// `bale_server_wire::decode_hash`), which is what `DataHash::from([u8; 32])`
+/// consumes.
 pub fn verify_xorb_body(body: &[u8], expected: &XorbHash) -> Result<(), XorbVerifyError> {
     let frames = parse_xorb_frames(body)?;
     let mut entries: Vec<(xet_core_structures::merklehash::MerkleHash, u64)> =
@@ -162,7 +147,7 @@ pub fn verify_xorb_body(body: &[u8], expected: &XorbHash) -> Result<(), XorbVeri
             0 => CompressionScheme::None,
             1 => CompressionScheme::LZ4,
             2 => CompressionScheme::ByteGrouping4LZ4,
-            // parse_xorb_frames already rejects anything outside 0..=2.
+            // Unreachable: parse_xorb_frames already rejects schemes outside 0..=2.
             other => {
                 return Err(XorbVerifyError::Parse(
                     XorbParseError::BadCompressionScheme {
@@ -199,11 +184,9 @@ pub fn verify_xorb_body(body: &[u8], expected: &XorbHash) -> Result<(), XorbVeri
     Ok(())
 }
 
-/// Decompress every chunk frame in `body` (which holds the bytes for one
-/// reconstruction term, i.e. the on-disk range covering one or more contiguous
-/// chunks of a single xorb) and append the result to `out` in order. Mirrors
-/// the per-frame loop in [`verify_xorb_body`] but without the hash check —
-/// callers (e.g. the file-download streamer) already know the xorb is intact.
+/// Decompress `body` (the on-disk range for one reconstruction term) into `out`,
+/// in order. Like [`verify_xorb_body`] without the hash check — callers (e.g. the
+/// download streamer) already know the xorb is intact.
 pub fn decompress_xorb_chunks_into(body: &[u8], out: &mut Vec<u8>) -> Result<(), XorbVerifyError> {
     let frames = parse_xorb_frames(body)?;
     for (i, f) in frames.iter().enumerate() {

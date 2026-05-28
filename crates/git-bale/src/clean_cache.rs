@@ -1,29 +1,10 @@
-//! Per-clean cache. Keyed by `blake3(pathname)` and verified by
-//! `(size, chunked_hashes)` rather than a single full-file hash.
+//! Per-clean cache. Keyed by `blake3(pathname)`, verified by
+//! `(size, chunked_hashes)` so a modified large file misses in ~ms (size check,
+//! then priority/parallel chunk hashing that bails on first mismatch) instead
+//! of paying `O(file_size)` on every `git status`/`git diff`. Hits still hash
+//! every chunk — a sample-only positive can't be trusted.
 //!
-//! ### Why chunked?
-//!
-//! `git status` and `git diff` invoke the clean filter on every command for
-//! any modified bale-filtered file. Hashing the entire file up front meant
-//! we always paid `O(file_size)` time even when the file had been changed
-//! and the cache was about to miss anyway. With chunked verification:
-//!
-//! 1. **Size check first.** Different size → guaranteed miss; we skip
-//!    reading the rest entirely and go straight to a full clean.
-//! 2. **Priority chunk order.** First chunk + last chunk + a random sample
-//!    of middle chunks are checked before the rest. Edits cluster at file
-//!    head/tail (headers, appends) in practice, so this catches the
-//!    majority of mismatches in a few hundred microseconds.
-//! 3. **Concurrent verification.** A small thread pool hashes chunks in
-//!    parallel, sharing an `AtomicBool` so the first mismatch shorts every
-//!    other worker.
-//!
-//! Net effect: cache *misses* on large modified files now bail out in
-//! ~milliseconds instead of `O(file_size)`; cache *hits* still hash every
-//! chunk for correctness (you can't trust a sample-only positive).
-//!
-//! Chunk fingerprints use xxh3-64 — change detection, not adversarial
-//! integrity, so the speed (~10× blake3 on modern x86) wins.
+//! Chunk fingerprints use xxh3-64 (change detection, not integrity; ~10× blake3).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -35,33 +16,23 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash3_64;
 
-/// Chunk size for the index. 1 MiB chosen so an 1 GiB file still indexes
-/// in ~1024 chunks (~64 KiB serialized) while leaving plenty of room for
-/// early-exit on small files.
 const CHUNK_SIZE: u64 = 1 << 20;
-/// Bump when the on-disk schema or the chunk-hash algorithm changes —
-/// old entries become invisible and rebuild on the next clean.
-/// v3: chunk hashes are xxh3-64 hex (was blake3 hex in v2).
+/// Bump on any on-disk schema or chunk-hash change — old entries go invisible
+/// and rebuild. v3: chunk hashes are xxh3-64 hex (was blake3 hex in v2).
 pub const CURRENT_VERSION: u32 = 3;
-/// How many random middle-chunks to check *before* the rest. 3 is enough
-/// to catch most middle edits before the linear sweep.
+/// Random middle-chunks checked before the linear sweep.
 const MIDDLE_SAMPLES: usize = 3;
-/// Worker count for parallel chunk hashing.
 const VERIFY_PARALLELISM: usize = 3;
 
 pub type PathKey = blake3::Hash;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CacheEntry {
-    /// Schema version. Older entries are treated as a cache miss.
     pub v: u32,
-    /// Size of the source file when the entry was written.
     pub size: u64,
-    /// Ordered, contiguous chunks covering `[0, size)`.
     pub chunks: Vec<Chunk>,
-    /// Pointer JSON to return on a cache hit. Stored verbatim including
-    /// the trailing newline so we can stream it back to git without
-    /// re-encoding.
+    /// Pointer JSON returned verbatim (incl. trailing newline) on a hit, so we
+    /// stream it back to git without re-encoding.
     pub pointer: String,
 }
 
@@ -69,8 +40,7 @@ pub struct CacheEntry {
 pub struct Chunk {
     pub start: u64,
     pub end: u64,
-    /// xxh3-64 of `[start..end]`, 16-char lowercase hex (big-endian) so the
-    /// cache file stays hand-readable for debugging.
+    /// xxh3-64 of `[start..end]` as 16-char lowercase hex.
     pub hash: String,
 }
 
@@ -82,8 +52,7 @@ fn chunk_hash_hex(bytes: &[u8]) -> String {
     format!("{:016x}", chunk_hash(bytes))
 }
 
-/// Hash the file pathname (as Git sends it) into the cache directory's
-/// filename so we don't have to deal with path-character escaping.
+/// Hash the pathname into the cache filename to sidestep path-char escaping.
 pub fn path_key(pathname: &str) -> PathKey {
     blake3::hash(pathname.as_bytes())
 }
@@ -131,13 +100,11 @@ pub fn save(git_dir: &Path, key: &PathKey, entry: &CacheEntry) -> io::Result<()>
     fs::rename(&tmp, &final_path)
 }
 
-/// Delete clean-cache entries whose stored pointer references one of `hashes`
-/// (the file-level merkle hash). `git-bale gc` calls this when it orphans staged
-/// content — without it, a cache hit on a later `git add` of the same bytes
-/// would hand git a pointer whose xorbs/shards gc already swept and which was
-/// never pushed, so the smudge can reconstruct from neither staging nor the
-/// server. Dropping the entry forces that re-add to do a full clean and
-/// re-stage. Returns the number of entries removed.
+/// Drop clean-cache entries whose pointer references one of `hashes` (file-level
+/// merkle). `git-bale gc` calls this when it orphans staged content: otherwise a
+/// later `git add` of the same bytes hits the cache and hands git a pointer
+/// whose xorbs/shards gc already swept and that was never pushed — smudge can
+/// then reconstruct from neither staging nor server. Returns entries removed.
 pub fn forget_hashes(git_dir: &Path, hashes: &BTreeSet<String>) -> io::Result<usize> {
     if hashes.is_empty() {
         return Ok(0);
@@ -169,16 +136,12 @@ pub fn forget_hashes(git_dir: &Path, hashes: &BTreeSet<String>) -> io::Result<us
     Ok(removed)
 }
 
-/// Pull the `hash` field out of a stored pointer JSON without depending on the
-/// pointer crate's type — the cache only ever needs the file id string.
 fn pointer_hash(pointer: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(pointer).ok()?;
     v.get("hash")?.as_str().map(str::to_string)
 }
 
-/// Like [`compute_chunks`] but for a byte slice already in memory — saves the
-/// disk round-trip when the clean filter receives the payload via pkt-line and
-/// holds it in RAM instead of spilling to a tmp file.
+/// In-memory variant of [`compute_chunks`] for a payload still in RAM.
 pub fn compute_chunks_from_slice(bytes: &[u8]) -> Vec<Chunk> {
     let size = bytes.len() as u64;
     let mut chunks = Vec::with_capacity((size.div_ceil(CHUNK_SIZE).max(1)) as usize);
@@ -202,9 +165,8 @@ pub fn compute_chunks_from_slice(bytes: &[u8]) -> Vec<Chunk> {
     chunks
 }
 
-/// Build the chunk index by hashing `path` in 1 MiB blocks. Returns one
-/// zero-length chunk for empty files so verify always has at least one
-/// fingerprint to compare against.
+/// Chunk index of `path`; empty files get one zero-length chunk so verify
+/// always has a fingerprint to compare.
 pub fn compute_chunks(path: &Path, size: u64) -> io::Result<Vec<Chunk>> {
     let mut file = fs::File::open(path)?;
     let chunk_count = size.div_ceil(CHUNK_SIZE).max(1) as usize;
@@ -232,9 +194,8 @@ pub fn compute_chunks(path: &Path, size: u64) -> io::Result<Vec<Chunk>> {
     Ok(chunks)
 }
 
-/// In-memory counterpart of [`verify_chunks`]. No threading: the slice is
-/// already in RAM so memcpy + xxh3 dominate; one pass per chunk on the calling
-/// thread beats fan-out overhead. Bail on the first mismatch.
+/// In-memory counterpart of [`verify_chunks`]. Single-threaded — for a slice in
+/// RAM, fan-out overhead exceeds the xxh3 cost. Bails on first mismatch.
 pub fn verify_chunks_in_memory(cached: &[Chunk], bytes: &[u8]) -> bool {
     if cached.is_empty() {
         return false;
@@ -261,22 +222,18 @@ pub fn verify_chunks_in_memory(cached: &[Chunk], bytes: &[u8]) -> bool {
     true
 }
 
-/// Verify the contents of `path` match every fingerprint in `cached`.
-/// Workers race on a shared `AtomicBool` and bail at the first mismatch.
+/// Verify `path` against every fingerprint in `cached`; workers share an
+/// `AtomicBool` and bail at the first mismatch.
 pub fn verify_chunks(cached: &[Chunk], path: &Path, file_size: u64) -> io::Result<bool> {
     if cached.is_empty() {
         return Ok(false);
     }
-    // Reject entries whose chunks don't fully cover the file: defensive against
-    // a partial cache write or a truncated source.
+    // Reject entries that don't fully cover the file (partial write / truncation).
     let covered: u64 = cached.iter().map(|c| c.end - c.start).sum();
     if covered != file_size {
         return Ok(false);
     }
-    // Parse the on-disk hex hashes into u64 once, so the hot loop can
-    // compare integers instead of paying hex on every chunk. Any malformed
-    // hex is treated as a verification failure (the entry is bogus; we'll
-    // rebuild it).
+    // Decode hex once so the hot loop compares u64s; malformed hex fails verify.
     let mut decoded: Vec<u64> = Vec::with_capacity(cached.len());
     for c in cached {
         match u64::from_str_radix(&c.hash, 16) {
@@ -285,10 +242,8 @@ pub fn verify_chunks(cached: &[Chunk], path: &Path, file_size: u64) -> io::Resul
         }
     }
 
-    // Share a single File across the worker stripes — verify_chunks runs on
-    // every `git status` / `git diff`, so dropping N opens to 1 is the cheap
-    // win. read_at / seek_read are stateless so concurrent workers don't
-    // contend on a shared seek cursor.
+    // One File shared across stripes; stateless read_at/seek_read avoid cursor
+    // contention. Runs on every `git status`/`git diff`, so N opens → 1.
     let file = Arc::new(fs::File::open(path)?);
 
     let order = priority_order(cached.len());
@@ -339,9 +294,8 @@ fn verify_stripe(
     Ok(())
 }
 
-/// Positional read that doesn't move the file's seek cursor, so multiple
-/// workers can share one `File` handle without locking. Loops to retry
-/// short reads (rare on regular files but well-defined to handle).
+/// Positional read (no seek cursor) so workers share one handle; loops over
+/// short reads.
 fn read_exact_at(file: &fs::File, buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     let mut remaining = buf;
     while !remaining.is_empty() {
@@ -372,18 +326,15 @@ fn pread(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
 
 #[cfg(not(any(unix, windows)))]
 fn pread(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    // Fallback for exotic targets: emulate via clone + seek. Less efficient
-    // (extra file descriptor + serialized seek), but correct.
+    // Exotic-target fallback: emulate pread via clone + seek.
     use std::io::{Read, Seek, SeekFrom};
     let mut handle = file.try_clone()?;
     handle.seek(SeekFrom::Start(offset))?;
     handle.read(buf)
 }
 
-/// Index ordering for verification: first, last, then a small random middle
-/// sample, then the rest. The bail-out heuristic is that edits near the
-/// head/tail of a file (headers, appended log lines) are far more common
-/// than uniform random edits.
+/// Verification order: first, last, random middle sample, then the rest —
+/// edits cluster at head/tail (headers, appends), so this bails sooner.
 fn priority_order(n: usize) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
@@ -395,9 +346,7 @@ fn priority_order(n: usize) -> Vec<usize> {
     let last = n - 1;
     let mut middle: Vec<usize> = (1..n - 1).collect();
 
-    // Cheap xorshift; we just need *some* permutation per call. Seeded
-    // from system nanoseconds and pid so two filter-process invocations
-    // for the same file aren't lockstep.
+    // Cheap xorshift; seeded from nanos + pid so two invocations aren't lockstep.
     let mut state: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)

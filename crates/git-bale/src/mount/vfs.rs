@@ -1,16 +1,8 @@
-//! In-memory virtual filesystem for the mount backends.
-//!
-//! Two construction modes:
-//! - *Diff* (`build`) flattens a pre-walked diff entry list into a fully
-//!   populated tree at construction time. Each leaf has the rev label folded
-//!   into the basename (`foo.txt` on side A → `foo__<labelA>.txt`), with
-//!   directories deduplicated across both sides.
-//! - *Lazy single-rev* (`build_single_lazy`) defers tree population: each
-//!   directory starts unresolved and reads its gix tree object the first time
-//!   FUSE looks inside it. Pays for nothing the user never touches.
-//!
-//! Inode IDs are stable for the life of the mount, including ones allocated
-//! lazily — `lookup_child` memoizes per `(parent, name)`.
+//! In-memory virtual filesystem for the mount backends. Two construction modes:
+//! `build` (diff) eagerly flattens a pre-walked entry list, folding the rev
+//! label into each basename (`foo.txt` → `foo__<labelA>.txt`); `build_single_lazy`
+//! allocates only the root and reads each dir's gix tree the first time FUSE
+//! looks inside. Inodes are stable for the life of the mount.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -35,22 +27,19 @@ pub struct Node {
 
 #[derive(Debug)]
 struct DirState {
-    /// child name → inode
     children: HashMap<OsString, u64>,
-    /// Some(...) until the dir has been resolved against its git tree object.
-    /// Eager (diff) dirs skip the lazy state entirely (`None`).
+    /// `Some` until resolved against the git tree; `None` for eager (diff) dirs.
     lazy: Option<LazyDir>,
 }
 
 #[derive(Debug, Clone)]
 struct LazyDir {
     tree_oid: gix::ObjectId,
-    /// Repo-relative directory path, "" at the root. Used for pathspec matching.
+    /// Repo-relative dir path ("" at root); for pathspec matching.
     path_prefix: String,
 }
 
-/// Per-VFS state needed to populate lazy directories. Absent in diff/eager
-/// constructions so `lookup_child` skips the lazy code path entirely.
+/// State for populating lazy dirs; absent in eager constructions.
 struct LazyContext {
     repo: Arc<gix::ThreadSafeRepository>,
     pathspec: Vec<String>,
@@ -69,9 +58,8 @@ pub struct DiffVfs {
 }
 
 impl DiffVfs {
-    /// Two-sided diff view: each side's path is labelled (`foo__main.rs` vs
-    /// `foo__feature.rs`) so a single mount point can show both versions
-    /// without overwriting each other.
+    /// Two-sided diff view: each side's path is labelled so one mount point
+    /// shows both versions without collision.
     pub fn build(entries: &[DiffEntry], label_a: &str, label_b: &str, reader: Arc<Reader>) -> Self {
         let mut state = empty_state();
         add_eager_root(&mut state);
@@ -90,11 +78,8 @@ impl DiffVfs {
         }
     }
 
-    /// Lazy single-rev view: only the root inode is allocated up front. The
-    /// first `lookup_child` / `readdir` on any directory reads the
-    /// corresponding tree object and populates its children. Pathspec entries
-    /// (literal prefix match, same semantics as the eager walker) prune
-    /// subtrees we never descend into.
+    /// Lazy single-rev view: only the root is allocated; each dir reads its tree
+    /// on first access. Pathspec entries (literal prefix) prune untouched subtrees.
     pub fn build_single_lazy(
         repo: Arc<gix::ThreadSafeRepository>,
         root_tree: gix::ObjectId,
@@ -172,9 +157,8 @@ impl DiffVfs {
             return;
         }
         if let Err(e) = populate_dir_locked(state, parent, ctx) {
-            // Surface as warn; callers see ENOENT for the lookup. We don't
-            // want to keep retrying — clear the lazy flag so a broken tree
-            // entry doesn't hammer the ODB on every FUSE call.
+            // Clear the lazy flag so a broken tree doesn't hammer the ODB on
+            // every FUSE call; the lookup just sees ENOENT.
             tracing::warn!("populate_dir({parent}) failed: {e:#}");
             if let Some(d) = state.dirs.get_mut(&parent) {
                 d.lazy = None;
@@ -264,9 +248,8 @@ fn eager_insert(state: &mut VfsState, path: &str, oid: &str, label: Option<&str>
         None => (*file_component).to_string(),
     };
     let key = OsString::from(&final_name);
-    // First write wins on collision — we never overwrite an existing entry
-    // because that would silently lose data (e.g. two different OIDs at the
-    // same labeled name).
+    // First write wins: overwriting would silently drop one of two OIDs that
+    // collided at the same labelled name.
     if let Some(dir) = state.dirs.get(&parent) {
         if dir.children.contains_key(&key) {
             return;
@@ -276,8 +259,7 @@ fn eager_insert(state: &mut VfsState, path: &str, oid: &str, label: Option<&str>
     let source = Arc::new(BlobSource {
         oid: oid.to_string(),
     });
-    // Size is unknown until we peek the blob; defer with a sentinel. The
-    // reader's `peek_size` is what `getattr` ultimately calls.
+    // Size deferred with a sentinel; `getattr` resolves it via `Reader::size_of`.
     state.nodes.insert(
         inode,
         Node {
@@ -357,8 +339,7 @@ fn populate_dir_locked(state: &mut VfsState, parent: u64, ctx: &LazyContext) -> 
                 },
             });
         }
-        // Symlinks and submodules are intentionally skipped — same scope
-        // restriction the eager walker had (it only emitted is_blob entries).
+        // Symlinks and submodules skipped (the eager walker only emits blobs).
     }
 
     for PendingChild { name, kind } in pending {
@@ -411,9 +392,7 @@ fn populate_dir_locked(state: &mut VfsState, parent: u64, ctx: &LazyContext) -> 
     Ok(())
 }
 
-/// File-leaf pathspec match. Same semantics as the eager walker's
-/// `any_filter_matches`: literal prefix, no globbing. Empty filter list lets
-/// everything through.
+/// File-leaf pathspec match: literal prefix, no globbing; empty filters pass all.
 fn pathspec_matches_file(path: &str, filters: &[String]) -> bool {
     if filters.is_empty() {
         return true;
@@ -424,11 +403,8 @@ fn pathspec_matches_file(path: &str, filters: &[String]) -> bool {
     })
 }
 
-/// Dir match: descend if the directory might *contain* or *be contained by*
-/// a filter. Three legal shapes:
-/// - filter equals the dir (we want the whole subtree),
-/// - dir is under the filter (we're inside a matched area),
-/// - filter is under the dir (must keep descending to reach the match).
+/// Descend if a filter equals the dir, is under it, or contains it (the dir is
+/// inside a matched area). Empty filters pass all.
 fn pathspec_intersects_dir(path: &str, filters: &[String]) -> bool {
     if filters.is_empty() {
         return true;
@@ -439,11 +415,10 @@ fn pathspec_intersects_dir(path: &str, filters: &[String]) -> bool {
     })
 }
 
-/// `foo.tar.gz` + `main` -> `foo.tar__main.gz`. We split on the *last* dot so
-/// multi-suffix names still look reasonable to diff tools.
+/// `foo.tar.gz` + `main` → `foo.tar__main.gz` (split on the last dot).
 fn label_filename(name: &str, label: &str) -> String {
     if let Some(dot) = name.rfind('.') {
-        // Don't break dotfiles like `.gitignore`.
+        // dot > 0 keeps dotfiles like `.gitignore` intact.
         if dot > 0 {
             let (stem, ext) = name.split_at(dot);
             return format!("{stem}__{label}{ext}");

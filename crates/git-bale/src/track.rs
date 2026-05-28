@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 
 const FILTER_SUFFIX: &str = "filter=bale -text";
 
-/// Add `patterns` to `<repo>/.gitattributes`, skipping any that already have a
-/// `filter=bale` line. Each pattern gets one line: `<pattern> filter=bale -text`.
+/// Add `patterns` to `.gitattributes` as `<pattern> filter=bale -text`, skipping
+/// any already filtered.
 pub fn track(repo: &Path, patterns: &[String]) -> Result<()> {
     let attrs_path = repo.join(".gitattributes");
     let existing = match fs::read_to_string(&attrs_path) {

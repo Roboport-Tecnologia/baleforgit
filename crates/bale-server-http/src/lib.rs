@@ -1,6 +1,5 @@
-//! HTTP layer for the Bale CAS server. See `docs/ARCHITECTURE.md` for the full
-//! route table, wire formats, and the "Tricky bits" notes that explain *why*
-//! several handlers behave the way they do.
+//! HTTP layer for the Bale CAS server. See `docs/ARCHITECTURE.md` for the route
+//! table, wire formats, and "Tricky bits" notes.
 
 mod metrics;
 
@@ -39,16 +38,11 @@ use tracing::Level;
 
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const SIGNATURE_TTL_SECS: u64 = 600;
-/// Hard cap on `term.unpacked_segment_bytes` honored during reconstruction.
-/// Set to 2× the 64 MiB xorb cap because a term's *uncompressed* span can be a
-/// little larger than the compressed xorb body (typical compression ratios for
-/// the workloads xet targets are modest, but the headroom keeps us from
-/// rejecting borderline-valid terms while still bounding the per-term Vec).
+// 2× the 64 MiB xorb cap: a term's uncompressed span can exceed the compressed
+// xorb body, so the headroom avoids rejecting borderline-valid terms.
 const MAX_TERM_UNPACKED_BYTES: u64 = 128 * 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
-
-// ---- Service & router ------------------------------------------------------
 
 pub struct Service<B, M, A> {
     pub blobs: Arc<B>,
@@ -100,11 +94,9 @@ where
             auth_middleware::<B, M, A>,
         ));
 
-    // Admin-or-owner endpoints live outside the JWT middleware: the handlers
-    // accept either a Bale JWT scoped to the owner OR the static admin bearer
-    // (BALE_ADMIN_TOKEN_HEX), so operators can read usage / set quotas without
-    // minting a Bale token. PUT /quotas/{owner} is admin-only and returns 404
-    // when admin is unconfigured.
+    // Outside the JWT middleware: these handlers also accept the static admin
+    // bearer (not a JWT), so operators can read usage / set quotas without
+    // minting a Bale token.
     let admin = Router::new()
         .route("/v1/usage/{owner}", get(get_owner_usage::<B, M, A>))
         .route(
@@ -116,8 +108,7 @@ where
             axum::routing::put(put_owner_quota::<B, M, A>),
         );
 
-    // Access logs at INFO; on 4xx/5xx the on_failure line fires at WARN even
-    // when ApiError (below) already logged the response body.
+    // Access logs at INFO; on_failure fires at WARN on 4xx/5xx.
     let trace = TraceLayer::new_for_http()
         .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
         .on_response(DefaultOnResponse::new().level(Level::INFO))
@@ -134,23 +125,19 @@ where
         )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(trace)
-        // Metrics middleware runs inside the trace layer so each recorded
-        // request also has the access-log span on the stack. No-op when no
-        // OTel meter provider is installed.
+        // Inside the trace layer so each recorded request has the access-log
+        // span on the stack. No-op when no OTel meter provider is installed.
         .layer(middleware::from_fn(metrics::middleware))
         .with_state(svc);
 
-    // Health probe sits outside auth and outside the access-log trace layer:
-    // k8s/loadbalancer probes fire every few seconds and would otherwise
-    // drown out real request logs.
+    // Outside auth and the trace layer: frequent probes would drown out real
+    // request logs.
     Router::new().route("/healthz", get(healthz)).merge(traced)
 }
 
 async fn healthz() -> &'static str {
     "ok"
 }
-
-// ---- Errors ----------------------------------------------------------------
 
 pub struct ApiError(pub StatusCode, pub String);
 
@@ -189,8 +176,6 @@ fn unauthorized(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::UNAUTHORIZED, msg.into())
 }
 
-// ---- Auth middleware -------------------------------------------------------
-
 async fn auth_middleware<B, M, A>(
     State(svc): State<Service<B, M, A>>,
     method: Method,
@@ -226,8 +211,6 @@ where
     req.extensions_mut().insert(claims);
     Ok(next.run(req).await)
 }
-
-// ---- Signed transfer URLs --------------------------------------------------
 
 struct SignedRange {
     hash_hex: String,
@@ -275,10 +258,7 @@ fn build_signed_url(
     format!("{base}/xorb/default/{xorb_hex}?s={start}&e={end_inclusive}&x={exp}&sig={sig}")
 }
 
-// ---- Quotas ----------------------------------------------------------------
-
-/// Resolves the quota an owner is subject to: per-owner override beats the
-/// server default. `None` = unlimited.
+// Per-owner override beats the server default; `None` = unlimited.
 async fn effective_quota<M: MetadataStore>(
     meta: &M,
     default: Option<u64>,
@@ -299,8 +279,6 @@ fn quota_exceeded(owner: &str, used: u64, quota: u64, would_add: u64) -> ApiErro
     )
 }
 
-// ---- Handlers: upload ------------------------------------------------------
-
 async fn upload_xorb<B, M, A>(
     State(svc): State<Service<B, M, A>>,
     Extension(claims): Extension<TokenClaims>,
@@ -316,11 +294,8 @@ where
     if body.len() > MAX_BODY_BYTES {
         return Err(bad_req("xorb exceeds 64 MiB limit"));
     }
-    // Quota: skip when the xorb already exists in CAS — content-addressed
-    // re-puts don't add disk bytes, so they don't push any owner over.
-    // Charge the upper bound (body.len()) against the owner's already-attributed
-    // stored bytes; the precise attribution lands at /shards when files
-    // referencing this xorb get registered.
+    // Skip the quota check on content-addressed re-puts: they add no disk bytes.
+    // Charge the upper bound (body.len()); precise attribution lands at /shards.
     let owner = claims.repo.owner().to_string();
     if let Some(quota) = effective_quota(svc.meta.as_ref(), svc.default_quota_bytes, &owner).await?
     {
@@ -333,9 +308,8 @@ where
             }
         }
     }
-    // Record on-disk frame ranges: shard CAS Info has only uncompressed
-    // offsets, so reconstruction can't compute HTTP byte ranges without this.
-    // Parse before persisting to reject malformed bodies without half-storing.
+    // Record on-disk frame ranges: shard CAS Info has only uncompressed offsets,
+    // so reconstruction can't compute HTTP byte ranges without this.
     let frames =
         parse_xorb_frames(&body).map_err(|e| bad_req(format!("malformed xorb body: {e}")))?;
     let layout: Vec<XorbFrameRow> = frames
@@ -349,9 +323,8 @@ where
         })
         .collect();
     let xorb = XorbHash(hash);
-    // Content-hash check: decompress each chunk, recompute the merkle
-    // aggregation, compare to the URL hash. Rejects a writer who'd otherwise
-    // be able to corrupt the CAS by uploading bytes that don't match.
+    // Recompute the merkle aggregation and compare to the URL hash, so a writer
+    // can't corrupt the CAS by uploading bytes that don't match.
     if let Err(e) = verify_xorb_body(&body, &xorb) {
         return Err(match e {
             XorbVerifyError::HashMismatch => bad_req("xorb body does not match URL hash"),
@@ -359,11 +332,9 @@ where
         });
     }
     let body_len = body.len() as u64;
-    // Register layout BEFORE writing the blob: a layout row with no backing
-    // blob is harmless (shard upload's `blobs.xorb_exists` gate rejects, and
-    // m6's ghost-xorb dedup tests cover the read-side handling), but a blob
-    // with no layout permanently wedges every file that references it because
-    // reconstruction can't compute byte ranges.
+    // Register layout BEFORE the blob: a layout row with no blob is harmless
+    // (the shard upload's `xorb_exists` gate rejects it), but a blob with no
+    // layout permanently wedges reconstruction, which can't compute byte ranges.
     svc.meta.register_xorb_layout(&xorb, &layout).await?;
     let was_inserted = svc.blobs.put_xorb(&xorb, body).await?;
     metrics::XORBS_UPLOADED.add(
@@ -401,10 +372,8 @@ where
             )));
         }
     }
-    // Reject malformed file terms before any metadata write: chunk_idx_end == 0
-    // (or start >= end) is the trap that underflows `chunk_idx_end - 1` in the
-    // reconstruction handler. Catch it at the trust boundary so bad terms never
-    // reach SQLite.
+    // Reject empty/inverted ranges before any metadata write: chunk_idx_end == 0
+    // would underflow `chunk_idx_end - 1` in the reconstruction handler.
     for f in &parsed.files {
         for e in &f.entries {
             if !svc.blobs.xorb_exists(&e.xorb).await? {
@@ -422,13 +391,9 @@ where
         }
     }
 
-    // Derive `num_bytes_on_disk` from the xorb_frames table (populated by
-    // upload_xorb when the body landed) rather than trusting the shard's
-    // claim: xet-data sets the shard's `num_bytes_on_disk` to 0
-    // unconditionally, so without this the owner accounting would collapse
-    // to 0 for every real client. Fall back to the shard's value when no
-    // frame layout is on file (covers shards that pre-set the field instead
-    // of leaving it 0).
+    // Derive `num_bytes_on_disk` from the xorb_frames table rather than the
+    // shard's claim: xet-data sets it to 0 unconditionally, which would collapse
+    // owner accounting to 0. Fall back to the shard's value when no layout exists.
     let xorb_hashes: Vec<XorbHash> = parsed.cas_blocks.iter().map(|cb| cb.xorb).collect();
     let frame_layouts = svc.meta.xorb_frame_layouts(&xorb_hashes).await?;
     for cb in &parsed.cas_blocks {
@@ -460,11 +425,9 @@ where
         svc.meta.register_xorb(&info, &rows).await?;
     }
 
-    // Per-owner quota: project the post-commit stored bytes by summing on-disk
-    // sizes for xorbs referenced by the shard's files that the owner doesn't
-    // already reference. Reject BEFORE register_file so an over-quota shard
-    // leaves no file rows behind (xorbs already on disk are still subject to
-    // GC). The xorbs were just registered above, so their sizes are queryable.
+    // Reject over-quota BEFORE register_files so the shard leaves no file rows
+    // behind (orphan xorbs already on disk are GC-able). Delta is the on-disk
+    // size of referenced xorbs the owner doesn't already reference.
     let owner = claims.repo.owner().to_string();
     if let Some(quota) = effective_quota(svc.meta.as_ref(), svc.default_quota_bytes, &owner).await?
     {
@@ -484,8 +447,8 @@ where
         }
     }
 
-    // Materialize file terms up front so a per-file shape error (verification
-    // count mismatch) fails the whole upload before any state changes.
+    // Materialize all terms up front so a verification-count mismatch fails the
+    // whole upload before any state changes.
     let mut files_to_register: Vec<(FileHash, Vec<FileTerm>)> =
         Vec::with_capacity(parsed.files.len());
     for f in &parsed.files {
@@ -514,18 +477,14 @@ where
         files_to_register.push((f.file_hash, terms));
     }
 
-    // Persist the shard archive first. It's content-addressed and inert
-    // without a metadata reference, so an orphan blob is cheap (GC-able)
-    // and recoverable on retry. Doing this before the atomic file-registration
-    // means a partial failure can never produce orphan file rows pointing at
-    // a missing shard archive.
+    // Persist the shard archive before file-registration: an orphan blob is
+    // GC-able, but a file row pointing at a missing shard archive is not.
     let shard_hash = shard_storage_hash(&body);
     let body_len = body.len() as u64;
     svc.blobs.put_shard(&shard_hash, body).await?;
 
-    // Single-transaction commit of all file registrations: a fault inside the
-    // batch rolls back the whole shard, so the client's "500 = nothing
-    // happened" mental model holds.
+    // Single transaction: a fault rolls back the whole shard, preserving the
+    // client's "500 = nothing happened" model.
     svc.meta
         .register_files(&claims.repo, &files_to_register)
         .await?;
@@ -541,8 +500,6 @@ fn shard_storage_hash(bytes: &[u8]) -> ShardHash {
     out.copy_from_slice(blake3::hash(bytes).as_bytes());
     ShardHash(Hash32(out))
 }
-
-// ---- Handlers: download ----------------------------------------------------
 
 async fn get_reconstruction<B, M, A>(
     State(svc): State<Service<B, M, A>>,
@@ -584,9 +541,8 @@ where
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "file not found".into()))?;
 
-    // Use the xorb's on-disk frame layout — NOT the chunks table, whose
-    // offsets live in uncompressed coordinate space. One batched query
-    // replaces what used to be N sequential round-trips.
+    // On-disk frame layout, NOT the chunks table whose offsets are in
+    // uncompressed coordinate space.
     let xorbs: Vec<XorbHash> = terms.iter().map(|t| t.xorb).collect();
     let layouts = svc.meta.xorb_frame_layouts(&xorbs).await?;
 
@@ -621,10 +577,9 @@ where
             },
         });
 
-        // If the BlobStore can offload the GET (e.g. S3 presign), use that URL
-        // directly so bytes never flow through us. The presigned URL must be
-        // signed over the same byte range the client will request — its TTL
-        // matches the self-signed URL's so client retry windows stay aligned.
+        // When the BlobStore can offload the GET (e.g. S3 presign), bytes skip
+        // us. The presigned URL must be signed over the same byte range the
+        // client will request, with a TTL matching the self-signed path.
         let presigned = svc
             .blobs
             .presign_xorb_range(
@@ -666,29 +621,19 @@ where
     })
 }
 
-// ---- Handlers: browser file download ---------------------------------------
-
 #[derive(Debug, Deserialize)]
 struct FileDownloadQuery {
-    /// Forge-issued JWT, mirrors the bearer the m11 client gets back from
-    /// `POST /info/bale/authenticate`. Rides the URL because browsers can't
-    /// attach Authorization on a 302 follow.
+    // Rides the URL because browsers can't attach Authorization on a 302 follow.
     token: String,
-    /// `owner/name` — bale-server does not decode the forge JWT itself, so the
-    /// caller must name the repo explicitly. The forge's `check_access` then
-    /// verifies the JWT binds to this repo.
+    // bale-server doesn't decode the forge JWT, so the caller names the repo and
+    // the forge's `check_access` verifies the JWT binds to it.
     repo: String,
-    /// Optional. When set, gates the `Content-Disposition: attachment;
-    /// filename=` value: we ignore it unless the JWT carries a matching
-    /// SHA-256 in `FilenameSHA256`.
     filename: Option<String>,
 }
 
-/// Just enough of the forge JWT body to extract the filename binding. Field
-/// name matches gitea's `services/lfs/server.go` `Claims.FilenameSHA256`
-/// (omitempty). We do NOT verify the JWT signature here — `check_repo_access`
-/// already does that on the forge, so an attacker can't substitute a JWT with
-/// a different filename hash without also passing the forge's signature check.
+// We do NOT verify the JWT signature here — `check_repo_access` does that on the
+// forge, so an attacker can't swap in a different filename hash. Field name
+// matches gitea's `Claims.FilenameSHA256`.
 #[derive(Debug, Default, Deserialize)]
 struct ForgeJwtPayload {
     #[serde(rename = "FilenameSHA256", default)]
@@ -724,15 +669,10 @@ fn parse_owner_name(repo: &str) -> Result<RepoRef, ApiError> {
     })
 }
 
-/// Browser-facing single-URL download. The forge (gitea) 302s here from
-/// `/raw/...`; we stream the reconstructed file bytes so they never round-trip
-/// through the forge.
-///
-/// Lives outside the JWT [`auth_middleware`] because a 302 from the forge to
-/// us can't carry an Authorization header — the bearer rides in `?token=`
-/// instead. The same scope guarantees still apply: [`RepoAuthz::check_repo_access`]
-/// runs against the forge, and the file's per-repo scope check (the M12
-/// invariant) runs locally against `meta.file_in_repo`.
+// Outside [`auth_middleware`] because a 302 from the forge can't carry an
+// Authorization header — the bearer rides in `?token=`. Scope guarantees still
+// hold: `check_repo_access` runs on the forge and the M12 per-repo check runs
+// locally against `meta.file_in_repo`.
 async fn get_file_download<B, M, A>(
     State(svc): State<Service<B, M, A>>,
     Path(file_hex): Path<String>,
@@ -747,8 +687,7 @@ where
         FileHash(decode_hash(&file_hex).map_err(|e| bad_req(format!("malformed file id: {e}")))?);
     let repo = parse_owner_name(&q.repo)?;
 
-    // Authoritative auth: forge verifies the JWT signature, scope, and binding
-    // to `repo`. We only learn the resolved user (logged for the access trail).
+    // Authoritative auth lives on the forge; we only learn the resolved user.
     let user = svc
         .authz
         .check_repo_access(&q.token, &repo, Scope::Read)
@@ -760,11 +699,9 @@ where
         return Err(ApiError(StatusCode::NOT_FOUND, "file not found".into()));
     }
 
-    // Filename binding: only honor a caller-supplied `filename` when its hash
-    // matches the JWT claim minted by the forge. Without this check, anyone
-    // sharing a leaked URL could rewrite the download name (and confuse
-    // browsers about file types). Missing claim ⇒ no Content-Disposition; an
-    // explicit mismatch is a 400 because the URL was tampered with.
+    // Honor a caller-supplied `filename` only when its hash matches the forge's
+    // JWT claim, so a leaked URL can't rewrite the download name. Missing claim ⇒
+    // no Content-Disposition; an explicit mismatch is a tampered URL (400).
     let validated_filename = match (&q.filename, extract_filename_sha256(&q.token)) {
         (Some(name), Some(claim)) => {
             use sha2::Digest;
@@ -788,9 +725,8 @@ where
     let total_bytes: u64 = terms.iter().map(|t| t.unpacked_segment_bytes as u64).sum();
 
     // Stream term by term so a multi-GiB download never lives in the server's
-    // address space. Each yield is one term's assembled bytes (one xorb range
-    // round-trip + frame decompression); an error mid-stream surfaces as a
-    // transport error to the client because headers are already sent.
+    // address space. An error mid-stream can only surface as a truncated
+    // transport error because the headers are already sent.
     let svc_for_stream = svc.clone();
     let file_hex_for_log = file_hex.clone();
     let user_for_log = user.0.clone();
@@ -867,10 +803,8 @@ where
     let byte_start = start_frame.on_disk_start as u64;
     let byte_end = (last_frame.on_disk_start as u64) + (last_frame.on_disk_len as u64);
 
-    // Bound the decompression buffer against the xorb cap so a corrupt term
-    // claiming gigabytes of "unpacked" bytes can't trigger an unbounded
-    // Vec::with_capacity. Xorbs are ≤64 MiB compressed, so any single term's
-    // unpacked size legitimately fits well within MAX_TERM_UNPACKED_BYTES.
+    // Cap the decompression buffer so a corrupt term claiming gigabytes can't
+    // trigger an unbounded Vec::with_capacity below.
     if (term.unpacked_segment_bytes as u64) > MAX_TERM_UNPACKED_BYTES {
         return Err(ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -891,11 +825,9 @@ where
     Ok(Bytes::from(out))
 }
 
-/// Strip characters that would break a quoted Content-Disposition header.
-/// The value goes inside double quotes; drop quotes, backslashes, control
-/// bytes, and non-ASCII so the header stays well-formed without escaping.
-/// RFC 5987 (`filename*=`) would preserve unicode, but most browsers also
-/// accept this ASCII-only fallback.
+// Drop quotes, backslashes, control bytes, and non-ASCII so the value stays a
+// well-formed quoted Content-Disposition without escaping. RFC 5987 would
+// preserve unicode, but this ASCII fallback is widely accepted.
 fn sanitize_filename(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
@@ -903,13 +835,11 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
-// ---- Handlers: global dedup ------------------------------------------------
-
-/// Max xorbs cited per dedup response. 8 × ~1024-chunk xorbs is ~384 KiB,
-/// well under the 64 MiB shard limit and small enough to stay round-trip fast.
+// Max xorbs cited per dedup response: 8 × ~1024-chunk xorbs is ~384 KiB, well
+// under the 64 MiB shard limit and round-trip fast.
 const DEDUP_NEIGHBORHOOD: usize = 8;
 
-/// Shard key lifetime — matches HF's published value.
+// Matches HF's published value.
 const DEDUP_KEY_TTL_SECS: u64 = 24 * 60 * 60;
 
 async fn get_dedup_chunk<B, M, A>(
@@ -931,10 +861,9 @@ where
         .xorbs_near_chunk(&chunk_hash, DEDUP_NEIGHBORHOOD)
         .await?;
 
-    // Filter out xorbs whose blobs are gone — the chunks table can outlive
-    // the blob store (wiped data root, future GC). Advertising a missing xorb
-    // would make the client skip re-upload, then /shards rejects the shard
-    // with "references missing xorb".
+    // Drop xorbs whose blobs are gone (chunks table can outlive the blob store):
+    // advertising one makes the client skip re-upload, then /shards rejects the
+    // shard with "references missing xorb".
     let mut near = Vec::with_capacity(candidates.len());
     let mut missing = 0usize;
     for x in candidates {
@@ -956,8 +885,8 @@ where
         return Err(ApiError(StatusCode::NOT_FOUND, "chunk not found".into()));
     }
 
-    // Per-response HMAC key written into the footer; the client wraps its
-    // own candidate chunks with it to match against ours without learning them.
+    // Per-response HMAC key in the footer: the client wraps its own candidate
+    // chunks with it to match ours without learning the plaintext hashes.
     let hmac_key: [u8; HASH_LEN] = rand::random();
 
     let mut cas_blocks = Vec::with_capacity(near.len());
@@ -1097,19 +1026,14 @@ fn parse_byte_range_header(v: &HeaderValue) -> Result<(u64, u64), String> {
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    // Folds the length difference into the accumulator so a length mismatch
-    // doesn't return early — callers that pass variable-length user input
-    // (e.g. an admin bearer that decoded to the wrong size) would otherwise
-    // leak length via timing. zip() naturally truncates to the shorter side;
-    // the (len ^ len) seed makes any difference visible regardless.
+    // Seed with the length difference so a length mismatch doesn't return early
+    // (zip truncates to the shorter side) and can't leak length via timing.
     let mut acc: u32 = (a.len() ^ b.len()) as u32;
     for (x_a, x_b) in a.iter().zip(b.iter()) {
         acc |= (x_a ^ x_b) as u32;
     }
     acc == 0
 }
-
-// ---- Mock HF Hub token endpoint --------------------------------------------
 
 async fn issue_xet_token<B, M, A>(
     State(svc): State<Service<B, M, A>>,
@@ -1150,11 +1074,9 @@ where
     }))
 }
 
-// ---- Handlers: usage + admin quotas ----------------------------------------
-
-/// Accepts either the admin bearer (constant-time compared) or a Bale JWT
-/// whose `repo.owner()` matches `owner`. Used by the read-side usage endpoints
-/// — they live outside the JWT middleware because the admin bearer is not a JWT.
+// Accepts the admin bearer (constant-time compared) or a Bale JWT whose
+// `repo.owner()` matches `owner`. The usage endpoints live outside the JWT
+// middleware because the admin bearer is not a JWT.
 async fn require_admin_or_owner<B, M, A>(
     svc: &Service<B, M, A>,
     headers: &HeaderMap,

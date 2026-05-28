@@ -1,8 +1,6 @@
-//! Fetch a reconstruction manifest and convert it to [`CachedManifest`].
-//! Called on the cold path only — once cached, the hot path skips the network.
-//!
-//! Calls `get_reconstruction_v1` directly. The `Client` trait would probe
-//! `/v2/...` first and fall back on 404, and baleforgit-server only speaks v1.
+//! Fetch a reconstruction manifest and convert it to [`CachedManifest`]
+//! (cold path only). Calls `get_reconstruction_v1` directly: the `Client` trait
+//! probes `/v2/...` first, and baleforgit-server only speaks v1.
 
 use anyhow::{anyhow, Context, Result};
 use xet_client::cas_client::auth::AuthConfig;
@@ -24,9 +22,8 @@ pub async fn fetch_manifest(cfg: &BaleConfig, file_id: &MerkleHash) -> Result<Ca
         .with_context(|| format!("fetching reconstruction manifest for {}", file_id.hex()))?
         .ok_or_else(|| anyhow!("server returned no reconstruction for {}", file_id.hex()))?;
 
-    // Normalize to plain hex `String` + `u64`: xet-client uses a `HexMerkleHash`
-    // newtype and a `u32` `unpacked_length`, both of which would tie our
-    // persisted shape to xet-client's internal types.
+    // Normalize to hex `String` + `u64` so our persisted shape isn't tied to
+    // xet-client's `HexMerkleHash` / `u32` internal types.
     let terms = response
         .terms
         .into_iter()

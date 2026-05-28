@@ -1,6 +1,4 @@
-//! MDB shard binary format parser and serializer.
-//!
-//! Layout (per Xet spec):
+//! MDB shard binary format parser and serializer. Layout (per Xet spec):
 //! ```text
 //! Header (48 B) | FileInfo... | FileInfo bookend (48 B)
 //!               | CasInfo...  | CasInfo bookend  (48 B)
@@ -26,11 +24,10 @@ pub const MDB_SHARD_FOOTER_VERSION: u64 = 1;
 const FLAG_WITH_VERIFICATION: u32 = 1 << 31; // 0x8000_0000
 const FLAG_WITH_METADATA_EXT: u32 = 1 << 30; // 0x4000_0000
 
-/// The canonical 32-byte magic that prefixes every MDB shard. Lifted verbatim
-/// from xet-core's `mdb_shard::shard_format::MDB_SHARD_HEADER_TAG` (see
-/// xet-core@git-xet-v0.2.1). Our parser only checks length, not identity, so
-/// shards written by older toolchains still round-trip; serialization uses
-/// this value so shards we produce are accepted by xet-core's strict check.
+/// Canonical 32-byte shard magic, verbatim from xet-core's
+/// `mdb_shard::shard_format::MDB_SHARD_HEADER_TAG` (git-xet-v0.2.1). Parse only
+/// checks length so older shards round-trip; serialize emits this so xet-core's
+/// strict check accepts ours.
 pub const MDB_SHARD_HEADER_TAG: [u8; HASH_LEN] = [
     b'H', b'F', b'R', b'e', b'p', b'o', b'M', b'e', b't', b'a', b'D', b'a', b't', b'a', 0, 85, 105,
     103, 69, 106, 123, 129, 87, 131, 165, 189, 217, 92, 205, 209, 74, 169,
@@ -75,9 +72,9 @@ pub struct ParsedFile {
     pub file_hash: FileHash,
     pub file_flags: u32,
     pub entries: Vec<FileTermEntry>,
-    /// One verification hash per entry, present iff `FLAG_WITH_VERIFICATION`.
+    /// One per entry, present iff `FLAG_WITH_VERIFICATION`.
     pub verifications: Vec<Hash32>,
-    /// Present iff `FLAG_WITH_METADATA_EXT`. The 32-byte SHA-256 of the file.
+    /// File SHA-256, present iff `FLAG_WITH_METADATA_EXT`.
     pub sha256: Option<Hash32>,
 }
 
@@ -165,11 +162,10 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Reverse the byte order within each 8-byte group of a 32-byte buffer.
-/// This is its own inverse. xet-core serializes a `MerkleHash` (internally
-/// `[u64; 4]`) as 32 little-endian bytes per u64; the same shape is reused
-/// for `FileMetadataExt.sha256`, so to round-trip a sha256 between the
-/// standard byte order and the on-disk layout we apply this swap.
+/// Reverse byte order within each of the four 8-byte groups (its own inverse).
+/// xet-core stores a `MerkleHash` (`[u64; 4]`) as 4 little-endian u64s, and
+/// reuses that layout for `FileMetadataExt.sha256`; this maps it to/from
+/// standard sha256 byte order.
 fn swap_u64_groups(input: [u8; HASH_LEN]) -> [u8; HASH_LEN] {
     let mut out = [0u8; HASH_LEN];
     for group in 0..4 {
@@ -191,7 +187,6 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
 
     let mut c = Cursor::new(bytes);
 
-    // Header
     let tag_slice = c.take(HASH_LEN)?;
     let mut tag = [0u8; HASH_LEN];
     tag.copy_from_slice(tag_slice);
@@ -206,7 +201,6 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
         footer_size,
     };
 
-    // File info section
     let mut files = Vec::new();
     loop {
         let file_hash = c.hash()?;
@@ -215,16 +209,12 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
         c.skip(8)?; // _unused
 
         if is_bookend_hash(&file_hash) {
-            // The remaining 16 bytes after the hash are required by layout
-            // (the bookend is a full 48-byte entry) — file_flags/num_entries
-            // and _unused all become part of the 16 trailing zero bytes.
+            // Bookend is a full 48-byte entry; flags/num_entries/_unused are its trailing zeros.
             break;
         }
 
-        // Bound the preallocation against the remaining buffer: each entry is
-        // ENTRY_SIZE bytes, so num_entries items cannot exceed remaining/ENTRY_SIZE
-        // without the parse failing later anyway. Guards against a malicious
-        // num_entries=u32::MAX from triggering a ~200 GiB Vec preallocation.
+        // Cap preallocation at remaining/ENTRY_SIZE so a hostile num_entries=u32::MAX
+        // can't trigger a ~200 GiB Vec; an honest count fails later anyway.
         let max_entries = (c.remaining() / ENTRY_SIZE) as u32;
         if num_entries > max_entries {
             return Err(ShardError::Truncated {
@@ -250,9 +240,7 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
 
         let mut verifications = Vec::new();
         if file_flags & FLAG_WITH_VERIFICATION != 0 {
-            // num_entries is already bounded against remaining above, but the
-            // verification section needs another ENTRY_SIZE bytes per entry on
-            // top of the file-term bytes we just consumed.
+            // Verification section needs another ENTRY_SIZE per entry beyond the file terms.
             if num_entries as usize > c.remaining() / ENTRY_SIZE {
                 return Err(ShardError::Truncated {
                     offset: c.pos,
@@ -268,11 +256,8 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
         }
 
         let sha256 = if file_flags & FLAG_WITH_METADATA_EXT != 0 {
-            // git-xet serializes the sha256 in the same little-endian-u64-group
-            // order as every other Xet hash on disk, NOT in plain sha256 byte
-            // order. Normalize here so `ParsedFile.sha256` matches the standard
-            // byte order (the inverse swap happens on serialize). See
-            // `swap_u64_groups` for the byte mapping.
+            // On disk the sha256 is in xet's u64-group order, not plain sha256 order;
+            // normalize to standard byte order (serialize applies the inverse).
             let h = c.hash()?;
             c.skip(16)?;
             Some(Hash32(swap_u64_groups(h.0)))
@@ -289,7 +274,6 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
         });
     }
 
-    // CAS info section
     let mut cas_blocks = Vec::new();
     loop {
         let cas_hash = c.hash()?;
@@ -330,7 +314,6 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
         });
     }
 
-    // Footer (optional)
     let footer = if footer_size == FOOTER_SIZE as u64 {
         let fv = c.u64()?;
         if fv != MDB_SHARD_FOOTER_VERSION {
@@ -373,14 +356,12 @@ pub fn parse(bytes: &[u8]) -> ShardResult<ParsedShard> {
 
 pub fn serialize(s: &ParsedShard) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_SIZE + ENTRY_SIZE * 16);
-    // Header
     out.extend_from_slice(&s.header.tag);
     out.extend_from_slice(&s.header.version.to_le_bytes());
     out.extend_from_slice(&s.header.footer_size.to_le_bytes());
 
     let file_info_offset = out.len() as u64;
 
-    // File info section
     for f in &s.files {
         out.extend_from_slice(&f.file_hash.as_bytes()[..]);
         out.extend_from_slice(&f.file_flags.to_le_bytes());
@@ -401,20 +382,18 @@ pub fn serialize(s: &ParsedShard) -> Vec<u8> {
             }
         }
         if f.file_flags & FLAG_WITH_METADATA_EXT != 0 {
-            // Caller invariant: flag implies Some(sha256). Defensive fallback to
-            // zeros keeps the layout valid rather than panicking server-wide.
+            // Flag implies Some(sha256); fall back to zeros to keep layout valid, not panic.
             let sha = f.sha256.unwrap_or(Hash32([0u8; HASH_LEN]));
             out.extend_from_slice(&swap_u64_groups(sha.0));
             out.extend_from_slice(&[0u8; 16]);
         }
     }
-    // File info bookend: 0xFF*32 + 0x00*16
+    // File-info bookend: 0xFF*32 + 0x00*16.
     out.extend_from_slice(&[0xFFu8; HASH_LEN]);
     out.extend_from_slice(&[0u8; 16]);
 
     let cas_info_offset = out.len() as u64;
 
-    // CAS info section
     for cb in &s.cas_blocks {
         out.extend_from_slice(&cb.xorb.as_bytes()[..]);
         out.extend_from_slice(&cb.cas_flags.to_le_bytes());
@@ -435,7 +414,6 @@ pub fn serialize(s: &ParsedShard) -> Vec<u8> {
     let footer_offset = out.len() as u64;
 
     if let Some(ref ft) = s.footer {
-        // 200-byte footer
         out.extend_from_slice(&ft.version.to_le_bytes());
         out.extend_from_slice(&file_info_offset.to_le_bytes());
         out.extend_from_slice(&cas_info_offset.to_le_bytes());
