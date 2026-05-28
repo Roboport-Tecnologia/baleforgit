@@ -38,6 +38,7 @@ use std::path::Path;
 use anyhow::Result;
 use gix::ObjectId;
 
+use crate::clean_cache;
 use crate::pointer;
 use crate::staging::{
     clear_file_markers, list_staged_files, remove_all_staged_objects, remove_empty_dirs,
@@ -72,7 +73,8 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
     }
     let want: BTreeSet<String> = staged.into_iter().map(|(h, _)| h).collect();
 
-    let live = collect_live_hashes(&repo, &want);
+    let (local_tips, remote_tips) = ref_tips(&repo);
+    let live = reachable_hashes(&repo, &want, &local_tips, &remote_tips);
     let dead: Vec<String> = want
         .iter()
         .filter(|h| !live.contains(*h))
@@ -92,6 +94,33 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
         dead.len()
     );
 
+    // A dropped marker means the content is either pushed (its commit is on a
+    // remote) or genuinely orphaned (unstaged/abandoned before any push). In the
+    // orphaned case the staged bytes are about to be swept and exist nowhere
+    // else — yet the path-keyed clean-cache still maps the same worktree bytes
+    // to that pointer, so a later `git add` would short-circuit to a pointer
+    // with no retrievable backing (the stage→unstage→stash data-loss bug).
+    // Invalidate those entries so the re-add does a full clean + re-stage.
+    // Pushed hashes keep their cache: their smudge correctly falls to the server.
+    let orphaned: BTreeSet<String> = if remote_tips.is_empty() {
+        dead.iter().cloned().collect()
+    } else {
+        let mut all_tips = local_tips;
+        all_tips.extend(remote_tips);
+        let reachable_anywhere = reachable_hashes(&repo, &want, &all_tips, &[]);
+        dead.iter()
+            .filter(|h| !reachable_anywhere.contains(*h))
+            .cloned()
+            .collect()
+    };
+    match clean_cache::forget_hashes(&git_dir, &orphaned) {
+        Ok(n) if n > 0 => {
+            tracing::debug!("git-bale gc: invalidated {n} stale clean-cache entr(ies)")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("git-bale gc: invalidating clean-cache: {e}"),
+    }
+
     // No marker left → nothing references the staged xorbs/shards. Sweep them
     // (same wipe push-pending performs after a successful drain).
     let remaining = list_staged_files(&git_dir).map(|v| v.len()).unwrap_or(0);
@@ -105,11 +134,19 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Returns the subset of `want` (staged file hashes) that is still referenced
-/// by the index or an unpushed commit. Stops as soon as every wanted hash is
-/// accounted for — the common "you just staged it" case resolves from the
-/// index without touching history.
-fn collect_live_hashes(repo: &gix::Repository, want: &BTreeSet<String>) -> HashSet<String> {
+/// Returns the subset of `want` (staged file hashes) reachable from the index
+/// or from commits in `tips` (with `hidden`'s ancestors pruned). The live set
+/// passes `tips = local refs`, `hidden = remotes` to mean "index or unpushed
+/// commit"; the orphan check passes all refs as tips with nothing hidden to
+/// mean "reachable anywhere". Stops as soon as every wanted hash is accounted
+/// for — the common "you just staged it" case resolves from the index without
+/// touching history.
+fn reachable_hashes(
+    repo: &gix::Repository,
+    want: &BTreeSet<String>,
+    tips: &[ObjectId],
+    hidden: &[ObjectId],
+) -> HashSet<String> {
     let mut live = HashSet::new();
     let mut seen_blobs: HashSet<ObjectId> = HashSet::new();
 
@@ -127,14 +164,16 @@ fn collect_live_hashes(repo: &gix::Repository, want: &BTreeSet<String>) -> HashS
         }
     }
 
-    // 2. Pointers introduced by unpushed commits: walk local refs, hide what
-    //    the remotes already have, and diff each commit against its first
-    //    parent so we only read the blobs it actually changed.
-    let (tips, hidden) = ref_tips(repo);
+    // 2. Pointers introduced by the walked commits, diffing each against its
+    //    first parent so we only read the blobs it actually changed.
     if tips.is_empty() {
         return live;
     }
-    let walk = match repo.rev_walk(tips).with_hidden(hidden).all() {
+    let walk = match repo
+        .rev_walk(tips.iter().copied())
+        .with_hidden(hidden.iter().copied())
+        .all()
+    {
         Ok(w) => w,
         Err(e) => {
             tracing::debug!("git-bale gc: rev walk failed ({e}); keeping index-reachable only");
@@ -169,9 +208,10 @@ fn collect_live_hashes(repo: &gix::Repository, want: &BTreeSet<String>) -> HashS
     live
 }
 
-/// Collect ref tips for the rev walk: every non-remote ref (plus HEAD, for a
-/// detached checkout) becomes a starting tip; remote-tracking refs become
-/// "hidden" so their ancestors — content already on a remote — are pruned.
+/// Split commit ref tips into `(local, remote)`: every non-remote ref (plus
+/// HEAD, for a detached checkout) is local; `refs/remotes/*` are remote. The
+/// live walk uses remotes as `hidden` (prune content already pushed); the
+/// orphan check walks local+remote as tips (reachable anywhere).
 fn ref_tips(repo: &gix::Repository) -> (Vec<ObjectId>, Vec<ObjectId>) {
     let mut tips = Vec::new();
     let mut hidden = Vec::new();
@@ -441,6 +481,88 @@ mod tests {
         assert!(
             file_is_staged(&git_dir, &b),
             "tip version (C2) must survive gc"
+        );
+    }
+
+    #[test]
+    fn orphaned_marker_invalidates_clean_cache_entry() {
+        // The stage→unstage→stash bug: bytes sit in the worktree (cleaned, so a
+        // clean-cache entry exists) but aren't in the index or any commit, and
+        // were never pushed. gc sweeps the staging AND must drop the clean-cache
+        // entry, else a re-add short-circuits to an unbacked pointer.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("readme.txt"), "hi\n").unwrap();
+        git(&["add", "."], dir.path());
+        git(&["commit", "-q", "-m", "init"], dir.path());
+
+        let git_dir = git_dir_of(dir.path());
+        let orphan = "a".repeat(64);
+        mark_file_staged(&git_dir, &orphan, 4096).unwrap();
+        stage_xorb(&git_dir);
+        // A clean-cache entry whose pointer references the orphaned hash.
+        let key = crate::clean_cache::path_key("f.bin");
+        let entry = crate::clean_cache::CacheEntry {
+            v: crate::clean_cache::CURRENT_VERSION,
+            size: 4096,
+            chunks: vec![],
+            pointer: format!("{{\"hash\":\"{orphan}\",\"file_size\":4096}}\n"),
+        };
+        crate::clean_cache::save(&git_dir, &key, &entry).unwrap();
+
+        reconcile(dir.path()).unwrap();
+
+        assert!(
+            !file_is_staged(&git_dir, &orphan),
+            "orphaned marker should be swept"
+        );
+        assert!(
+            crate::clean_cache::load(&git_dir, &key).unwrap().is_none(),
+            "orphaned hash's clean-cache entry must be invalidated"
+        );
+    }
+
+    #[test]
+    fn pushed_marker_keeps_clean_cache_entry() {
+        // Mirror of the above but the content was PUSHED (a remote-tracking ref
+        // names its commit). gc still drops the dangling marker, but the
+        // clean-cache entry must survive so a post-push `git status` still
+        // short-circuits (the smudge correctly falls to the server).
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let pushed = "d".repeat(64);
+        write_pointer(dir.path(), "f.bin", &pushed);
+        git(&["add", "f.bin"], dir.path());
+        git(&["commit", "-q", "-m", "pushed"], dir.path());
+        git(
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            dir.path(),
+        );
+        // Drop it from the index so it isn't kept via the index scan.
+        std::fs::remove_file(dir.path().join("f.bin")).unwrap();
+        git(&["rm", "-q", "--cached", "f.bin"], dir.path());
+
+        let git_dir = git_dir_of(dir.path());
+        mark_file_staged(&git_dir, &pushed, 4096).unwrap();
+        stage_xorb(&git_dir);
+        let key = crate::clean_cache::path_key("f.bin");
+        let entry = crate::clean_cache::CacheEntry {
+            v: crate::clean_cache::CURRENT_VERSION,
+            size: 4096,
+            chunks: vec![],
+            pointer: format!("{{\"hash\":\"{pushed}\",\"file_size\":4096}}\n"),
+        };
+        crate::clean_cache::save(&git_dir, &key, &entry).unwrap();
+
+        reconcile(dir.path()).unwrap();
+
+        assert!(
+            !file_is_staged(&git_dir, &pushed),
+            "pushed content's dangling marker should still be dropped"
+        );
+        assert!(
+            crate::clean_cache::load(&git_dir, &key).unwrap().is_some(),
+            "pushed hash's clean-cache entry must survive (smudge falls to server)"
         );
     }
 

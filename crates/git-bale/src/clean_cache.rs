@@ -25,6 +25,7 @@
 //! Chunk fingerprints use xxh3-64 — change detection, not adversarial
 //! integrity, so the speed (~10× blake3 on modern x86) wins.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -128,6 +129,51 @@ pub fn save(git_dir: &Path, key: &PathKey, entry: &CacheEntry) -> io::Result<()>
         f.sync_all()?;
     }
     fs::rename(&tmp, &final_path)
+}
+
+/// Delete clean-cache entries whose stored pointer references one of `hashes`
+/// (the file-level merkle hash). `git-bale gc` calls this when it orphans staged
+/// content — without it, a cache hit on a later `git add` of the same bytes
+/// would hand git a pointer whose xorbs/shards gc already swept and which was
+/// never pushed, so the smudge can reconstruct from neither staging nor the
+/// server. Dropping the entry forces that re-add to do a full clean and
+/// re-stage. Returns the number of entries removed.
+pub fn forget_hashes(git_dir: &Path, hashes: &BTreeSet<String>) -> io::Result<usize> {
+    if hashes.is_empty() {
+        return Ok(0);
+    }
+    let dir = cache_dir(git_dir);
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0usize;
+    for ent in entries {
+        let path = ent?.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(entry) = serde_json::from_slice::<CacheEntry>(&bytes) else {
+            continue;
+        };
+        if pointer_hash(&entry.pointer).is_some_and(|h| hashes.contains(&h)) {
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Pull the `hash` field out of a stored pointer JSON without depending on the
+/// pointer crate's type — the cache only ever needs the file id string.
+fn pointer_hash(pointer: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(pointer).ok()?;
+    v.get("hash")?.as_str().map(str::to_string)
 }
 
 /// Like [`compute_chunks`] but for a byte slice already in memory — saves the
@@ -547,6 +593,60 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!((chunks[0].start, chunks[0].end), (0, 0));
         assert!(verify_chunks_in_memory(&chunks, b""));
+    }
+
+    #[test]
+    fn forget_hashes_removes_only_matching_entries() {
+        let dir = tempdir().unwrap();
+        let keep_hash = "a".repeat(64);
+        let drop_hash = "b".repeat(64);
+        let keep_key = path_key("keep.bin");
+        let drop_key = path_key("drop.bin");
+        let chunk = vec![Chunk {
+            start: 0,
+            end: 4,
+            hash: chunk_hash_hex(b"data"),
+        }];
+        save(
+            dir.path(),
+            &keep_key,
+            &dummy_entry(
+                4,
+                chunk.clone(),
+                &format!("{{\"hash\":\"{keep_hash}\",\"file_size\":4}}\n"),
+            ),
+        )
+        .unwrap();
+        save(
+            dir.path(),
+            &drop_key,
+            &dummy_entry(
+                4,
+                chunk,
+                &format!("{{\"hash\":\"{drop_hash}\",\"file_size\":4}}\n"),
+            ),
+        )
+        .unwrap();
+
+        let mut want = BTreeSet::new();
+        want.insert(drop_hash);
+        assert_eq!(forget_hashes(dir.path(), &want).unwrap(), 1);
+        assert!(load(dir.path(), &keep_key).unwrap().is_some());
+        assert!(load(dir.path(), &drop_key).unwrap().is_none());
+    }
+
+    #[test]
+    fn forget_hashes_empty_set_is_noop() {
+        let dir = tempdir().unwrap();
+        let key = path_key("f.bin");
+        save(
+            dir.path(),
+            &key,
+            &dummy_entry(0, vec![], "{\"hash\":\"abc\",\"file_size\":0}\n"),
+        )
+        .unwrap();
+        assert_eq!(forget_hashes(dir.path(), &BTreeSet::new()).unwrap(), 0);
+        assert!(load(dir.path(), &key).unwrap().is_some());
     }
 
     #[test]

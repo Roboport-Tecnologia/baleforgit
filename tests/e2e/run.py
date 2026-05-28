@@ -2104,14 +2104,19 @@ def phase_basic_user_ops(
         label="basic:after-unstage",
     )
 
-    # Re-stage — pointer cache should short-circuit the clean filter.
-    staging_before = set(staging_files(repo))
-    with timings.measure("basic: re-stage (pointer cache hit)"):
+    # Re-stage. The `git restore --staged` above fires the post-checkout hook →
+    # `git-bale gc`, which sweeps the now-unreferenced staging AND invalidates
+    # its clean-cache entry — otherwise a cache-hit re-add would short-circuit to
+    # a pointer whose bytes gc just deleted and which were never pushed (the
+    # stage→unstage→stash data-loss regression). So the re-add must do a full
+    # clean and re-populate staging; if it leaves staging empty, the stash/pop
+    # below would have nothing to reconstruct from offline.
+    with timings.measure("basic: re-stage (re-clean after gc-swept unstage)"):
         git(["add", "small.bin"], cwd=repo, env=env)
-    staging_after = set(staging_files(repo))
-    if staging_before != staging_after:
+    if not staging_files(repo):
         raise TestFailure(
-            "re-stage produced different staging files — pointer cache miss"
+            "re-stage left staging empty — gc swept it and the re-add did not "
+            "re-stage; the staged bytes are now unreconstructable offline"
         )
     verify_pointer_at(
         repo, env, spec=":small.bin",
@@ -2241,8 +2246,8 @@ def phase_spilled_clean(
     defaults to 4 GiB, so no realistic e2e file ever spills and `handle_clean`
     (the NamedTempFile branch) plus the file-backed `clean_cache::verify_chunks`
     go uncovered. Capping `BALE_MAX_INLINE_CLEAN` at 1 MiB and pushing a 5 MiB
-    file forces the spill: the first `git add` stages via the tmpfile path; an
-    unstage + re-add reloads the clean-cache and verifies the spilled payload
+    file forces the spill: the first `git add` stages via the tmpfile path; a
+    touch + re-add reloads the clean-cache and verifies the spilled payload
     through the file-backed `verify_chunks`."""
     repo, env = init_repo_for_push(
         work_root=work_root,
@@ -2276,22 +2281,25 @@ def phase_spilled_clean(
     if not clean_cache_entries(repo):
         raise TestFailure("spilled: clean-cache empty after `git add`")
 
-    # Unstage + re-add. The second clean reloads the clean-cache and, because
-    # the payload still spills, verifies it through the file-backed
-    # `verify_chunks` (not the in-memory variant). A cache hit must not produce
-    # new staging artifacts.
-    git(["restore", "--staged", "spilled.bin"], cwd=repo, env=env)
-    with timings.measure("spilled: re-stage (file-backed clean-cache hit)"):
+    # Bump mtime (content unchanged) to invalidate git's stat cache, forcing the
+    # next `git add` to re-run clean. That second clean reloads the clean-cache
+    # and, because the payload still spills, verifies it through the file-backed
+    # `verify_chunks` (not the in-memory variant). We deliberately do NOT unstage
+    # here: `git restore --staged` would fire the post-checkout gc hook, which
+    # sweeps + invalidates staging, turning this into a cache miss. A cache hit
+    # must not produce new staging artifacts.
+    os.utime(blob_path, None)
+    with timings.measure("spilled: re-add (file-backed clean-cache hit)"):
         git(["add", "spilled.bin"], cwd=repo, env=env)
     if set(staging_files(repo)) != staging_after_add:
         raise TestFailure(
-            "spilled: re-stage changed staging files — clean-cache miss on the "
+            "spilled: re-add changed staging files — clean-cache miss on the "
             "spilled verify path"
         )
     verify_pointer_at(
         repo, env, spec=":spilled.bin",
         expected_sha=payload_sha, expected_size=SPILL_FILE_BYTES,
-        label="spilled:after-restage",
+        label="spilled:after-readd",
     )
 
     with timings.measure("spilled: commit"):

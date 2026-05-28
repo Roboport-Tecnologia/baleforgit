@@ -7,9 +7,28 @@ locations and the proposed e2e change.
 
 **Snapshot context**: run on macOS (Darwin), `--coverage` mode (so the
 SIGKILL phases `failure-kill`, `failure-conndrop`, `failure-dbbusy`,
-`s3-failure-kill`, `s3-failure-conndrop` auto-skipped). Overall totals:
-46.8% fn / 51.5% line / 49.5% region. `bale-server-shard` was excluded
-from the analysis on purpose.
+`s3-failure-kill`, `s3-failure-conndrop` auto-skipped). `bale-server-shard`
+was excluded from the analysis on purpose.
+
+Overall totals progression:
+- Original analysis: 46.8% fn / 51.5% line / 49.5% region.
+- After §1 mount-session fix: ~65.3% line.
+- **Current (2026-05-28, full suite green incl. `spilled-clean` + `otlp`):
+  60.87% fn / 73.10% line / 72.04% region.** Targeted files this round:
+  `telemetry.rs` ~0 → 92.1% line, `clean_cache.rs` → 84.2%,
+  `filter_process.rs` → 80.2%, `gc.rs` → 87.9%.
+
+Two production bugs were surfaced while wiring these phases (both fixed):
+- **gc data-loss**: `git restore --staged` fires the post-checkout gc hook,
+  which swept staging the clean-cache still pointed at → `git add` →
+  unstage → re-add → `git stash`/`pop` lost the bytes. Fixed by
+  `clean_cache::forget_hashes` invalidation in gc (see §1-adjacent notes /
+  ARCHITECTURE.md).
+- **OTLP export never worked**: the async reqwest exporter panicked ("no
+  reactor running") on the SDK's dedicated export threads, silently dropping
+  all telemetry whenever `OTEL_EXPORTER_OTLP_ENDPOINT` was set. Fixed by
+  switching `opentelemetry-otlp` to the blocking reqwest client. Verified
+  against a real `otel/opentelemetry-collector` (spans + metrics decoded).
 
 Report tree at `target/coverage-e2e/html/index.html`. Per-file HTML
 under `target/coverage-e2e/html/coverage/`. A small helper at

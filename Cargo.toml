@@ -59,7 +59,10 @@ uuid = { version = "=1.23.1", features = ["v4"] }
 # API surface so its instruments are no-ops when no provider is installed.
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
-opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls", "trace", "metrics"] }
+# Blocking reqwest client: the SDK's BatchSpanProcessor / PeriodicReader export
+# on a dedicated non-tokio thread, where the async client panics with "no
+# reactor running". The blocking client needs no ambient runtime.
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics"] }
 tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 
 bale-server-core = { path = "crates/bale-server-core" }

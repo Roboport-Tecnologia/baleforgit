@@ -9,6 +9,14 @@
 //! by convention). `tracing` spans flow into the OTel pipeline via the
 //! `tracing-opentelemetry` bridge, so existing `tracing::info_span!` /
 //! `#[tracing::instrument]` call-sites become OTel spans for free.
+//!
+//! The exporter uses the **blocking** reqwest client (see the `opentelemetry-otlp`
+//! features in the root `Cargo.toml`), not the async one. Both the
+//! `BatchSpanProcessor` and `PeriodicReader` export from their own dedicated OS
+//! thread, which has no Tokio reactor — the async client panics there with "no
+//! reactor running", silently dropping every span/metric. Export is off the
+//! request path on those threads anyway, so blocking I/O there is correct and
+//! never stalls request handling.
 
 use anyhow::{Context, Result};
 use opentelemetry::global;
