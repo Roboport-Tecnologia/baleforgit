@@ -87,6 +87,7 @@ from baleharness.phases.push_pending import (
     phase_push_pending_corrupt_staging,
     phase_push_pending_noop,
 )
+from baleharness.phases.resync import phase_resync_after_cas_wipe
 from baleharness.phases.scenario import (
     phase_basic_user_ops,
     phase_big_file_dedup,
@@ -568,6 +569,17 @@ def main() -> int:
                 admin_token_hex=admin_token_hex,
             )
 
+        def _phase_resync() -> None:
+            phase_resync_after_cas_wipe(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+
         def _phase_gc_abandon() -> None:
             phase_gc_abandon_checkout(
                 timings=timings,
@@ -642,6 +654,10 @@ def main() -> int:
             "failure-kill": ("g3", False, _phase_failure_kill),
             "failure-conndrop": ("g3", False, _phase_failure_conndrop),
             "failure-dbbusy": ("g3", False, _phase_failure_dbbusy),
+            # Disaster recovery: wipe the server CAS, then re-add + force-push
+            # to repopulate it. Owns its own isolated container + data dir, so
+            # the wipe doesn't touch earlier phases' shared-server state.
+            "resync-wipe": ("g3", False, _phase_resync),
             # gc staging reconciliation. Each owns its own bare repo + commits,
             # so g3 — not read-only (they push new history).
             "gc-abandon-checkout": ("g3", False, _phase_gc_abandon),

@@ -66,6 +66,7 @@ found" error until that's fixed; the harness logic itself is portable.
 | `gc-abandon-checkout` | `git-bale gc`: push a baseline, stage a change, abandon it (`git reset` + `git checkout`); the post-checkout hook's gc fully wipes the orphaned staging. The user-reported bug. |
 | `gc-keeps-unpushed`   | DATA-LOSS GUARD: two stacked *unpushed* commits (tip names only v2); manual `git-bale gc` must NOT drop v1's staging. Push + cold-clone then reconstructs every revision byte-for-byte. |
 | `gc-mixed`            | Committed-but-unpushed v1 survives while a staged-then-abandoned (never-committed) v2 is forgotten; v1 stays pushable + reconstructable end to end. |
+| `resync-wipe`         | Disaster recovery: push a binary, restart the server with a BLANK CAS (fresh data dir, same bare repo), then delete `.git`, re-init, re-add (which re-stages locally), and `git push -f` to repopulate. A cold clone must reconstruct the file byte-for-byte. |
 | `spilled-clean`       | Caps `BALE_MAX_INLINE_CLEAN` at 1 MiB so a 5 MiB `git add` drives the clean filter's spill-to-tmpfile path; an unstage + re-add hits the file-backed clean-cache verify, then push + cold/hot resmudge round-trips the spilled file. |
 
 ### S3 mode (`run_s3.py`)

@@ -45,6 +45,9 @@ E2E_REPO_OFFLINE = "offline-net"
 E2E_REPO_GC1 = "gc-abandon"
 E2E_REPO_GC2 = "gc-keep"
 E2E_REPO_GC3 = "gc-mixed"
+# The resync-after-wipe phase owns its own isolated container; this is the bare
+# repo it force-pushes to after the server's CAS is wiped out from under it.
+E2E_REPO_RESYNC = "resync-wipe"
 E2E_USER = "e2e"
 # The browser-download phase downloads bigfile.bin (pushed to repo2) through
 # GET /v1/files/{id}, using this JWT to exercise the filename-binding branch.
