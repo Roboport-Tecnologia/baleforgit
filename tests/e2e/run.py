@@ -1887,6 +1887,69 @@ class MockForgeServer:
             self._thread = None
 
 
+class OtlpCollector:
+    """Minimal OTLP/HTTP collector for the telemetry phase. Binds 0.0.0.0 so
+    the server container reaches it via the host's primary IP, accepts POSTs on
+    any path (the exporter targets /v1/traces and /v1/metrics), drains the
+    protobuf body, and answers 200 with an empty body — which the
+    opentelemetry-rust HTTP exporter accepts as a successful export. Records a
+    per-path hit count so the phase can assert the server's exporter pipeline
+    actually fired."""
+
+    def __init__(self, *, port: Optional[int] = None) -> None:
+        self.port = port or pick_free_port()
+        self._lock = threading.Lock()
+        self.hits: dict[str, int] = {}
+        self._server: Optional["http.server.ThreadingHTTPServer"] = None
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def url(self) -> str:
+        # Base endpoint; the server appends /v1/traces + /v1/metrics per the
+        # OTLP/HTTP spec. 127.0.0.1 is the container's own loopback, so we hand
+        # it the host's primary IP (same cross-bridge route as MockAuthzServer).
+        return f"http://{host_primary_ip()}:{self.port}"
+
+    def hit_count(self, path: str) -> int:
+        with self._lock:
+            return self.hits.get(path, 0)
+
+    def start(self) -> None:
+        import http.server
+
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):  # noqa: N802
+                pass
+
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                with outer._lock:
+                    outer.hits[self.path] = outer.hits.get(self.path, 0) + 1
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-protobuf")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        self._server = http.server.ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True, name="OtlpCollector"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+
 def wait_for_server_progress(
     server: ServerHandle, *, min_bytes: int, timeout_s: float = 15.0
 ) -> int:
@@ -4132,6 +4195,94 @@ def phase_authz_http_coverage(
         mock.stop()
 
 
+def phase_otlp_telemetry(
+    *,
+    timings: Timings,
+    rt: Runtime,
+    image_tag: str,
+    work_root: Path,
+    client: ClientEnv,
+    ssh_public_key: str,
+    admin_token_hex: str,
+) -> None:
+    """Boot the server with the OTLP env vars pointed at a host-side collector,
+    push a small file to generate request spans, and confirm the exporter
+    pipeline fires. Covers `telemetry.rs`'s endpoint-configured init (span +
+    metric provider build, the tracing→OTel bridge) and both arms of the
+    signal-endpoint URL resolver — all no-ops when the env is unset, which is
+    why every other phase leaves them uncovered.
+
+    Traces use the per-signal `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (verbatim
+    URL); metrics fall back to appending `/v1/metrics` onto the base
+    `OTEL_EXPORTER_OTLP_ENDPOINT` — between them they hit both branches of
+    `signal_endpoint`."""
+    phase_root = work_root / "otlp"
+    phase_root.mkdir()
+    data_root = phase_root / "data"
+    data_root.mkdir()
+    jwt_secret = secrets.token_bytes(32).hex()
+    transfer_secret = secrets.token_bytes(32).hex()
+
+    collector = OtlpCollector()
+    collector.start()
+    info(f"otlp: collector listening at {collector.url}")
+    server: Optional[ServerHandle] = None
+    try:
+        with timings.measure("otlp: container start"):
+            server = start_container(
+                rt,
+                image_tag=image_tag,
+                data_root=data_root,
+                jwt_secret_hex=jwt_secret,
+                transfer_secret_hex=transfer_secret,
+                ssh_public_key=ssh_public_key,
+                test_repos=[f"{E2E_OWNER}/{E2E_REPO}"],
+                admin_token_hex=admin_token_hex,
+                name_suffix="otlp",
+                extra_env={
+                    "OTEL_EXPORTER_OTLP_ENDPOINT": collector.url,
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": f"{collector.url}/v1/traces",
+                    # Flush promptly instead of on the multi-second SDK defaults
+                    # so the assert below doesn't wait a whole batch interval.
+                    "OTEL_BSP_SCHEDULE_DELAY": "500",
+                    "OTEL_METRIC_EXPORT_INTERVAL": "500",
+                },
+            )
+
+        # A real push drives the SSH authenticate + xorb/shard POST handlers,
+        # each carrying a tower_http request span → exported to /v1/traces.
+        repo, env = init_repo_for_push(
+            work_root=work_root, client=client, server=server,
+            owner=E2E_OWNER, repo=E2E_REPO, name="otlp-client",
+        )
+        payload = deterministic_payload(SMALL_FILE_BYTES, seed=b"otlp")
+        (repo / "f.bin").write_bytes(payload)
+        git(["add", "f.bin"], cwd=repo, env=env)
+        git(["commit", "-m", "add f.bin"], cwd=repo, env=env)
+        with timings.measure("otlp: push (generates request spans)"):
+            git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if collector.hit_count("/v1/traces") > 0:
+                break
+            time.sleep(0.25)
+        traces = collector.hit_count("/v1/traces")
+        metrics = collector.hit_count("/v1/metrics")
+        info(f"otlp: collector hits — /v1/traces={traces} /v1/metrics={metrics}")
+        if traces == 0:
+            raise TestFailure(
+                "otlp: collector never received a /v1/traces export — the "
+                "server's OTLP span pipeline did not fire"
+            )
+    finally:
+        # Clean stop (SIGTERM) lets main return so the OTLP Guard flushes a
+        # final batch AND the llvm atexit hook writes this container's profraws.
+        if server is not None:
+            server.stop()
+        collector.stop()
+
+
 def phase_failure_server_kill_mid_upload(
     *,
     timings: Timings,
@@ -5346,6 +5497,19 @@ def main() -> int:
                 )
             else:
                 info("-- skipping phase 'https-origin' (per --skip)")
+
+            if "otlp" not in args.skip:
+                phase_otlp_telemetry(
+                    timings=timings,
+                    rt=rt,
+                    image_tag=image_tag,
+                    work_root=work_root,
+                    client=client,
+                    ssh_public_key=ssh_public_key,
+                    admin_token_hex=admin_token_hex,
+                )
+            else:
+                info("-- skipping phase 'otlp' (per --skip)")
 
         info("ALL CHECKS PASSED")
     except TestFailure as e:

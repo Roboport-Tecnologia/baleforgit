@@ -133,7 +133,7 @@ Per-file detail (all MISSING-E2E unless noted):
 | 2 | ~~`GET /v1/files/{file_id}` browser download~~ **DONE** (`browser-download` phase, +115 lines) | ~150 | bale-server-http:698-892 |
 | 3 | ~~Spilled-clean (>4 GiB) path~~ **DONE** (`spilled-clean` phase) | ~130 | filter_process.rs:253-477, clean_cache.rs:220-382 |
 | 4 | ~~HTTPS-origin phase~~ **DONE** (`https-origin` phase, +39 resolver / +10 remote) | ~80 | resolver.rs:101-190, 281-337 |
-| 5 | OTLP-collector sub-phase | ~60 | bale-server-bin/telemetry.rs |
+| 5 | ~~OTLP-collector sub-phase~~ **DONE** (`otlp` phase) | ~60 | bale-server-bin/telemetry.rs |
 | 6 | `PUT /v1/quotas/{owner}` admin-quota phase | ~40 | bale-server-http:1241-1266, meta-sqlite:597-615, http:288 |
 | 7 | `phase_uninstall` | ~40 | install.rs |
 | 8 | `phase_track` (swap manual `.gitattributes` write for `git-bale track`) | ~30 | track.rs, main.rs:148-153 |
@@ -183,11 +183,19 @@ smart-HTTP server is needed — those two ops only read origin + POST to the
 forge, they never transfer refs. Lifted resolver.rs 38.5% → 79.2% line and
 remote.rs 58.5% → 67.9%.
 
-**Phase 5 (OTLP collector)**: Python socket draining POSTs to
-`/v1/traces` and `/v1/metrics`. Run server with
-`OTEL_EXPORTER_OTLP_ENDPOINT=http://host.containers.internal:PORT`.
-Covers `telemetry.rs:72-122, 141-151`. Could fold into the `usage`
-phase since the server is already up.
+**Phase 5 (OTLP collector)** — **DONE**, the `otlp` coverage phase. An
+`OtlpCollector` (stdlib `ThreadingHTTPServer` on `0.0.0.0`, reachable from
+the container via `host_primary_ip()`) drains POSTs and answers `200`; a
+dedicated server container boots with `OTEL_EXPORTER_OTLP_ENDPOINT` (base,
+used by metrics) **and** `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (per-signal,
+verbatim URL) so both arms of `signal_endpoint` run, plus
+`OTEL_BSP_SCHEDULE_DELAY`/`OTEL_METRIC_EXPORT_INTERVAL=500` for prompt
+flushing. A small push generates INFO-level `tower_http` request spans; the
+phase polls until the collector sees a `/v1/traces` export. Covers
+`telemetry.rs:72-122` (span + metric provider build, tracing→OTel bridge)
+and `141-151` (both signal-endpoint branches); `Guard::drop`'s Some-arms are
+hit on the clean container stop. Did not fold into `usage` — that container
+is already up without the OTLP env, so a dedicated boot was needed.
 
 **Phase 6 (admin quota PUT)**: also exercises the 401-on-missing-bearer,
 not-hex-bearer, wrong-admin-token, and `effective_quota` Some(n)
@@ -372,6 +380,9 @@ run for those phases.
    (~130 lines across filter_process.rs + clean_cache.rs).
 5. **OTLP collector + admin-quota + uninstall + track phases**
    (§2.5–§2.8). ~130 lines combined, each phase modest in complexity.
+   - ~~OTLP collector (§2.5)~~ **DONE** — `otlp` coverage phase.
+   - Remaining: admin-quota PUT (§2.6), `phase_uninstall` (§2.7),
+     `phase_track` (§2.8).
 6. **Wire-level security probes** (§3 cross-repo M12 scope, JWT-owner
    mismatch, signed-URL tampering). Small in lines, but load-bearing
    for the invariants called out in CLAUDE.md.

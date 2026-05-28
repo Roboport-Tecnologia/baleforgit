@@ -134,6 +134,14 @@ covers every pluggable trait impl:
   `BALE_AUTHZ_HTTP_URL` set; three pushes against three test repos so
   the mock can return 200 / 403 / 500 per repo; one direct token-mint
   probe with an unknown hub bearer for the 401 branch.
+- `https-origin` — drives the `git-bale` resolver's HTTP-origin auth
+  branch (`MockForgeServer` + a canned `credential.helper`) so both the
+  upload and download scopes resolve over HTTP instead of SSH.
+- `otlp` — boots a server with `OTEL_EXPORTER_OTLP_ENDPOINT` /
+  `_TRACES_ENDPOINT` pointed at a host-side `OtlpCollector`, pushes a
+  small file, and asserts the collector receives a `/v1/traces` export —
+  exercising `bale-server-bin::telemetry`'s exporter init + signal-URL
+  resolution, which are no-ops whenever the OTLP env is unset.
 
 Coverage mode **auto-skips** phases that SIGKILL the server (`failure-
 kill`, `failure-conndrop`, `failure-dbbusy`, and the s3 equivalents) —
