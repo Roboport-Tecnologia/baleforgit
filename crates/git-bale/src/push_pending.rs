@@ -27,7 +27,6 @@
 //! loudly on mismatch — a divergence would indicate either xet-data version
 //! skew between clean and push-pending or staging-side corruption.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -39,7 +38,10 @@ use xet_runtime::core::XetRuntime;
 
 use crate::config::RawConfig;
 use crate::resolver;
-use crate::staging::{clear_file_markers, list_staged_files, staging_root};
+use crate::staging::{
+    clear_file_markers, list_staged_files, remove_all_staged_objects, remove_empty_dirs,
+    staging_root,
+};
 
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -160,94 +162,4 @@ async fn re_translate_one(
         );
     }
     Ok(())
-}
-
-/// Recursively removes any `default.<hex>` (xorb) and `<hex>.mdb` (shard)
-/// leaves under `staging`. Anything else (the `file-index/` dir, an empty
-/// `xet/` tree) is left alone — `remove_empty_dirs` handles the cleanup.
-fn remove_all_staged_objects(staging: &Path) -> std::io::Result<()> {
-    let rd = match std::fs::read_dir(staging) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    for entry in rd {
-        let entry = entry?;
-        let path = entry.path();
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            remove_all_staged_objects(&path)?;
-        } else if ft.is_file() {
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if is_xorb_filename(name) || is_shard_filename(name) {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn is_xorb_filename(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("default.") else {
-        return false;
-    };
-    is_64_lower_hex(rest)
-}
-
-fn is_shard_filename(name: &str) -> bool {
-    let Some(stem) = name.strip_suffix(".mdb") else {
-        return false;
-    };
-    is_64_lower_hex(stem)
-}
-
-fn is_64_lower_hex(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
-fn remove_empty_dirs(root: &Path) -> std::io::Result<()> {
-    if !root.is_dir() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            let _ = remove_empty_dirs(&entry.path());
-        }
-    }
-    // rmdir succeeds only when the directory is empty — exactly what we want.
-    let _ = std::fs::remove_dir(root);
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn xorb_filename_recognition() {
-        let h = "a".repeat(64);
-        assert!(is_xorb_filename(&format!("default.{h}")));
-        assert!(!is_xorb_filename(&format!("foo.{h}")));
-        assert!(!is_xorb_filename(&format!("default.{}", "a".repeat(63))));
-        assert!(!is_xorb_filename(&format!("default.{}.bak", h)));
-    }
-
-    #[test]
-    fn shard_filename_recognition() {
-        let h = "0".repeat(64);
-        assert!(is_shard_filename(&format!("{h}.mdb")));
-        assert!(!is_shard_filename("not-a-shard.txt"));
-        assert!(!is_shard_filename(&format!("{}.mdb", "X".repeat(64))));
-    }
-
-    #[test]
-    fn hex64_check_rejects_uppercase() {
-        assert!(!is_64_lower_hex(&"A".repeat(64)));
-        assert!(is_64_lower_hex(&"0".repeat(64)));
-        assert!(!is_64_lower_hex(""));
-    }
 }

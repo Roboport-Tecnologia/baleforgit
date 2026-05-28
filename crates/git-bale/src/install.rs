@@ -4,10 +4,14 @@
 //! long-running process when present, and it's faster than spawning a fresh
 //! `clean`/`smudge` subprocess per file.
 //!
-//! Local-scope install also writes a `pre-push` hook that runs
-//! `git-bale push-pending` so xorbs/shards staged by `clean` (`git add`)
-//! actually reach the server before `git push` advertises pointers that
-//! reference them.
+//! Local-scope install also writes git hooks:
+//!   - `pre-push` runs `git-bale push-pending` so xorbs/shards staged by
+//!     `clean` (`git add`) actually reach the server before `git push`
+//!     advertises pointers that reference them.
+//!   - `post-checkout` / `post-commit` / `post-merge` run `git-bale gc` so
+//!     staging for changes that were unstaged or discarded gets reclaimed
+//!     (clean only ever *adds* to staging; without gc, abandoned bytes would
+//!     linger until the next push).
 
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -26,15 +30,46 @@ pub enum Scope {
 const SECTION: &str = "filter.bale";
 const PROCESS_VALUE: &str = "git-bale filter-process";
 
-/// Identifies a pre-push hook we wrote so `uninstall` can remove it without
-/// clobbering a user-authored hook.
+/// Identifies a hook we wrote so `uninstall` can remove it (and `install` can
+/// re-write it) without clobbering a user-authored hook.
 const HOOK_MARKER: &str = "# bale-marker: managed-by-git-bale-do-not-edit";
+
+/// Hooks that trigger staging reconciliation. Each fires when the worktree or
+/// HEAD may have moved off content that `git add` had staged.
+const GC_HOOKS: [&str; 3] = ["post-checkout", "post-commit", "post-merge"];
+
+/// What to do when a hook file already exists and isn't ours.
+#[derive(Clone, Copy)]
+enum OnConflict {
+    /// Abort the install — the hook is load-bearing (pre-push gates upload
+    /// correctness), so silently skipping it would be dangerous.
+    Fail,
+    /// Leave the user's hook alone and warn — gc is best-effort cleanup, not
+    /// correctness-critical, so it's not worth blocking an install over.
+    Skip,
+}
 
 pub fn install(scope: Scope, repo: Option<&Path>) -> Result<()> {
     set_config(scope, repo, "process", PROCESS_VALUE)?;
     set_config(scope, repo, "required", "true")?;
     if matches!(scope, Scope::Local) {
-        install_pre_push_hook(repo)?;
+        install_managed_hook(
+            repo,
+            "pre-push",
+            "exec git-bale push-pending",
+            "Drain xorbs/shards staged by `git add` to the bale server before\n\
+             # git pushes refs that reference them. Aborts the push on failure.",
+            OnConflict::Fail,
+        )?;
+        for hook in GC_HOOKS {
+            install_managed_hook(
+                repo,
+                hook,
+                "git-bale gc || true",
+                "Reclaim staging for bale files that were unstaged or discarded.",
+                OnConflict::Skip,
+            )?;
+        }
     }
     Ok(())
 }
@@ -44,7 +79,10 @@ pub fn uninstall(scope: Scope, repo: Option<&Path>) -> Result<()> {
     let _ = unset_config(scope, repo, "process");
     let _ = unset_config(scope, repo, "required");
     if matches!(scope, Scope::Local) {
-        let _ = uninstall_pre_push_hook(repo);
+        let _ = uninstall_managed_hook(repo, "pre-push");
+        for hook in GC_HOOKS {
+            let _ = uninstall_managed_hook(repo, hook);
+        }
     }
     Ok(())
 }
@@ -56,8 +94,14 @@ pub fn uninstall_all(repo: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn install_pre_push_hook(repo: Option<&Path>) -> Result<()> {
-    let hook_path = resolve_hook_path(repo, "pre-push")?;
+fn install_managed_hook(
+    repo: Option<&Path>,
+    hook_name: &str,
+    command: &str,
+    description: &str,
+    on_conflict: OnConflict,
+) -> Result<()> {
+    let hook_path = resolve_hook_path(repo, hook_name)?;
     if let Some(parent) = hook_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating hooks dir {}", parent.display()))?;
@@ -66,33 +110,39 @@ fn install_pre_push_hook(repo: Option<&Path>) -> Result<()> {
     if hook_path.exists() {
         let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
         if !existing.contains(HOOK_MARKER) {
-            return Err(anyhow!(
-                "refusing to overwrite existing pre-push hook at {}\n\
-                 add this line to it manually:\n\
-                 \texec git-bale push-pending\n\
-                 (or move the existing hook aside and re-run `git-bale install --local`)",
-                hook_path.display()
-            ));
+            match on_conflict {
+                OnConflict::Fail => {
+                    return Err(anyhow!(
+                        "refusing to overwrite existing {hook_name} hook at {}\n\
+                         add this line to it manually:\n\
+                         \t{command}\n\
+                         (or move the existing hook aside and re-run `git-bale install --local`)",
+                        hook_path.display()
+                    ));
+                }
+                OnConflict::Skip => {
+                    eprintln!(
+                        "git-bale: leaving your existing {hook_name} hook at {} untouched; \
+                         add `{command}` to it to enable automatic staging cleanup",
+                        hook_path.display()
+                    );
+                    return Ok(());
+                }
+            }
         }
     }
 
-    let body = format!(
-        "#!/bin/sh\n\
-         {HOOK_MARKER}\n\
-         # Drain xorbs/shards staged by `git add` to the bale server before\n\
-         # git pushes refs that reference them. Aborts the push on failure.\n\
-         exec git-bale push-pending\n"
-    );
+    let body = format!("#!/bin/sh\n{HOOK_MARKER}\n# {description}\n{command}\n");
     write_atomic(&hook_path, body.as_bytes())
-        .with_context(|| format!("writing pre-push hook to {}", hook_path.display()))?;
+        .with_context(|| format!("writing {hook_name} hook to {}", hook_path.display()))?;
     let mut perms = std::fs::metadata(&hook_path)?.permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&hook_path, perms)?;
     Ok(())
 }
 
-fn uninstall_pre_push_hook(repo: Option<&Path>) -> Result<()> {
-    let hook_path = resolve_hook_path(repo, "pre-push")?;
+fn uninstall_managed_hook(repo: Option<&Path>, hook_name: &str) -> Result<()> {
+    let hook_path = resolve_hook_path(repo, hook_name)?;
     if !hook_path.exists() {
         return Ok(());
     }
@@ -102,7 +152,7 @@ fn uninstall_pre_push_hook(repo: Option<&Path>) -> Result<()> {
         return Ok(());
     }
     std::fs::remove_file(&hook_path)
-        .with_context(|| format!("removing pre-push hook {}", hook_path.display()))?;
+        .with_context(|| format!("removing {hook_name} hook {}", hook_path.display()))?;
     Ok(())
 }
 
@@ -196,4 +246,71 @@ fn unset_config(scope: Scope, repo: Option<&Path>, key: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git_init(dir: &Path) {
+        let st = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git init failed");
+    }
+
+    #[test]
+    fn install_writes_then_uninstall_removes_all_managed_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path());
+        install(Scope::Local, Some(dir.path())).unwrap();
+        let hooks = dir.path().join(".git").join("hooks");
+        for (name, needle) in [
+            ("pre-push", "git-bale push-pending"),
+            ("post-checkout", "git-bale gc"),
+            ("post-commit", "git-bale gc"),
+            ("post-merge", "git-bale gc"),
+        ] {
+            let body = std::fs::read_to_string(hooks.join(name)).unwrap();
+            assert!(body.contains(HOOK_MARKER), "{name} hook missing marker");
+            assert!(body.contains(needle), "{name} hook missing `{needle}`");
+        }
+        // Re-install is idempotent (overwrites our own marked hooks).
+        install(Scope::Local, Some(dir.path())).unwrap();
+
+        uninstall(Scope::Local, Some(dir.path())).unwrap();
+        for name in ["pre-push", "post-checkout", "post-commit", "post-merge"] {
+            assert!(!hooks.join(name).exists(), "{name} hook should be gone");
+        }
+    }
+
+    #[test]
+    fn foreign_gc_hook_is_preserved_but_foreign_pre_push_is_fatal() {
+        // A user-authored gc-class hook is left alone; the install still
+        // succeeds and the correctness-critical pre-push is written.
+        let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path());
+        let hooks = dir.path().join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let foreign = "#!/bin/sh\necho mine\n";
+        std::fs::write(hooks.join("post-commit"), foreign).unwrap();
+
+        install(Scope::Local, Some(dir.path())).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(hooks.join("post-commit")).unwrap(),
+            foreign,
+            "a foreign post-commit hook must not be clobbered"
+        );
+        assert!(hooks.join("pre-push").exists(), "pre-push still installed");
+
+        // A foreign pre-push, by contrast, aborts the whole install.
+        let dir2 = tempfile::tempdir().unwrap();
+        git_init(dir2.path());
+        let hooks2 = dir2.path().join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks2).unwrap();
+        std::fs::write(hooks2.join("pre-push"), foreign).unwrap();
+        assert!(install(Scope::Local, Some(dir2.path())).is_err());
+    }
 }

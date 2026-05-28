@@ -228,14 +228,14 @@ Design properties:
 - **Pretty-printed JSON pointer** with stable key order (`hash`, `file_size`, `sha256`). Tracked as a normal blob, parseable without xet-core.
 - **Long-running process**: one filter-process subprocess per `git add` / `git checkout` fan-out, not one subprocess per file.
 - **Deduplicated per-user chunk cache** instead of a whole-file local store — the worktree file is the only full copy on disk.
-- **Deferred upload**: `git add` chunks and stages locally; `git push` (via a pre-push hook) is what actually moves bytes to the server.
+- **Deferred upload**: `git add` chunks and stages locally; `git push` (via a pre-push hook) is what actually moves bytes to the server. A `git-bale gc` step (wired into post-checkout/commit/merge hooks) reclaims staging for changes that were unstaged or discarded before they were ever pushed.
 
 Layout on disk:
 
 ```
 <repo>/big.bin                          # worktree (one copy)
 <repo>/.git/bale/manifests/<file_id>.json # per-file reconstruction terms
-<repo>/.git/bale/staging/                 # pending xorbs+shards, drained by push-pending
+<repo>/.git/bale/staging/                 # pending xorbs+shards (+ file-index/ markers), drained by push-pending, reconciled by gc
 <repo>/.git/bale/clean-cache/<blake3(path)> # path-keyed, chunked-verified pointer cache
 ~/.cache/bale/chunks/                     # shared chunk pool across repos
 ```
@@ -280,7 +280,20 @@ Two filter-process startup optimisations matter specifically because `git diff` 
 4. Strips the lookup tables + footer from each shard before upload by truncating to `MDBShardFile.shard.metadata.file_lookup_offset` and rewriting the header's `footer_size` field to 0 — same algorithm as xet-data's private `read_shard_to_bytes_remove_footer`. Without this step the bale shard parser sees lookup bytes where it expects either the cas-info bookend or the footer, and 400s.
 5. Deletes each local file on 2xx and best-effort `rmdir`s now-empty directories. Re-running after a partial failure is safe because both endpoints are content-addressed and idempotent (`was_inserted: false` on a repeat xorb, `result: 0` on a repeat shard).
 
-`git-bale install --local` writes a `.git/hooks/pre-push` that just `exec`s `git-bale push-pending`. The hook carries a `bale-marker:` line so `git-bale uninstall --local` removes it without clobbering a hand-written hook. Global / system-scope installs don't touch the hook — hooks are inherently per-repo. The hook path comes from `git rev-parse --git-path hooks/pre-push` so worktrees and `core.hooksPath` overrides resolve correctly.
+`git-bale install --local` writes managed git hooks, each carrying a `bale-marker:` line so `git-bale uninstall --local` can remove it without clobbering a hand-written hook. A `pre-push` hook `exec`s `git-bale push-pending`; `post-checkout`, `post-commit`, and `post-merge` hooks run `git-bale gc || true`. The pre-push hook is correctness-critical, so install **fails** if a foreign (unmarked) pre-push hook already exists; the gc hooks are best-effort, so install **skips with a warning** rather than clobbering a foreign hook of the same name. Global / system-scope installs don't touch hooks — hooks are inherently per-repo. The hook path comes from gix (`git_dir().join("hooks")`, honoring `core.hooksPath` from the merged config snapshot) so worktrees and overrides resolve correctly.
+
+### Staging reconciliation (`git-bale gc`)
+
+`clean` only ever *adds* to staging; only a successful `push-pending` drains it. So if you `git add` a change and then abandon it (`git reset`, `git checkout`, switch branches), its staged xorbs/shards used to linger forever — and worse, the next `push-pending` would upload that orphaned content even though no commit references it. `git-bale gc` (`crates/git-bale/src/gc.rs`) reconciles staging against git reachability.
+
+The invariant that makes this safe: **everything in staging is unpushed** (push-pending wipes the whole dir on success), so a staged file's marker is still needed iff some pointer git could push references it. gc computes the set of "live" bale file hashes from:
+
+1. the **index** (covers staged-but-uncommitted pointers), and
+2. pointers introduced by **unpushed commits** — a `rev_walk` over all local refs with remote-tracking refs marked *hidden*, diffing each commit against its first parent so only changed blobs are read. The walk early-outs as soon as every staged hash is accounted for, so the common "you just staged it" case resolves from the index alone.
+
+Any staged marker **not** in the live set is dangling and removed. The set must never *under*-count: dropping a marker for committed-but-unpushed content (e.g. an older version in a stacked commit whose tip no longer names it) would strand that content, because push-pending drains by marker and the lukewarm smudge path is gated on the marker — a later push would then advertise a pointer the server can't reconstruct. Pruning by remote-tracking refs only ever *shrinks* the live set toward content the server already has, which is safe to drop.
+
+Xorbs are shared across files by xet-data's local dedup, so gc never deletes an individual xorb while any marker survives. The object sweep (xorbs + shards + the `file-index/` dir) runs only once **no** marker remains — the same all-or-nothing wipe push-pending performs after a drain. The mixed case (some markers live, some dangling) drops the dead markers but leaves the shared objects for the next push to clear. Reads are header-gated (`find_header` size/kind) so non-pointer blobs are never inflated, and the cheap exit when staging holds no markers keeps the hooks nearly free on most checkouts. Drives `gc-abandon-checkout` / `gc-keeps-unpushed` / `gc-mixed` in `tests/e2e/run_gc.py`.
 
 ### Hot vs lukewarm vs cold smudge
 
@@ -290,7 +303,7 @@ On `command=smudge` (filter sees a pointer, must reconstruct), git-bale tries th
    1. Load `.git/bale/manifests/<file_id>.json`. Returns `None` for missing / malformed / unknown-version manifests — all three trigger the next path.
    2. For each cached term, ask the local chunk cache (`xet-client::chunk_cache`) for the chunk range. Any miss → fall through.
    3. Concatenate the chunk bytes into a temp file. Length checks guard against stale manifests corrupting the worktree.
-2. **Lukewarm path** — staging-dir reconstruction. After `git add` but before `git-bale push-pending`, the xorbs/shards are still under `.git/bale/staging/`. We open a `FileDownloadSession` against `TranslatorConfig::local_config(<git_dir>/bale/staging/)` and call `download_to_writer(info, 0..file_size, dest)`. Any error (missing xorb, missing shard, post-push-pending empty tree) is logged at `debug` and we fall through. This keeps `git add big.bin && rm big.bin && git checkout -- big.bin` working before the user has pushed. Gated on a per-file marker `<staging>/file-index/<file_hex>` written by `clean` — without it, smudges for file hashes we never staged (e.g. `git stash`'s HEAD-restore phase) drop into xet-data's `ReconstructionTermManager`, return zero terms, and trip a `debug_assert_eq!` in its progress tracker that calls `update_item_size(0, true)` after a previous `update_item_size(file_size, true)` already finalized the size. Release builds drop the assert; dev builds panic. `push-pending` clears the markers after a successful drain so they don't outlive the staged bytes.
+2. **Lukewarm path** — staging-dir reconstruction. After `git add` but before `git-bale push-pending`, the xorbs/shards are still under `.git/bale/staging/`. We open a `FileDownloadSession` against `TranslatorConfig::local_config(<git_dir>/bale/staging/)` and call `download_to_writer(info, 0..file_size, dest)`. Any error (missing xorb, missing shard, post-push-pending empty tree) is logged at `debug` and we fall through. This keeps `git add big.bin && rm big.bin && git checkout -- big.bin` working before the user has pushed. Gated on a per-file marker `<staging>/file-index/<file_hex>` written by `clean` — without it, smudges for file hashes we never staged (e.g. `git stash`'s HEAD-restore phase) drop into xet-data's `ReconstructionTermManager`, return zero terms, and trip a `debug_assert_eq!` in its progress tracker that calls `update_item_size(0, true)` after a previous `update_item_size(file_size, true)` already finalized the size. Release builds drop the assert; dev builds panic. `push-pending` clears the markers after a successful drain, and `git-bale gc` drops any marker whose file is no longer reachable, so markers don't outlive the staged bytes they advertise.
 3. **Cold path** — `FileDownloadSession::download_to_writer` against the remote bale server, same code path xet-core uses for HF-Hub-hosted Xet content. As a side effect, it also writes the manifest to `.git/bale/manifests/` so subsequent checkouts go through the hot path. The manifest stores only content-addressed `terms` (xorb hash + chunk-index range), **not** `fetch_info` URLs — those signed URLs expire after `SIGNATURE_TTL_SECS` (10 min) and aren't safe to persist.
 
 Critical detail: the cold path passes `0..file_size` (not `FileRange::full()`, which xet-core defaults to) to `download_to_writer`. baleforgit-server has no Range support on `/v1/reconstructions/*`, and xet-data's prefetcher fans out to up to 256 MiB beyond EOF when given an unbounded range — every prefetched block then re-fetches the full file terms and trips xet-data's `SequentialWriter` contiguity check. The cap keeps the prefetcher quiet. Drives `m11_native_filter`.
@@ -531,8 +544,9 @@ Client side (`crates/git-bale/`):
 | Config loader (env + `git config`) | `crates/git-bale/src/config.rs` |
 | Remote URL parsing (http/https/ssh) | `crates/git-bale/src/remote.rs` |
 | Forge auth resolver | `crates/git-bale/src/resolver.rs` |
-| `git-bale install` / `git-bale uninstall` (+ pre-push hook) | `crates/git-bale/src/install.rs` |
+| `git-bale install` / `git-bale uninstall` (+ pre-push / post-checkout / post-commit / post-merge hooks) | `crates/git-bale/src/install.rs` |
 | `git-bale push-pending` (drain `.git/bale/staging/`) | `crates/git-bale/src/push_pending.rs` |
-| Local staging-dir path helper | `crates/git-bale/src/staging.rs` |
+| `git-bale gc` (reconcile `.git/bale/staging/` against git reachability) | `crates/git-bale/src/gc.rs` |
+| Local staging-dir path + cleanup helpers | `crates/git-bale/src/staging.rs` |
 | `git-bale track` (`.gitattributes` writer) | `crates/git-bale/src/track.rs` |
 | `git-bale mount-diff` (read-only FUSE diff view) | `crates/git-bale/src/mount/` |

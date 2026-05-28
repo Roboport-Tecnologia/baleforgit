@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use git_bale::install::{self, Scope};
 use git_bale::mount::{self, MountDiffArgs, MountRevArgs};
-use git_bale::{filter_process, push_pending, track};
+use git_bale::{filter_process, gc, push_pending, track};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,6 +37,11 @@ enum Command {
     /// Upload any xorbs/shards staged by `clean` (`git add`) to the configured
     /// bale server. Invoked from the pre-push hook installed by `git-bale install`.
     PushPending,
+    /// Reconcile the staging area: forget xorbs/shards/markers that no longer
+    /// belong to the index or an unpushed commit. Invoked from the
+    /// post-checkout/post-commit/post-merge hooks installed by `git-bale
+    /// install`; safe to run by hand.
+    Gc,
     /// Mount a read-only virtual FS exposing both sides of a `git diff`.
     MountDiff(MountDiffCliArgs),
     /// Mount a read-only virtual FS exposing the files at one revision.
@@ -154,6 +159,7 @@ fn main() -> Result<()> {
         }
         Command::FilterProcess => filter_process::run(),
         Command::PushPending => push_pending::run(),
+        Command::Gc => gc::run(),
         Command::MountDiff(a) => mount::run(MountDiffArgs {
             rev_a: a.rev_a,
             rev_b: a.rev_b,

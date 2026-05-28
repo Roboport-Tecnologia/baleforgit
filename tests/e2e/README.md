@@ -13,6 +13,7 @@ verified against the on-disk numbers and the `/v1/usage` API.
 ```bash
 python3 tests/e2e/run.py        # filesystem blob store (the default)
 python3 tests/e2e/run_s3.py     # S3 blob store via a MinIO sidecar
+python3 tests/e2e/run_gc.py     # `git-bale gc` staging reconciliation
 ```
 
 ## Prereqs
@@ -81,6 +82,19 @@ start.
 
 A timing summary (per-phase wallclock + throughput on the
 bytes-relevant phases) prints at the end of every run.
+
+### gc mode (`run_gc.py`)
+
+Focused suite for `git-bale gc` — staging reconciliation. Reuses the
+container/transport machinery from `run.py` (one server container, three
+isolated repos) and drives the *intended* end state, so every phase fails
+against a pre-fix binary and passes once the fix lands.
+
+| Phase                 | What it verifies                                                                                          |
+|-----------------------|-----------------------------------------------------------------------------------------------------------|
+| `gc-abandon-checkout` | Push a baseline, stage a change, abandon it (`git reset` + `git checkout`); the post-checkout hook's gc fully wipes the orphaned staging. The user-reported bug. |
+| `gc-keeps-unpushed`   | DATA-LOSS GUARD: two stacked *unpushed* commits (tip names only v2); manual `git-bale gc` must NOT drop v1's staging. Push + cold-clone then reconstructs every revision byte-for-byte. |
+| `gc-mixed`            | Committed-but-unpushed v1 survives while a staged-then-abandoned (never-committed) v2 is forgotten; v1 stays pushable + reconstructable end to end. |
 
 ## Flags
 
@@ -163,6 +177,7 @@ testing and coverage measurement stay separate.
 |                            | `git-bale-authenticate` script, starts sshd, execs `baleforgit-server`. Also pass-through for `BALE_S3_*` env vars when set. |
 | `run.py`                   | The fs-mode harness.                                                   |
 | `run_s3.py`                | The S3-mode harness (MinIO sidecar; 4 phases).                         |
+| `run_gc.py`                | The `git-bale gc` staging-reconciliation harness (3 phases).           |
 | `s3lib.py`                 | `MinioGuard`, `Network`, `S3StorageView`, and the 4 S3 phase functions.|
 | `run_matrix.py`            | Multi-run driver for `run.py`. Pass `--s3` to invoke `run_s3.py` once. |
 | `README.md`                | This file.                                                             |
