@@ -417,9 +417,13 @@ def build_instrumented_git_bale() -> Path:
     info("building instrumented git-bale (RUSTFLAGS=-C instrument-coverage)")
     env = os.environ.copy()
     env["RUSTFLAGS"] = "-C instrument-coverage"
+    # `--features coverage` enables an explicit __llvm_profile_write_file()
+    # call right after fuse_main_real returns, because libfuse-t kills the
+    # process by SIGPIPE on macOS unmount teardown before atexit can flush.
     r = subprocess.run(
         [
             "cargo", "build", "--release", "-p", "git-bale",
+            "--features", "coverage",
             "--target-dir", str(target_dir),
         ],
         cwd=REPO_ROOT,
@@ -2676,7 +2680,15 @@ def phase_offline_and_restart(
 
 class MountUnavailable(Exception):
     """libfuse / fuse-t not installed on this host. The mount phase signals
-    this to its caller so the whole phase skips instead of failing."""
+    this to its caller so the whole phase skips instead of failing.
+
+    `stderr` carries the binary's full stderr so the skip handler can log
+    everything — under --coverage a mount-up timeout previously surfaced as
+    a single-line "skipped" without any clue what the binary was doing."""
+
+    def __init__(self, reason: str, *, stderr: str = "") -> None:
+        super().__init__(reason)
+        self.stderr = stderr
 
 
 _LIBFUSE_HINT = "needs libfuse at runtime"
@@ -2746,7 +2758,11 @@ def _mount_session(
     )
     mounted = False
     try:
-        _wait_mounted(mount_point, mount_root, proc, timeout_s=30.0)
+        # llvm-cov instrumentation slows the binary by ~5x on macOS; the
+        # prod 30s timeout would expire before fuse_main_real even returned
+        # from mount(), causing the whole subsystem to skip silently.
+        wait_timeout = 120.0 if _COVERAGE is not None else 30.0
+        _wait_mounted(mount_point, mount_root, proc, timeout_s=wait_timeout)
         mounted = _is_mounted(mount_point, mount_root)
         if not mounted:
             try:
@@ -2757,10 +2773,13 @@ def _mount_session(
             err_txt = stderr.decode("utf-8", "replace") if stderr else ""
             out_txt = stdout.decode("utf-8", "replace") if stdout else ""
             if _LIBFUSE_HINT in err_txt:
-                raise MountUnavailable(err_txt.strip().splitlines()[0])
+                raise MountUnavailable(
+                    err_txt.strip().splitlines()[0], stderr=err_txt.strip()
+                )
             raise TestFailure(
-                f"[{label}] mount never came up (exit={proc.returncode}):\n"
-                f"stderr:\n{err_txt}\nstdout:\n{out_txt}"
+                f"[{label}] mount never came up after {wait_timeout:.0f}s "
+                f"(exit={proc.returncode}):\nstderr:\n{err_txt}\n"
+                f"stdout:\n{out_txt}"
             )
         yield mount_point
     finally:
@@ -2782,6 +2801,17 @@ def _mount_session(
             proc.communicate(timeout=1.0)
         except (subprocess.TimeoutExpired, ValueError):
             pass
+        # Under --coverage, .profraw files are only written on clean exit.
+        # fuse-t kills the mount process by SIGPIPE during teardown, so the
+        # binary installs a SIGPIPE handler that flushes the profile and
+        # _exit(0)s (see mount/backend/libfuse.rs). A non-zero/sig exit here
+        # means that handler regressed and this session's coverage is lost.
+        if _COVERAGE is not None and proc.returncode not in (0, None):
+            info(
+                f"-- [{label}] WARNING: mount proc exit={proc.returncode} "
+                f"(expected 0 under --coverage) — profile data for this "
+                f"session was likely dropped"
+            )
         try:
             mount_point.rmdir()
         except OSError:
@@ -2929,6 +2959,8 @@ def phase_mount_rev(
                     )
     except MountUnavailable as e:
         info(f"-- mount-rev: skipping ({e})")
+        if e.stderr and e.stderr != str(e):
+            info(f"-- mount-rev: binary stderr:\n{e.stderr}")
 
 
 def phase_mount_diff(
@@ -3033,6 +3065,8 @@ def phase_mount_diff(
                 pass
     except MountUnavailable as e:
         info(f"-- mount-diff: skipping ({e})")
+        if e.stderr and e.stderr != str(e):
+            info(f"-- mount-diff: binary stderr:\n{e.stderr}")
 
 
 def phase_mount_diff_mixed(
@@ -3193,6 +3227,8 @@ def phase_mount_diff_mixed(
                         )
     except MountUnavailable as e:
         info(f"-- mount-diff-mixed: skipping ({e})")
+        if e.stderr and e.stderr != str(e):
+            info(f"-- mount-diff-mixed: binary stderr:\n{e.stderr}")
 
 
 # =============================================================================

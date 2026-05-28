@@ -13,6 +13,14 @@ path = "src/main.rs"
 name = "git_bale"
 path = "src/lib.rs"
 
+[features]
+# Enabled by the e2e harness's --coverage build alongside RUSTFLAGS=-C
+# instrument-coverage. Adds an explicit __llvm_profile_write_file() call
+# after fuse_main_real because libfuse-t kills the process by SIGPIPE on
+# unmount, before atexit can flush .profraw files. No effect in prod
+# builds.
+coverage = []
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true

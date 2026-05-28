@@ -43,6 +43,40 @@ use crate::mount::vfs::{DiffVfs, Node, NodeKind, ROOT_INODE};
 /// process-wide reference. Set right before `fuse_main_real`, never cleared.
 static ACTIVE_VFS: OnceLock<Arc<DiffVfs>> = OnceLock::new();
 
+// macOS fuse-t kills the mount process by SIGPIPE from *inside*
+// fuse_main_real during unmount teardown (the FUSE channel fd is closed
+// while fuse-t is still writing to it). The signal never returns control to
+// our code, so under `-C instrument-coverage` the atexit-registered profile
+// flush never fires and every `.profraw` from a mount session is lost —
+// leaving mount/reader.rs and mount/vfs.rs at 0% even though their callbacks
+// ran. The handler flushes the profile via __llvm_profile_write_file (linked
+// only under the `coverage` feature) then _exit(0)s; both calls are
+// async-signal-safe. Armed only for the fuse_main_real window, so normal
+// Rust SIGPIPE semantics hold everywhere else.
+#[cfg(feature = "coverage")]
+extern "C" {
+    fn __llvm_profile_write_file() -> c_int;
+}
+
+#[cfg(feature = "coverage")]
+extern "C" fn coverage_sigpipe_flush(_sig: c_int) {
+    // SAFETY: the profile-write routine takes no lock the interrupted main
+    // thread could hold, and _exit bypasses libc atexit.
+    unsafe {
+        let _ = __llvm_profile_write_file();
+        libc::_exit(0);
+    }
+}
+
+fn arm_coverage_sigpipe_flush() {
+    #[cfg(feature = "coverage")]
+    // SAFETY: installing a handler with a constant fn pointer.
+    unsafe {
+        let handler: extern "C" fn(c_int) = coverage_sigpipe_flush;
+        libc::signal(libc::SIGPIPE, handler as usize as libc::sighandler_t);
+    }
+}
+
 fn vfs() -> Option<&'static Arc<DiffVfs>> {
     ACTIVE_VFS.get()
 }
@@ -123,6 +157,8 @@ impl MountBackend for LibfuseBackend {
             "git-bale: filesystem ready at {} (Ctrl-C to unmount)",
             mount_point.display()
         );
+
+        arm_coverage_sigpipe_flush();
 
         // SAFETY: argv outlives the call; ops is stack-allocated and read by
         // libfuse synchronously during fuse_main_real. fuse_main_real blocks
