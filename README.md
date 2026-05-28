@@ -28,6 +28,8 @@ git push
 
 `git add` chunks the file and stages xorbs/shards under `.git/bale/staging/` — no network. The actual upload happens at `git push`, via the pre-push hook installed by `git-bale install --local`. If you want to push the staged content explicitly (e.g. before a clone to verify, or after editing then reverting), run `git-bale push-pending`.
 
+If you stage a change and then abandon it (`git reset`, `git checkout`) before pushing, the staged bytes are no longer needed. `git-bale gc` reclaims that orphaned staging by reconciling it against what the index and your unpushed commits still reference; `install --local` runs it automatically via post-checkout/commit/merge hooks, and it's safe to run by hand anytime.
+
 ### Without a forge (manual config)
 
 If you're running your own `baleforgit-server` and don't have a forge integration, pin the server URL and a token in git config:

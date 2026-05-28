@@ -2,6 +2,7 @@ pub mod clean_cache;
 pub mod config;
 pub mod filter_process;
 pub mod fs_util;
+pub mod gc;
 pub mod install;
 pub mod local_reconstruct;
 pub mod manifest_cache;
