@@ -83,6 +83,7 @@ from baleharness.phases.mount import (
     phase_mount_edge_cases,
     phase_mount_rev,
 )
+from baleharness.phases.progress import phase_progress_demo
 from baleharness.phases.push_pending import (
     phase_push_pending_corrupt_staging,
     phase_push_pending_noop,
@@ -578,6 +579,17 @@ def main() -> int:
                 admin_token_hex=admin_token_hex,
             )
 
+        def _phase_progress_demo() -> None:
+            phase_progress_demo(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+
         def _phase_resync() -> None:
             phase_resync_after_cas_wipe(
                 timings=timings,
@@ -672,7 +684,15 @@ def main() -> int:
             "gc-abandon-checkout": ("g3", False, _phase_gc_abandon),
             "gc-keeps-unpushed": ("g3", False, _phase_gc_keep),
             "gc-mixed": ("g3", False, _phase_gc_mixed),
+            # Hand-driven demo of the upload progress bar. Gated to --only
+            # (see MANUAL_ONLY_PHASES) so it never runs in a normal sweep.
+            "progress-demo": ("g3", False, _phase_progress_demo),
         }
+
+        # Phases that must be explicitly requested via --only; skipped silently
+        # in any run that doesn't name them (a normal full sweep, or a
+        # different --only set).
+        MANUAL_ONLY_PHASES = {"progress-demo"}
 
         # Build the within-group lists in declaration order, then apply
         # --order per group.
@@ -713,9 +733,14 @@ def main() -> int:
             info(f"--only active: running only {args.only}")
 
         def filtered_out(name: str) -> Optional[str]:
-            """Reason `name` is excluded by --skip / --only, or None to run it."""
+            """Reason `name` is excluded by --skip / --only / manual-only, or
+            None to run it."""
             if name in args.skip:
                 return "per --skip"
+            # Manual-only phases run only when named in --only. Reported like
+            # the --only exclusion (silently) so a normal sweep stays quiet.
+            if name in MANUAL_ONLY_PHASES and name not in args.only:
+                return "manual-only"
             if args.only and name not in args.only:
                 return "not in --only"
             return None

@@ -118,6 +118,40 @@ python3 tests/e2e/run.py [--git-bale PATH] [--image-tag TAG] [--no-build]
 - `--coverage-dir PATH` — override the coverage output directory
   (implies `--coverage`). Defaults to `<repo>/target/coverage-e2e/`.
 
+## Watching the upload progress bar (`progress-demo`)
+
+`progress-demo` is a **manual-only** phase: it's in the registry but never
+runs in a normal sweep — only when you ask for it by name, and only via
+`--only` (it's gated so a plain run or a different `--only` set skips it
+silently). It exists to *show* git-bale's upload progress indicator, which
+the pre-push hook draws on stderr once an upload runs past ~200 ms.
+
+```bash
+cargo build --release -p git-bale
+python3 tests/e2e/run.py --only progress-demo --no-build
+```
+
+Run it **from an interactive terminal**: the phase pushes with the
+harness's output capture turned off, so the hook inherits your TTY — the
+condition git-bale checks before drawing the bar. Piped/redirected (CI,
+captured) runs stay silent by design, which is why no normal phase asserts
+on it.
+
+Two env knobs:
+
+- `FILE_TIMER` (default `1`, decimals OK) — seconds the server should
+  "take" per file, realised as a client→server byte throttle in front of
+  the CAS port so the upload (and the bar) stretches over ~`FILE_TIMER`s
+  per file. Set it under ~`0.2` to watch the 200 ms threshold *suppress*
+  the bar; set it to `3`–`5` to watch the bar climb slowly. `0` = no
+  throttle (instant server).
+- `FILE_COUNT` (default `5`) — how many distinct files to add + push; each
+  is 4 MiB of unique (incompressible) content, so none dedup away.
+
+```bash
+FILE_TIMER=3 FILE_COUNT=8 python3 tests/e2e/run.py --only progress-demo --no-build
+```
+
 ## Coverage mode
 
 `python3 tests/e2e/run.py --coverage` runs the suite against instrumented
@@ -186,7 +220,7 @@ testing and coverage measurement stay separate.
 | `entrypoint.sh`            | Generates ssh host keys + authorized_keys + bare repos + the fake     |
 |                            | `git-bale-authenticate` script, starts sshd, execs `baleforgit-server`. Also pass-through for `BALE_S3_*` env vars when set. |
 | `run.py`                   | Thin fs-mode entry point: runs `baleharness.cli.main` and re-exports the names `s3lib.py` / `run_s3.py` import via `from run import …`. |
-| `baleharness/`             | The harness itself, split into focused modules (see below). `cli.py` owns the phase registry + `main()`; `phases/` holds one module per phase category (`scenario`, `mount`, `adversarial`, `failure`, `coverage_phases`, `gc`). |
+| `baleharness/`             | The harness itself, split into focused modules (see below). `cli.py` owns the phase registry + `main()`; `phases/` holds one module per phase category (`scenario`, `mount`, `adversarial`, `failure`, `coverage_phases`, `gc`, `progress`). |
 | `run_legacy.py`            | Frozen copy of the pre-split monolithic `run.py`, kept only to validate the refactor against. Delete once parity is confirmed. |
 | `run_s3.py`                | The S3-mode harness (MinIO sidecar; 4 phases).                         |
 | `s3lib.py`                 | `MinioGuard`, `Network`, `S3StorageView`, and the 4 S3 phase functions.|
@@ -319,8 +353,8 @@ not seconds — parallelism would buy us little and obscure failures.
 
 1. Define `def phase_<your_name>(...)` in the matching
    `baleharness/phases/<category>.py` module (`scenario`, `mount`,
-   `adversarial`, `failure`, `coverage_phases`, or `gc`). A brand-new
-   category gets a new module under `baleharness/phases/`.
+   `adversarial`, `failure`, `coverage_phases`, `gc`, or `progress`). A
+   brand-new category gets a new module under `baleharness/phases/`.
 2. Take an explicit `timings: Timings` parameter so its wallclock shows
    up in the summary. Use `with timings.measure("name", bytes_moved=…)`
    for any IO-heavy stretch — `bytes_moved` turns into a throughput
@@ -328,6 +362,9 @@ not seconds — parallelism would buy us little and obscure failures.
 3. Wire it into the `REGISTRY` dict in `baleharness/cli.py` (`main()`),
    choosing its group (`g1` / `g2-head` / `g2-tail` / `g3`) and
    `read_only` flag. g2-tail phases auto-skip when `rev_state` is empty.
+   To make a phase run *only* on explicit `--only` request (a hand-driven
+   demo, not part of any sweep), also add its name to `MANUAL_ONLY_PHASES`
+   — see `progress-demo`.
 4. Document it in the README phase table above.
 
 ### Gotchas

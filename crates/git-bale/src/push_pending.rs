@@ -12,7 +12,7 @@
 //! session must equal the marker's `file_hex`. We assert that and bail on
 //! mismatch (version skew between clean and push-pending, or staging corruption).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tempfile::NamedTempFile;
@@ -22,6 +22,7 @@ use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy,
 use xet_runtime::core::XetRuntime;
 
 use crate::config::RawConfig;
+use crate::progress::{UploadProgress, UploadSnapshot};
 use crate::resolver;
 use crate::staging::{
     clear_file_markers, list_staged_files, remove_all_staged_objects, remove_empty_dirs,
@@ -68,8 +69,29 @@ pub fn run() -> Result<()> {
 
     let staged_files_for_async = staged_files.clone();
     let server_url = auth.server_url.clone();
-    rt.bridge_sync(async move {
+
+    // Reports upload progress to a terminal once the work runs past ~200ms. The
+    // session is created inside the async block below, so the poller reads it
+    // through a shared slot (empty = "preparing", before the session exists).
+    let session_slot: Arc<Mutex<Option<Arc<FileUploadSession>>>> = Arc::new(Mutex::new(None));
+    let slot_for_poll = session_slot.clone();
+    let progress = UploadProgress::start(move || {
+        let session = slot_for_poll.lock().unwrap().clone();
+        let Some(session) = session else {
+            return UploadSnapshot::default();
+        };
+        let r = session.report();
+        UploadSnapshot {
+            bytes_uploaded: r.total_transfer_bytes_completed,
+            bytes_total: r.total_transfer_bytes,
+            rate_bytes_per_sec: r.total_transfer_bytes_completion_rate,
+        }
+    });
+
+    let slot_for_async = session_slot;
+    let result = rt.bridge_sync(async move {
         let upload_session = FileUploadSession::new(Arc::new(online_cfg)).await?;
+        *slot_for_async.lock().unwrap() = Some(upload_session.clone());
         let download_session = FileDownloadSession::new(Arc::new(local_cfg), None).await?;
 
         for (file_hex, file_size_opt) in &staged_files_for_async {
@@ -90,9 +112,14 @@ pub fn run() -> Result<()> {
         }
         upload_session.finalize().await?;
         Ok::<(), anyhow::Error>(())
-    })
-    .map_err(|e| anyhow!("xet runtime error during push-pending: {e:?}"))?
-    .map_err(|e| explain_dedup_cache_mismatch(e, &server_url))?;
+    });
+
+    // Clear the progress line before surfacing any error or cleanup warning.
+    progress.finish();
+
+    result
+        .map_err(|e| anyhow!("xet runtime error during push-pending: {e:?}"))?
+        .map_err(|e| explain_dedup_cache_mismatch(e, &server_url))?;
 
     // Server now holds the reconstruction info; safe to drop staging.
     if let Err(e) = clear_file_markers(&git_dir) {

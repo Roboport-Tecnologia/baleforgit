@@ -9,6 +9,7 @@ pub mod manifest_cache;
 pub mod mount;
 pub mod pktline;
 pub mod pointer;
+pub mod progress;
 pub mod push_pending;
 pub mod remote;
 pub mod remote_manifest;
