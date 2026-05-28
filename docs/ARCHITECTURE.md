@@ -77,7 +77,7 @@ The repo ships one client: the native `git-bale` filter in `crates/git-bale/`, a
 4. Server returns JSON `QueryReconstructionResponse`.
 5. Client fetches each `url` with the prescribed `Range` header. The server (transfer layer) verifies the HMAC signature, verifies the Range header matches the signed range (otherwise 401), and streams the bytes from `BlobStore::get_xorb_range`. Client deserializes chunks, strips `offset_into_first_range` from the first one, concatenates.
 
-`Range:` request-side support on `/v1/reconstructions/*` is **not yet implemented** — the prototype always returns the full file's terms. Range support on the transfer URL itself is fully implemented (and mandatory, since signatures cover the byte range). The native `git-bale` smudge handler works around the missing range support by passing `0..file_size` to `xet-data` (see "Native filter" below).
+`Range:` request-side support on `/v1/reconstructions/*` is **intentionally absent** — the server always returns the full file's terms. Range support on the transfer URL itself is fully implemented (and mandatory, since signatures cover the byte range). The native `git-bale` smudge handler accounts for this by passing `0..file_size` to `xet-data` (see "Native filter" below).
 
 ### Global dedup
 
@@ -122,7 +122,7 @@ pub trait MetadataStore: Send + Sync {
 
     async fn xorb_exists(&self, xorb: &XorbHash) -> CoreResult<bool>;
     async fn lookup_file(&self, file_hash: &FileHash) -> CoreResult<Option<Vec<FileTerm>>>;
-    // M12 scope check: true iff `file_hash` is registered in `repo_id`.
+    // Scope check: true iff `file_hash` is registered in `repo_id`.
     async fn file_in_repo(&self, file_hash: &FileHash, repo_id: &str) -> CoreResult<bool>;
     async fn lookup_chunk(&self, chunk_hash: &ChunkHash) -> CoreResult<Option<ChunkLocation>>;
     async fn xorbs_near_chunk(&self, chunk_hash: &ChunkHash, limit: usize)
@@ -161,7 +161,7 @@ pub trait RepoAuthz: Send + Sync {
 | Trait | Crate | Impl |
 |-------|-------|------|
 | `BlobStore` | `bale-server-storage-fs` | `FsBlobStore` — atomic temp→rename writes, byte-range reads |
-| `BlobStore` | `bale-server-storage-mem` | `MemBlobStore` — `RwLock<HashMap>`, used for tests and the M8 pluggability check |
+| `BlobStore` | `bale-server-storage-mem` | `MemBlobStore` — `RwLock<HashMap>`, used for tests and the pluggability check |
 | `BlobStore` | `bale-server-storage-s3` | `S3BlobStore` — AWS SDK against any S3-compatible API (AWS S3, MinIO, R2, B2); real presigned `GET` URLs returned from `presign_xorb_range`, so reconstruction bytes never flow through the server's HTTP layer |
 | `MetadataStore` | `bale-server-meta-sqlite` | `SqliteMetadataStore` — runtime `sqlx` queries (no compile-time DB) |
 | `RepoAuthz` | `bale-server-authz-mem` | `AlwaysAllow` (tests) and `ConfigAuthz` (static map of hub bearers → users → repo scopes) |
@@ -195,7 +195,7 @@ Browser file download (outside the JWT middleware — bearer rides in the query 
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/v1/files/{file_id}?token=<forge-jwt>&repo=<owner/name>&filename=<name>` | Streams the reconstructed file. Forge (e.g. gitea) calls `check_repo_access` to validate the JWT against `repo`, then the M12 `file_in_repo` scope check runs locally (404 on miss). `filename` is honored for `Content-Disposition: attachment` only when its SHA-256 matches the `FilenameSHA256` claim in the JWT payload — caller-rewritten filenames on leaked URLs get 400. |
+| GET | `/v1/files/{file_id}?token=<forge-jwt>&repo=<owner/name>&filename=<name>` | Streams the reconstructed file. Forge (e.g. gitea) calls `check_repo_access` to validate the JWT against `repo`, then the per-repo `file_in_repo` scope check runs locally (404 on miss). `filename` is honored for `Content-Disposition: attachment` only when its SHA-256 matches the `FilenameSHA256` claim in the JWT payload — caller-rewritten filenames on leaked URLs get 400. |
 
 Mock HF Hub token endpoint:
 
@@ -247,7 +247,7 @@ Layout on disk:
 The clean filter keeps a per-repo pointer cache at `<git_dir>/bale/clean-cache/<blake3(pathname)>`. Each entry is JSON shaped:
 
 ```json
-{ "v": 2, "size": 30000000, "chunks": [{ "start": 0, "end": 1048576, "hash": "..." }, ...], "pointer": "{...}\n" }
+{ "v": 3, "size": 30000000, "chunks": [{ "start": 0, "end": 1048576, "hash": "..." }, ...], "pointer": "{...}\n" }
 ```
 
 Verification order on every clean call:
@@ -316,7 +316,7 @@ Critical detail: the cold path passes `0..file_size` (not `FileRange::full()`, w
 
 `git-bale` deliberately holds no baleforgit-server secret of its own. Auth is resolved on first-use per scope (one resolution for write/clean, one for read/smudge, cached in the filter-process lifetime). The resolver lives in `crates/git-bale/src/resolver.rs`:
 
-1. **Fast path**: if both `bale.serverUrl` and `bale.token` are set in local git config (or `BALE_SERVER_URL` / `BALE_TOKEN` env), use them as-is. This is the `m11` test path and the "I'm running my own forge and just want a static service token" mode.
+1. **Fast path**: if both `bale.serverUrl` and `bale.token` are set in local git config (or `BALE_SERVER_URL` / `BALE_TOKEN` env), use them as-is. This is the "I'm running my own forge and just want a static service token" mode.
 2. **Remote parse**: `git remote get-url origin` → HTTP(S) or SSH `RemoteUrl` (scp-style `git@host:owner/repo.git` also supported).
 3. **Forge authenticate**:
    - HTTPS → `POST {forge}/<owner>/<repo>.git/info/bale/authenticate?op=<download|upload>` with HTTPS Basic auth pulled from `git credential fill`. The user's password / PAT is verified inside the forge and never travels beyond it.
@@ -406,9 +406,9 @@ owner_quotas (owner TEXT PK, limit_bytes INTEGER NOT NULL)
 
 `xorb_frames` is populated at upload time by `parse_xorb_frames` in `bale-server-shard`. It is the *only* source of truth for HTTP byte ranges — the `chunks` table records uncompressed offsets from the shard's CAS Info section, which don't match on-disk positions for any real LZ4-compressed xorb. See the "Tricky bits" note below.
 
-`files` has a composite primary key on `(file_hash, repo_id)`. The same content can be registered in multiple repos (cross-repo dedup at the file level), and each registration independently grants read access via the M12 scope check.
+`files` has a composite primary key on `(file_hash, repo_id)`. The same content can be registered in multiple repos (cross-repo dedup at the file level), and each registration independently grants read access via the per-repo scope check.
 
-`files.owner` is the slice of `repo_id` before the first `/`, denormalised so quota and usage aggregations can hit the `files_by_owner` index instead of `LIKE 'alice/%'`. Populated at `register_file` time from `RepoRef::owner()` — there is no separate backfill or migration path, so existing dev DBs from before owner accounting will fail to open and should be deleted.
+`files.owner` is the slice of `repo_id` before the first `/`, denormalised so quota and usage aggregations can hit the `files_by_owner` index instead of `LIKE 'alice/%'`. Populated at `register_file` time from `RepoRef::owner()` — there is no backfill or migration path, so a dev DB missing the `owner` column won't open and must be recreated from scratch.
 
 This is the minimum needed to answer reconstruction queries, global-dedup queries, and per-owner accounting. Migrations run automatically on connection open (idempotent `CREATE TABLE IF NOT EXISTS ...`).
 
@@ -498,10 +498,10 @@ See [`SERVER.md` § "Observability"](SERVER.md#observability) for the operator-f
 
 These are the easy-to-get-wrong parts of the protocol. Calling them out explicitly so they don't get re-broken.
 
-- **Xet hash hex encoding** (spec §"Converting Hashes to Strings"). Not plain hex. Bytes are reordered as four little-endian u64s before stringifying. The spec text shows a doc-typo example missing one byte; the actual algorithm produces 64 hex chars from 32 input bytes. See `bale_server_wire::{encode_hash, decode_hash}` and its `hash_hex_spec_vector` test.
+- **Xet hash hex encoding** (spec §"Converting Hashes to Strings"). Not plain hex. Bytes are reordered as four little-endian u64s before stringifying. The spec text shows a doc-typo example missing one byte; the actual algorithm produces 64 hex chars from 32 input bytes. See `bale_server_wire::{encode_hash, decode_hash}`.
 - **Shard upload validation** — every xorb referenced by an uploaded shard MUST already be in the `xorbs` table (we return 400 otherwise). Per-term `FileVerificationEntry` MUST be present (spec says "MUST be set for shard uploads"). Per-term `chunk_idx_start < chunk_idx_end` is checked at the trust boundary — an empty/inverted range used to underflow `chunk_idx_end - 1` at reconstruction time and crash the request task; now rejected with 400 before any metadata write, plus a defensive `start >= end` guard at both reconstruction sites. We can additionally re-verify by recomputing the term verification hash against the chunk hashes we already indexed — *not done yet*; tracked as a hardening TODO.
 - **Write ordering across the two stores** — both upload handlers commit metadata-first, then blob-store:
-    - **`POST /v1/xorbs/...`** writes `register_xorb_layout` BEFORE `put_xorb`. A layout row with no backing blob is harmless: the next shard upload's `blobs.xorb_exists` check rejects with 400 (`missing xorb`), and the M6 ghost-xorb dedup tests already cover the "metadata says yes, blob says no" shape. The inverse — blob with no layout — used to wedge every file referencing that xorb permanently (reconstruction returns 500 "xorb on-disk layout missing"), so that direction is now explicitly forbidden.
+    - **`POST /v1/xorbs/...`** writes `register_xorb_layout` BEFORE `put_xorb`. A layout row with no backing blob is harmless: the next shard upload's `blobs.xorb_exists` check rejects with 400 (`missing xorb`), the same "metadata says yes, blob says no" shape the global-dedup path already tolerates. The inverse — blob with no layout — used to wedge every file referencing that xorb permanently (reconstruction returns 500 "xorb on-disk layout missing"), so that direction is now explicitly forbidden.
     - **`POST /shards`** writes `put_shard` first (content-addressed archive, inert without metadata pointing at it — orphan archive is GC-able and recoverable on retry), then registers all xorb metadata, then commits every file in a SINGLE atomic batch via `register_files`. A partial fault inside the batch rolls back the whole shard; the client's "500 ⇒ nothing happened" mental model holds. The earlier per-file loop could leave the first N-1 file rows committed while the client believed the upload failed — those orphans were then reachable to anyone who knew the file hash.
 - **`url_range.end` is inclusive** in the wire format (matches HTTP `Range:` semantics). The chunk-index `range.end` is **exclusive**. We translate carefully in `get_reconstruction`.
 - **Idempotency** — `POST /v1/xorbs/{prefix}/{hash}` and `POST /shards` are content-addressed; re-uploading the same content MUST return 200, not error. `was_inserted: false` on the xorb side; `result: 0` on the shard side (we currently always return `1`; both are spec-defined "success — value is informational").
@@ -523,7 +523,7 @@ Server side:
 | MDB shard binary parser/serializer | `crates/bale-server-shard/src/lib.rs` |
 | Xorb chunk-frame parser (on-disk layout) | `crates/bale-server-shard/src/xorb.rs` |
 | Filesystem blob store | `crates/bale-server-storage-fs/src/lib.rs` |
-| In-memory blob store (M8 pluggability) | `crates/bale-server-storage-mem/src/lib.rs` |
+| In-memory blob store (pluggability) | `crates/bale-server-storage-mem/src/lib.rs` |
 | S3-compatible blob store | `crates/bale-server-storage-s3/src/lib.rs` |
 | SQLite metadata store | `crates/bale-server-meta-sqlite/src/lib.rs` |
 | Static authz (`AlwaysAllow`, `ConfigAuthz`) | `crates/bale-server-authz-mem/src/lib.rs` |

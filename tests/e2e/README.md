@@ -28,7 +28,7 @@ python3 tests/e2e/run_s3.py     # S3 blob store via a MinIO sidecar
   ```
 
 - Python 3.9+. Only stdlib is used.
-- *Optional* (`mount-rev`/`mount-diff` phases only): libfuse3 on Linux,
+- *Optional* (`mount-rev`/`mount-diff` phases only): libfuse2 on Linux,
   fuse-t on macOS. Both phases skip cleanly when missing.
 
 The harness is cross-platform by design (uses `pathlib`, `subprocess`,

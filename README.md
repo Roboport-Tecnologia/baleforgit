@@ -98,7 +98,7 @@ Bale for Git is a Git large-file system that does content-defined chunking + chu
 - [`docs/SERVER.md`](docs/SERVER.md) — running `baleforgit-server`: install, configuration (incl. `BALE_DEFAULT_QUOTA_BYTES` and `BALE_ADMIN_TOKEN_HEX` for per-owner quotas), container, artifact verification.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — request flows, trait surface, storage layout, protocol notes, and the "Tricky bits" section.
 - [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md) — what a git forge has to implement to support `git-bale`.
-- [`docs/STATUS.md`](docs/STATUS.md) — milestone breakdown (M1–M12) with what each one provides.
+- [`docs/STATUS.md`](docs/STATUS.md) — feature breakdown with what each piece provides.
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — building from source, the test matrix, CI workflows, and how releases are cut.
 
 ## License

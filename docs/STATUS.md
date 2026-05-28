@@ -1,17 +1,16 @@
 # Status
 
-All implemented milestones (M1–M8, M11, M12) are done. M1–M6 build out the server itself; M7, M8, M11, M12 prove it end-to-end against real clients and exercise alternate trait impls, the native `git-bale` filter, and the per-repo scope check on reconstruction. M9 and M10 covered an LFS-bridge adapter that has since been removed (LFS compatibility is no longer in scope). Behavior is verified from the user's perspective by the `tests/e2e/` harness; there are no Rust unit or integration tests.
+Everything is done. Behavior is verified from the user's perspective by the `tests/e2e/` harness; there are no Rust unit or integration tests.
 
-| Milestone | Status | What it provides |
-|-----------|--------|------------------|
-| M1 — Wire types + shard parser | done | Hex encoding, JSON shapes, MDB shard binary format |
-| M2 — Filesystem + SQLite stores | done | `BlobStore` on disk, `MetadataStore` on SQLite |
-| M3 — Upload endpoints | done | `POST /v1/xorbs/{prefix}/{hash}`, `POST /shards` |
-| M4 — Download endpoints | done | `GET /v1/reconstructions/...`, signed `/xorb/default/...` transfer |
-| M5 — Auth + mock HF Hub token endpoint | done | HS256 JWTs, scope enforcement, `GET /api/{type}s/.../bale-{rw}-token/{rev}` |
-| M6 — Global dedup endpoint | done | `GET /v1/chunks/{prefix}/{hash}` (per-response HMAC-wrapped shard) |
-| M7 — End-to-end against `git-xet` | done | Implements the custom-transfer JSON protocol spoken by the real `git-xet transfer` binary |
-| M8 — Pluggability sanity (alternate impls) | done | `bale-server-storage-mem` (in-memory `BlobStore`) + `bale-server-authz-http` (HTTP-backed `RepoAuthz` skeleton) show the `BlobStore`/`RepoAuthz` traits are pluggable |
-| M9 / M10 — LFS bridge | removed | The Go LFS adapter has been removed; LFS compatibility is no longer in scope. |
-| M11 — Native filter (`git-bale`) | done | `crates/git-bale` implements Git's long-running filter protocol directly. Content lives only as the worktree file, a shared chunk cache (`~/.cache/bale/chunks` by default), and a per-repo manifest cache (`.git/bale/manifests/`). The `tests/e2e/` harness drives `git add` + `git checkout` round-trips and asserts the hot path (cached manifest + cached chunks) makes **zero** calls to `/v1/reconstructions/`. |
-| M12 — Per-repo scope check on reconstruction | done | `/v1/reconstructions/*` requires a `(file_hash, repo_id=claims.repo)` row in the `files` table — returns 404 on miss (no existence leak). The `files` PK is `(file_hash, repo_id)`, so the same content registered in multiple repos grants independent read access (cross-repo dedup). |
+| Milestone | What it provides |
+|-----------|------------------|
+| Wire types + shard parser | Hex encoding, JSON shapes, MDB shard binary format |
+| Filesystem + SQLite stores | `BlobStore` on disk, `MetadataStore` on SQLite |
+| Upload endpoints | `POST /v1/xorbs/{prefix}/{hash}`, `POST /shards` |
+| Download endpoints | `GET /v1/reconstructions/...`, signed `/xorb/default/...` transfer |
+| Auth + token endpoint | HS256 JWTs, scope enforcement, `GET /api/{type}s/.../bale-{rw}-token/{rev}` |
+| Global dedup endpoint | `GET /v1/chunks/{prefix}/{hash}` (per-response HMAC-wrapped shard) |
+| Pluggable trait impls | `bale-server-storage-mem` (in-memory `BlobStore`) + `bale-server-authz-http` (HTTP-backed `RepoAuthz`) show the `BlobStore`/`RepoAuthz` traits are swappable |
+| Native filter (`git-bale`) | Implements Git's long-running filter protocol directly. Content lives only as the worktree file, a shared chunk cache (`~/.cache/bale/chunks` by default), and a per-repo manifest cache (`.git/bale/manifests/`). The hot path (cached manifest + cached chunks) makes **zero** calls to `/v1/reconstructions/`. |
+| Per-repo scope check on reconstruction | `/v1/reconstructions/*` requires a `(file_hash, repo_id=claims.repo)` row in the `files` table — returns 404 on miss (no existence leak). The `files` PK is `(file_hash, repo_id)`, so the same content registered in multiple repos grants independent read access (cross-repo dedup). |
+| Owner accounting + quotas | Per-owner + per-repo storage accounting, soft quotas, and the `/v1/usage/{owner}`, `/v1/usage/repo/{owner}/{repo}`, `/v1/quotas/{owner}` endpoints. |

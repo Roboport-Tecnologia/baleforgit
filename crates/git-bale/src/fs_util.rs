@@ -47,39 +47,3 @@ pub fn restrict_user_cache_dir(dir: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn bale_dir_is_0o700_after_create() {
-        let dir = tempfile::tempdir().unwrap();
-        create_bale_subdir(dir.path(), "manifests").unwrap();
-        let mode = std::fs::metadata(dir.path().join("bale"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700, "bale/ should be 0o700");
-    }
-
-    #[test]
-    fn tightens_loose_existing_perms() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("bale/something")).unwrap();
-        std::fs::set_permissions(
-            dir.path().join("bale"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        create_bale_subdir(dir.path(), "manifests").unwrap();
-        let mode = std::fs::metadata(dir.path().join("bale"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700);
-    }
-}

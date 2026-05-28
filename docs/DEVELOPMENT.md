@@ -4,7 +4,7 @@ This document covers building, testing, and shipping the project. For consumer d
 
 ## Toolchain
 
-Rust 1.88+.
+Rust 1.94+.
 
 ## Common commands
 
@@ -44,7 +44,7 @@ crates/
 └── git-bale/                 # Native Git filter (filter.bale.process driver)
 ```
 
-The workspace `Cargo.toml` `exclude`s the sibling clone of `xet-core/` from `cargo build --workspace`. `git-bale` depends on `xet-core/` via path deps.
+`git-bale` depends on `xet-data`, `xet-client`, `xet-core-structures`, and `xet-runtime` from crates.io, pinned to `=1.5.2`. The sibling `xet-core/` clone is a source reference only — the workspace `Cargo.toml` `exclude`s it from `cargo build --workspace`.
 
 ## Tests
 
