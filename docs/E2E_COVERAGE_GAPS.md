@@ -131,7 +131,7 @@ Per-file detail (all MISSING-E2E unless noted):
 |---|---|---|---|
 | 1 | ~~Fix happy mount sessions (see §1)~~ **DONE** | ~890 | mount/* |
 | 2 | ~~`GET /v1/files/{file_id}` browser download~~ **DONE** (`browser-download` phase, +115 lines) | ~150 | bale-server-http:698-892 |
-| 3 | Spilled-clean (>4 GiB) path | ~130 | filter_process.rs:253-477, clean_cache.rs:220-382 |
+| 3 | ~~Spilled-clean (>4 GiB) path~~ **DONE** (`spilled-clean` phase) | ~130 | filter_process.rs:253-477, clean_cache.rs:220-382 |
 | 4 | ~~HTTPS-origin phase~~ **DONE** (`https-origin` phase, +39 resolver / +10 remote) | ~80 | resolver.rs:101-190, 281-337 |
 | 5 | OTLP-collector sub-phase | ~60 | bale-server-bin/telemetry.rs |
 | 6 | `PUT /v1/quotas/{owner}` admin-quota phase | ~40 | bale-server-http:1241-1266, meta-sqlite:597-615, http:288 |
@@ -162,13 +162,16 @@ attachment; filename="bigfile.bin"`; (c) same JWT + tampered filename →
 400. `forge_jwt_with_filename()` builds the JWT; `http_get_file()` is the
 probe. Lifted bale-server-http line coverage 63.9% → 76.4%.
 
-**Phase 3 (>4 GiB spilled clean)**: two options: (a) push an actual
->4 GiB file in a dedicated phase, or (b) make `MAX_INLINE_CLEAN`
-env-overridable in `filter_process.rs` and drop to ~1 MiB for one
-phase. Option (b) is dramatically cheaper. This single fix unlocks
-~50 lines in `filter_process.rs` (L253-274, L310-313, L337-338,
-L402-477) and ~80 lines in `clean_cache.rs` (L220-382 — the
-file-backed verify path + `priority_order`).
+**Phase 3 (>4 GiB spilled clean)** — **DONE**, the `spilled-clean` phase
+(option (b)). `MAX_INLINE_CLEAN` is now overridable via the
+`BALE_MAX_INLINE_CLEAN` env var (a byte count); the phase sets it to 1 MiB
+and pushes a 5 MiB file to its own `e2e/spilled-clean` repo. The first
+`git add` spills to a `NamedTempFile` (`filter_process.rs` L254-274,
+`handle_clean` L402-477); an unstage + re-add reloads the clean-cache and
+verifies the still-spilling payload through the file-backed
+`clean_cache::verify_chunks` (L220-382 — `verify_stripe`, `read_exact_at`,
+`pread`, and `priority_order`'s 6-chunk middle shuffle). Lukewarm + cold/hot
+resmudge round-trips the spilled file end to end.
 
 **Phase 4 (HTTPS origin)** — **DONE**, the `https-origin` phase. A new
 `MockForgeServer` answers `/<owner>/<repo>.git/info/bale/authenticate`
@@ -363,7 +366,10 @@ run for those phases.
    67.6% line coverage.
 3. ~~**HTTPS-origin phase** (§2.4).~~ **DONE** — `https-origin` phase,
    resolver.rs 38.5% → 79.2%, overall 67.6% → 68.7% line coverage.
-4. **Spilled-clean threshold knob** (§2.3). ~130 lines.
+4. ~~**Spilled-clean threshold knob** (§2.3).~~ **DONE** — `spilled-clean`
+   phase; `BALE_MAX_INLINE_CLEAN` env override + a 5 MiB push exercise
+   `handle_clean`'s tmpfile branch and the file-backed `verify_chunks`
+   (~130 lines across filter_process.rs + clean_cache.rs).
 5. **OTLP collector + admin-quota + uninstall + track phases**
    (§2.5–§2.8). ~130 lines combined, each phase modest in complexity.
 6. **Wire-level security probes** (§3 cross-repo M12 scope, JWT-owner

@@ -222,6 +222,17 @@ fn ensure_runtime(slot: &mut Option<Arc<XetRuntime>>) -> Result<&Arc<XetRuntime>
 /// the disk round-trip that previously cost ~250 ms on a 350 MiB file.
 const MAX_INLINE_CLEAN: usize = 4 * 1024 * 1024 * 1024;
 
+/// Resolve the in-memory/spill threshold. `BALE_MAX_INLINE_CLEAN` (a byte
+/// count) overrides the default so tests can exercise the spilled-clean path
+/// without staging a multi-GiB file; an unset or unparseable value falls back
+/// to [`MAX_INLINE_CLEAN`].
+fn max_inline_clean() -> usize {
+    std::env::var("BALE_MAX_INLINE_CLEAN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_INLINE_CLEAN)
+}
+
 /// Holds the clean payload either entirely in memory or spilled to a tmp file.
 /// Whichever branch we take, downstream cache-verify and xet-pipeline calls
 /// pick the matching code path.
@@ -234,7 +245,10 @@ enum CleanPayload {
 /// `MAX_INLINE_CLEAN`, at which point we transfer accumulated bytes to a tmp
 /// file and continue spilling there. Bytes received are unchanged either way
 /// — the choice is purely about where they live.
-fn drain_clean_payload<R: Read>(reader: &mut PktReader<R>) -> Result<(CleanPayload, u64)> {
+fn drain_clean_payload<R: Read>(
+    reader: &mut PktReader<R>,
+    max_inline: usize,
+) -> Result<(CleanPayload, u64)> {
     use crate::pktline::Packet;
     let mut buf: Vec<u8> = Vec::new();
     let mut spilled: Option<NamedTempFile> = None;
@@ -251,7 +265,7 @@ fn drain_clean_payload<R: Read>(reader: &mut PktReader<R>) -> Result<(CleanPaylo
                 }
                 if let Some(f) = spilled.as_mut() {
                     f.write_all(&bytes)?;
-                } else if buf.len().saturating_add(bytes.len()) > MAX_INLINE_CLEAN {
+                } else if buf.len().saturating_add(bytes.len()) > max_inline {
                     let mut f = NamedTempFile::new()?;
                     f.write_all(&buf)?;
                     f.write_all(&bytes)?;
@@ -285,7 +299,7 @@ fn do_clean<R: Read, W: Write>(
     writer: &mut PktWriter<W>,
     pathname: &str,
 ) -> Result<()> {
-    let (payload, file_size) = drain_clean_payload(reader)?;
+    let (payload, file_size) = drain_clean_payload(reader, max_inline_clean())?;
 
     let git_dir = raw.git_dir.as_deref().ok_or_else(|| {
         anyhow!("clean: cannot stage upload — no git directory resolved from cwd")

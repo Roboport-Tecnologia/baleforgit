@@ -54,6 +54,15 @@ CONTAINER_NAME_PREFIX = "baleforgit-e2e"
 JWT_TTL_YEARS = 100
 BIG_FILE_BYTES = 35 * 1024 * 1024  # 35 MB (~547 chunks at 64 KiB target).
 SMALL_FILE_BYTES = 8 * 1024
+GC_PAYLOAD_BYTES = 256 * 1024  # a handful of CDC chunks → real xorbs/shards staged
+# The clean filter holds payloads in RAM up to a 4 GiB default, so no realistic
+# e2e file ever spills to a tmpfile. The spilled-clean phase caps the threshold
+# via BALE_MAX_INLINE_CLEAN and pushes a file above it to drive `handle_clean`'s
+# tmpfile branch + the file-backed `clean_cache::verify_chunks` path.
+SPILL_INLINE_THRESHOLD = 1024 * 1024  # 1 MiB
+# Above the threshold, not a 1 MiB multiple (partial trailing chunk), and a
+# 6-chunk index so verify's priority_order exercises its middle-sample shuffle.
+SPILL_FILE_BYTES = 5 * 1024 * 1024 + 4096
 # E2E_HUB_TOKEN is opaque inside the container; just needs to match what
 # BALE_GRANTS expects.
 E2E_HUB_TOKEN = "e2e-hub-token-not-a-secret"
@@ -61,6 +70,13 @@ E2E_OWNER = "e2e"
 E2E_REPO = "repo"
 E2E_REPO_2 = "repo2"
 E2E_REPO_3 = "mixed-files"
+E2E_REPO_SPILL = "spilled-clean"
+# Dedicated repos for the gc staging-reconciliation phases. Each gc phase
+# pushes its own `main`, so they can't share a bare repo with the push-side
+# phases above (or each other) without a non-fast-forward collision.
+E2E_REPO_GC1 = "gc-abandon"
+E2E_REPO_GC2 = "gc-keep"
+E2E_REPO_GC3 = "gc-mixed"
 E2E_USER = "e2e"
 
 
@@ -1369,6 +1385,30 @@ def manifest_cache_entries(repo: Path) -> list[Path]:
     return [p for p in m.iterdir() if p.is_file()]
 
 
+def staged_markers(repo: Path) -> set[str]:
+    """The set of `<file_hex>` markers under `.git/bale/staging/file-index/`.
+    Each marker name is the merkle file hash the clean filter recorded — the
+    same value as a committed pointer's `hash` field, so we can correlate a
+    marker with the file version that produced it. This is the precise signal
+    `git-bale gc` operates on."""
+    d = repo / ".git" / "bale" / "staging" / "file-index"
+    if not d.exists():
+        return set()
+    return {p.name for p in d.iterdir() if p.is_file()}
+
+
+def pointer_hash_at(repo: Path, env: dict, spec: str, *, label: str) -> str:
+    """The bale pointer `hash` (merkle file id) for the blob at git `spec`
+    (e.g. `HEAD:data.bin` for the committed version or `:data.bin` for the
+    staged-in-index version)."""
+    blob = cat_file_bytes(repo, env, spec)
+    if not is_bale_pointer(blob):
+        raise TestFailure(
+            f"[{label}] expected a bale pointer at {spec}, got: {blob[:200]!r}"
+        )
+    return str(pointer_field(blob, "hash"))
+
+
 # =============================================================================
 # Usage API
 # =============================================================================
@@ -2127,6 +2167,105 @@ def phase_basic_user_ops(
         )
 
 
+def phase_spilled_clean(
+    *,
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+) -> None:
+    """Drive the clean filter's spill-to-tmpfile path. The in-memory cap
+    defaults to 4 GiB, so no realistic e2e file ever spills and `handle_clean`
+    (the NamedTempFile branch) plus the file-backed `clean_cache::verify_chunks`
+    go uncovered. Capping `BALE_MAX_INLINE_CLEAN` at 1 MiB and pushing a 5 MiB
+    file forces the spill: the first `git add` stages via the tmpfile path; an
+    unstage + re-add reloads the clean-cache and verifies the spilled payload
+    through the file-backed `verify_chunks`."""
+    repo, env = init_repo_for_push(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_SPILL,
+        name="spilled",
+    )
+    # The filter reads this from the env git hands it, so the cap applies to
+    # every clean below; the production default (4 GiB) would never spill.
+    env["BALE_MAX_INLINE_CLEAN"] = str(SPILL_INLINE_THRESHOLD)
+
+    payload = deterministic_payload(SPILL_FILE_BYTES, seed=b"spilled-clean")
+    payload_sha = sha256_bytes(payload)
+    blob_path = repo / "spilled.bin"
+    blob_path.write_bytes(payload)
+
+    with timings.measure(
+        "spilled: stage (spills to tmpfile)", bytes_moved=SPILL_FILE_BYTES
+    ):
+        git(["add", "spilled.bin"], cwd=repo, env=env)
+    verify_pointer_at(
+        repo, env, spec=":spilled.bin",
+        expected_sha=payload_sha, expected_size=SPILL_FILE_BYTES,
+        label="spilled:after-stage",
+    )
+    staging_after_add = set(staging_files(repo))
+    if not staging_after_add:
+        raise TestFailure("spilled: staging dir empty after `git add`")
+    if not clean_cache_entries(repo):
+        raise TestFailure("spilled: clean-cache empty after `git add`")
+
+    # Unstage + re-add. The second clean reloads the clean-cache and, because
+    # the payload still spills, verifies it through the file-backed
+    # `verify_chunks` (not the in-memory variant). A cache hit must not produce
+    # new staging artifacts.
+    git(["restore", "--staged", "spilled.bin"], cwd=repo, env=env)
+    with timings.measure("spilled: re-stage (file-backed clean-cache hit)"):
+        git(["add", "spilled.bin"], cwd=repo, env=env)
+    if set(staging_files(repo)) != staging_after_add:
+        raise TestFailure(
+            "spilled: re-stage changed staging files — clean-cache miss on the "
+            "spilled verify path"
+        )
+    verify_pointer_at(
+        repo, env, spec=":spilled.bin",
+        expected_sha=payload_sha, expected_size=SPILL_FILE_BYTES,
+        label="spilled:after-restage",
+    )
+
+    with timings.measure("spilled: commit"):
+        git(["commit", "-m", "add spilled.bin"], cwd=repo, env=env)
+
+    # Lukewarm: reconstruct the spilled file from staging before it's pushed —
+    # proves the tmpfile clean produced valid staging artifacts.
+    with timings.measure("spilled: lukewarm resmudge (pre-push)"):
+        force_resmudge_lukewarm(
+            repo, env, "spilled.bin",
+            expected_sha=payload_sha, expected_size=SPILL_FILE_BYTES,
+            label="spilled:lukewarm-pre-push",
+        )
+
+    with timings.measure(
+        "spilled: push (drains staging)", bytes_moved=SPILL_FILE_BYTES
+    ):
+        git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+    if staging_files(repo):
+        raise TestFailure("spilled: staging not drained after push")
+
+    with timings.measure(
+        "spilled: cold resmudge after push", bytes_moved=SPILL_FILE_BYTES
+    ):
+        force_resmudge_cold(
+            repo, env, "spilled.bin",
+            expected_sha=payload_sha, expected_size=SPILL_FILE_BYTES,
+            label="spilled:cold-resmudge-after-push",
+        )
+    with timings.measure("spilled: hot resmudge after push"):
+        force_resmudge_and_verify(
+            repo, env, "spilled.bin",
+            expected_sha=payload_sha, expected_size=SPILL_FILE_BYTES,
+            label="spilled:hot-resmudge-after-push",
+        )
+
+
 def phase_big_file_dedup(
     *,
     timings: Timings,
@@ -2850,10 +2989,16 @@ def phase_offline_and_restart(
             jwt_secret_hex=jwt_secret_hex,
             transfer_secret_hex=transfer_secret_hex,
             ssh_public_key=ssh_public_key,
+            # Must host the gc + spilled-clean repos too: those g3 phases run
+            # after this rebind, against the restarted server returned here.
             test_repos=[
                 f"{E2E_OWNER}/{E2E_REPO}",
                 f"{E2E_OWNER}/{E2E_REPO_2}",
                 f"{E2E_OWNER}/{E2E_REPO_3}",
+                f"{E2E_OWNER}/{E2E_REPO_SPILL}",
+                f"{E2E_OWNER}/{E2E_REPO_GC1}",
+                f"{E2E_OWNER}/{E2E_REPO_GC2}",
+                f"{E2E_OWNER}/{E2E_REPO_GC3}",
             ],
             cas_port=cas_port,
             ssh_port=ssh_port,
@@ -4435,6 +4580,202 @@ def phase_failure_transient_db(
 # =============================================================================
 
 
+# =============================================================================
+# gc phases (staging-area reconciliation)
+# =============================================================================
+#
+# `git add` stages a bale file's xorbs/shards offline under
+# `.git/bale/staging/`; only a successful `git push` (pre-push hook running
+# `git-bale push-pending`) drains them. Abandoning a staged change (`git
+# reset` + `git checkout`) used to leak those bytes forever. `git-bale gc`
+# reconciles staging against git reachability; the post-checkout/-commit/-merge
+# hooks installed by `install --local` run it. Each phase owns its own bare
+# repo so they're independent of the push-side phases and of each other.
+
+
+def phase_gc_abandon_checkout(
+    *, timings: Timings, server: ServerHandle, client: ClientEnv, work_root: Path
+) -> None:
+    """The user-reported bug: stage a change, then abandon it entirely. The
+    post-checkout hook's gc must sweep the orphaned staging.
+
+    The baseline v1 is pushed first, so push-pending has already wiped its
+    staging and v1 lives on the server. After abandoning v2 there is nothing
+    left in git that references any staged bytes → gc does a full wipe."""
+    with timings.measure("gc-abandon-checkout"):
+        repo, env = init_repo_for_push(
+            work_root=work_root, client=client, server=server,
+            owner=E2E_OWNER, repo=E2E_REPO_GC1, name="gc-abandon",
+        )
+        rel = "big.bin"
+        v1 = deterministic_payload(GC_PAYLOAD_BYTES, seed=b"gc-abandon-v1")
+        v2 = deterministic_payload(GC_PAYLOAD_BYTES, seed=b"gc-abandon-v2")
+
+        (repo / rel).write_bytes(v1)
+        git(["add", rel], cwd=repo, env=env)
+        git(["commit", "-m", "add big v1"], cwd=repo, env=env)
+        git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+        if staging_files(repo):
+            raise TestFailure(
+                "[gc-abandon] precondition: push should have drained staging, "
+                f"but xorbs/shards remain: {[str(p) for p in staging_files(repo)]}"
+            )
+
+        # Stage a change...
+        (repo / rel).write_bytes(v2)
+        git(["add", rel], cwd=repo, env=env)
+        if not staging_files(repo):
+            raise TestFailure("[gc-abandon] git add should have staged v2 xorbs")
+        if not staged_markers(repo):
+            raise TestFailure("[gc-abandon] git add should have written a marker")
+
+        # ...then abandon it: unstage, then discard the worktree edit. The
+        # `git checkout` fires the post-checkout hook → `git-bale gc`.
+        git(["reset"], cwd=repo, env=env)
+        git(["checkout", "--", rel], cwd=repo, env=env)
+
+        leftover = staging_files(repo)
+        if leftover:
+            raise TestFailure(
+                "[gc-abandon] staging not reclaimed after the change was "
+                f"discarded; orphaned objects remain: {[str(p) for p in leftover]}"
+            )
+        if staged_markers(repo):
+            raise TestFailure(
+                f"[gc-abandon] stale markers survived the discard: {staged_markers(repo)}"
+            )
+        # Worktree is back to v1.
+        verify_worktree(
+            repo, rel, expected_sha=sha256_bytes(v1),
+            expected_size=len(v1), label="gc-abandon",
+        )
+        info("[gc-abandon] orphaned staging swept; v1 worktree intact")
+
+
+def phase_gc_keeps_unpushed(
+    *, timings: Timings, server: ServerHandle, client: ClientEnv, work_root: Path
+) -> None:
+    """DATA-LOSS GUARD. Two stacked commits, neither pushed: C1 adds v1, C2
+    changes it to v2. The branch tip references only v2, but a future `git
+    push` uploads BOTH commits, so v1's staged bytes are still needed. A
+    naive cleanup keyed on the worktree/tip would drop v1 and silently
+    corrupt history; gc must keep it.
+
+    Proof is end-to-end: after gc, push both commits, cold-clone, and check
+    out every revision — if v1 had been dropped the server would lack it and
+    the C1 checkout would fail or mismatch."""
+    with timings.measure("gc-keeps-unpushed"):
+        repo, env = init_repo_for_push(
+            work_root=work_root, client=client, server=server,
+            owner=E2E_OWNER, repo=E2E_REPO_GC2, name="gc-keep",
+        )
+        rel = "data.bin"
+        v1 = deterministic_payload(GC_PAYLOAD_BYTES, seed=b"gc-keep-v1")
+        v2 = deterministic_payload(GC_PAYLOAD_BYTES, seed=b"gc-keep-v2")
+
+        (repo / rel).write_bytes(v1)
+        git(["add", rel], cwd=repo, env=env)
+        git(["commit", "-m", "data v1"], cwd=repo, env=env)
+        c1 = git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()
+        h1 = pointer_hash_at(repo, env, f"HEAD:{rel}", label="gc-keep")
+
+        (repo / rel).write_bytes(v2)
+        git(["add", rel], cwd=repo, env=env)
+        git(["commit", "-m", "data v2"], cwd=repo, env=env)
+        c2 = git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()
+        h2 = pointer_hash_at(repo, env, f"HEAD:{rel}", label="gc-keep")
+
+        before = staged_markers(repo)
+        if not {h1, h2} <= before:
+            raise TestFailure(
+                "[gc-keep] precondition: both unpushed versions should be "
+                f"staged; want {{{h1[:8]}.., {h2[:8]}..}} have {before}"
+            )
+
+        # Manual gc — the tip only references v2, but v1 lives in unpushed C1.
+        run([str(client.git_bale_bin), "gc"], cwd=repo, env=env)
+
+        after = staged_markers(repo)
+        if not {h1, h2} <= after:
+            raise TestFailure(
+                "[gc-keep] DATA LOSS: gc dropped a marker for committed-but-"
+                f"unpushed content. before={before} after={after}"
+            )
+
+        # Push both commits, cold-clone, verify EVERY revision reconstructs.
+        git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+        clone, cenv, _cache = init_repo_for_clone(
+            work_root=work_root, client=client, server=server,
+            owner=E2E_OWNER, repo=E2E_REPO_GC2, name="gc-keep-clone",
+        )
+        git(["checkout", c1], cwd=clone, env=cenv)
+        verify_worktree(
+            clone, rel, expected_sha=sha256_bytes(v1),
+            expected_size=len(v1), label="gc-keep@C1",
+        )
+        git(["checkout", c2], cwd=clone, env=cenv)
+        verify_worktree(
+            clone, rel, expected_sha=sha256_bytes(v2),
+            expected_size=len(v2), label="gc-keep@C2",
+        )
+        info("[gc-keep] unpushed v1 survived gc; all revisions reconstruct")
+
+
+def phase_gc_mixed(
+    *, timings: Timings, server: ServerHandle, client: ClientEnv, work_root: Path
+) -> None:
+    """The mixed case: one committed-but-unpushed version (must survive) plus
+    one staged-then-abandoned version (must be forgotten). gc keeps the live
+    marker and drops only the dangling one; v1 stays pushable + reconstructable."""
+    with timings.measure("gc-mixed"):
+        repo, env = init_repo_for_push(
+            work_root=work_root, client=client, server=server,
+            owner=E2E_OWNER, repo=E2E_REPO_GC3, name="gc-mixed",
+        )
+        rel = "m.bin"
+        v1 = deterministic_payload(GC_PAYLOAD_BYTES, seed=b"gc-mixed-v1")
+        v2 = deterministic_payload(GC_PAYLOAD_BYTES, seed=b"gc-mixed-v2")
+
+        (repo / rel).write_bytes(v1)
+        git(["add", rel], cwd=repo, env=env)
+        git(["commit", "-m", "m v1"], cwd=repo, env=env)  # committed, NOT pushed
+        h1 = pointer_hash_at(repo, env, f"HEAD:{rel}", label="gc-mixed")
+
+        (repo / rel).write_bytes(v2)
+        git(["add", rel], cwd=repo, env=env)  # staged, never committed
+        h2 = pointer_hash_at(repo, env, f":{rel}", label="gc-mixed")
+        if h1 == h2:
+            raise TestFailure("[gc-mixed] v1 and v2 unexpectedly hash-collided")
+
+        git(["reset"], cwd=repo, env=env)               # unstage v2 (now dangling)
+        git(["checkout", "--", rel], cwd=repo, env=env)  # restore v1; fires gc hook
+
+        markers = staged_markers(repo)
+        if h1 not in markers:
+            raise TestFailure(
+                "[gc-mixed] DATA LOSS: gc dropped the committed-but-unpushed "
+                f"v1 marker {h1[:8]}..; markers={markers}"
+            )
+        if h2 in markers:
+            raise TestFailure(
+                "[gc-mixed] gc kept the abandoned (never-committed) v2 marker "
+                f"{h2[:8]}..; markers={markers}"
+            )
+
+        # v1 still uploads and reconstructs after a cold clone.
+        git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+        clone, cenv, _cache = init_repo_for_clone(
+            work_root=work_root, client=client, server=server,
+            owner=E2E_OWNER, repo=E2E_REPO_GC3, name="gc-mixed-clone",
+        )
+        git(["checkout", "main"], cwd=clone, env=cenv)
+        verify_worktree(
+            clone, rel, expected_sha=sha256_bytes(v1),
+            expected_size=len(v1), label="gc-mixed",
+        )
+        info("[gc-mixed] live v1 kept, dangling v2 dropped, v1 reconstructs")
+
+
 def resolve_git_bale(arg_path: Optional[str]) -> Path:
     candidates: list[Path] = []
     if arg_path:
@@ -4734,6 +5075,10 @@ def main() -> int:
                     f"{E2E_OWNER}/{E2E_REPO}",
                     f"{E2E_OWNER}/{E2E_REPO_2}",
                     f"{E2E_OWNER}/{E2E_REPO_3}",
+                    f"{E2E_OWNER}/{E2E_REPO_SPILL}",
+                    f"{E2E_OWNER}/{E2E_REPO_GC1}",
+                    f"{E2E_OWNER}/{E2E_REPO_GC2}",
+                    f"{E2E_OWNER}/{E2E_REPO_GC3}",
                 ],
                 cas_port=cas_port,
                 ssh_port=ssh_port,
@@ -4753,6 +5098,11 @@ def main() -> int:
 
         def _phase_wrong_token() -> None:
             phase_adversarial_wrong_token(
+                timings=timings, server=server, client=client, work_root=work_root,
+            )
+
+        def _phase_spilled() -> None:
+            phase_spilled_clean(
                 timings=timings, server=server, client=client, work_root=work_root,
             )
 
@@ -4860,6 +5210,21 @@ def main() -> int:
                 admin_token_hex=admin_token_hex,
             )
 
+        def _phase_gc_abandon() -> None:
+            phase_gc_abandon_checkout(
+                timings=timings, server=server, client=client, work_root=work_root,
+            )
+
+        def _phase_gc_keep() -> None:
+            phase_gc_keeps_unpushed(
+                timings=timings, server=server, client=client, work_root=work_root,
+            )
+
+        def _phase_gc_mixed() -> None:
+            phase_gc_mixed(
+                timings=timings, server=server, client=client, work_root=work_root,
+            )
+
         # name -> (group, read_only, fn)
         REGISTRY: dict[str, tuple[str, bool, Callable[[], None]]] = {
             "basic":           ("g1",      False, _phase_basic),
@@ -4887,12 +5252,20 @@ def main() -> int:
             # Independent (own repo + commits), so g3 — not read-only because
             # it pushes new history that other phases shouldn't see.
             "mount-diff-mixed": ("g3",     False, _phase_mount_diff_mixed),
+            # Own repo + commits, forces the clean filter's spill path via a
+            # capped BALE_MAX_INLINE_CLEAN. g3 for the same reason as above.
+            "spilled-clean":   ("g3",      False, _phase_spilled),
             # Failure-recovery phases each own their own isolated container
             # + data dir, so they can crash/restart the server or block its
             # DB without disturbing earlier phases' state.
             "failure-kill":      ("g3", False, _phase_failure_kill),
             "failure-conndrop":  ("g3", False, _phase_failure_conndrop),
             "failure-dbbusy":    ("g3", False, _phase_failure_dbbusy),
+            # gc staging reconciliation. Each owns its own bare repo + commits,
+            # so g3 — not read-only (they push new history).
+            "gc-abandon-checkout": ("g3", False, _phase_gc_abandon),
+            "gc-keeps-unpushed":   ("g3", False, _phase_gc_keep),
+            "gc-mixed":            ("g3", False, _phase_gc_mixed),
         }
 
         # Build the within-group lists in declaration order, then apply
