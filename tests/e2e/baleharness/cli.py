@@ -82,6 +82,10 @@ from baleharness.phases.mount import (
     phase_mount_diff_mixed,
     phase_mount_rev,
 )
+from baleharness.phases.push_pending import (
+    phase_push_pending_corrupt_staging,
+    phase_push_pending_noop,
+)
 from baleharness.phases.scenario import (
     phase_basic_user_ops,
     phase_big_file_dedup,
@@ -378,6 +382,22 @@ def main() -> int:
                 jwt_secret_hex=jwt_secret_hex,
             )
 
+        def _phase_pp_noop() -> None:
+            phase_push_pending_noop(
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+            )
+
+        def _phase_pp_corrupt() -> None:
+            phase_push_pending_corrupt_staging(
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+            )
+
         def _phase_spilled() -> None:
             phase_spilled_clean(
                 timings=timings,
@@ -563,6 +583,10 @@ def main() -> int:
             # Routes git-bale's CAS traffic through a counting proxy and asserts
             # only push/pull cross it. Own repo + commits, so g1 (independent).
             "offline-no-network": ("g1", False, _phase_offline_net),
+            # push-pending drain edge cases. Own ephemeral client repos against
+            # the shared server, never push successfully, so g1 (independent).
+            "push-pending-noop": ("g1", False, _phase_pp_noop),
+            "push-pending-corrupt": ("g1", False, _phase_pp_corrupt),
             "bigfile": ("g2-head", False, _phase_bigfile),
             "usage": ("g2-tail", True, _phase_usage),
             # Dereferences rev_state["repo_path"]/["env"] (the live bigfile
