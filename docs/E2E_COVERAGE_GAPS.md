@@ -132,7 +132,7 @@ Per-file detail (all MISSING-E2E unless noted):
 | 1 | ~~Fix happy mount sessions (see §1)~~ **DONE** | ~890 | mount/* |
 | 2 | ~~`GET /v1/files/{file_id}` browser download~~ **DONE** (`browser-download` phase, +115 lines) | ~150 | bale-server-http:698-892 |
 | 3 | Spilled-clean (>4 GiB) path | ~130 | filter_process.rs:253-477, clean_cache.rs:220-382 |
-| 4 | HTTPS-origin phase | ~80 | resolver.rs:101-190, 281-337 |
+| 4 | ~~HTTPS-origin phase~~ **DONE** (`https-origin` phase, +39 resolver / +10 remote) | ~80 | resolver.rs:101-190, 281-337 |
 | 5 | OTLP-collector sub-phase | ~60 | bale-server-bin/telemetry.rs |
 | 6 | `PUT /v1/quotas/{owner}` admin-quota phase | ~40 | bale-server-http:1241-1266, meta-sqlite:597-615, http:288 |
 | 7 | `phase_uninstall` | ~40 | install.rs |
@@ -170,11 +170,15 @@ phase. Option (b) is dramatically cheaper. This single fix unlocks
 L402-477) and ~80 lines in `clean_cache.rs` (L220-382 — the
 file-backed verify path + `priority_order`).
 
-**Phase 4 (HTTPS origin)**: reuse the `authz-http` mock forge.
-Configure `origin` as `http://<mock>/<owner>/<repo>.git` and run
-push/clone. Covers the entire `Http | Https` branch in
-`resolver.rs:101-108`, `authenticate_http` (143-190), and
-`git_credential_fill` (281-337).
+**Phase 4 (HTTPS origin)** — **DONE**, the `https-origin` phase. A new
+`MockForgeServer` answers `/<owner>/<repo>.git/info/bale/authenticate`
+(returns the bale href + Bearer hub token); the client repo's `origin` is
+an `http://` URL and a canned `credential.helper` supplies Basic creds.
+`git-bale push-pending` (op=upload) and `force_resmudge_cold` (op=download)
+both take the HTTP resolver branch, so both scope arms are covered. No git
+smart-HTTP server is needed — those two ops only read origin + POST to the
+forge, they never transfer refs. Lifted resolver.rs 38.5% → 79.2% line and
+remote.rs 58.5% → 67.9%.
 
 **Phase 5 (OTLP collector)**: Python socket draining POSTs to
 `/v1/traces` and `/v1/metrics`. Run server with
@@ -357,14 +361,15 @@ run for those phases.
 2. ~~**Browser `/v1/files/...` phase** (§2.2).~~ **DONE** — `browser-download`
    phase, +115 lines on bale-server-http (63.9% → 76.4%), overall 65.3% →
    67.6% line coverage.
-3. **Spilled-clean threshold knob** (§2.3). ~130 lines.
-4. **HTTPS-origin + OTLP collector + admin-quota + uninstall + track
-   phases** (§2.4–§2.8). ~210 lines combined, each phase modest in
-   complexity.
-5. **Wire-level security probes** (§3 cross-repo M12 scope, JWT-owner
+3. ~~**HTTPS-origin phase** (§2.4).~~ **DONE** — `https-origin` phase,
+   resolver.rs 38.5% → 79.2%, overall 67.6% → 68.7% line coverage.
+4. **Spilled-clean threshold knob** (§2.3). ~130 lines.
+5. **OTLP collector + admin-quota + uninstall + track phases**
+   (§2.5–§2.8). ~130 lines combined, each phase modest in complexity.
+6. **Wire-level security probes** (§3 cross-repo M12 scope, JWT-owner
    mismatch, signed-URL tampering). Small in lines, but load-bearing
    for the invariants called out in CLAUDE.md.
-6. **Trim dead code** (§4 deletion candidates + §5). Improves the
+7. **Trim dead code** (§4 deletion candidates + §5). Improves the
    coverage signal without writing new tests:
    - `config::BaleConfig::load`
    - `pointer::{write_pointer, encode_pointer, read_pointer}`

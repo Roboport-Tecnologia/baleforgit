@@ -1762,6 +1762,91 @@ class MockAuthzServer:
             self._thread = None
 
 
+class MockForgeServer:
+    """Stand-in for a git forge's `/<owner>/<repo>.git/info/bale/authenticate`
+    endpoint — the HTTPS half of the forge protocol the git-bale resolver uses
+    when `origin` is an `http(s)://` URL (instead of the SSH
+    `git-bale-authenticate` command). A real forge verifies the user's password
+    locally and returns the baleforgit-server href plus a short-lived Bearer;
+    we return a fixed href + hub token (`docs/BALE_FORGE_PROTOCOL.md`).
+
+    Wire shape the resolver expects (resolver.rs `authenticate_http`):
+        POST /<owner>/<repo>.git/info/bale/authenticate?op=upload|download
+        Authorization: Basic <base64(user:pass)>
+        200 { "href": "<bale-server-url>", "header": {"Authorization": "Bearer <tok>"} }
+
+    We do NOT serve git smart-HTTP: the two operations that drive the HTTP
+    resolver branch — `git-bale push-pending` and a cold smudge — only read
+    `origin`'s URL and POST to this endpoint; they never transfer git refs.
+    That keeps the mock to one endpoint instead of wrapping `git http-backend`.
+    The client runs on the host, so it reaches us on 127.0.0.1.
+    """
+
+    def __init__(
+        self, *, bale_href: str, hub_token: str, port: Optional[int] = None
+    ) -> None:
+        self.bale_href = bale_href.rstrip("/")
+        self.hub_token = hub_token
+        self.port = port or pick_free_port()
+        self.calls: list[tuple[str, bool]] = []  # (op, had_basic_auth)
+        self._server: Optional["http.server.ThreadingHTTPServer"] = None
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def start(self) -> None:
+        import http.server
+
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):  # noqa: N802
+                pass
+
+            def do_POST(self):  # noqa: N802
+                parsed = urllib.parse.urlparse(self.path)
+                if not parsed.path.endswith("/info/bale/authenticate"):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                op = urllib.parse.parse_qs(parsed.query).get("op", [""])[0]
+                had_basic = self.headers.get("Authorization", "").startswith("Basic ")
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                with outer._lock:
+                    outer.calls.append((op, had_basic))
+                body = json.dumps(
+                    {
+                        "href": outer.bale_href,
+                        "header": {"Authorization": f"Bearer {outer.hub_token}"},
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True, name="MockForgeServer"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+
 def wait_for_server_progress(
     server: ServerHandle, *, min_bytes: int, timeout_s: float = 15.0
 ) -> int:
@@ -3670,6 +3755,128 @@ def _authz_http_decide(bearer: str, repo_id: str, scope: str) -> tuple[int, dict
     return 403, {"error": f"unknown repo {repo_id!r}"}
 
 
+HTTP_ORIGIN_REPO = f"{E2E_OWNER}/http-origin"
+
+
+def phase_https_origin_coverage(
+    *,
+    timings: Timings,
+    rt: Runtime,
+    image_tag: str,
+    work_root: Path,
+    client: ClientEnv,
+    ssh_public_key: str,
+    admin_token_hex: str,
+) -> None:
+    """Drive the git-bale resolver's HTTP(S)-origin auth branch. When `origin`
+    is an `http://` URL the resolver gets Basic creds from `git credential
+    fill`, POSTs the forge's `/info/bale/authenticate`, then exchanges the
+    forge bearer for a bale token — versus the SSH `git-bale-authenticate`
+    command every other phase uses. Covers resolver.rs `Http | Https` arm,
+    `authenticate_http`, and `git_credential_fill`.
+
+    `git-bale push-pending` (op=upload) and a cold smudge (op=download) both
+    read `origin` and take the HTTP branch, exercising both scope arms. Neither
+    transfers git refs, so a single mock endpoint suffices — no git smart-HTTP
+    server needed.
+    """
+    owner, name = HTTP_ORIGIN_REPO.split("/", 1)
+    phase_root = work_root / "https-origin"
+    phase_root.mkdir()
+    data_root = phase_root / "data"
+    data_root.mkdir()
+    jwt_secret = secrets.token_bytes(32).hex()
+    transfer_secret = secrets.token_bytes(32).hex()
+    server: Optional[ServerHandle] = None
+    forge: Optional[MockForgeServer] = None
+    try:
+        with timings.measure("https-origin: container start"):
+            server = start_container(
+                rt,
+                image_tag=image_tag,
+                data_root=data_root,
+                jwt_secret_hex=jwt_secret,
+                transfer_secret_hex=transfer_secret,
+                ssh_public_key=ssh_public_key,
+                test_repos=[HTTP_ORIGIN_REPO],
+                admin_token_hex=admin_token_hex,
+                name_suffix="https-origin",
+            )
+        forge = MockForgeServer(
+            bale_href=server.public_host_url, hub_token=E2E_HUB_TOKEN
+        )
+        forge.start()
+        info(f"https-origin: mock forge at {forge.base_url}")
+
+        env = client.make_env()
+        # The credential helper always supplies creds, but belt-and-suspenders
+        # against a hang if it ever doesn't.
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        work = work_root / "https-origin-client"
+        work.mkdir()
+        git(["init", "-b", "main", "."], cwd=work, env=env)
+        run([str(client.git_bale_bin), "install", "--local"], cwd=work, env=env)
+        cache_dir = work_root / "cache-https-origin"
+        cache_dir.mkdir(exist_ok=True)
+        git(["config", "--local", "bale.cacheDir", str(cache_dir)], cwd=work, env=env)
+        # git_credential_fill reads credential.helper from local config; this
+        # canned helper hands back fixed Basic creds (the mock forge accepts
+        # any) so the resolver never blocks on an interactive prompt.
+        git(
+            [
+                "config", "--local", "credential.helper",
+                "!f() { echo username=e2e; echo password=pw; }; f",
+            ],
+            cwd=work, env=env,
+        )
+        origin = f"{forge.base_url}/{owner}/{name}.git"
+        git(["remote", "add", "origin", origin], cwd=work, env=env)
+        (work / ".gitattributes").write_text("*.bin filter=bale -text\n")
+        git(["add", ".gitattributes"], cwd=work, env=env)
+        git(["commit", "-m", "enable bale filter"], cwd=work, env=env)
+
+        payload = deterministic_payload(SMALL_FILE_BYTES, seed=b"http-origin")
+        sha = sha256_bytes(payload)
+        (work / "f.bin").write_bytes(payload)
+        git(["add", "f.bin"], cwd=work, env=env)  # clean → staging (offline)
+        git(["commit", "-m", "add f.bin"], cwd=work, env=env)
+
+        # Upload: push-pending resolves origin over HTTP (op=upload) and POSTs
+        # xorbs/shards to the bale href the forge returned, draining staging.
+        with timings.measure("https-origin: push-pending (HTTP resolve + upload)"):
+            run([str(client.git_bale_bin), "push-pending"], cwd=work, env=env)
+
+        # Download: with staging drained + caches wiped, the smudge must
+        # resolve origin over HTTP (op=download) and reconstruct over the wire.
+        with timings.measure("https-origin: cold smudge (HTTP resolve + reconstruct)"):
+            force_resmudge_cold(
+                work, env, "f.bin",
+                expected_sha=sha, expected_size=SMALL_FILE_BYTES,
+                label="https-origin",
+            )
+
+        ops = {op for op, _ in forge.calls}
+        if "upload" not in ops or "download" not in ops:
+            raise TestFailure(
+                f"https-origin: forge ops {sorted(ops)} missing upload/download "
+                "— the HTTP resolver branch didn't drive both scopes"
+            )
+        if not forge.calls or not all(had_basic for _, had_basic in forge.calls):
+            raise TestFailure(
+                "https-origin: a forge authenticate call arrived without Basic "
+                "auth — git_credential_fill path not exercised"
+            )
+        info(
+            f"https-origin: forge recorded {len(forge.calls)} authenticate "
+            f"calls, ops={sorted(ops)}"
+        )
+    finally:
+        if forge is not None:
+            forge.stop()
+        if server is not None:
+            server.stop()
+
+
 def phase_authz_http_coverage(
     *,
     timings: Timings,
@@ -4753,6 +4960,19 @@ def main() -> int:
                 )
             else:
                 info("-- skipping phase 'authz-http' (per --skip)")
+
+            if "https-origin" not in args.skip:
+                phase_https_origin_coverage(
+                    timings=timings,
+                    rt=rt,
+                    image_tag=image_tag,
+                    work_root=work_root,
+                    client=client,
+                    ssh_public_key=ssh_public_key,
+                    admin_token_hex=admin_token_hex,
+                )
+            else:
+                info("-- skipping phase 'https-origin' (per --skip)")
 
         info("ALL CHECKS PASSED")
     except TestFailure as e:
