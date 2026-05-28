@@ -46,6 +46,7 @@ found" error until that's fixed; the harness logic itself is portable.
 | `offline-no-network` | A counting TCP proxy in front of the CAS server proves add/status/diff/commit/checkout/stash/pop/unstage/gc make **zero** server connections; `git push` (positive control) MUST make the count non-zero. |
 | `push-pending-noop` | `git-bale push-pending` with no `.git/bale/staging/` is a clean no-op (exit 0) — the pre-push hook runs on every push, so a push with no bale changes must not error. |
 | `push-pending-corrupt` | DATA-LOSS GUARD: a staged xorb deleted after `git add` (marker outlives its bytes) makes `push-pending` fail the local reconstruct — it must NOT clear the marker or report success on a file it couldn't upload, and nothing reaches the server. |
+| `track`         | `git-bale track` appends `filter=bale` lines to `.gitattributes`: creates the file when absent, dedups already-tracked patterns, normalizes a missing trailing newline (LF or CRLF) so a new pattern isn't fused onto the last line, skips empty patterns, and errors on an unreadable (directory) `.gitattributes`. |
 | `bigfile`       | 35 MB binary pushed at three revisions; storage growth per push matches the *actual* edit size.     |
 | `usage`         | `GET /v1/usage/{owner}` and `GET /v1/usage/repo/{owner}/{repo}` numbers agree with on-disk bytes.   |
 | `dedup`         | A *second file* with bit-identical content adds zero new xorb bytes.                                |

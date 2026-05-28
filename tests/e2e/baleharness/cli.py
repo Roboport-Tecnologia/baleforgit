@@ -98,6 +98,7 @@ from baleharness.phases.scenario import (
     phase_spilled_clean,
     phase_usage_api,
 )
+from baleharness.phases.track import phase_track
 from baleharness.proc import pick_free_port, tool_on_path
 from baleharness.registry import PHASE_GROUPS_ORDER, order_within_group
 from baleharness.runtime import build_image, detect_runtime, image_exists
@@ -398,6 +399,13 @@ def main() -> int:
                 work_root=work_root,
             )
 
+        def _phase_track() -> None:
+            phase_track(
+                timings=timings,
+                client=client,
+                work_root=work_root,
+            )
+
         def _phase_spilled() -> None:
             phase_spilled_clean(
                 timings=timings,
@@ -587,6 +595,9 @@ def main() -> int:
             # the shared server, never push successfully, so g1 (independent).
             "push-pending-noop": ("g1", False, _phase_pp_noop),
             "push-pending-corrupt": ("g1", False, _phase_pp_corrupt),
+            # `git-bale track` .gitattributes editing. Pure-local (no server),
+            # own scratch dirs, so g1 (independent).
+            "track": ("g1", False, _phase_track),
             "bigfile": ("g2-head", False, _phase_bigfile),
             "usage": ("g2-tail", True, _phase_usage),
             # Dereferences rev_state["repo_path"]/["env"] (the live bigfile
