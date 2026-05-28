@@ -1,9 +1,9 @@
 //! A single-line upload progress indicator for `push-pending`.
 //!
 //! The line mimics git's own progress style so it reads as one with the push
-//! output it precedes (`Uploading bales: 100% (8/8), 32.0 MiB, done.` sitting
-//! above `Enumerating objects: …`). Behaviour splits on whether stderr is a
-//! terminal:
+//! output it precedes (`Uploading bales: 100% (8/8), 32.0 MiB | 3.0 MiB/s,
+//! done.` sitting above `Enumerating objects: …`). Behaviour splits on whether
+//! stderr is a terminal:
 //!
 //!   * On a TTY it redraws a `\r`-style line — `Uploading bales: 47% (4/8),
 //!     14.5 MiB | 3.0 MiB/s` — held back for the first 200ms so a fast or
@@ -145,13 +145,10 @@ fn render(s: &UploadSnapshot, file_count: usize) -> String {
     let frac = (s.bytes_uploaded as f64 / s.bytes_total as f64).clamp(0.0, 1.0);
     let pct = (frac * 100.0).round() as u64;
     let n = files_done(s, file_count);
-    let rate = match s.rate_bytes_per_sec {
-        Some(r) if r >= 1.0 => format!(" | {}/s", fmt_bytes(r as u64)),
-        _ => String::new(),
-    };
     format!(
-        "Uploading bales: {pct}% ({n}/{file_count}), {}{rate}",
+        "Uploading bales: {pct}% ({n}/{file_count}), {}{}",
         fmt_bytes(s.bytes_uploaded),
+        rate_clause(s),
     )
 }
 
@@ -161,10 +158,22 @@ fn summary(s: &UploadSnapshot, file_count: usize) -> String {
         // "Counting objects: 100% (13/13), done.".
         format!("Uploading bales: 100% ({file_count}/{file_count}), done.")
     } else {
+        // Keep the size + rate, like git's "Writing objects: 100% (6/6),
+        // 622 bytes | 622.00 KiB/s, done.".
         format!(
-            "Uploading bales: 100% ({file_count}/{file_count}), {}, done.",
+            "Uploading bales: 100% ({file_count}/{file_count}), {}{}, done.",
             fmt_bytes(s.bytes_uploaded),
+            rate_clause(s),
         )
+    }
+}
+
+// git-style " | 3.0 MiB/s" throughput clause; empty until the speed tracker has
+// enough samples to report a rate.
+fn rate_clause(s: &UploadSnapshot) -> String {
+    match s.rate_bytes_per_sec {
+        Some(r) if r >= 1.0 => format!(" | {}/s", fmt_bytes(r as u64)),
+        _ => String::new(),
     }
 }
 

@@ -126,8 +126,8 @@ runs in a normal sweep — only when you ask for it by name, and only via
 silently). It exists to *show* git-bale's upload progress indicator: the
 pre-push hook draws a live, git-styled `Uploading bales: 47% (4/8), … | …/s`
 line on stderr once an upload runs past ~200 ms, then finalizes it in place
-to `Uploading bales: 100% (N/N), <size>, done.` (which prints even when the
-push was too fast to ever show the live line).
+to `Uploading bales: 100% (N/N), <size> | <rate>, done.` (which prints even
+when the push was too fast to ever show the live line).
 
 ```bash
 cargo build --release -p git-bale
