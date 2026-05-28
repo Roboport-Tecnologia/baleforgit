@@ -50,6 +50,7 @@ found" error until that's fixed; the harness logic itself is portable.
 | `clone`         | Cold-clone over SSH; every historical revision checks out with the correct sha256.                  |
 | `mount-rev`     | `git-bale mount HEAD` exposes both a plain blob and a bale-tracked file via FUSE; bytes match.      |
 | `mount-diff`    | `git-bale mount-diff v1 v3` exposes both labeled sides of a 35 MB binary; each side reconstructs.   |
+| `mount-diff-mixed` | `mount-diff` over a fresh repo with both a plain text file and a bale-tracked binary; both sides of each match `git show` byte-for-byte, and `diff -q` reports the labelled sides differ. |
 | `offline-restart` | Hot-path smudge works with the server stopped; data persists across a fresh container.            |
 | `wrong-token`   | Push with a bogus `bale.token` is rejected and does not corrupt the data dir.                       |
 | `tampered-xorb` | A xorb whose bytes were flipped on disk does NOT produce matching content via cold smudge.          |
