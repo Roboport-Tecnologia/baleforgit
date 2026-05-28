@@ -65,7 +65,7 @@ ls /tmp/v1/        # files at v1.0.0, as they were committed
 
 Both modes: no bytes are copied to disk — each `read` streams from git's object DB or, for Bale-tracked files, the chunk cache (with a network fallback that also repopulates the cache).
 
-Requires libfuse at runtime (not at build time): `libfuse3` on Linux, [fuse-t](https://www.fuse-t.org/) on macOS. Windows is not supported yet.
+Requires libfuse at runtime (not at build time): `libfuse2` on Linux (Debian/Ubuntu) — `fuse-libs` on Fedora/RHEL, `fuse2` on Arch — and [fuse-t](https://www.fuse-t.org/) on macOS. Windows is not supported yet.
 
 ## Configuration
 

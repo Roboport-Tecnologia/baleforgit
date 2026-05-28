@@ -2,12 +2,21 @@
 //!
 //! libfuse is loaded dynamically via `libloading`, not linked at build time —
 //! so the workspace still builds on machines without libfuse installed; only
-//! `mount-diff` at runtime needs it. On Linux that's `libfuse3.so.3`; on
-//! macOS that's `libfuse-t.dylib` (the fuse-t userspace shim).
+//! `mount` / `mount-diff` at runtime need it. On Linux that's `libfuse.so.2`;
+//! on macOS that's `libfuse-t.dylib` (the fuse-t userspace shim).
 //!
 //! ABI notes:
-//! - We target libfuse 3.x's `fuse_main_real` signature. fuse-t advertises
-//!   API+ABI compatibility with libfuse 3.x, so the same struct layouts apply.
+//! - We target the libfuse **2.x** `fuse_main_real` signature. fuse-t on macOS
+//!   advertises libfuse 2.9.x ABI compatibility (its `fuse_main_real` reads a
+//!   2.x-shaped `fuse_operations` struct), so we pick the 2.x layout for both
+//!   platforms — that way one set of struct definitions works everywhere
+//!   instead of forking by OS.
+//! - libfuse 2 differs from 3: it has `getdir` (slot 2) and `utime` (slot 13)
+//!   that 3 dropped, `getattr` takes 2 args (no fi), `init` takes 1 arg (no
+//!   cfg), and `readdir` takes 5 args (no flags). Get any of those wrong and
+//!   the rest of the operations table is shifted into the wrong slots —
+//!   reads silently return EIO from libfuse's default no-op handler because
+//!   our `open` ends up where libfuse expects `truncate`.
 //! - The high-level API uses *path-based* callbacks: each request gives us a
 //!   `const char *path`, and we have to walk it to an inode ourselves. That's
 //!   slightly slower than the low-level (inode) API for deep trees, but the
@@ -19,7 +28,7 @@
 #![allow(non_camel_case_types, non_snake_case)]
 
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_double, c_int, c_uint, c_void};
+use std::os::raw::{c_char, c_int, c_uint, c_ulong, c_void};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -84,16 +93,24 @@ impl MountBackend for LibfuseBackend {
 
         // Argv we pass to libfuse: it parses these like a CLI tool. `-f`
         // keeps the daemon in the foreground (we want to block until ^C),
-        // and `-o ro` enforces read-only at the kernel. Multi-threaded —
-        // `Reader` holds its handles / caches behind `Mutex`/`Arc` and the
-        // per-open tempfile path makes parallel reads of the same big file
-        // serve from one reconstruction.
+        // `-o ro` enforces read-only at the kernel, and the cache hints
+        // (`use_ino,kernel_cache,attr_timeout=30,entry_timeout=30`) keep
+        // stat-heavy tools from re-hitting our callbacks per syscall —
+        // in libfuse 3 these would be set via `fuse_config` in `init`, but
+        // 2.x exposes them only via mount options. Multi-threaded — `Reader`
+        // holds its handles / caches behind `Mutex`/`Arc` and the per-open
+        // tempfile path makes parallel reads of the same big file serve
+        // from one reconstruction.
         let argv_strings = [
             CString::new("git-bale-mount").unwrap(),
             CString::new(mount_str).context("CString for mount point")?,
             CString::new("-f").unwrap(),
             CString::new("-o").unwrap(),
-            CString::new("ro,default_permissions,fsname=git-bale").unwrap(),
+            CString::new(
+                "ro,default_permissions,use_ino,kernel_cache,\
+                 attr_timeout=30,entry_timeout=30,fsname=git-bale",
+            )
+            .unwrap(),
         ];
         let mut argv_ptrs: Vec<*mut c_char> = argv_strings
             .iter()
@@ -153,10 +170,11 @@ fn libfuse_candidates() -> &'static [&'static str] {
     #[cfg(target_os = "linux")]
     {
         &[
-            "libfuse3.so.3",
-            "libfuse3.so",
-            "/usr/lib/x86_64-linux-gnu/libfuse3.so.3",
-            "/usr/lib64/libfuse3.so.3",
+            "libfuse.so.2",
+            "libfuse.so",
+            "/usr/lib/x86_64-linux-gnu/libfuse.so.2",
+            "/usr/lib/aarch64-linux-gnu/libfuse.so.2",
+            "/usr/lib64/libfuse.so.2",
         ]
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -181,9 +199,9 @@ impl std::fmt::Display for LibfuseUnavailable {
         )?;
         writeln!(f, "Install one of:")?;
         if cfg!(target_os = "linux") {
-            writeln!(f, "  • Debian/Ubuntu:  sudo apt install libfuse3-3")?;
-            writeln!(f, "  • Fedora/RHEL:    sudo dnf install fuse3")?;
-            writeln!(f, "  • Arch:           sudo pacman -S fuse3")?;
+            writeln!(f, "  • Debian/Ubuntu:  sudo apt install libfuse2")?;
+            writeln!(f, "  • Fedora/RHEL:    sudo dnf install fuse-libs")?;
+            writeln!(f, "  • Arch:           sudo pacman -S fuse2")?;
         } else if cfg!(target_os = "macos") {
             writeln!(
                 f,
@@ -239,23 +257,40 @@ fn load_libfuse() -> Result<libloading::Library> {
 }
 
 // ---------------------------------------------------------------------------
-// FFI type definitions for libfuse 3.x
+// FFI type definitions for libfuse 2.x
 // ---------------------------------------------------------------------------
 
+/// libfuse 2.x `fuse_file_info`. Differs from libfuse 3 most importantly in
+/// the position of `fh`: 24 here vs 16 in libfuse 3, because 2.x carries an
+/// extra `fh_old` (`unsigned long`) and `writepage` before the bitfield word.
+/// Get this offset wrong and the file handle round-tripped between `open` and
+/// `read` lands on garbage. The Apple variant of the struct packs two extra
+/// bitfields (`purge_attr`, `purge_ubc`) into the same 32-bit slot, so the
+/// total size stays at 40 bytes on both Linux and macOS.
 #[repr(C)]
 pub struct fuse_file_info {
     pub flags: c_int,
-    pub bits1: u32, // bitfields: writepage:1, direct_io:1, keep_cache:1, ...
-    pub bits2: u32, // padding bitfields (32)
+    pub fh_old: c_ulong,
+    pub writepage: c_int,
+    /// `direct_io:1, keep_cache:1, flush:1, nonseekable:1, flock_release:1,
+    /// padding:27` (Linux) — or `padding:25, purge_attr:1, purge_ubc:1` after
+    /// the same five on macOS. We only read `flags`, so the bitfield contents
+    /// don't matter to us; only the 4-byte width does, for layout.
+    pub bits: u32,
     pub fh: u64,
     pub lock_owner: u64,
-    pub poll_events: u32,
 }
 
+/// libfuse 2.x `fuse_conn_info`. We never read or write it — `init` receives
+/// a pointer that we ignore — but `fuse_main_real` needs a pointer of the
+/// right shape so the prefix layout below has to match. The reserved tail is
+/// sized generously enough to cover both libfuse 2.9 (Linux) and fuse-t's
+/// macOS-extended layout.
 #[repr(C)]
 pub struct fuse_conn_info {
     pub proto_major: c_uint,
     pub proto_minor: c_uint,
+    pub async_read: c_uint,
     pub max_write: c_uint,
     pub max_read: c_uint,
     pub max_readahead: c_uint,
@@ -263,38 +298,7 @@ pub struct fuse_conn_info {
     pub want: c_uint,
     pub max_background: c_uint,
     pub congestion_threshold: c_uint,
-    pub time_gran: c_uint,
-    pub reserved: [c_uint; 22],
-}
-
-#[repr(C)]
-pub struct fuse_config {
-    pub set_gid: c_int,
-    pub gid: c_uint,
-    pub set_uid: c_int,
-    pub uid: c_uint,
-    pub set_mode: c_int,
-    pub umask: c_uint,
-    pub entry_timeout: c_double,
-    pub negative_timeout: c_double,
-    pub attr_timeout: c_double,
-    pub intr: c_int,
-    pub intr_signal: c_int,
-    pub remember: c_int,
-    pub hard_remove: c_int,
-    pub use_ino: c_int,
-    pub readdir_ino: c_int,
-    pub direct_io: c_int,
-    pub kernel_cache: c_int,
-    pub auto_cache: c_int,
-    pub no_rofd_flush: c_int,
-    pub ac_attr_timeout_set: c_int,
-    pub ac_attr_timeout: c_double,
-    pub nullpath_ok: c_int,
-    pub parallel_direct_writes: c_int,
-    pub show_help: c_int,
-    pub modules: *mut c_char,
-    pub debug: c_int,
+    pub reserved: [c_uint; 23],
 }
 
 pub type fuse_fill_dir_t = unsafe extern "C" fn(
@@ -302,18 +306,23 @@ pub type fuse_fill_dir_t = unsafe extern "C" fn(
     name: *const c_char,
     stbuf: *const libc_stat,
     off: off_t,
-    flags: c_int,
 ) -> c_int;
 
-/// All unused operations are `*mut c_void` so we don't have to write 30+
-/// correct function-pointer signatures. Layout/order matches libfuse 3.x
-/// exactly — the *position* of each field in the struct is the ABI, and we
-/// only need typed pointers for the ones we actually populate.
+/// libfuse 2.x `fuse_operations`. Unused slots are `*mut c_void` so we don't
+/// have to write 30+ correct function-pointer signatures. The *position* of
+/// each field is the ABI — slot drift is what breaks reads on fuse-t. Versus
+/// libfuse 3, this layout adds `getdir` (slot 2) and `utime` (slot 13),
+/// `getattr`/`chmod`/`chown`/`truncate` drop their `fi` arg, `init` drops
+/// `fuse_config`, and `readdir` drops its trailing `flags`.
+///
+/// The four `flag_*` bitfields after `bmap` are part of the struct's wire
+/// shape: their 32-bit width is what keeps `ioctl` aligned at the correct
+/// offset. We never set them — the defaults (all zero) are what we want.
 #[repr(C)]
 pub struct fuse_operations {
-    pub getattr:
-        Option<unsafe extern "C" fn(*const c_char, *mut libc_stat, *mut fuse_file_info) -> c_int>,
+    pub getattr: Option<unsafe extern "C" fn(*const c_char, *mut libc_stat) -> c_int>,
     pub readlink: *mut c_void,
+    pub getdir: *mut c_void,
     pub mknod: *mut c_void,
     pub mkdir: *mut c_void,
     pub unlink: *mut c_void,
@@ -324,6 +333,7 @@ pub struct fuse_operations {
     pub chmod: *mut c_void,
     pub chown: *mut c_void,
     pub truncate: *mut c_void,
+    pub utime: *mut c_void,
     pub open: Option<unsafe extern "C" fn(*const c_char, *mut fuse_file_info) -> c_int>,
     pub read: Option<
         unsafe extern "C" fn(
@@ -351,32 +361,36 @@ pub struct fuse_operations {
             fuse_fill_dir_t,
             off_t,
             *mut fuse_file_info,
-            c_int,
         ) -> c_int,
     >,
     pub releasedir: *mut c_void,
     pub fsyncdir: *mut c_void,
-    pub init: Option<unsafe extern "C" fn(*mut fuse_conn_info, *mut fuse_config) -> *mut c_void>,
+    pub init: Option<unsafe extern "C" fn(*mut fuse_conn_info) -> *mut c_void>,
     pub destroy: Option<unsafe extern "C" fn(*mut c_void)>,
     pub access: *mut c_void,
     pub create: *mut c_void,
+    pub ftruncate: *mut c_void,
+    pub fgetattr: *mut c_void,
     pub lock: *mut c_void,
     pub utimens: *mut c_void,
     pub bmap: *mut c_void,
+    /// Packed bitfields: `flag_nullpath_ok:1, flag_nopath:1,
+    /// flag_utime_omit_ok:1, flag_reserved:29`. Treated as one opaque `u32`
+    /// since we leave all flags off.
+    pub flag_bits: u32,
     pub ioctl: *mut c_void,
     pub poll: *mut c_void,
     pub write_buf: *mut c_void,
     pub read_buf: *mut c_void,
     pub flock: *mut c_void,
     pub fallocate: *mut c_void,
-    pub copy_file_range: *mut c_void,
-    pub lseek: *mut c_void,
 }
 
 fn build_operations() -> fuse_operations {
     fuse_operations {
         getattr: Some(op_getattr),
         readlink: std::ptr::null_mut(),
+        getdir: std::ptr::null_mut(),
         mknod: std::ptr::null_mut(),
         mkdir: std::ptr::null_mut(),
         unlink: std::ptr::null_mut(),
@@ -387,6 +401,7 @@ fn build_operations() -> fuse_operations {
         chmod: std::ptr::null_mut(),
         chown: std::ptr::null_mut(),
         truncate: std::ptr::null_mut(),
+        utime: std::ptr::null_mut(),
         open: Some(op_open),
         read: Some(op_read),
         write: std::ptr::null_mut(),
@@ -406,17 +421,18 @@ fn build_operations() -> fuse_operations {
         destroy: Some(op_destroy),
         access: std::ptr::null_mut(),
         create: std::ptr::null_mut(),
+        ftruncate: std::ptr::null_mut(),
+        fgetattr: std::ptr::null_mut(),
         lock: std::ptr::null_mut(),
         utimens: std::ptr::null_mut(),
         bmap: std::ptr::null_mut(),
+        flag_bits: 0,
         ioctl: std::ptr::null_mut(),
         poll: std::ptr::null_mut(),
         write_buf: std::ptr::null_mut(),
         read_buf: std::ptr::null_mut(),
         flock: std::ptr::null_mut(),
         fallocate: std::ptr::null_mut(),
-        copy_file_range: std::ptr::null_mut(),
-        lseek: std::ptr::null_mut(),
     }
 }
 
@@ -424,14 +440,10 @@ fn build_operations() -> fuse_operations {
 // Callback implementations
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" fn op_init(_conn: *mut fuse_conn_info, cfg: *mut fuse_config) -> *mut c_void {
-    if !cfg.is_null() {
-        // We hand out stable inodes; let the kernel cache attrs aggressively.
-        (*cfg).use_ino = 1;
-        (*cfg).kernel_cache = 1;
-        (*cfg).attr_timeout = 30.0;
-        (*cfg).entry_timeout = 30.0;
-    }
+unsafe extern "C" fn op_init(_conn: *mut fuse_conn_info) -> *mut c_void {
+    // The cache hints (use_ino, kernel_cache, attr_timeout, entry_timeout)
+    // are passed via `-o` to fuse_main_real instead of through a config
+    // struct — libfuse 2.x's init has no `fuse_config` argument.
     std::ptr::null_mut()
 }
 
@@ -457,11 +469,7 @@ fn lookup_path(vfs: &DiffVfs, path: &str) -> Option<Node> {
     Some(current)
 }
 
-unsafe extern "C" fn op_getattr(
-    path: *const c_char,
-    stbuf: *mut libc_stat,
-    _fi: *mut fuse_file_info,
-) -> c_int {
+unsafe extern "C" fn op_getattr(path: *const c_char, stbuf: *mut libc_stat) -> c_int {
     if stbuf.is_null() {
         return -libc::EFAULT;
     }
@@ -588,7 +596,6 @@ unsafe extern "C" fn op_readdir(
     filler: fuse_fill_dir_t,
     _offset: off_t,
     _fi: *mut fuse_file_info,
-    _flags: c_int,
 ) -> c_int {
     let Some(p) = cstr_to_path(path) else {
         return -libc::ENOENT;
@@ -605,8 +612,8 @@ unsafe extern "C" fn op_readdir(
 
     let dot = CString::new(".").unwrap();
     let dotdot = CString::new("..").unwrap();
-    let _ = filler(buf, dot.as_ptr(), std::ptr::null(), 0, 0);
-    let _ = filler(buf, dotdot.as_ptr(), std::ptr::null(), 0, 0);
+    let _ = filler(buf, dot.as_ptr(), std::ptr::null(), 0);
+    let _ = filler(buf, dotdot.as_ptr(), std::ptr::null(), 0);
 
     let Some(children) = vfs.readdir(node.inode) else {
         return 0;
@@ -616,7 +623,7 @@ unsafe extern "C" fn op_readdir(
         // stbuf = NULL → kernel issues getattr for each. Cheaper than
         // computing every size eagerly here (Bale entries would trigger
         // reconstruction just to list a directory).
-        let _ = filler(buf, c.as_ptr(), std::ptr::null(), 0, 0);
+        let _ = filler(buf, c.as_ptr(), std::ptr::null(), 0);
     }
     0
 }
