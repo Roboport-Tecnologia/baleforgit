@@ -2665,6 +2665,364 @@ def phase_offline_and_restart(
 
 
 # =============================================================================
+# Mount helpers (read-only FUSE mounts via `git-bale mount` / `mount-diff`)
+# =============================================================================
+
+
+class MountUnavailable(Exception):
+    """libfuse / fuse-t not installed on this host. The mount phase signals
+    this to its caller so the whole phase skips instead of failing."""
+
+
+_LIBFUSE_HINT = "needs libfuse at runtime"
+
+
+def _unmount_path(mount_point: Path) -> None:
+    """Best-effort unmount. fusermount3 / fusermount on Linux (rootless-safe),
+    plain `umount` everywhere else. Silent if not currently mounted."""
+    for cmd in (
+        ["fusermount3", "-u", str(mount_point)],
+        ["fusermount", "-u", str(mount_point)],
+        ["umount", str(mount_point)],
+    ):
+        if not shutil.which(cmd[0]):
+            continue
+        r = subprocess.run(cmd, capture_output=True, check=False)
+        if r.returncode == 0:
+            return
+
+
+def _is_mounted(mount_point: Path, parent: Path) -> bool:
+    """A FUSE mount makes `mount_point`'s st_dev differ from its parent's.
+    Works on Linux + macOS (fuse-t) without parsing /proc/mounts."""
+    try:
+        return mount_point.stat().st_dev != parent.stat().st_dev
+    except OSError:
+        return False
+
+
+def _wait_mounted(
+    mount_point: Path, parent: Path, proc: subprocess.Popen, timeout_s: float
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return  # caller will inspect the dead process
+        if _is_mounted(mount_point, parent):
+            return
+        time.sleep(0.05)
+
+
+@contextmanager
+def _mount_session(
+    *,
+    client: ClientEnv,
+    repo: Path,
+    env: dict,
+    mount_root: Path,
+    argv_tail: list[str],
+    label: str,
+) -> Iterator[Path]:
+    """Spawn `git-bale <argv_tail>` (mount or mount-diff), wait for the FUSE
+    mount to come up, yield the mount point. Cleans up the mount and the
+    process on exit even if the body raises.
+
+    Raises MountUnavailable when libfuse/fuse-t is missing on the host so
+    the caller can skip the phase rather than failing it."""
+    mount_point = mount_root / f"mnt-{secrets.token_hex(3)}"
+    mount_point.mkdir()
+    cmd = [str(client.git_bale_bin), *argv_tail, "--mount", str(mount_point)]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(repo),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    mounted = False
+    try:
+        _wait_mounted(mount_point, mount_root, proc, timeout_s=30.0)
+        mounted = _is_mounted(mount_point, mount_root)
+        if not mounted:
+            try:
+                stdout, stderr = proc.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate(timeout=2.0)
+            err_txt = stderr.decode("utf-8", "replace") if stderr else ""
+            out_txt = stdout.decode("utf-8", "replace") if stdout else ""
+            if _LIBFUSE_HINT in err_txt:
+                raise MountUnavailable(err_txt.strip().splitlines()[0])
+            raise TestFailure(
+                f"[{label}] mount never came up (exit={proc.returncode}):\n"
+                f"stderr:\n{err_txt}\nstdout:\n{out_txt}"
+            )
+        yield mount_point
+    finally:
+        # Unmount first so libfuse returns from fuse_main_real and the
+        # foreground process exits on its own; killing while still mounted
+        # can leave a stale entry on macOS (fuse-t) for tens of seconds.
+        if mounted:
+            _unmount_path(mount_point)
+        try:
+            proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
+        try:
+            proc.communicate(timeout=1.0)
+        except (subprocess.TimeoutExpired, ValueError):
+            pass
+        try:
+            mount_point.rmdir()
+        except OSError:
+            pass
+
+
+def mount_rev_session(
+    *,
+    client: ClientEnv,
+    repo: Path,
+    env: dict,
+    mount_root: Path,
+    rev: str,
+    paths: Optional[list[str]] = None,
+    label: str = "mount-rev",
+):
+    argv = ["mount", rev]
+    if paths:
+        argv.append("--")
+        argv.extend(paths)
+    return _mount_session(
+        client=client, repo=repo, env=env, mount_root=mount_root,
+        argv_tail=argv, label=label,
+    )
+
+
+def mount_diff_session(
+    *,
+    client: ClientEnv,
+    repo: Path,
+    env: dict,
+    mount_root: Path,
+    rev_a: str,
+    rev_b: str,
+    label_a: str,
+    label_b: str,
+    paths: Optional[list[str]] = None,
+    label: str = "mount-diff",
+):
+    argv = [
+        "mount-diff", rev_a, rev_b,
+        "--label-a", label_a, "--label-b", label_b,
+    ]
+    if paths:
+        argv.append("--")
+        argv.extend(paths)
+    return _mount_session(
+        client=client, repo=repo, env=env, mount_root=mount_root,
+        argv_tail=argv, label=label,
+    )
+
+
+# =============================================================================
+# Mount phases
+# =============================================================================
+
+
+def phase_mount_rev(
+    *,
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+    rev_state: dict,
+) -> None:
+    """Cold-clone the bigfile repo, mount HEAD as a read-only FUSE FS, and
+    verify both the non-bale `.gitattributes` (served from gix's ODB) and
+    the bale-tracked `bigfile.bin` (reconstructed via the same Reader the
+    smudge filter uses) come through correctly.
+
+    The mount path exercises Reader's cold-then-warm transition end-to-end
+    over real SSH-forge auth + network reconstruction — coverage no Rust
+    unit test reaches because libfuse is mocked out there."""
+    if not rev_state.get("shas"):
+        raise TestFailure("mount-rev: rev_state missing — bigfile phase didn't run")
+    expected_sha = rev_state["shas"][-1]
+    clone_path, env, _cache = init_repo_for_clone(
+        work_root=work_root, client=client, server=server,
+        owner=E2E_OWNER, repo=E2E_REPO_2, name="mount-rev-clone",
+    )
+    mount_root = work_root / "mount-rev-points"
+    mount_root.mkdir(exist_ok=True)
+    try:
+        with timings.measure(
+            "mount-rev: mount HEAD + read bigfile via FUSE",
+            bytes_moved=BIG_FILE_BYTES,
+        ):
+            with mount_rev_session(
+                client=client, repo=clone_path, env=env,
+                mount_root=mount_root, rev="HEAD",
+                label="mount-rev",
+            ) as mp:
+                attrs = (mp / ".gitattributes").read_bytes()
+                if b"filter=bale" not in attrs:
+                    raise TestFailure(
+                        f"mount-rev: .gitattributes unexpected: {attrs!r}"
+                    )
+                # stat must report the *decompressed* size, not the pointer
+                # JSON length — Reader.size_of reads only the pointer.
+                size = (mp / "bigfile.bin").stat().st_size
+                if size != BIG_FILE_BYTES:
+                    raise TestFailure(
+                        f"mount-rev: bigfile.bin stat size {size} != "
+                        f"{BIG_FILE_BYTES} (size_of returning pointer JSON "
+                        "length instead of file_size?)"
+                    )
+                got_sha = sha256_file(mp / "bigfile.bin")
+                if got_sha != expected_sha:
+                    raise TestFailure(
+                        f"mount-rev: bigfile.bin sha {got_sha} != HEAD sha "
+                        f"{expected_sha} — Reader reconstructed wrong bytes"
+                    )
+                # If lazy dir population is broken, individual lookups still
+                # work but readdir returns an empty list.
+                names = sorted(p.name for p in mp.iterdir())
+                for required in (".gitattributes", "bigfile.bin"):
+                    if required not in names:
+                        raise TestFailure(
+                            f"mount-rev: readdir missing {required!r}; got {names}"
+                        )
+        # Hot path: re-mount on the same clone hits the manifest + chunk
+        # caches the first mount populated.
+        with timings.measure(
+            "mount-rev: re-mount HEAD (hot caches)",
+            bytes_moved=BIG_FILE_BYTES,
+        ):
+            with mount_rev_session(
+                client=client, repo=clone_path, env=env,
+                mount_root=mount_root, rev="HEAD",
+                label="mount-rev-hot",
+            ) as mp:
+                got_sha = sha256_file(mp / "bigfile.bin")
+                if got_sha != expected_sha:
+                    raise TestFailure(
+                        f"mount-rev (hot): bigfile.bin sha {got_sha} != "
+                        f"{expected_sha} — cache returned stale bytes"
+                    )
+    except MountUnavailable as e:
+        info(f"-- mount-rev: skipping ({e})")
+
+
+def phase_mount_diff(
+    *,
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+    rev_state: dict,
+) -> None:
+    """Cold-clone the bigfile repo, mount `git diff v1 v3`, and verify both
+    sides reconstruct correctly with their respective shas. Both sides are
+    bale-tracked pointers, so each one drives a full Reader cold-path
+    reconstruction through libfuse."""
+    if len(rev_state.get("commits", [])) < 3:
+        raise TestFailure(
+            "mount-diff: rev_state needs v1+v3 commits — bigfile phase did "
+            "not produce them"
+        )
+    v1_commit = rev_state["commits"][0]
+    v3_commit = rev_state["commits"][2]
+    v1_sha = rev_state["shas"][0]
+    v3_sha = rev_state["shas"][2]
+    clone_path, env, _cache = init_repo_for_clone(
+        work_root=work_root, client=client, server=server,
+        owner=E2E_OWNER, repo=E2E_REPO_2, name="mount-diff-clone",
+    )
+    mount_root = work_root / "mount-diff-points"
+    mount_root.mkdir(exist_ok=True)
+    try:
+        with timings.measure(
+            "mount-diff: v1 vs v3 + read both sides via FUSE",
+            bytes_moved=2 * BIG_FILE_BYTES,
+        ):
+            with mount_diff_session(
+                client=client, repo=clone_path, env=env,
+                mount_root=mount_root,
+                rev_a=v1_commit, rev_b=v3_commit,
+                label_a="v1", label_b="v3",
+                label="mount-diff",
+            ) as mp:
+                names = sorted(p.name for p in mp.iterdir())
+                for required in ("bigfile__v1.bin", "bigfile__v3.bin"):
+                    if required not in names:
+                        raise TestFailure(
+                            f"mount-diff: labeled entry {required!r} missing "
+                            f"from readdir; got {names}"
+                        )
+                got_v1 = sha256_file(mp / "bigfile__v1.bin")
+                if got_v1 != v1_sha:
+                    raise TestFailure(
+                        f"mount-diff: bigfile__v1.bin sha {got_v1} != v1 sha "
+                        f"{v1_sha} — reconstructed wrong bytes for side A"
+                    )
+                got_v3 = sha256_file(mp / "bigfile__v3.bin")
+                if got_v3 != v3_sha:
+                    raise TestFailure(
+                        f"mount-diff: bigfile__v3.bin sha {got_v3} != v3 sha "
+                        f"{v3_sha} — reconstructed wrong bytes for side B"
+                    )
+                for name in ("bigfile__v1.bin", "bigfile__v3.bin"):
+                    sz = (mp / name).stat().st_size
+                    if sz != BIG_FILE_BYTES:
+                        raise TestFailure(
+                            f"mount-diff: {name} stat size {sz} != "
+                            f"{BIG_FILE_BYTES}"
+                        )
+        # Pathspec must yield an empty diff and exit with "no files differ"
+        # rather than silently mounting an empty FS.
+        empty_mp = mount_root / f"empty-{secrets.token_hex(3)}"
+        empty_mp.mkdir()
+        try:
+            with timings.measure("mount-diff: pathspec rejects empty result"):
+                completed = subprocess.run(
+                    [
+                        str(client.git_bale_bin), "mount-diff",
+                        v1_commit, v3_commit,
+                        "--label-a", "v1", "--label-b", "v3",
+                        "--mount", str(empty_mp),
+                        "--", "no-such-path",
+                    ],
+                    cwd=str(clone_path), env=env,
+                    capture_output=True, check=False, timeout=30.0,
+                )
+            if completed.returncode == 0:
+                raise TestFailure(
+                    "mount-diff: pathspec filtering an empty result did not "
+                    "error (would have mounted an empty FS instead)"
+                )
+            err = completed.stderr.decode("utf-8", "replace")
+            if _LIBFUSE_HINT in err:
+                info(f"-- mount-diff pathspec: skipping ({err.splitlines()[0]})")
+            elif "no files differ" not in err:
+                raise TestFailure(
+                    f"mount-diff: pathspec-empty exit was non-zero but "
+                    f"stderr lacked 'no files differ':\n{err}"
+                )
+        finally:
+            try:
+                empty_mp.rmdir()
+            except OSError:
+                pass
+    except MountUnavailable as e:
+        info(f"-- mount-diff: skipping ({e})")
+
+
+# =============================================================================
 # Adversarial phases
 # =============================================================================
 
@@ -3896,6 +4254,18 @@ def main() -> int:
                 work_root=work_root, rev_state=rev_state,
             )
 
+        def _phase_mount_rev() -> None:
+            phase_mount_rev(
+                timings=timings, server=server, client=client,
+                work_root=work_root, rev_state=rev_state,
+            )
+
+        def _phase_mount_diff() -> None:
+            phase_mount_diff(
+                timings=timings, server=server, client=client,
+                work_root=work_root, rev_state=rev_state,
+            )
+
         def _phase_quota() -> None:
             phase_adversarial_quota_exceeded(
                 timings=timings, rt=rt, image_tag=image_tag,
@@ -3942,6 +4312,10 @@ def main() -> int:
             "clone":           ("g2-tail", True,  _phase_clone),
             "offline-restart": ("g2-tail", True,  _phase_offline_restart),
             "tampered-xorb":   ("g2-tail", True,  _phase_tampered_xorb),
+            # Read-only FUSE mounts of pushed history. Skip cleanly when the
+            # host has no libfuse / fuse-t installed.
+            "mount-rev":       ("g2-tail", True,  _phase_mount_rev),
+            "mount-diff":      ("g2-tail", True,  _phase_mount_diff),
             "quota":           ("g3",      False, _phase_quota),
             # Failure-recovery phases each own their own isolated container
             # + data dir, so they can crash/restart the server or block its

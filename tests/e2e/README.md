@@ -28,6 +28,8 @@ python3 tests/e2e/run_s3.py     # S3 blob store via a MinIO sidecar
   ```
 
 - Python 3.9+. Only stdlib is used.
+- *Optional* (`mount-rev`/`mount-diff` phases only): libfuse3 on Linux,
+  fuse-t on macOS. Both phases skip cleanly when missing.
 
 The harness is cross-platform by design (uses `pathlib`, `subprocess`,
 `urllib`, no POSIX-only assumptions). On Windows the container is still
@@ -46,6 +48,8 @@ found" error until that's fixed; the harness logic itself is portable.
 | `dedup`         | A *second file* with bit-identical content adds zero new xorb bytes.                                |
 | `idempotency`   | Re-pushing with no new commits doesn't grow server storage.                                         |
 | `clone`         | Cold-clone over SSH; every historical revision checks out with the correct sha256.                  |
+| `mount-rev`     | `git-bale mount HEAD` exposes both a plain blob and a bale-tracked file via FUSE; bytes match.      |
+| `mount-diff`    | `git-bale mount-diff v1 v3` exposes both labeled sides of a 35 MB binary; each side reconstructs.   |
 | `offline-restart` | Hot-path smudge works with the server stopped; data persists across a fresh container.            |
 | `wrong-token`   | Push with a bogus `bale.token` is rejected and does not corrupt the data dir.                       |
 | `tampered-xorb` | A xorb whose bytes were flipped on disk does NOT produce matching content via cold smudge.          |
