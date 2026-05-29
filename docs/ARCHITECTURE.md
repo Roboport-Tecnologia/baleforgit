@@ -314,6 +314,8 @@ On `command=smudge` (filter sees a pointer, must reconstruct), git-bale tries th
 
 Critical detail: the cold path passes `0..file_size` (not `FileRange::full()`, which xet-core defaults to) to `download_to_writer`. baleforgit-server has no Range support on `/v1/reconstructions/*`, and xet-data's prefetcher fans out to up to 256 MiB beyond EOF when given an unbounded range — every prefetched block then re-fetches the full file terms and trips xet-data's `SequentialWriter` contiguity check. The cap keeps the prefetcher quiet.
 
+**Download progress.** Each cold-path reconstruction records its size + duration into a `progress::DownloadTracker` held for the filter-process lifetime; when git closes the stream (checkout/clone done), `run()` prints one git-styled summary, `Downloading bales: 100% (N/N), <size> | <rate>, done.` (N = files fetched over the network; cache/staging hits aren't counted, so a fully-cached checkout stays silent). Unlike the upload indicator this draws **no live bar** — the smudge filter runs inside git's checkout, which is already painting its own `\r` "Filtering content:" line on the same stderr, and the filter never learns the total file count (git feeds smudges one at a time). The single `\n`-terminated summary lands cleanly after git's checkout progress has cleared, on a TTY or piped (the e2e `progress-demo` phase asserts it from a captured cold clone).
+
 ### Auth resolution
 
 `git-bale` deliberately holds no baleforgit-server secret of its own. Auth is resolved on first-use per scope (one resolution for write/clean, one for read/smudge, cached in the filter-process lifetime). The resolver lives in `crates/git-bale/src/resolver.rs`:

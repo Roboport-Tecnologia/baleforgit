@@ -52,14 +52,18 @@ pub fn run() -> Result<()> {
     // `git-bale push-pending`. Only smudge resolves auth, cached for the process.
     let mut smudge_cfg: Option<BaleConfig> = None;
 
+    // Tallies cold-path (network) reconstructions across this whole
+    // filter-process; a summary prints once when git closes the stream (EOF).
+    let mut downloads = crate::progress::DownloadTracker::new();
+
     loop {
         let headers = match reader.read_text_list() {
             Ok(h) => h,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         };
         if headers.is_empty() {
-            return Ok(());
+            break;
         }
         let map = parse_headers(&headers);
         let command = map
@@ -90,6 +94,7 @@ pub fn run() -> Result<()> {
                     &mut reader,
                     &mut writer,
                     pathname,
+                    &mut downloads,
                 ) {
                     report_request_error(&mut reader, &mut writer, "smudge", pathname, &e)?;
                 }
@@ -102,6 +107,11 @@ pub fn run() -> Result<()> {
             }
         }
     }
+
+    // git closed the stream: the checkout/clone is done and its own "Filtering
+    // content" progress has cleared, so this is the clean spot to report.
+    downloads.finish();
+    Ok(())
 }
 
 fn resolve_cached<'a>(
@@ -461,6 +471,7 @@ fn handle_smudge<R: Read, W: Write>(
     reader: &mut PktReader<R>,
     writer: &mut PktWriter<W>,
     pathname: &str,
+    downloads: &mut crate::progress::DownloadTracker,
 ) -> Result<()> {
     let mut pointer_buf = Vec::with_capacity(256);
     reader.read_binary_to(&mut pointer_buf, SMUDGE_PAYLOAD_CAP)?;
@@ -571,6 +582,7 @@ fn handle_smudge<R: Read, W: Write>(
         let dest_file = tmp.reopen()?;
         let info_for_dl = info.clone();
         let cache_for_dl = chunk_cache.clone();
+        let dl_start = std::time::Instant::now();
         rt.bridge_sync(async move {
             let session =
                 FileDownloadSession::new(Arc::new(translator), Some(cache_for_dl)).await?;
@@ -580,6 +592,7 @@ fn handle_smudge<R: Read, W: Write>(
             Ok::<(), anyhow::Error>(())
         })
         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+        downloads.record(file_size, dl_start.elapsed().as_secs_f64());
 
         // Best-effort manifest fetch so subsequent checkouts hit the hot path;
         // failure only keeps the cache cold.

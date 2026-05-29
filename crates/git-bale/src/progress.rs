@@ -148,7 +148,7 @@ fn render(s: &UploadSnapshot, file_count: usize) -> String {
     format!(
         "Uploading bales: {pct}% ({n}/{file_count}), {}{}",
         fmt_bytes(s.bytes_uploaded),
-        rate_clause(s),
+        rate_clause(s.rate_bytes_per_sec),
     )
 }
 
@@ -163,15 +163,14 @@ fn summary(s: &UploadSnapshot, file_count: usize) -> String {
         format!(
             "Uploading bales: 100% ({file_count}/{file_count}), {}{}, done.",
             fmt_bytes(s.bytes_uploaded),
-            rate_clause(s),
+            rate_clause(s.rate_bytes_per_sec),
         )
     }
 }
 
-// git-style " | 3.0 MiB/s" throughput clause; empty until the speed tracker has
-// enough samples to report a rate.
-fn rate_clause(s: &UploadSnapshot) -> String {
-    match s.rate_bytes_per_sec {
+// git-style " | 3.0 MiB/s" throughput clause; empty when no usable rate.
+fn rate_clause(rate: Option<f64>) -> String {
+    match rate {
         Some(r) if r >= 1.0 => format!(" | {}/s", fmt_bytes(r as u64)),
         _ => String::new(),
     }
@@ -203,5 +202,57 @@ fn fmt_bytes(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// Accumulates cold-path (network) reconstructions across one `git-bale
+/// filter-process` lifetime and prints a single git-styled summary when it
+/// ends — the download counterpart to the upload indicator.
+///
+/// No live bar: the smudge filter runs *inside* git's checkout, which is
+/// drawing its own `\r`-based "Filtering content:" progress on the same stderr;
+/// a second live line would clobber it, and the filter never learns the total
+/// file count anyway (git feeds it one smudge at a time). So we only emit the
+/// final `Downloading bales: 100% (N/N), <size> | <rate>, done.` line, which
+/// lands cleanly after git's checkout progress has cleared.
+#[derive(Default)]
+pub struct DownloadTracker {
+    files: usize,
+    bytes: u64,
+    secs: f64,
+}
+
+impl DownloadTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one file reconstructed over the network: its size and how long
+    /// the download took (for the aggregate rate). Cache / staging hits are
+    /// local, not downloads, so they must not be recorded.
+    pub fn record(&mut self, bytes: u64, secs: f64) {
+        self.files += 1;
+        self.bytes += bytes;
+        self.secs += secs;
+    }
+
+    /// Print the summary to stderr (plain line, `\n`-terminated, on a TTY or
+    /// not — like the upload summary). No-op when nothing was downloaded, so a
+    /// checkout served entirely from cache/staging stays silent.
+    pub fn finish(&self) {
+        if self.files == 0 {
+            return;
+        }
+        let n = self.files;
+        if self.bytes == 0 {
+            eprintln!("Downloading bales: 100% ({n}/{n}), done.");
+            return;
+        }
+        let rate = (self.secs > 0.0).then(|| self.bytes as f64 / self.secs);
+        eprintln!(
+            "Downloading bales: 100% ({n}/{n}), {}{}, done.",
+            fmt_bytes(self.bytes),
+            rate_clause(rate),
+        );
     }
 }

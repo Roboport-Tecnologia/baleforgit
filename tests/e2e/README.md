@@ -118,21 +118,30 @@ python3 tests/e2e/run.py [--git-bale PATH] [--image-tag TAG] [--no-build]
 - `--coverage-dir PATH` — override the coverage output directory
   (implies `--coverage`). Defaults to `<repo>/target/coverage-e2e/`.
 
-## The upload progress indicator (`progress-demo`)
+## The progress indicators (`progress-demo`)
 
-git-bale's pre-push hook draws a live, git-styled
+**Upload** — git-bale's pre-push hook draws a live, git-styled
 `Uploading bales: 47% (4/8), … | …/s` line on stderr once an upload runs past
 ~200 ms, then finalizes it in place to
 `Uploading bales: 100% (N/N), <size> | <rate>, done.` (the summary prints even
-when the push was too fast to ever show the live line). The `progress-demo`
-phase exercises it two ways:
+when the push was too fast to ever show the live line).
+
+**Download** — the smudge filter (clone/checkout) prints a single
+`Downloading bales: 100% (N/N), <size> | <rate>, done.` summary when git
+finishes filtering, counting only files reconstructed over the network. There's
+no live bar here: git is already drawing its own `\r` "Filtering content:" line
+on the same stderr, and the filter never learns the total file count.
+
+The `progress-demo` phase exercises both two ways:
 
 - **In a normal sweep** it pushes a couple of fixed variants through
-  `git-bale push-pending` with stderr *captured* and asserts the summary line —
-  one fresh multi-file push (size clause present) and one byte-identical,
-  fully-deduped push (`100% (1/1), done.`, no size). No env vars, no live bar,
+  `git-bale push-pending` with stderr *captured* and asserts the upload summary
+  — one fresh multi-file push (size clause present) and one byte-identical,
+  fully-deduped push (`100% (1/1), done.`, no size) — then cold-clones and
+  asserts the `Downloading bales: …, done.` summary. No env vars, no live bar,
   nothing printed to the screen.
-- **Via `--only progress-demo`** it becomes a hand-driven *visual* demo:
+- **Via `--only progress-demo`** it becomes a hand-driven *visual* demo
+  (showing the live upload bar and the download summary):
 
   ```bash
   cargo build --release -p git-bale

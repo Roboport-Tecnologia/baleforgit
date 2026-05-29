@@ -5,10 +5,11 @@ never touch other phases' shared-server state:
 
   * Normal sweep (`from_only=False`) — validates the indicator without any
     env knobs. It pushes a couple of fixed variants through `git-bale
-    push-pending` with stderr *captured*, and asserts the git-styled summary
-    line it leaves behind. No TTY, no live bar drawn; we only check the final
-    `Uploading bales: 100% (N/N), …, done.` line (and that the deduped variant
-    drops the size clause). Nothing is printed to the screen.
+    push-pending` with stderr *captured* and asserts the git-styled upload
+    summary (a fresh multi-file push with a size clause, plus a byte-identical
+    fully-deduped push that drops it), then cold-clones and asserts the smudge
+    filter's matching `Downloading bales: 100% (N/N), …, done.` summary. No
+    TTY, no live bar drawn; nothing is printed to the screen.
 
   * `--only progress-demo` (`from_only=True`) — a hand-driven *visual* demo.
     It reads FILE_TIMER / FILE_COUNT and pushes with capture turned OFF so the
@@ -188,6 +189,7 @@ def _interactive_demo(
     if staging_files(repo):
         raise TestFailure("progress-demo: staging not drained after push")
 
+    info("progress-demo: cloning — watch for the download summary below (TTY only)")
     with timings.measure("progress-demo: cold clone", bytes_moved=total_bytes):
         clone_path, clone_env, _ = init_repo_for_clone(
             work_root=work_root,
@@ -197,7 +199,19 @@ def _interactive_demo(
             repo=E2E_REPO,
             name="progress-demo-clone",
         )
-        git(["checkout", "main"], cwd=clone_path, env=clone_env)
+        # capture=False so the smudge filter's download summary reaches the
+        # terminal, same as the push above.
+        res = git(
+            ["checkout", "main"],
+            cwd=clone_path,
+            env=clone_env,
+            capture=False,
+            expect_fail=True,
+        )
+    if res.returncode != 0:
+        raise TestFailure(
+            f"git checkout failed (exit {res.returncode}); see output above"
+        )
     for name, sha in files:
         verify_worktree(
             clone_path,
@@ -260,7 +274,8 @@ def _validation_variants(
             "progress-demo[dedup]: staging not drained after push-pending"
         )
 
-    # Confirm the uploaded bytes round-trip: push the refs, then cold-clone.
+    # Download side: push the refs, cold-clone, and assert the smudge filter's
+    # download summary (a fresh clone reconstructs every file over the network).
     git(["push", "-u", "origin", "main"], cwd=repo, env=env)
     clone_path, clone_env, _ = init_repo_for_clone(
         work_root=work_root,
@@ -270,7 +285,11 @@ def _validation_variants(
         repo=E2E_REPO,
         name="progress-validate-clone",
     )
-    git(["checkout", "main"], cwd=clone_path, env=clone_env)
+    with timings.measure(
+        "progress-demo: variant cold clone", bytes_moved=3 * VARIANT_FILE_BYTES
+    ):
+        checkout = git(["checkout", "main"], cwd=clone_path, env=clone_env)
+    _assert_download_summary(checkout.stderr, label="clone")
     for name, sha in fresh:
         verify_worktree(
             clone_path,
@@ -279,7 +298,7 @@ def _validation_variants(
             expected_size=VARIANT_FILE_BYTES,
             label="progress-demo:variant-clone",
         )
-    info("progress-demo: fresh + deduped summary variants validated")
+    info("progress-demo: upload + download summary variants validated")
 
 
 def _assert_summary(
@@ -318,4 +337,35 @@ def _assert_summary(
     ):
         raise TestFailure(
             f"progress-demo[{label}]: size clause not git-styled: {remainder!r}"
+        )
+
+
+def _assert_download_summary(stderr_bytes: bytes, *, label: str) -> None:
+    """A cold clone reconstructs every file over the network, so the smudge
+    filter must leave a git-styled `Downloading bales: 100% (N/N), <size>[ |
+    <rate>], done.` line. N is left loose — files with identical content share a
+    file id, so a duplicate hits the manifest cache instead of downloading — we
+    only require N/N with N>=1 and a real size clause."""
+    text = stderr_bytes.decode("utf-8", "replace")
+    line = next(
+        (
+            ln.strip()
+            for ln in text.splitlines()
+            if ln.strip().startswith("Downloading bales:")
+        ),
+        None,
+    )
+    if line is None:
+        raise TestFailure(
+            f"progress-demo[{label}]: no 'Downloading bales:' summary in "
+            f"checkout stderr:\n{text}"
+        )
+    m = re.fullmatch(
+        r"Downloading bales: 100% \((\d+)/(\d+)\), [\d.]+ \w+( \| [\d.]+ \w+/s)?, done\.",
+        line,
+    )
+    if m is None or m.group(1) != m.group(2) or int(m.group(1)) < 1:
+        raise TestFailure(
+            f"progress-demo[{label}]: download summary not git-styled "
+            f"`100% (N/N), <size>, done.` with N>=1: {line!r}"
         )
