@@ -118,43 +118,44 @@ python3 tests/e2e/run.py [--git-bale PATH] [--image-tag TAG] [--no-build]
 - `--coverage-dir PATH` — override the coverage output directory
   (implies `--coverage`). Defaults to `<repo>/target/coverage-e2e/`.
 
-## Watching the upload progress bar (`progress-demo`)
+## The upload progress indicator (`progress-demo`)
 
-`progress-demo` is a **manual-only** phase: it's in the registry but never
-runs in a normal sweep — only when you ask for it by name, and only via
-`--only` (it's gated so a plain run or a different `--only` set skips it
-silently). It exists to *show* git-bale's upload progress indicator: the
-pre-push hook draws a live, git-styled `Uploading bales: 47% (4/8), … | …/s`
-line on stderr once an upload runs past ~200 ms, then finalizes it in place
-to `Uploading bales: 100% (N/N), <size> | <rate>, done.` (which prints even
-when the push was too fast to ever show the live line).
+git-bale's pre-push hook draws a live, git-styled
+`Uploading bales: 47% (4/8), … | …/s` line on stderr once an upload runs past
+~200 ms, then finalizes it in place to
+`Uploading bales: 100% (N/N), <size> | <rate>, done.` (the summary prints even
+when the push was too fast to ever show the live line). The `progress-demo`
+phase exercises it two ways:
 
-```bash
-cargo build --release -p git-bale
-python3 tests/e2e/run.py --only progress-demo --no-build
-```
+- **In a normal sweep** it pushes a couple of fixed variants through
+  `git-bale push-pending` with stderr *captured* and asserts the summary line —
+  one fresh multi-file push (size clause present) and one byte-identical,
+  fully-deduped push (`100% (1/1), done.`, no size). No env vars, no live bar,
+  nothing printed to the screen.
+- **Via `--only progress-demo`** it becomes a hand-driven *visual* demo:
 
-Run it **from an interactive terminal**: the phase pushes with the
-harness's output capture turned off, so the hook inherits your TTY — the
-condition git-bale checks before drawing the live line. Piped/redirected
-(CI, captured) runs draw no live line — they emit only the final one-line
-`Uploading bales: 100% (N/N), …, done.` summary (no escape codes), which no
-phase's assertions depend on.
+  ```bash
+  cargo build --release -p git-bale
+  python3 tests/e2e/run.py --only progress-demo --no-build
+  ```
 
-Two env knobs:
+  Run it **from an interactive terminal** — the demo pushes with the harness's
+  output capture turned off, so the hook inherits your TTY (the condition
+  git-bale checks before drawing the live line). A throttle proxy stretches the
+  upload so the bar is watchable, and these two env knobs apply:
 
-- `FILE_TIMER` (default `1`, decimals OK) — seconds the server should
-  "take" per file, realised as a client→server byte throttle in front of
-  the CAS port so the upload (and the bar) stretches over ~`FILE_TIMER`s
-  per file. Set it under ~`0.2` to watch the 200 ms threshold *suppress*
-  the live line (the final summary still prints); set it to `3`–`5` to watch
-  it climb slowly. `0` = no throttle (instant server).
-- `FILE_COUNT` (default `5`) — how many distinct files to add + push; each
-  is 4 MiB of unique (incompressible) content, so none dedup away.
+  - `FILE_TIMER` (default `1`, decimals OK) — seconds the server should
+    "take" per file, realised as a client→server byte throttle in front of
+    the CAS port so the upload (and the bar) stretches over ~`FILE_TIMER`s
+    per file. Set it under ~`0.2` to watch the 200 ms threshold *suppress*
+    the live line (the final summary still prints); set it to `3`–`5` to
+    watch it climb slowly. `0` = no throttle (instant server).
+  - `FILE_COUNT` (default `5`) — how many distinct files to add + push; each
+    is 4 MiB of unique (incompressible) content, so none dedup away.
 
-```bash
-FILE_TIMER=3 FILE_COUNT=8 python3 tests/e2e/run.py --only progress-demo --no-build
-```
+  ```bash
+  FILE_TIMER=3 FILE_COUNT=8 python3 tests/e2e/run.py --only progress-demo --no-build
+  ```
 
 ## Coverage mode
 
@@ -366,9 +367,6 @@ not seconds — parallelism would buy us little and obscure failures.
 3. Wire it into the `REGISTRY` dict in `baleharness/cli.py` (`main()`),
    choosing its group (`g1` / `g2-head` / `g2-tail` / `g3`) and
    `read_only` flag. g2-tail phases auto-skip when `rev_state` is empty.
-   To make a phase run *only* on explicit `--only` request (a hand-driven
-   demo, not part of any sweep), also add its name to `MANUAL_ONLY_PHASES`
-   — see `progress-demo`.
 4. Document it in the README phase table above.
 
 ### Gotchas

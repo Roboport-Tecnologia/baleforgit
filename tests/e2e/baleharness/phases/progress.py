@@ -1,46 +1,52 @@
-"""Manual-only demo phase: watch the git-bale upload progress indicator.
+"""The git-bale upload progress indicator: a validation phase + a hand demo.
 
-Not part of any normal run — it's a hand-driven demo, registered as
-`progress-demo` and gated so it only fires under `--only progress-demo`.
-Its whole point is the *visual*: it runs `git push` with the harness's
-output capture turned OFF, so git-bale's pre-push hook inherits this
-process's stderr. When you launch the harness from an interactive
-terminal, that's a TTY — which is exactly the condition git-bale checks
-before drawing the progress bar (see crates/git-bale/src/progress.rs).
+The phase runs in two modes, both on their own isolated container so they
+never touch other phases' shared-server state:
 
-Two env knobs:
-  FILE_TIMER  (default 1, decimals OK) — how many seconds the server should
-              take to ingest each file. Realised as a client→server byte
-              throttle on a TcpProxy that fronts the CAS port, so the
-              upload stream (and thus the bar) advances over ~FILE_TIMER
-              seconds per file instead of finishing in milliseconds on
-              localhost. Set it below ~0.2 to watch the 200ms threshold
-              suppress the bar; set it to 3–5 to watch the bar climb slowly.
-  FILE_COUNT  (default 5) — how many distinct files to add + push. Each has
-              unique (incompressible) content so none dedup away and every
-              one contributes real upload bytes.
+  * Normal sweep (`from_only=False`) — validates the indicator without any
+    env knobs. It pushes a couple of fixed variants through `git-bale
+    push-pending` with stderr *captured*, and asserts the git-styled summary
+    line it leaves behind. No TTY, no live bar drawn; we only check the final
+    `Uploading bales: 100% (N/N), …, done.` line (and that the deduped variant
+    drops the size clause). Nothing is printed to the screen.
+
+  * `--only progress-demo` (`from_only=True`) — a hand-driven *visual* demo.
+    It reads FILE_TIMER / FILE_COUNT and pushes with capture turned OFF so the
+    pre-push hook inherits your terminal; on a TTY git-bale then draws the live
+    bar. A throttle proxy in front of the CAS port stretches the upload so the
+    bar is watchable. See `tests/e2e/README.md`.
+
+Env knobs (only read in the `--only` demo):
+  FILE_TIMER  (default 1, decimals OK) — seconds the server should "take" per
+              file, realised as a client→server byte throttle. Under ~0.2 the
+              200ms threshold suppresses the live bar (summary still prints);
+              3–5 makes it climb slowly. 0 = no throttle.
+  FILE_COUNT  (default 5) — distinct files to add + push, each unique
+              (incompressible) so none dedup away.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from pathlib import Path
 
 from baleharness.client import ClientEnv
 from baleharness.config import E2E_OWNER, E2E_REPO
-from baleharness.gitutil import git, verify_pointer_at, verify_worktree
+from baleharness.gitutil import git, verify_worktree
 from baleharness.logutil import TestFailure, info
 from baleharness.mocks import TcpProxy
 from baleharness.payloads import deterministic_payload
-from baleharness.proc import pick_free_port, sha256_bytes
+from baleharness.proc import pick_free_port, run, sha256_bytes
 from baleharness.repo import init_repo_for_clone, init_repo_for_push
 from baleharness.runtime import Runtime
-from baleharness.server import start_container
+from baleharness.server import ServerHandle, start_container
 from baleharness.storage import staging_files
 from baleharness.timing import Timings
 
-PER_FILE_BYTES = 4 * 1024 * 1024
+DEMO_FILE_BYTES = 4 * 1024 * 1024  # --only demo: big enough for a visible climb
+VARIANT_FILE_BYTES = 256 * 1024  # sweep variants: small + fast
 
 
 def _env_float(name: str, default: float) -> float:
@@ -78,15 +84,8 @@ def phase_progress_demo(
     client: ClientEnv,
     ssh_public_key: str,
     admin_token_hex: str,
+    from_only: bool,
 ) -> None:
-    file_timer = _env_float("FILE_TIMER", 1.0)
-    file_count = _env_int("FILE_COUNT", 5)
-
-    # Throttle the client→server direction so each file's worth of bytes takes
-    # ~FILE_TIMER seconds to upload; that's the window the bar is visible in.
-    # FILE_TIMER=0 means "instant server" — no throttle, bar likely suppressed.
-    throttle = int(PER_FILE_BYTES / file_timer) if file_timer > 0 else None
-
     phase_root = work_root / "progress-demo"
     phase_root.mkdir()
     data_root = phase_root / "data"
@@ -95,15 +94,25 @@ def phase_progress_demo(
     transfer_secret = secrets.token_bytes(32).hex()
     cas_port = pick_free_port()
     ssh_port = pick_free_port()
-    proxy_port = pick_free_port()
-    proxy = TcpProxy(
-        listen_port=proxy_port,
-        upstream_host="127.0.0.1",
-        upstream_port=cas_port,
-        throttle_bytes_per_sec=throttle,
-    )
-    proxy.start()
-    proxy_url = f"http://127.0.0.1:{proxy_port}"
+
+    # The live bar is only watchable if the upload is slowed down, so the demo
+    # fronts the CAS port with a throttle proxy. The sweep variants don't draw a
+    # bar (captured, non-TTY), so they talk to the server directly.
+    proxy = None
+    public_host_url_override = None
+    if from_only:
+        file_timer = _env_float("FILE_TIMER", 1.0)
+        proxy_port = pick_free_port()
+        throttle = int(DEMO_FILE_BYTES / file_timer) if file_timer > 0 else None
+        proxy = TcpProxy(
+            listen_port=proxy_port,
+            upstream_host="127.0.0.1",
+            upstream_port=cas_port,
+            throttle_bytes_per_sec=throttle,
+        )
+        proxy.start()
+        public_host_url_override = f"http://127.0.0.1:{proxy_port}"
+
     server = start_container(
         rt,
         image_tag=image_tag,
@@ -116,87 +125,197 @@ def phase_progress_demo(
         ssh_port=ssh_port,
         admin_token_hex=admin_token_hex,
         name_suffix=f"progress-demo-{os.getpid()}",
-        public_host_url_override=proxy_url,
-    )
-    total_bytes = PER_FILE_BYTES * file_count
-    info(
-        f"progress-demo: FILE_COUNT={file_count} × {PER_FILE_BYTES // (1024 * 1024)} "
-        f"MiB = {total_bytes // (1024 * 1024)} MiB, FILE_TIMER={file_timer}s/file "
-        f"(throttle={'none' if throttle is None else f'{throttle} B/s'})"
+        public_host_url_override=public_host_url_override,
     )
     try:
-        repo, env = init_repo_for_push(
+        if from_only:
+            _interactive_demo(timings, server, client, work_root, file_timer)
+        else:
+            _validation_variants(timings, server, client, work_root)
+    finally:
+        if proxy is not None:
+            proxy.kill()
+        server.stop()
+
+
+def _interactive_demo(
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+    file_timer: float,
+) -> None:
+    file_count = _env_int("FILE_COUNT", 5)
+    total_bytes = DEMO_FILE_BYTES * file_count
+    info(
+        f"progress-demo: FILE_COUNT={file_count} × {DEMO_FILE_BYTES // (1024 * 1024)} "
+        f"MiB = {total_bytes // (1024 * 1024)} MiB, FILE_TIMER={file_timer}s/file"
+    )
+    repo, env = init_repo_for_push(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO,
+        name="progress-demo-client",
+    )
+    files: list[tuple[str, str]] = []  # (name, sha256)
+    for i in range(file_count):
+        payload = deterministic_payload(
+            DEMO_FILE_BYTES, seed=f"progress-demo-{i}".encode()
+        )
+        name = f"data{i}.bin"
+        (repo / name).write_bytes(payload)
+        files.append((name, sha256_bytes(payload)))
+    with timings.measure("progress-demo: stage + commit", bytes_moved=total_bytes):
+        git(["add", "."], cwd=repo, env=env)
+        git(["commit", "-m", f"add {file_count} files"], cwd=repo, env=env)
+
+    info("progress-demo: pushing — watch for the upload line below (TTY only)")
+    # capture=False lets the pre-push hook's git-bale push-pending write its
+    # progress line straight to this terminal. expect_fail=True keeps run()
+    # from trying to .decode() the (uncaptured, None) stdout on a bad exit.
+    with timings.measure("progress-demo: git push", bytes_moved=total_bytes):
+        res = git(
+            ["push", "-u", "origin", "main"],
+            cwd=repo,
+            env=env,
+            capture=False,
+            expect_fail=True,
+        )
+    if res.returncode != 0:
+        raise TestFailure(f"git push failed (exit {res.returncode}); see output above")
+    if staging_files(repo):
+        raise TestFailure("progress-demo: staging not drained after push")
+
+    with timings.measure("progress-demo: cold clone", bytes_moved=total_bytes):
+        clone_path, clone_env, _ = init_repo_for_clone(
             work_root=work_root,
             client=client,
             server=server,
             owner=E2E_OWNER,
             repo=E2E_REPO,
-            name="progress-demo-client",
+            name="progress-demo-clone",
         )
-        files: list[tuple[str, str]] = []  # (name, sha256)
-        for i in range(file_count):
-            payload = deterministic_payload(
-                PER_FILE_BYTES, seed=f"progress-demo-{i}".encode()
-            )
-            name = f"data{i}.bin"
-            (repo / name).write_bytes(payload)
-            files.append((name, sha256_bytes(payload)))
-        with timings.measure("progress-demo: stage + commit", bytes_moved=total_bytes):
-            git(["add", "."], cwd=repo, env=env)
-            git(["commit", "-m", f"add {file_count} files"], cwd=repo, env=env)
-        for name, sha in files:
-            verify_pointer_at(
-                repo,
-                env,
-                spec=f"HEAD:{name}",
-                expected_sha=sha,
-                expected_size=PER_FILE_BYTES,
-                label="progress-demo:after-commit",
-            )
+        git(["checkout", "main"], cwd=clone_path, env=clone_env)
+    for name, sha in files:
+        verify_worktree(
+            clone_path,
+            name,
+            expected_sha=sha,
+            expected_size=DEMO_FILE_BYTES,
+            label="progress-demo:after-clone",
+        )
+    info("progress-demo: all files round-tripped through the server")
 
-        info("progress-demo: pushing — watch for the upload bar below (TTY only)")
-        # capture=False lets the pre-push hook's git-bale push-pending write its
-        # progress bar straight to this terminal. expect_fail=True keeps run()
-        # from trying to .decode() the (uncaptured, None) stdout on a bad exit.
-        with timings.measure("progress-demo: git push", bytes_moved=total_bytes):
-            res = git(
-                ["push", "-u", "origin", "main"],
-                cwd=repo,
-                env=env,
-                capture=False,
-                expect_fail=True,
-            )
-        if res.returncode != 0:
-            raise TestFailure(
-                f"git push failed (exit {res.returncode}); see output above"
-            )
-        if staging_files(repo):
-            raise TestFailure(
-                "progress-demo: staging not drained after push — push-pending "
-                "didn't finalize the upload"
-            )
 
-        # Prove the bytes actually reached the server: cold-clone (downloads are
-        # not throttled) and re-materialize every file from reconstruction.
-        with timings.measure("progress-demo: cold clone", bytes_moved=total_bytes):
-            clone_path, clone_env, _ = init_repo_for_clone(
-                work_root=work_root,
-                client=client,
-                server=server,
-                owner=E2E_OWNER,
-                repo=E2E_REPO,
-                name="progress-demo-clone",
-            )
-            git(["checkout", "main"], cwd=clone_path, env=clone_env)
-        for name, sha in files:
-            verify_worktree(
-                clone_path,
-                name,
-                expected_sha=sha,
-                expected_size=PER_FILE_BYTES,
-                label="progress-demo:after-clone",
-            )
-        info("progress-demo: all files round-tripped through the server")
-    finally:
-        proxy.kill()
-        server.stop()
+def _validation_variants(
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+) -> None:
+    git_bale = str(client.git_bale_bin)
+    repo, env = init_repo_for_push(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO,
+        name="progress-validate-client",
+    )
+
+    # Variant 1: three fresh files → a real upload, so the summary carries the
+    # size clause (`100% (3/3), <size>, done.`).
+    fresh: list[tuple[str, str]] = []
+    for i in range(3):
+        payload = deterministic_payload(
+            VARIANT_FILE_BYTES, seed=f"progress-variant-{i}".encode()
+        )
+        name = f"v{i}.bin"
+        (repo / name).write_bytes(payload)
+        fresh.append((name, sha256_bytes(payload)))
+    git(["add", "."], cwd=repo, env=env)
+    git(["commit", "-m", "3 fresh files"], cwd=repo, env=env)
+    with timings.measure(
+        "progress-demo: variant fresh", bytes_moved=3 * VARIANT_FILE_BYTES
+    ):
+        res = run([git_bale, "push-pending"], cwd=repo, env=env)
+    _assert_summary(res.stderr, count=3, with_size=True, label="fresh")
+    if staging_files(repo):
+        raise TestFailure(
+            "progress-demo[fresh]: staging not drained after push-pending"
+        )
+
+    # Variant 2: a byte-identical copy of v0 → fully deduped against content the
+    # server already holds, so the summary drops the size (`100% (1/1), done.`).
+    (repo / "dup.bin").write_bytes((repo / "v0.bin").read_bytes())
+    git(["add", "dup.bin"], cwd=repo, env=env)
+    git(["commit", "-m", "duplicate of v0"], cwd=repo, env=env)
+    with timings.measure("progress-demo: variant dedup"):
+        res = run([git_bale, "push-pending"], cwd=repo, env=env)
+    _assert_summary(res.stderr, count=1, with_size=False, label="dedup")
+    if staging_files(repo):
+        raise TestFailure(
+            "progress-demo[dedup]: staging not drained after push-pending"
+        )
+
+    # Confirm the uploaded bytes round-trip: push the refs, then cold-clone.
+    git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+    clone_path, clone_env, _ = init_repo_for_clone(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO,
+        name="progress-validate-clone",
+    )
+    git(["checkout", "main"], cwd=clone_path, env=clone_env)
+    for name, sha in fresh:
+        verify_worktree(
+            clone_path,
+            name,
+            expected_sha=sha,
+            expected_size=VARIANT_FILE_BYTES,
+            label="progress-demo:variant-clone",
+        )
+    info("progress-demo: fresh + deduped summary variants validated")
+
+
+def _assert_summary(
+    stderr_bytes: bytes, *, count: int, with_size: bool, label: str
+) -> None:
+    text = stderr_bytes.decode("utf-8", "replace")
+    line = next(
+        (
+            ln.strip()
+            for ln in text.splitlines()
+            if ln.strip().startswith("Uploading bales:")
+        ),
+        None,
+    )
+    if line is None:
+        raise TestFailure(
+            f"progress-demo[{label}]: no 'Uploading bales:' summary in "
+            f"push-pending stderr:\n{text}"
+        )
+    prefix = f"Uploading bales: 100% ({count}/{count}),"
+    if not line.startswith(prefix) or not line.endswith("done."):
+        raise TestFailure(
+            f"progress-demo[{label}]: summary line {line!r} doesn't match "
+            f"{prefix!r} … 'done.'"
+        )
+    # Remainder is "done." (deduped, no new bytes) or "<size>[ | <rate>], done.".
+    remainder = line[len(prefix) :].strip()
+    had_size = remainder != "done."
+    if had_size != with_size:
+        raise TestFailure(
+            f"progress-demo[{label}]: summary size-clause present={had_size}, "
+            f"expected {with_size}: {line!r}"
+        )
+    if had_size and not re.fullmatch(
+        r"[\d.]+ \w+( \| [\d.]+ \w+/s)?, done\.", remainder
+    ):
+        raise TestFailure(
+            f"progress-demo[{label}]: size clause not git-styled: {remainder!r}"
+        )

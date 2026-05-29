@@ -588,6 +588,9 @@ def main() -> int:
                 client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
+                # --only progress-demo → the env-driven interactive visual demo;
+                # in a normal sweep → fixed, captured-and-asserted variants.
+                from_only="progress-demo" in args.only,
             )
 
         def _phase_resync() -> None:
@@ -684,15 +687,11 @@ def main() -> int:
             "gc-abandon-checkout": ("g3", False, _phase_gc_abandon),
             "gc-keeps-unpushed": ("g3", False, _phase_gc_keep),
             "gc-mixed": ("g3", False, _phase_gc_mixed),
-            # Hand-driven demo of the upload progress bar. Gated to --only
-            # (see MANUAL_ONLY_PHASES) so it never runs in a normal sweep.
+            # Validates the upload progress indicator: a normal sweep pushes
+            # fixed variants and asserts the captured summary; `--only
+            # progress-demo` instead runs the env-driven interactive visual demo.
             "progress-demo": ("g3", False, _phase_progress_demo),
         }
-
-        # Phases that must be explicitly requested via --only; skipped silently
-        # in any run that doesn't name them (a normal full sweep, or a
-        # different --only set).
-        MANUAL_ONLY_PHASES = {"progress-demo"}
 
         # Build the within-group lists in declaration order, then apply
         # --order per group.
@@ -733,14 +732,9 @@ def main() -> int:
             info(f"--only active: running only {args.only}")
 
         def filtered_out(name: str) -> Optional[str]:
-            """Reason `name` is excluded by --skip / --only / manual-only, or
-            None to run it."""
+            """Reason `name` is excluded by --skip / --only, or None to run it."""
             if name in args.skip:
                 return "per --skip"
-            # Manual-only phases run only when named in --only. Reported like
-            # the --only exclusion (silently) so a normal sweep stays quiet.
-            if name in MANUAL_ONLY_PHASES and name not in args.only:
-                return "manual-only"
             if args.only and name not in args.only:
                 return "not in --only"
             return None
