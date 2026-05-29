@@ -417,7 +417,16 @@ pub fn serialize(s: &ParsedShard) -> Vec<u8> {
         out.extend_from_slice(&ft.version.to_le_bytes());
         out.extend_from_slice(&file_info_offset.to_le_bytes());
         out.extend_from_slice(&cas_info_offset.to_le_bytes());
-        out.extend_from_slice(&[0u8; 48]);
+        // file/xorb/chunk lookup tables are omitted (counts = 0), but each
+        // offset must still point at the section end, not 0: xet's
+        // read_all_truncated_hashes takes file_lookup_offset as the *end* of the
+        // xorb-info range, so a zero here makes (end - xorb_info_offset)
+        // underflow — debug panic, release OOM — when the client ingests the
+        // dedup shard. Mirror xet's own serializer, which sets the offset even
+        // when the table is absent.
+        for offset_or_count in [footer_offset, 0, footer_offset, 0, footer_offset, 0] {
+            out.extend_from_slice(&offset_or_count.to_le_bytes());
+        }
         out.extend_from_slice(&ft.chunk_hash_hmac_key.0);
         out.extend_from_slice(&ft.shard_creation_timestamp.to_le_bytes());
         out.extend_from_slice(&ft.shard_key_expiry.to_le_bytes());

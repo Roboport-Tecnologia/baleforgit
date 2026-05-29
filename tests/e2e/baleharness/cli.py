@@ -67,6 +67,7 @@ from baleharness.phases.coverage_phases import (
     phase_https_origin_coverage,
     phase_otlp_telemetry,
 )
+from baleharness.phases.dedup_shard import phase_global_dedup_shard
 from baleharness.phases.failure import (
     phase_failure_connection_drop_mid_upload,
     phase_failure_server_kill_mid_upload,
@@ -604,6 +605,17 @@ def main() -> int:
                 admin_token_hex=admin_token_hex,
             )
 
+        def _phase_global_dedup_shard() -> None:
+            phase_global_dedup_shard(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+
         def _phase_gc_abandon() -> None:
             phase_gc_abandon_checkout(
                 timings=timings,
@@ -682,6 +694,11 @@ def main() -> int:
             # to repopulate it. Owns its own isolated container + data dir, so
             # the wipe doesn't touch earlier phases' shared-server state.
             "resync-wipe": ("g3", False, _phase_resync),
+            # Server global-dedup shard footer: fetch one from /v1/chunks, plant
+            # it in the client's xet shard-cache, and push again so the upload
+            # session ingests it via read_all_truncated_hashes (the path that
+            # underflowed on file_lookup_offset=0). Own container + repo, g3.
+            "global-dedup-shard": ("g3", False, _phase_global_dedup_shard),
             # gc staging reconciliation. Each owns its own bare repo + commits,
             # so g3 — not read-only (they push new history).
             "gc-abandon-checkout": ("g3", False, _phase_gc_abandon),
