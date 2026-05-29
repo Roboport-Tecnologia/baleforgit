@@ -1152,11 +1152,13 @@ where
     let repo_id = format!("{owner}/{repo}");
     let raw = svc.meta.raw_bytes_for_repo(&repo_id).await?;
     let stored = svc.meta.stored_bytes_for_repo(&repo_id).await?;
+    let exclusive = svc.meta.exclusive_stored_bytes_for_repo(&repo_id).await?;
     Ok(Json(RepoUsageResponse {
         repo_id,
         raw_bytes: raw,
         stored_bytes: stored,
         dedup_savings_bytes: raw.saturating_sub(stored),
+        exclusive_bytes: exclusive,
     }))
 }
 

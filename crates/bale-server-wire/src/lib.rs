@@ -129,11 +129,15 @@ pub struct SetOwnerQuotaRequest {
 
 /// No quota field — quotas are owner-scoped. `raw_bytes` is the user-facing repo
 /// size (sum of file totals, ignoring cross-repo dedup); `stored_bytes` is the
-/// attributable on-disk cost.
+/// on-disk cost of every xorb the repo references (siblings may share some);
+/// `exclusive_bytes` is the subset no *sibling* repo (same owner) references —
+/// how much the owner's stored bytes would drop if the repo were deleted
+/// (`exclusive_bytes <= stored_bytes`; cross-owner sharing is ignored).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepoUsageResponse {
     pub repo_id: String,
     pub raw_bytes: u64,
     pub stored_bytes: u64,
     pub dedup_savings_bytes: u64,
+    pub exclusive_bytes: u64,
 }

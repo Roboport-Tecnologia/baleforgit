@@ -295,6 +295,12 @@ pub trait MetadataStore: Send + Sync {
     /// [`Self::stored_bytes_for_owner`] per-repo. Cross-repo dedup within an
     /// owner can make this smaller than `raw_bytes_for_repo`.
     async fn stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
+    /// On-disk bytes of the xorbs this repo references that no *sibling* repo
+    /// (same owner) references — how much the owner's stored bytes would drop if
+    /// this repo were deleted. Cross-owner sharing is ignored, matching the
+    /// owner-independent accounting in [`Self::stored_bytes_for_owner`]. Always
+    /// `<= stored_bytes_for_repo`; the gap is storage shared with sibling repos.
+    async fn exclusive_stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
 }
 
 /// Authorization layer. Pluggable so it can proxy to an external repo

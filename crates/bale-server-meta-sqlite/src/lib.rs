@@ -637,6 +637,38 @@ impl MetadataStore for SqliteMetadataStore {
         nonneg_i64_to_u64(n, "stored_bytes_for_repo")
     }
 
+    async fn exclusive_stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64> {
+        // Xorbs this repo references, minus any also referenced by a *sibling*
+        // repo (same owner) — the amount the owner's stored_bytes would drop if
+        // this repo were deleted. Cross-owner sharing is ignored, matching the
+        // owner-independent accounting in stored_bytes_for_owner.
+        let owner = repo_id.split_once('/').map_or(repo_id, |(o, _)| o);
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(num_bytes_on_disk), 0) AS n
+             FROM xorbs
+             WHERE hash IN (
+                 SELECT DISTINCT ft.xorb_hash
+                 FROM file_terms ft
+                 JOIN files f ON f.file_hash = ft.file_hash
+                 WHERE f.repo_id = ?
+             )
+             AND hash NOT IN (
+                 SELECT DISTINCT ft.xorb_hash
+                 FROM file_terms ft
+                 JOIN files f ON f.file_hash = ft.file_hash
+                 WHERE f.owner = ? AND f.repo_id <> ?
+             )",
+        )
+        .bind(repo_id)
+        .bind(owner)
+        .bind(repo_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CoreError::Internal(format!("exclusive_stored_bytes_for_repo: {e}")))?;
+        let n: i64 = row.try_get("n").map_err(internal)?;
+        nonneg_i64_to_u64(n, "exclusive_stored_bytes_for_repo")
+    }
+
     async fn unaccounted_xorb_bytes_for_owner(
         &self,
         owner: &str,

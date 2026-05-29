@@ -145,6 +145,9 @@ pub trait MetadataStore: Send + Sync {
     // (e.g. "alice/big-model"). Used by the gitea repo settings page.
     async fn raw_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
     async fn stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
+    // On-disk bytes referenced by this repo and no same-owner sibling — how much
+    // the owner's stored bytes drop if it's deleted (cross-owner sharing ignored).
+    async fn exclusive_stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
 }
 
 #[async_trait]
@@ -445,7 +448,7 @@ Two numbers, both queryable by `GET /v1/usage/{owner}` (which returns JSON `{own
 
 `dedup_savings_bytes = raw_bytes - stored_bytes`.
 
-`GET /v1/usage/repo/{owner}/{repo}` returns the same shape (minus the quota field) keyed by full `repo_id`. The intended consumer is a per-repo settings page in a forge: `raw_bytes` is the "this repo's total size" to surface to the user, ignoring chunk-level dedup with sibling repos. Stored-bytes is also returned but is generally less useful at the per-repo level — sibling repos under the same owner can share xorbs, so a repo's "stored" cost in isolation is somewhat fictional. Same auth rule as the owner endpoint.
+`GET /v1/usage/repo/{owner}/{repo}` returns `{repo_id, raw_bytes, stored_bytes, dedup_savings_bytes, exclusive_bytes}` (no quota field — quotas are owner-scoped) keyed by full `repo_id`. The intended consumer is a per-repo settings page in a forge: `raw_bytes` is the "this repo's total size" to surface to the user, ignoring chunk-level dedup with sibling repos. `stored_bytes` is the on-disk cost of every xorb the repo references, but sibling repos can share xorbs, so it double-counts shared storage and a repo's "stored" cost in isolation is somewhat fictional. **`exclusive_bytes`** is the genuinely-per-repo number: `SUM(num_bytes_on_disk)` over the xorbs this repo's files reference *minus* those referenced by another repo **of the same owner** — i.e. how much the owner's `stored_bytes` would drop if this repo were deleted. Cross-owner sharing is deliberately ignored, mirroring the owner-independent accounting above (a xorb shared only across owners still counts in full for each, so it's exclusive to this repo within its owner's world). It's always `<= stored_bytes`; the gap is storage shared with sibling repos. Same auth rule as the owner endpoint.
 
 ### Quota enforcement
 

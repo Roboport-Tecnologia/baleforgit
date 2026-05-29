@@ -974,8 +974,9 @@ def phase_usage_api(
     Contract from the wire types: `raw_bytes` = sum of file sizes registered
     for that scope (counting every revision separately), `stored_bytes` =
     actually-attributable on-disk cost, `dedup_savings_bytes = raw - stored`.
-    Storage growth from this phase's pushes is the upper bound on
-    `stored_bytes` for repo2.
+    The repo response also carries `exclusive_bytes` = on-disk cost of xorbs no
+    same-owner sibling repo references (`<= stored_bytes`). Storage growth from
+    this phase's pushes is the upper bound on `stored_bytes` for repo2.
     """
     with timings.measure("usage api: fetch + verify"):
         owner_usage = fetch_usage(server, token=bale_admin_token, owner=E2E_OWNER)
@@ -1022,6 +1023,22 @@ def phase_usage_api(
             raise TestFailure(
                 "repo stored_bytes is 0 but we pushed 35 MB three times — "
                 "shard's CAS Info isn't reaching `xorbs`/`file_terms`"
+            )
+
+        # exclusive_bytes (xorbs no same-owner sibling references) is bounded
+        # above by stored_bytes, and must be > 0 here: repo1 and repo2 share an
+        # owner but repo2's three 35 MB revisions share no chunks with repo1's
+        # 8 KiB file, so its big xorbs are exclusive to it.
+        excl = int(repo_usage["exclusive_bytes"])
+        if excl > int(repo_usage["stored_bytes"]):
+            raise TestFailure(
+                f"repo exclusive_bytes={excl} exceeds stored_bytes="
+                f"{repo_usage['stored_bytes']} — exclusive set isn't a subset"
+            )
+        if excl == 0:
+            raise TestFailure(
+                "repo exclusive_bytes is 0 but repo2's 35 MB binary is shared "
+                "with no sibling repo — exclusive accounting is wrong"
             )
 
         # dedup_savings_bytes is derivable from raw - stored at both scopes.
