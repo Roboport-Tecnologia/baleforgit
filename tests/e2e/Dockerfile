@@ -106,7 +106,14 @@ RUN mkdir -p /coverage && chown bale:bale /coverage
 # owned by a UID different from the `git` user that runs git-receive-pack
 # inside the container. Git's "dubious ownership" check would then refuse
 # every push. This is a test-only image; opt out of the check system-wide.
-RUN printf '[safe]\n\tdirectory = *\n' > /etc/gitconfig
+#
+# core.fsync: the bare repos live on a host bind-mount reached through the
+# podman-machine host<->VM filesystem bridge (virtiofs/9p). Git writes loose
+# objects as write-tmp + rename with no fsync by default, and that bridge
+# doesn't guarantee data-before-rename ordering — so a clone can read back a
+# truncated loose object that a just-completed push wrote ("loose object ...
+# is corrupt"). Forcing fsync on loose objects closes that window.
+RUN printf '[safe]\n\tdirectory = *\n[core]\n\tfsync = loose-object\n\tfsyncMethod = fsync\n' > /etc/gitconfig
 
 EXPOSE 8080 2222
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
