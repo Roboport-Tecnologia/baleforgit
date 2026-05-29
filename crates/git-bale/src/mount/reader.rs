@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
+use xet_client::cas_client::auth::TokenRefresher;
 use xet_client::chunk_cache::{get_cache, CacheConfig, ChunkCache};
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
@@ -376,7 +377,10 @@ impl Reader {
             drop(trunc);
 
             let cfg = self.resolved_cfg()?;
-            let translator = build_translator_config(&cfg)?;
+            let translator = build_translator_config(
+                &cfg,
+                resolver::forge_refresher(raw, resolver::Scope::Read),
+            )?;
             let info_clone = info.clone();
             let cache_clone = chunk_cache.clone();
             let dest_file = tmp.reopen()?;
@@ -396,8 +400,10 @@ impl Reader {
             if let Some(git_dir) = raw.git_dir.as_deref() {
                 if let Ok(merkle) = info.merkle_hash() {
                     let cfg_clone = cfg.clone();
-                    let fetched =
-                        rt.bridge_sync(async move { fetch_manifest(&cfg_clone, &merkle).await });
+                    let refresher = resolver::forge_refresher(raw, resolver::Scope::Read);
+                    let fetched = rt.bridge_sync(async move {
+                        fetch_manifest(&cfg_clone, refresher, &merkle).await
+                    });
                     if let Ok(Ok(manifest)) = fetched {
                         let _ = manifest_cache::save(git_dir, &file_id_hex, &manifest);
                     }
@@ -436,11 +442,14 @@ impl Reader {
     }
 }
 
-fn build_translator_config(cfg: &BaleConfig) -> Result<TranslatorConfig> {
+fn build_translator_config(
+    cfg: &BaleConfig,
+    refresher: Arc<dyn TokenRefresher>,
+) -> Result<TranslatorConfig> {
     Ok(default_config(
         cfg.server_url.clone(),
         Some((cfg.token.clone(), cfg.token_expiration)),
-        None,
+        Some(refresher),
         None,
     )?)
 }

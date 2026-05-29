@@ -65,6 +65,16 @@ class ServerHandle:
             "utf-8", "replace"
         )
 
+    def is_healthy(self) -> bool:
+        """Quiet one-shot `/healthz` probe (no retry, no logging). A crashed
+        server's container exits under `--rm`, so this goes false the moment
+        the process dies — the per-push crash detector the churn phase needs."""
+        try:
+            with urllib.request.urlopen(self.healthz_url, timeout=2) as resp:
+                return resp.status == 200
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
+            return False
+
     def disk_xorb_bytes(self) -> int:
         return dir_size_bytes(self.data_root / "xorbs")
 

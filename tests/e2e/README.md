@@ -66,6 +66,7 @@ found" error until that's fixed; the harness logic itself is portable.
 | `gc-abandon-checkout` | `git-bale gc`: push a baseline, stage a change, abandon it (`git reset` + `git checkout`); the post-checkout hook's gc fully wipes the orphaned staging. The user-reported bug. |
 | `gc-keeps-unpushed`   | DATA-LOSS GUARD: two stacked *unpushed* commits (tip names only v2); manual `git-bale gc` must NOT drop v1's staging. Push + cold-clone then reconstructs every revision byte-for-byte. |
 | `gc-mixed`            | Committed-but-unpushed v1 survives while a staged-then-abandoned (never-committed) v2 is forgotten; v1 stays pushable + reconstructable end to end. |
+| `churn`               | Sustained churn against ONE reused repo: 12 rounds of edit→commit→push (rotating region edits on a multi-chunk file, plus add/delete of extra files and a plain non-bale text file), with cold clones at rounds 3/7/11 that each reconstruct the FULL accumulated history byte-for-byte. Integrity verified at every step (staged + committed pointers, post-push worktree), `/healthz` probed after each push (a push that crashes the server fails it), and server disk asserted monotonic. The regression guard for the "data corrupted + server crashed after the Nth push" class of bug. Scales up via `HUGE_CHURN=N` — see [Scaling churn](#scaling-the-churn-phase-huge_churn). |
 | `resync-wipe`         | Disaster recovery: push a binary, restart the server with a BLANK CAS (fresh data dir, same bare repo), then delete `.git`, re-init, re-add, and `git push -f`. The first push is *rejected* — every chunk dedups against the client's stale xet cache, so the xorbs the blank server lacks are never re-uploaded — and the client surfaces a plain-language cache-mismatch explanation (naming the active cache dir + `BALE_XET_CACHE`), not a bare `400 Bad Request on /shards`; the rejected push leaves staging intact and writes nothing to the server. Recovery then follows that advice: a second `git push -f` with `BALE_XET_CACHE` pointed at a fresh dir re-uploads everything and succeeds, and a cold clone reconstructs the file byte-for-byte. |
 | `spilled-clean`       | Caps `BALE_MAX_INLINE_CLEAN` at 1 MiB so a 5 MiB `git add` drives the clean filter's spill-to-tmpfile path; an unstage + re-add hits the file-backed clean-cache verify, then push + cold/hot resmudge round-trips the spilled file. |
 | `global-dedup-shard`  | The server's `GET /v1/chunks` dedup shard must ingest without crashing the upload session. Seeds a repo, fetches the dedup shard for a known chunk straight from the endpoint and asserts its footer is well-formed (lookup offsets == `footer_offset`, never 0), then plants that shard into the client's xet `shard-cache/` and pushes again — the second push's `FileUploadSession` scans + ingests it via `read_all_truncated_hashes`, the path that underflowed (debug panic / release OOM) when `file_lookup_offset` was 0. Deterministic: doesn't rely on the 1/1024 global-dedup chunk sampling, which the release binary can't lower. |
@@ -157,6 +158,42 @@ phase exercises it two ways:
   ```bash
   FILE_TIMER=3 FILE_COUNT=8 python3 tests/e2e/run.py --only progress-demo --no-build
   ```
+
+## Scaling the churn phase (`HUGE_CHURN`)
+
+The `churn` phase normally runs a quick 12-round pass. Set `HUGE_CHURN=N`
+(a positive integer) **together with `--only churn`** to run a randomized,
+scaled-up stress variant that targets **roughly N minutes** of wall-clock —
+`HUGE_CHURN=1` ≈ 1 min, `HUGE_CHURN=5` ≈ 5 min, and so on (measured: N=1 →
+60 s, N=2 → 122 s on a warm image):
+
+```bash
+HUGE_CHURN=5 python3 tests/e2e/run.py --only churn --no-build
+```
+
+What scales with N:
+
+- **Rounds** scale linearly (60 × N), so it's "a lot of changes committed and
+  pushed" against one reused repo — the direct stress for the
+  crash/corruption-after-the-Nth-push fear.
+- Each round edits a **random subset** of several big base files (33 MiB
+  across 5 files) at random offsets/lengths, rewrites a plain non-bale text
+  file, and randomly adds/deletes extra files (some plain text). Add and
+  delete probabilities are balanced so the worktree size stays roughly
+  constant and total time stays linear in N.
+- A **cold clone every 15 rounds** walks the most recent 15 revisions,
+  verifying each reconstructs byte-for-byte. The window slides and tiles the
+  history, so every revision is cold-verified exactly once while each clone's
+  cost stays constant (a full-history walk at each clone would make total time
+  grow quadratically with N).
+
+Integrity is still checked at every step (staged + committed pointers,
+post-push worktree, `/healthz` after each push, monotonic server disk). The
+run is randomized but reproducible: the RNG seed is logged at the start, and
+`HUGE_CHURN_SEED=<int>` pins it so a failure replays the exact same sequence.
+
+`HUGE_CHURN` is ignored outside `--only churn`, so a normal full sweep never
+balloons into the multi-minute variant.
 
 ## Coverage mode
 

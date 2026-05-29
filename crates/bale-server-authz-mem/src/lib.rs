@@ -88,7 +88,10 @@ impl ConfigAuthz {
     }
 }
 
-pub const DEFAULT_TOKEN_TTL_SECS: u64 = 3600;
+/// 5 minutes (UTC unix seconds, like `tokens::mint`'s `exp`). Short on purpose:
+/// the client refreshes via the forge before expiry (`git-bale`'s
+/// `ForgeTokenRefresher`), so a leaked token has a small blast radius.
+pub const DEFAULT_TOKEN_TTL_SECS: u64 = 300;
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     // Fold the length diff in so a presented token's length isn't leaked via timing.

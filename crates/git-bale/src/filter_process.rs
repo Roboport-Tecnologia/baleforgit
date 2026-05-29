@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use tempfile::NamedTempFile;
+use xet_client::cas_client::auth::TokenRefresher;
 use xet_client::chunk_cache::{get_cache, CacheConfig};
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
@@ -567,7 +568,8 @@ fn handle_smudge<R: Read, W: Write>(
         // prefetch re-receives full-file terms, shifting `cur_file_byte_offset`
         // 256 MiB per round and tripping SequentialWriter's contiguity check.
         // Capping at `file_size` skips the speculative prefetch entirely.
-        let translator = build_translator_config(cfg)?;
+        let translator =
+            build_translator_config(cfg, resolver::forge_refresher(raw, resolver::Scope::Read))?;
         let dest_file = tmp.reopen()?;
         let info_for_dl = info.clone();
         let cache_for_dl = chunk_cache.clone();
@@ -592,8 +594,11 @@ fn handle_smudge<R: Read, W: Write>(
                 }
             };
             let cfg_for_fetch = cfg.clone();
+            let refresher = resolver::forge_refresher(raw, resolver::Scope::Read);
             let fetched =
-                rt.bridge_sync(async move { fetch_manifest(&cfg_for_fetch, &merkle).await });
+                rt.bridge_sync(
+                    async move { fetch_manifest(&cfg_for_fetch, refresher, &merkle).await },
+                );
             match fetched {
                 Ok(Ok(manifest)) => {
                     if let Err(e) = manifest_cache::save(git_dir, &file_id_hex, &manifest) {
@@ -710,11 +715,14 @@ fn is_safe_file_id(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn build_translator_config(cfg: &BaleConfig) -> Result<TranslatorConfig> {
+fn build_translator_config(
+    cfg: &BaleConfig,
+    refresher: Arc<dyn TokenRefresher>,
+) -> Result<TranslatorConfig> {
     Ok(default_config(
         cfg.server_url.clone(),
         Some((cfg.token.clone(), cfg.token_expiration)),
-        None,
+        Some(refresher),
         None,
     )?)
 }

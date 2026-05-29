@@ -36,6 +36,11 @@ E2E_REPO = "repo"
 E2E_REPO_2 = "repo2"
 E2E_REPO_3 = "mixed-files"
 E2E_REPO_SPILL = "spilled-clean"
+# The churn phase hammers ONE reused repo with many edit→commit→push rounds,
+# taking cold clones at several points to prove the accumulating server state
+# stays consistent — and the server stays up — push after push. Guards the
+# "data corrupted + server crashed after the Nth push" class of regression.
+E2E_REPO_CHURN = "churn"
 # The offline-no-network phase routes git-bale's CAS traffic through a counting
 # proxy and asserts only push/pull cross it; it pushes its own `main`.
 E2E_REPO_OFFLINE = "offline-net"
@@ -60,3 +65,42 @@ BROWSER_DL_JWT = forge_jwt_with_filename(BROWSER_DL_FILENAME)
 # Tolerance for "no growth" assertions on disk: filesystems may round up to
 # block boundaries even when nothing logically changed.
 SIZE_TOLERANCE_BYTES = 4096
+
+# Churn phase tuning. Many rounds, each editing a multi-chunk file (so CDC
+# dedup is exercised), plus rotating add/delete of extra files and a plain
+# (non-bale) text file in the same commits. Clones are taken at a few rounds
+# to reconstruct the full accumulated history against the reused server state.
+CHURN_ROUNDS = 12
+CHURN_FILE_A_BYTES = 768 * 1024  # edited every round via a rotating region poke
+CHURN_FILE_B_BYTES = 512 * 1024  # written once, then left alone (dedups forever)
+CHURN_EDIT_BYTES = 64 * 1024  # ~one CDC chunk replaced per round
+CHURN_EXTRA_BYTES = 256 * 1024  # rotating add/delete files
+CHURN_CLONE_AFTER_ROUNDS = (3, 7, 11)  # 0-indexed; 11 is the final round
+
+# HUGE churn — opt-in, scaled stress run. `HUGE_CHURN=N` targets ~N minutes of
+# wall-clock (`HUGE_CHURN=1` ≈ 1 min, `=5` ≈ 5 min, …): rounds scale linearly
+# with N, several big base files are edited in random subsets each round, with
+# random (balanced) add/delete of extra files — some plain text. A cold clone
+# every CLONE_EVERY rounds walks the most recent CLONE_EVERY revisions (a
+# sliding window that tiles the history, so every revision is cold-verified
+# once while the per-clone cost stays constant — total time linear in N, not
+# quadratic). The RNG seed is logged and overridable via HUGE_CHURN_SEED.
+MiB = 1024 * 1024
+HUGE_CHURN_ROUNDS_PER_MIN = 60  # rounds per unit of N (calibrated to ~1 min)
+HUGE_CHURN_CLONE_EVERY = 15  # cold clone cadence AND the walk-window width
+HUGE_CHURN_BASE_FILES = (
+    ("big1.bin", 12 * MiB),
+    ("big2.bin", 9 * MiB),
+    ("big3.bin", 6 * MiB),
+    ("med1.bin", 4 * MiB),
+    ("med2.bin", 2 * MiB),
+)  # 33 MiB total
+HUGE_CHURN_WALK_STRIDE = 1  # verify every revision within the window
+HUGE_CHURN_EDIT_FILES = (2, 4)  # (min, max) base files edited per round
+HUGE_CHURN_EDIT_BYTES = (256 * 1024, 2 * MiB)  # (min, max) region replaced
+# add_prob == del_prob keeps the worktree size roughly constant across rounds,
+# so per-round cost (and thus total time) stays linear in N.
+HUGE_CHURN_ADD_PROB = 0.30  # chance a round adds a new file
+HUGE_CHURN_PLAIN_ADD_PROB = 0.25  # of those adds, fraction that are plain text
+HUGE_CHURN_NEW_BYTES = (1 * MiB, 6 * MiB)  # (min, max) size of a new bale file
+HUGE_CHURN_DEL_PROB = 0.30  # chance a round deletes a previously-added file

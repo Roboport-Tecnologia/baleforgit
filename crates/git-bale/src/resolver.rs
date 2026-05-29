@@ -15,10 +15,13 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::header;
 use serde::Deserialize;
+use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
 use crate::config::RawConfig;
 use crate::remote::{parse_origin, RemoteScheme, RemoteUrl};
@@ -106,6 +109,62 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
         &forge_bearer,
     )
     .await
+}
+
+/// Mirrors xet's private `REFRESH_BUFFER_SEC`: xet treats a token as expired
+/// once it lapses within this window, so a freshly minted token whose `exp` is
+/// already inside it would be re-refreshed immediately.
+const REFRESH_BUFFER_SEC: u64 = 30;
+
+/// Stop after this many consecutive re-mints that come back already-expired.
+/// That only happens when client and server clocks differ by more than the
+/// token TTL — a fresh token won't help, so we surface the skew rather than
+/// storm the forge re-minting doomed tokens forever.
+const MAX_EXPIRED_REFRESHES: u32 = 3;
+
+/// A [`TokenRefresher`] that re-runs [`resolve`] through the forge to mint a
+/// fresh bale token. Wired into every CAS client so xet swaps in a new token
+/// ~30s before the short-lived current one lapses (`is_expired`), instead of
+/// hard-failing — and so a single operation can outlive one token's TTL.
+pub fn forge_refresher(raw: &RawConfig, scope: Scope) -> Arc<dyn TokenRefresher> {
+    Arc::new(ForgeTokenRefresher {
+        raw: raw.clone(),
+        scope,
+        consecutive_expired: AtomicU32::new(0),
+    })
+}
+
+struct ForgeTokenRefresher {
+    raw: RawConfig,
+    scope: Scope,
+    consecutive_expired: AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl TokenRefresher for ForgeTokenRefresher {
+    async fn refresh(&self) -> std::result::Result<TokenInfo, AuthError> {
+        // Floor of 1s between re-mints. xet serializes refresh() (it's `&mut
+        // self` on the TokenProvider), so this throttles a near-expiry or
+        // skew-driven retry from hammering the forge before the cap below trips.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let resolved = resolve(&self.raw, self.scope)
+            .await
+            .map_err(|e| AuthError::token_refresh_failure(format!("{e:#}")))?;
+        let now = now_utc();
+        if resolved.token_expiration <= now.saturating_add(REFRESH_BUFFER_SEC) {
+            let n = self.consecutive_expired.fetch_add(1, Ordering::Relaxed) + 1;
+            if n > MAX_EXPIRED_REFRESHES {
+                return Err(AuthError::token_refresh_failure(format!(
+                    "re-minted bale token is already expired (exp {} ≤ now {now}) {n}× in a row; \
+                     client and server clocks differ by more than the token TTL — sync clocks (NTP)",
+                    resolved.token_expiration,
+                )));
+            }
+        } else {
+            self.consecutive_expired.store(0, Ordering::Relaxed);
+        }
+        Ok((resolved.token, resolved.token_expiration))
+    }
 }
 
 #[derive(Deserialize)]
@@ -356,6 +415,11 @@ async fn exchange_token(
         .as_deref()
         .map(|s| s.trim_end_matches('/').to_string())
         .unwrap_or_else(|| server_url.trim_end_matches('/').to_string());
+    // `exp` is UTC unix seconds (server `tokens::mint`); xet's TokenProvider
+    // compares it to the *local* UTC clock, so client and server clocks must
+    // agree (NTP) — a skew larger than the TTL makes a fresh token look
+    // already-expired. The token is short-lived; xet calls our
+    // `ForgeTokenRefresher` ~30s before it lapses to re-mint via the forge.
     Ok(ResolvedAuth {
         server_url: resolved_url,
         token: body.access_token,
@@ -396,11 +460,25 @@ fn validate_segment(label: &str, s: &str) -> Result<()> {
     Ok(())
 }
 
-fn far_future_epoch() -> u64 {
+/// UTC seconds since the unix epoch (same basis as the server's `tokens::mint`
+/// and xet's `is_expired`).
+fn now_utc() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    now + 100 * 365 * 24 * 60 * 60
+        .unwrap_or(0)
+}
+
+/// "Effectively never expires" sentinel (now + ~100 years, UTC) for a token
+/// with no client-side refresh path: the literal `bale.token` / `BALE_TOKEN`
+/// "static service token" mode, where the user hands us a token string but no
+/// `exp` and there's no forge to re-mint from. xet's `TokenProvider` *requires*
+/// an expiry and refreshes once it lapses, so a near-term value would make it
+/// try to refresh a token it can neither refresh nor needs to. Used only when
+/// `bale.tokenExpiration` is unset — set that if your static token has a real
+/// expiry. (Forge-resolved tokens use their server `exp` + `ForgeTokenRefresher`
+/// instead and never reach here.)
+fn far_future_epoch() -> u64 {
+    now_utc() + 100 * 365 * 24 * 60 * 60
 }

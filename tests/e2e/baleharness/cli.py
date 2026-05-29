@@ -39,6 +39,7 @@ from baleharness.config import (
     E2E_REPO,
     E2E_REPO_2,
     E2E_REPO_3,
+    E2E_REPO_CHURN,
     E2E_REPO_GC1,
     E2E_REPO_GC2,
     E2E_REPO_GC3,
@@ -99,6 +100,7 @@ from baleharness.phases.scenario import (
     phase_offline_and_restart,
     phase_offline_no_network,
     phase_push_idempotency,
+    phase_repeated_churn,
     phase_spilled_clean,
     phase_usage_api,
 )
@@ -356,6 +358,7 @@ def main() -> int:
                     f"{E2E_OWNER}/{E2E_REPO_3}",
                     f"{E2E_OWNER}/{E2E_REPO_SPILL}",
                     f"{E2E_OWNER}/{E2E_REPO_OFFLINE}",
+                    f"{E2E_OWNER}/{E2E_REPO_CHURN}",
                     f"{E2E_OWNER}/{E2E_REPO_GC1}",
                     f"{E2E_OWNER}/{E2E_REPO_GC2}",
                     f"{E2E_OWNER}/{E2E_REPO_GC3}",
@@ -640,6 +643,25 @@ def main() -> int:
                 work_root=work_root,
             )
 
+        def _phase_churn() -> None:
+            # HUGE mode is opt-in and only under `--only churn`, so a normal
+            # full sweep never balloons into the stress variant. HUGE_CHURN=N
+            # targets ~N minutes of wall-clock (N must be a positive int).
+            huge_minutes = 0
+            raw = os.environ.get("HUGE_CHURN")
+            if "churn" in args.only and raw:
+                try:
+                    huge_minutes = max(0, int(raw))
+                except ValueError:
+                    die(f"HUGE_CHURN must be a non-negative integer, got {raw!r}")
+            phase_repeated_churn(
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+                huge_minutes=huge_minutes,
+            )
+
         # name -> (group, read_only, fn)
         REGISTRY: dict[str, tuple[str, bool, Callable[[], None]]] = {
             "basic": ("g1", False, _phase_basic),
@@ -704,6 +726,11 @@ def main() -> int:
             "gc-abandon-checkout": ("g3", False, _phase_gc_abandon),
             "gc-keeps-unpushed": ("g3", False, _phase_gc_keep),
             "gc-mixed": ("g3", False, _phase_gc_mixed),
+            # Sustained churn: many edit→commit→push rounds against ONE reused
+            # repo, with cold clones at several rounds that reconstruct the full
+            # accumulated history. Integrity + server health checked every push.
+            # Owns its own bare repo + commits, so g3 (not read-only).
+            "churn": ("g3", False, _phase_churn),
             # Validates the upload progress indicator: a normal sweep pushes
             # fixed variants and asserts the captured summary; `--only
             # progress-demo` instead runs the env-driven interactive visual demo.

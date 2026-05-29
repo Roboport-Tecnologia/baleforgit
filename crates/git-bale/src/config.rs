@@ -140,7 +140,10 @@ fn resolve_cache_dir(snapshot: Option<&gix::config::Snapshot<'_>>) -> Result<Pat
         .join("chunks"))
 }
 
-/// Sentinel "never expires" for tokens with no configured refresh path.
+/// "Effectively never expires" sentinel for a literal `bale.token` with no
+/// `bale.tokenExpiration` set and no forge to re-mint from. See the fuller note
+/// on `resolver::far_future_epoch`; xet needs *some* expiry and would otherwise
+/// try to refresh a static token it can't.
 fn far_future_epoch() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()

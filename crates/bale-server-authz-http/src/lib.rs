@@ -24,7 +24,9 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub const DEFAULT_TOKEN_TTL_SECS: u64 = 3600;
+/// 5 minutes (UTC unix seconds). Short on purpose: clients refresh via the
+/// forge before expiry, so a leaked token has a small blast radius.
+pub const DEFAULT_TOKEN_TTL_SECS: u64 = 300;
 
 /// Caps a hostile upstream that streams gigabytes; the real body is tiny JSON.
 const MAX_UPSTREAM_RESPONSE_BYTES: u64 = 64 * 1024;

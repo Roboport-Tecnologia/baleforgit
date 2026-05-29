@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import random
 import secrets
+from dataclasses import dataclass
 from pathlib import Path
 
 from baleharness.client import ClientEnv
@@ -11,11 +13,28 @@ from baleharness.config import (
     BIG_FILE_BYTES,
     BROWSER_DL_FILENAME,
     BROWSER_DL_JWT,
+    CHURN_CLONE_AFTER_ROUNDS,
+    CHURN_EDIT_BYTES,
+    CHURN_EXTRA_BYTES,
+    CHURN_FILE_A_BYTES,
+    CHURN_FILE_B_BYTES,
+    CHURN_ROUNDS,
     E2E_HUB_TOKEN,
+    HUGE_CHURN_ADD_PROB,
+    HUGE_CHURN_BASE_FILES,
+    HUGE_CHURN_CLONE_EVERY,
+    HUGE_CHURN_DEL_PROB,
+    HUGE_CHURN_EDIT_BYTES,
+    HUGE_CHURN_EDIT_FILES,
+    HUGE_CHURN_NEW_BYTES,
+    HUGE_CHURN_PLAIN_ADD_PROB,
+    HUGE_CHURN_ROUNDS_PER_MIN,
+    HUGE_CHURN_WALK_STRIDE,
     E2E_OWNER,
     E2E_REPO,
     E2E_REPO_2,
     E2E_REPO_3,
+    E2E_REPO_CHURN,
     E2E_REPO_GC1,
     E2E_REPO_GC2,
     E2E_REPO_GC3,
@@ -1397,13 +1416,14 @@ def phase_offline_and_restart(
             jwt_secret_hex=jwt_secret_hex,
             transfer_secret_hex=transfer_secret_hex,
             ssh_public_key=ssh_public_key,
-            # Must host the gc + spilled-clean repos too: those g3 phases run
-            # after this rebind, against the restarted server returned here.
+            # Must host the gc + spilled-clean + churn repos too: those g3
+            # phases run after this rebind, against the restarted server here.
             test_repos=[
                 f"{E2E_OWNER}/{E2E_REPO}",
                 f"{E2E_OWNER}/{E2E_REPO_2}",
                 f"{E2E_OWNER}/{E2E_REPO_3}",
                 f"{E2E_OWNER}/{E2E_REPO_SPILL}",
+                f"{E2E_OWNER}/{E2E_REPO_CHURN}",
                 f"{E2E_OWNER}/{E2E_REPO_GC1}",
                 f"{E2E_OWNER}/{E2E_REPO_GC2}",
                 f"{E2E_OWNER}/{E2E_REPO_GC3}",
@@ -1442,3 +1462,390 @@ def phase_offline_and_restart(
             label="restart:post-restart-dup",
         )
     return new_server
+
+
+@dataclass
+class _ChurnParams:
+    huge: bool
+    minutes: int  # N from HUGE_CHURN=N (the ~wall-clock-minutes target); 0 if normal
+    rounds: int
+    clone_after: tuple
+    walk_stride: int  # verify every Nth revision within a clone's walk
+    # None = walk the whole history; int = walk only the most recent N revisions
+    # (a sliding window that tiles the history → linear total time).
+    walk_window: "int | None"
+    base_files: tuple  # ((name, size), ...) created in round 0
+    # Huge-mode-only knobs (ignored when huge is False).
+    edit_files: tuple = (1, 1)  # (min, max) base files edited per round
+    edit_bytes: tuple = (0, 0)  # (min, max) region replaced per edited file
+    add_prob: float = 0.0
+    plain_add_prob: float = 0.0  # of the adds, fraction that are plain text
+    new_bytes: tuple = (0, 0)  # (min, max) size of a newly-added bale file
+    del_prob: float = 0.0
+
+
+def _churn_params(huge_minutes: int) -> _ChurnParams:
+    """`huge_minutes` is N from `HUGE_CHURN=N` (≈ minutes of wall-clock); N ≥ 1
+    selects the scaled stress run, anything else the small default run. Rounds
+    scale linearly with N and a cold clone is taken every CLONE_EVERY rounds,
+    each walking the most recent CLONE_EVERY revisions — a window that tiles the
+    full history, so coverage is complete but per-clone cost is constant."""
+    if huge_minutes >= 1:
+        rounds = HUGE_CHURN_ROUNDS_PER_MIN * huge_minutes
+        every = HUGE_CHURN_CLONE_EVERY
+        clones = sorted(set(range(every - 1, rounds, every)) | {rounds - 1})
+        return _ChurnParams(
+            huge=True,
+            minutes=huge_minutes,
+            rounds=rounds,
+            clone_after=tuple(clones),
+            walk_stride=HUGE_CHURN_WALK_STRIDE,
+            walk_window=every,
+            base_files=HUGE_CHURN_BASE_FILES,
+            edit_files=HUGE_CHURN_EDIT_FILES,
+            edit_bytes=HUGE_CHURN_EDIT_BYTES,
+            add_prob=HUGE_CHURN_ADD_PROB,
+            plain_add_prob=HUGE_CHURN_PLAIN_ADD_PROB,
+            new_bytes=HUGE_CHURN_NEW_BYTES,
+            del_prob=HUGE_CHURN_DEL_PROB,
+        )
+    return _ChurnParams(
+        huge=False,
+        minutes=0,
+        rounds=CHURN_ROUNDS,
+        clone_after=CHURN_CLONE_AFTER_ROUNDS,
+        walk_stride=1,
+        walk_window=None,
+        base_files=(("a.bin", CHURN_FILE_A_BYTES), ("b.bin", CHURN_FILE_B_BYTES)),
+    )
+
+
+def _churn_put_bale(repo: Path, files: dict, all_names: set, name: str, payload: bytes):
+    (repo / name).write_bytes(payload)
+    files[name] = (sha256_bytes(payload), len(payload))
+    all_names.add(name)
+
+
+def _churn_put_plain(repo: Path, files: dict, all_names: set, name: str, text: str):
+    (repo / name).write_text(text)
+    blob = text.encode()
+    files[name] = (sha256_bytes(blob), len(blob))
+    all_names.add(name)
+
+
+def _churn_delete(repo: Path, files: dict, name: str) -> None:
+    (repo / name).unlink()
+    del files[name]
+
+
+def _churn_mutate_normal(
+    r: int, repo: Path, files: dict, all_names: set, live: dict
+) -> None:
+    """Deterministic mutation plan: rotating region edit of a.bin every round,
+    a static b.bin, a plain notes.txt, and add (r%3) / delete (r%4) of extras."""
+    if r == 0:
+        a = deterministic_payload(CHURN_FILE_A_BYTES, seed=b"churn-a")
+        live["a.bin"] = a
+        _churn_put_bale(repo, files, all_names, "a.bin", a)
+        b = deterministic_payload(CHURN_FILE_B_BYTES, seed=b"churn-b")
+        _churn_put_bale(repo, files, all_names, "b.bin", b)
+        _churn_put_plain(repo, files, all_names, "notes.txt", f"churn round {r}\n")
+        return
+    offset = (r * CHURN_EDIT_BYTES) % (CHURN_FILE_A_BYTES - CHURN_EDIT_BYTES)
+    a = replace_region(
+        live["a.bin"],
+        offset=offset,
+        length=CHURN_EDIT_BYTES,
+        seed=f"churn-a-r{r}".encode(),
+    )
+    live["a.bin"] = a
+    _churn_put_bale(repo, files, all_names, "a.bin", a)
+    _churn_put_plain(repo, files, all_names, "notes.txt", f"churn round {r}\n")
+    if r % 3 == 0:
+        _churn_put_bale(
+            repo,
+            files,
+            all_names,
+            f"extra{r}.bin",
+            deterministic_payload(CHURN_EXTRA_BYTES, seed=f"churn-x{r}".encode()),
+        )
+    if r % 4 == 0:
+        extras = sorted(n for n in files if n.startswith("extra"))
+        if extras:
+            _churn_delete(repo, files, extras[0])
+
+
+def _churn_mutate_huge(
+    r: int,
+    params: _ChurnParams,
+    rng: random.Random,
+    repo: Path,
+    files: dict,
+    all_names: set,
+    live: dict,
+) -> None:
+    """Randomized mutation plan (seeded `rng`): each round edits a random
+    subset of the big base files at random offsets/lengths, rewrites a plain
+    text file, and probabilistically adds (bale or plain) / deletes extra
+    files. All choices flow from `rng`, so the logged seed reproduces the run.
+    Payload *bytes* stay sha-verifiable — only the structure is random."""
+    if r == 0:
+        for name, size in params.base_files:
+            payload = deterministic_payload(size, seed=f"churn-base-{name}".encode())
+            live[name] = payload
+            _churn_put_bale(repo, files, all_names, name, payload)
+        _churn_put_plain(repo, files, all_names, "notes.txt", "churn round 0\n")
+        return
+    editable = sorted(live)
+    lo, hi = params.edit_files
+    for name in rng.sample(editable, rng.randint(lo, min(hi, len(editable)))):
+        cur = live[name]
+        size = len(cur)
+        region = min(rng.randint(*params.edit_bytes), size)
+        offset = rng.randint(0, size - region) if size > region else 0
+        new = replace_region(
+            cur, offset=offset, length=region, seed=f"churn-h-{name}-r{r}".encode()
+        )
+        live[name] = new
+        _churn_put_bale(repo, files, all_names, name, new)
+    _churn_put_plain(repo, files, all_names, "notes.txt", f"churn round {r}\n")
+    if rng.random() < params.add_prob:
+        if rng.random() < params.plain_add_prob:
+            text = "".join(f"r{r} log line {i}\n" for i in range(rng.randint(50, 2000)))
+            _churn_put_plain(repo, files, all_names, f"gen{r}.log", text)
+        else:
+            size = rng.randint(*params.new_bytes)
+            _churn_put_bale(
+                repo,
+                files,
+                all_names,
+                f"gen{r}.bin",
+                deterministic_payload(size, seed=f"churn-gen-{r}".encode()),
+            )
+    if rng.random() < params.del_prob:
+        gens = sorted(n for n in files if n.startswith("gen"))
+        if gens:
+            _churn_delete(repo, files, rng.choice(gens))
+
+
+def _churn_verify_snapshot(
+    repo: Path,
+    snapshot: dict,
+    all_names: set,
+    *,
+    label: str,
+) -> None:
+    """Assert the checked-out worktree exactly matches `snapshot`
+    ({name: (sha256, size)}): every file present with the right bytes, and
+    every file that ever existed but isn't in this revision is absent."""
+    for name, (sha, size) in snapshot.items():
+        verify_worktree(
+            repo, name, expected_sha=sha, expected_size=size, label=f"{label}:{name}"
+        )
+    for name in all_names - set(snapshot):
+        if (repo / name).exists():
+            raise TestFailure(
+                f"[{label}] {name} present in worktree but not in this "
+                "revision's tree — a stale file leaked across checkouts"
+            )
+
+
+def _churn_clone_and_verify(
+    *,
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+    history: list,
+    all_names: set,
+    round_idx: int,
+    walk_stride: int = 1,
+    walk_window: "int | None" = None,
+) -> None:
+    """Cold-clone the churn repo as it stands after `round_idx`, then walk a
+    span of the revision history verifying each one reconstructs byte-for-byte.
+    A fresh cache dir forces every smudge through the cold
+    `/v1/reconstructions/` path against the reused server state.
+
+    `walk_window` bounds the span to the most recent N revisions (huge mode);
+    None walks the whole history (default mode). With clones placed every
+    `walk_window` rounds the windows tile, so every revision is still
+    cold-verified exactly once while each walk stays constant-cost."""
+    head = history[round_idx]
+    clone_path, env, _cache = init_repo_for_clone(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_CHURN,
+        name=f"churnclone-r{round_idx}",
+    )
+    head_bytes = sum(size for _sha, size in head["snapshot"].values())
+    with timings.measure(
+        f"churn: clone after round {round_idx} (cold HEAD)", bytes_moved=head_bytes
+    ):
+        git(["checkout", "main"], cwd=clone_path, env=env)
+    _churn_verify_snapshot(
+        clone_path,
+        head["snapshot"],
+        all_names,
+        label=f"churn:clone-r{round_idx}:HEAD",
+    )
+    # `git checkout <oid>` only re-smudges paths that differ from the current
+    # tree, so each step reconstructs just the delta against the accumulating
+    # server state.
+    start = 0 if walk_window is None else max(0, round_idx - walk_window + 1)
+    revs = sorted(set(range(start, round_idx + 1, walk_stride)) | {round_idx})
+    note = ""
+    if start > 0 or walk_stride > 1:
+        note = f" (revs {start}..{round_idx}, {len(revs)} of {round_idx + 1})"
+    with timings.measure(f"churn: clone-r{round_idx} walk {len(revs)} revisions"):
+        for ri in revs:
+            entry = history[ri]
+            git(["checkout", entry["commit"]], cwd=clone_path, env=env)
+            _churn_verify_snapshot(
+                clone_path,
+                entry["snapshot"],
+                all_names,
+                label=f"churn:clone-r{round_idx}:rev{ri}",
+            )
+        git(["checkout", "main"], cwd=clone_path, env=env)
+    info(f"  churn: clone after round {round_idx} verified {len(revs)} revs{note}")
+
+
+def phase_repeated_churn(
+    *,
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+    huge_minutes: int = 0,
+) -> None:
+    """Sustained churn against ONE reused repo: many rounds of
+    edit→commit→push, with cold clones taken at several different points that
+    each reconstruct the accumulated history byte-for-byte.
+
+    This is the regression guard for the "data got corrupted and the server
+    crashed after the Nth push" class of bug. Integrity is checked at every
+    step: the staged pointer after each `git add`, the committed pointer after
+    each commit, the server's `/healthz` after each push (a crash takes the
+    container down under `--rm`, so the probe goes false), the monotonic
+    server disk total, the post-push worktree, and a cold-clone history walk
+    at the clone rounds.
+
+    `huge_minutes >= 1` (opt-in via `HUGE_CHURN=N ... --only churn`) scales this
+    into a randomized stress run of roughly N minutes: rounds scale linearly
+    with N, several big base files are edited in random subsets, extra files
+    are randomly added/deleted, and a cold clone every CLONE_EVERY rounds
+    window-walks the history. The RNG seed is logged (override via
+    `HUGE_CHURN_SEED`)."""
+    params = _churn_params(huge_minutes)
+    rng: random.Random | None = None
+    if params.huge:
+        seed = int(os.environ.get("HUGE_CHURN_SEED") or secrets.randbits(64))
+        rng = random.Random(seed)
+        base_total = sum(s for _n, s in params.base_files)
+        info(
+            f"churn: HUGE ×{params.minutes} (~{params.minutes} min target) — "
+            f"{params.rounds} rounds, {len(params.base_files)} base files "
+            f"({fmt_bytes(base_total)}), cold clone every {params.walk_window} "
+            f"rounds, seed {seed} (set HUGE_CHURN_SEED to reproduce)"
+        )
+
+    repo, env = init_repo_for_push(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_CHURN,
+        name="churn",
+    )
+
+    # Logical worktree model, mutated round by round. {name: (sha256, size)}.
+    files: dict[str, tuple[str, int]] = {}
+    all_names: set[str] = set()
+    # Per-round: {"commit": oid, "snapshot": {name: (sha, size)}}.
+    history: list[dict] = []
+    # Current bytes of every repeatedly-edited bale file (region edits chain).
+    live: dict[str, bytes] = {}
+    prev_disk = server.disk_total_bytes()
+
+    for r in range(params.rounds):
+        if params.huge:
+            _churn_mutate_huge(r, params, rng, repo, files, all_names, live)
+        else:
+            _churn_mutate_normal(r, repo, files, all_names, live)
+
+        with timings.measure(f"churn r{r}: stage"):
+            git(["add", "-A"], cwd=repo, env=env)
+        # Every bale file's staged pointer must match the bytes we just wrote.
+        for name, (sha, size) in files.items():
+            if name.endswith(".bin"):
+                verify_pointer_at(
+                    repo,
+                    env,
+                    spec=f":{name}",
+                    expected_sha=sha,
+                    expected_size=size,
+                    label=f"churn-r{r}:staged:{name}",
+                )
+
+        git(["commit", "-m", f"churn round {r}"], cwd=repo, env=env)
+        for name, (sha, size) in files.items():
+            if name.endswith(".bin"):
+                verify_pointer_at(
+                    repo,
+                    env,
+                    spec=f"HEAD:{name}",
+                    expected_sha=sha,
+                    expected_size=size,
+                    label=f"churn-r{r}:committed:{name}",
+                )
+
+        round_bytes = sum(size for _sha, size in files.values())
+        with timings.measure(f"churn r{r}: push", bytes_moved=round_bytes):
+            git(["push", "origin", "main"], cwd=repo, env=env)
+        if staging_files(repo):
+            raise TestFailure(f"churn r{r}: staging not drained after push")
+        # The crash guard: a push that took the server down fails this probe.
+        if not server.is_healthy():
+            raise TestFailure(
+                f"churn r{r}: server unhealthy after push — the push appears to "
+                f"have crashed it\n--- container logs ---\n{server.logs()}"
+            )
+        disk = server.disk_total_bytes()
+        if disk + SIZE_TOLERANCE_BYTES < prev_disk:
+            raise TestFailure(
+                f"churn r{r}: server disk shrank {fmt_bytes(prev_disk)} → "
+                f"{fmt_bytes(disk)} across a push — CAS content went missing"
+            )
+        prev_disk = disk
+        # Worktree must still hold the just-pushed bytes (push mustn't disturb it).
+        for name, (sha, size) in files.items():
+            verify_worktree(
+                repo,
+                name,
+                expected_sha=sha,
+                expected_size=size,
+                label=f"churn-r{r}:worktree-after-push:{name}",
+            )
+
+        history.append({"commit": _head_oid(repo, env), "snapshot": dict(files)})
+        info(f"  churn round {r}: pushed {len(files)} files, disk {fmt_bytes(disk)}")
+
+        if r in params.clone_after:
+            _churn_clone_and_verify(
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+                history=history,
+                all_names=all_names,
+                round_idx=r,
+                walk_stride=params.walk_stride,
+                walk_window=params.walk_window,
+            )
+
+
+def _head_oid(repo: Path, env: dict) -> str:
+    return git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()

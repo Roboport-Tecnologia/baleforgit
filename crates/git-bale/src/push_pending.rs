@@ -60,7 +60,7 @@ pub fn run() -> Result<()> {
     let online_cfg = default_config(
         auth.server_url.trim_end_matches('/').to_string(),
         Some((auth.token.clone(), auth.token_expiration)),
-        None,
+        Some(resolver::forge_refresher(&raw, resolver::Scope::Write)),
         None,
     )
     .context("building online TranslatorConfig for push-pending")?;
@@ -114,12 +114,19 @@ pub fn run() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-    // Clear the progress line before surfacing any error or cleanup warning.
-    progress.finish();
-
-    result
-        .map_err(|e| anyhow!("xet runtime error during push-pending: {e:?}"))?
-        .map_err(|e| explain_dedup_cache_mismatch(e, &server_url))?;
+    let outcome = result
+        .map_err(|e| anyhow!("xet runtime error during push-pending: {e:?}"))
+        .and_then(|inner| inner.map_err(|e| explain_dedup_cache_mismatch(e, &server_url)));
+    // finish() prints the persistent "…done." summary, so only on success; on
+    // error the Drop impl clears the live line instead of leaving a misleading
+    // 100% sitting above the actual failure.
+    match outcome {
+        Ok(()) => progress.finish(),
+        Err(e) => {
+            drop(progress);
+            return Err(e);
+        }
+    }
 
     // Server now holds the reconstruction info; safe to drop staging.
     if let Err(e) = clear_file_markers(&git_dir) {
