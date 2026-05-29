@@ -48,7 +48,6 @@ from typing import Optional
 
 HERE = Path(__file__).resolve().parent
 RUN_PY = HERE / "run.py"
-RUN_S3_PY = HERE / "run_s3.py"
 
 
 @dataclass
@@ -146,20 +145,21 @@ def main() -> int:
     parser.add_argument(
         "--s3",
         action="store_true",
-        help="Run the S3 suite (run_s3.py) instead of the fs suite. The "
-        "S3 suite has no concept of ordering or preserved state, so "
-        "the matrix collapses to a single invocation.",
+        help="Run the whole suite on the S3 backend (`run.py --backend s3`) "
+        "instead of the fs suite. The S3 run tears its bucket down at the "
+        "end, so the preserved-state permutations don't apply; the matrix "
+        "collapses to a single forward, clean-slate invocation.",
     )
     args = parser.parse_args()
 
     if args.s3:
-        # The S3 runner has 4 isolated phases; no --order/--state-dir/
-        # --reuse-from to vary. Run it once and surface the result.
-        _info("S3 mode: running run_s3.py once (no matrix permutations apply)")
+        # --backend s3 can't --reuse-from (the bucket is torn down per run),
+        # so the ordering/preserved-state permutations collapse to one run.
+        _info("S3 mode: running `run.py --backend s3` once (no permutations apply)")
         r = _invoke(
-            label="s3 suite",
-            extra_args=[],
-            runner=RUN_S3_PY,
+            label="s3 suite (full)",
+            extra_args=["--backend", "s3"],
+            runner=RUN_PY,
             stream=not args.quiet,
             output_file=None,
         )

@@ -10,14 +10,15 @@ from pathlib import Path
 from typing import Optional
 
 from baleharness.client import ClientEnv
-from baleharness.config import E2E_OWNER, E2E_REPO
+from baleharness.config import BIG_FILE_BYTES, E2E_OWNER, E2E_REPO
 from baleharness.gitutil import git, verify_pointer_at, verify_worktree
-from baleharness.logutil import TestFailure, info
+from baleharness.logutil import TestFailure, fmt_bytes, info
 from baleharness.mocks import TcpProxy, hold_db_writer_lock
 from baleharness.payloads import deterministic_payload
 from baleharness.proc import pick_free_port, sha256_bytes
 from baleharness.repo import init_repo_for_clone, init_repo_for_push
 from baleharness.runtime import Runtime
+from baleharness.s3backend import S3_PROXY_THROTTLE_BPS, get_active_s3_backend
 from baleharness.server import ServerHandle, start_container
 from baleharness.storage import staging_files
 from baleharness.timing import Timings
@@ -515,4 +516,180 @@ def phase_failure_transient_db(
             label="failure-dbbusy:after-clone",
         )
     finally:
+        server.stop()
+
+
+def phase_failure_s3_conndrop(
+    *,
+    timings: Timings,
+    rt: Runtime,
+    image_tag: str,
+    work_root: Path,
+    client: ClientEnv,
+    ssh_public_key: str,
+    admin_token_hex: str,
+) -> None:
+    """Drop the server↔MinIO TCP connection mid-PUT — the one failure mode the
+    rest of the suite can't reach. The fs `failure-conndrop` severs
+    client↔server; this severs server↔storage, which only exists when the
+    blob store is remote. S3-only: cleanly skips under the fs backend.
+
+    A host-side TcpProxy sits between the server (in its container) and MinIO.
+    The server reaches the proxy at the host's primary IP (BALE_S3_ENDPOINT_URL
+    override, which wins over the backend's auto-injected endpoint); the proxy
+    forwards to MinIO on the host loopback. `proxy.kill()` slams every socket
+    without FIN — a sudden upstream drop from the AWS SDK's view. The SDK
+    retries transient connection errors, so we hold the link down ~3s and bring
+    it back: the test tolerates both "SDK swallowed the drop" and "SDK gave up,
+    client retries". Either way the file must reconstruct from MinIO afterward
+    and the bucket must hold one copy."""
+    backend = get_active_s3_backend()
+    if backend is None:
+        info("-- failure-s3-conndrop: server↔storage drop is S3-only; skipping")
+        return
+    minio = backend.minio
+
+    phase_root = work_root / "failure-s3-conndrop"
+    phase_root.mkdir()
+    data_root = phase_root / "data"
+    data_root.mkdir()
+    jwt_secret = secrets.token_bytes(32).hex()
+    transfer_secret = secrets.token_bytes(32).hex()
+
+    proxy_port = pick_free_port()
+    # bind 0.0.0.0 so the server container reaches the proxy via the host's
+    # primary IP (routed over the bridge); throttle so a 35 MiB upload can't
+    # finish before the kill lands.
+    proxy = TcpProxy(
+        listen_port=proxy_port,
+        upstream_host="127.0.0.1",
+        upstream_port=minio.host_port,
+        throttle_bytes_per_sec=S3_PROXY_THROTTLE_BPS,
+        bind_host="0.0.0.0",
+    )
+    proxy.start()
+    proxy_url = f"http://{minio.host_ip}:{proxy_port}"
+    info(f"  server→S3 proxy URL: {proxy_url}")
+
+    # The active backend makes start_container auto-wire BALE_S3_* + network;
+    # the endpoint override points S3 writes at the proxy instead of MinIO
+    # directly. disk_*_bytes still reads the bucket directly (not via proxy).
+    server = start_container(
+        rt,
+        image_tag=image_tag,
+        data_root=data_root,
+        jwt_secret_hex=jwt_secret,
+        transfer_secret_hex=transfer_secret,
+        ssh_public_key=ssh_public_key,
+        test_repos=[f"{E2E_OWNER}/{E2E_REPO}"],
+        admin_token_hex=admin_token_hex,
+        name_suffix="s3-conndrop",
+        extra_env={"BALE_S3_ENDPOINT_URL": proxy_url},
+    )
+    try:
+        repo, env = init_repo_for_push(
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO,
+            name="s3-conndrop-client",
+        )
+        # Fast-fail xet so a server error (cascading from the dropped S3
+        # connection) doesn't burn 30s of retries before the push exits.
+        env = fail_fast_xet_env(env)
+        payload = deterministic_payload(BIG_FILE_BYTES, seed=b"s3-conndrop")
+        payload_sha = sha256_bytes(payload)
+        (repo / "s3drop.bin").write_bytes(payload)
+        with timings.measure(
+            "failure-s3-conndrop: stage + commit", bytes_moved=BIG_FILE_BYTES
+        ):
+            git(["add", "s3drop.bin"], cwd=repo, env=env)
+            git(["commit", "-m", "s3 mid-upload drop"], cwd=repo, env=env)
+
+        with timings.measure("failure-s3-conndrop: push then drop"):
+            proc = _start_push_background(repo, env)
+            try:
+                # Wait until the proxy is forwarding — proves the server is
+                # mid-PUT to MinIO, not still parsing the request.
+                deadline = time.monotonic() + 30.0
+                while time.monotonic() < deadline:
+                    if proxy.bytes_forwarded >= 64 * 1024:
+                        break
+                    time.sleep(0.05)
+                if proxy.bytes_forwarded < 64 * 1024:
+                    raise TestFailure(
+                        f"failure-s3-conndrop: proxy never forwarded ≥64 KiB "
+                        f"within 30s (seen {proxy.bytes_forwarded}) — the server "
+                        "may not be using the BALE_S3_ENDPOINT_URL override"
+                    )
+            except TestFailure:
+                proc.kill()
+                proc.wait(timeout=2.0)
+                raise
+
+            info("  dropping server→MinIO connections via proxy.kill()")
+            proxy.kill()
+            # Hold the link down long enough that aws-sdk-s3's standard retry
+            # policy exhausts before the proxy returns — otherwise the SDK
+            # swallows the drop and the failure path isn't exercised.
+            time.sleep(3.0)
+            proxy.start()
+            info("  proxy restarted; awaiting push exit")
+            rc = _wait_push(proc, timeout_s=120.0)
+            push_succeeded_first_try = rc == 0
+
+        if push_succeeded_first_try:
+            info("  push survived the drop via aws-sdk-s3 retries")
+        else:
+            info("  push failed mid-drop; retrying (proxy is back up)")
+            if not staging_files(repo):
+                raise TestFailure(
+                    "failure-s3-conndrop: staging dir empty after failed push — "
+                    "client lost its pending xorbs"
+                )
+            with timings.measure(
+                "failure-s3-conndrop: retry push", bytes_moved=BIG_FILE_BYTES
+            ):
+                git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+            if staging_files(repo):
+                raise TestFailure(
+                    "failure-s3-conndrop: staging dir not drained after retry"
+                )
+
+        # Cold clone proves the file genuinely lives in MinIO and reconstructs
+        # (the presigned download traffic doesn't go through the dropped proxy).
+        with timings.measure(
+            "failure-s3-conndrop: cold clone after recovery",
+            bytes_moved=BIG_FILE_BYTES,
+        ):
+            clone_path, clone_env, _ = init_repo_for_clone(
+                work_root=work_root,
+                client=client,
+                server=server,
+                owner=E2E_OWNER,
+                repo=E2E_REPO,
+                name="s3-conndrop-clone",
+            )
+            git(["checkout", "main"], cwd=clone_path, env=clone_env)
+        verify_worktree(
+            clone_path,
+            "s3drop.bin",
+            expected_sha=payload_sha,
+            expected_size=BIG_FILE_BYTES,
+            label="failure-s3-conndrop:after-recovery-clone",
+        )
+
+        # No double-counting: a retry that re-uploaded should still leave ~one
+        # copy in the bucket, not two.
+        stored = server.disk_xorb_bytes()
+        if stored > BIG_FILE_BYTES * 3 // 2:
+            raise TestFailure(
+                f"failure-s3-conndrop: stored xorb bytes {fmt_bytes(stored)} "
+                f"exceeds 1.5× payload ({fmt_bytes(BIG_FILE_BYTES)}) — retry may "
+                "have double-written"
+            )
+        info(f"  failure-s3-conndrop: final stored xorb bytes = {fmt_bytes(stored)}")
+    finally:
+        proxy.kill()
         server.stop()

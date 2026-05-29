@@ -11,8 +11,8 @@ verified against the on-disk numbers and the `/v1/usage` API.
 **Not run by `cargo test`.** Invoke it directly:
 
 ```bash
-python3 tests/e2e/run.py        # filesystem blob store (the default)
-python3 tests/e2e/run_s3.py     # S3 blob store via a MinIO sidecar
+python3 tests/e2e/run.py                # filesystem blob store (the default)
+python3 tests/e2e/run.py --backend s3   # the WHOLE suite against an S3 (MinIO) blob store
 ```
 
 ## Prereqs
@@ -63,6 +63,7 @@ found" error until that's fixed; the harness logic itself is portable.
 | `failure-kill`     | Server is SIGKILL'd mid-upload; restart on the same data dir and a retry `git push` recovers cleanly. |
 | `failure-conndrop` | A TCP proxy in front of the CAS port is killed mid-upload (server stays up); retry succeeds.        |
 | `failure-dbbusy`   | A sidecar `sqlite3` shell holds an IMMEDIATE write lock on `meta.db`; the user-side push still succeeds because sqlx's busy_timeout waits the lock out. |
+| `failure-s3-conndrop` | **S3-only** (self-skips on fs): the server↔MinIO TCP link is dropped mid-PUT via a host-side `TcpProxy`; the AWS SDK's retries and/or a client retry on the recovered link converge, and the file reconstructs from the bucket with one copy stored. |
 | `gc-abandon-checkout` | `git-bale gc`: push a baseline, stage a change, abandon it (`git reset` + `git checkout`); the post-checkout hook's gc fully wipes the orphaned staging. The user-reported bug. |
 | `gc-keeps-unpushed`   | DATA-LOSS GUARD: two stacked *unpushed* commits (tip names only v2); manual `git-bale gc` must NOT drop v1's staging. Push + cold-clone then reconstructs every revision byte-for-byte. |
 | `gc-mixed`            | Committed-but-unpushed v1 survives while a staged-then-abandoned (never-committed) v2 is forgotten; v1 stays pushable + reconstructable end to end. |
@@ -71,28 +72,45 @@ found" error until that's fixed; the harness logic itself is portable.
 | `spilled-clean`       | Caps `BALE_MAX_INLINE_CLEAN` at 1 MiB so a 5 MiB `git add` drives the clean filter's spill-to-tmpfile path; an unstage + re-add hits the file-backed clean-cache verify, then push + cold/hot resmudge round-trips the spilled file. |
 | `global-dedup-shard`  | The server's `GET /v1/chunks` dedup shard must ingest without crashing the upload session. Seeds a repo, fetches the dedup shard for a known chunk straight from the endpoint and asserts its footer is well-formed (lookup offsets == `footer_offset`, never 0), then plants that shard into the client's xet `shard-cache/` and pushes again — the second push's `FileUploadSession` scans + ingests it via `read_all_truncated_hashes`, the path that underflowed (debug panic / release OOM) when `file_lookup_offset` was 0. Deterministic: doesn't rely on the 1/1024 global-dedup chunk sampling, which the release binary can't lower. |
 
-### S3 mode (`run_s3.py`)
+### Running the whole suite on S3
 
-Brings up a MinIO sidecar (`quay.io/minio/minio`, ~120 MB on first pull)
-on a per-run podman network, then runs four phases against a server that
-uses MinIO as its `BlobStore` instead of the local filesystem.
+```bash
+python3 tests/e2e/run.py --backend s3
+```
 
-| Phase                  | What it verifies                                                                                       |
-|------------------------|--------------------------------------------------------------------------------------------------------|
-| `s3-basic`             | Push + cold-clone roundtrip against S3 storage; bucket actually receives xorbs (no silent fs fallback).|
-| `s3-dedup`             | CDC chunk-level dedup against MinIO object counts; a duplicate file adds ≤ 4 KiB of bucket bytes.      |
-| `s3-failure-kill`      | Server is killed while mid-PUT to MinIO; restart + retry converges via content-addressed idempotency.  |
-| `s3-failure-conndrop`  | Server↔MinIO TCP connection dropped mid-PUT via a host-side `TcpProxy`; retry on the recovered link succeeds. |
+`--backend s3` brings up a MinIO sidecar (`quay.io/minio/minio`, ~120 MB on
+first pull) on a per-run podman network, then runs the **entire phase
+registry** (every phase in the table above) against a server that uses MinIO
+as its `BlobStore` instead of the local filesystem — the same flows, the same
+assertions, just a different backend. It composes with `--skip` / `--only` /
+`--order`.
 
-Each phase writes under its own `BALE_S3_PREFIX` so they share one
-bucket without cross-contamination. The S3-conndrop phase requires
-podman 4+ (or docker with the equivalent) because it relies on
-`host.containers.internal` to make the host-side proxy reachable from
-inside the server container; older runtimes will error out at server
-start.
+How it works: a process-global backend (set once in `cli.main`, mirroring the
+coverage-mode global) makes `start_container` auto-inject the `BALE_S3_*` env +
+shared-network args for *every* container it launches. Each server is scoped to
+its own bucket prefix derived from its `data_root` — stable across a restart on
+the same dir (so `failure-kill` / `offline-restart` land on the same subtree)
+and distinct across phases (the bucket-level analogue of the fs suite's
+per-phase data dirs). `ServerHandle.disk_*_bytes()` answers from `mc ls` against
+that prefix instead of the local `data_root/xorbs` tree, so the storage-accounting
+assertions (`bigfile` growth, `usage`-vs-disk, `dedup`, quota, churn monotonicity)
+work unchanged; `tampered-xorb` corrupts a bucket object instead of an on-disk
+file. The fs failure phases already cover the S3 failure scenarios end to end
+(SIGKILL mid-upload, client↔server drop, busy DB) since meta.db and the staging
+retry path are backend-agnostic.
+
+The one S3 scenario with no fs analogue — a **server↔MinIO** TCP drop mid-PUT
+(distinct from `failure-conndrop`'s client↔server drop) — is its own phase,
+`failure-s3-conndrop`. It self-skips under the fs backend and runs only under
+`--backend s3`.
 
 A timing summary (per-phase wallclock + throughput on the
 bytes-relevant phases) prints at the end of every run.
+
+> Note: a small `s3lib.py` survives with two phases (`phase_s3_basic`,
+> `phase_s3_dedup`) that **coverage mode** runs against the instrumented image
+> to light up `bale-server-storage-s3` in the report. It has no standalone
+> entry point — the whole suite on S3 is `run.py --backend s3`.
 
 ## Flags
 
@@ -116,6 +134,14 @@ python3 tests/e2e/run.py [--git-bale PATH] [--image-tag TAG] [--no-build]
   unknown phase name errors out. Composes with `--skip` (a phase named in
   both is skipped). Note phases needing earlier state still auto-skip:
   `--only usage` runs nothing because `bigfile` didn't populate `rev_state`.
+- `--backend {fs,s3}` — blob store backend for **every** server in the run.
+  `fs` (default) is the in-container local data dir. `s3` brings up a MinIO
+  sidecar on a per-run podman network and runs the *whole* phase registry
+  against it — each server (the shared one and every per-phase one) is scoped
+  to its own bucket prefix derived from its `data_root`, the bucket-level
+  analogue of the fs suite's per-phase data dirs. Mutually exclusive with
+  `--coverage` and `--reuse-from` (the bucket is torn down at end of run).
+  See [Running the whole suite on S3](#running-the-whole-suite-on-s3) below.
 - `--coverage` — see [Coverage mode](#coverage-mode) below.
 - `--coverage-dir PATH` — override the coverage output directory
   (implies `--coverage`). Defaults to `<repo>/target/coverage-e2e/`.
@@ -233,8 +259,8 @@ covers every pluggable trait impl:
   resolution, which are no-ops whenever the OTLP env is unset.
 
 Coverage mode **auto-skips** phases that SIGKILL the server (`failure-
-kill`, `failure-conndrop`, `failure-dbbusy`, and the s3 equivalents) —
-LLVM's atexit hook can't flush profraws on SIGKILL.
+kill`, `failure-conndrop`, `failure-dbbusy`) — LLVM's atexit hook can't
+flush profraws on SIGKILL.
 
 Requires `llvm-profdata` and `llvm-cov` from the `llvm-tools-preview`
 component (install with `rustup component add llvm-tools-preview`).
@@ -262,12 +288,12 @@ testing and coverage measurement stay separate.
 | `Dockerfile`               | Multi-stage build of the bundled `baleforgit-server` + `sshd` image.   |
 | `entrypoint.sh`            | Generates ssh host keys + authorized_keys + bare repos + the fake     |
 |                            | `git-bale-authenticate` script, starts sshd, execs `baleforgit-server`. Also pass-through for `BALE_S3_*` env vars when set. |
-| `run.py`                   | Thin fs-mode entry point: runs `baleharness.cli.main` and re-exports the names `s3lib.py` / `run_s3.py` import via `from run import …`. |
-| `baleharness/`             | The harness itself, split into focused modules (see below). `cli.py` owns the phase registry + `main()`; `phases/` holds one module per phase category (`scenario`, `mount`, `adversarial`, `failure`, `coverage_phases`, `gc`, `progress`). |
+| `run.py`                   | Entry point: runs `baleharness.cli.main` (the fs *and* `--backend s3` suites) and re-exports the names `s3lib.py` imports via `from run import …`. |
+| `baleharness/`             | The harness itself, split into focused modules (see below). `cli.py` owns the phase registry + `main()` + the `--backend` flag; `phases/` holds one module per phase category (`scenario`, `mount`, `adversarial`, `failure`, `coverage_phases`, `gc`, `progress`). |
+| `baleharness/s3backend.py` | `MinioGuard`, `Network`, `S3StorageView`, the `BALE_S3_*` env/run-arg helpers, the `data_root`→prefix derivation, and the process-global "active S3 backend" that makes `start_container` S3-aware under `--backend s3`. Importable without `run`, so `server.py` uses it without a cycle. |
 | `run_legacy.py`            | Frozen copy of the pre-split monolithic `run.py`, kept only to validate the refactor against. Delete once parity is confirmed. |
-| `run_s3.py`                | The S3-mode harness (MinIO sidecar; 4 phases).                         |
-| `s3lib.py`                 | `MinioGuard`, `Network`, `S3StorageView`, and the 4 S3 phase functions.|
-| `run_matrix.py`            | Multi-run driver for `run.py`. Pass `--s3` to invoke `run_s3.py` once. |
+| `s3lib.py`                 | Two S3 phases (`phase_s3_basic`, `phase_s3_dedup`) that coverage mode runs against the instrumented image; re-exports the infra from `baleharness.s3backend`. No standalone entry point — the whole suite on S3 is `run.py --backend s3`. |
+| `run_matrix.py`            | Multi-run driver for `run.py`. Pass `--s3` to run the whole suite on the S3 backend. |
 | `README.md`                | This file.                                                             |
 
 ## Reproducibility

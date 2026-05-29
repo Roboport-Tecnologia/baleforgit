@@ -71,6 +71,7 @@ from baleharness.phases.coverage_phases import (
 from baleharness.phases.dedup_shard import phase_global_dedup_shard
 from baleharness.phases.failure import (
     phase_failure_connection_drop_mid_upload,
+    phase_failure_s3_conndrop,
     phase_failure_server_kill_mid_upload,
     phase_failure_transient_db,
 )
@@ -108,6 +109,12 @@ from baleharness.phases.track import phase_track
 from baleharness.proc import pick_free_port, tool_on_path
 from baleharness.registry import PHASE_GROUPS_ORDER, order_within_group
 from baleharness.runtime import build_image, detect_runtime, image_exists
+from baleharness.s3backend import (
+    ActiveS3Backend,
+    MinioGuard,
+    Network,
+    set_active_s3_backend,
+)
 from baleharness.server import ServerHandle, start_container
 from baleharness.state import STATE_FILE, load_state, save_state
 from baleharness.timing import Timings
@@ -184,6 +191,16 @@ def main() -> int:
         "phases are eligible to run in this mode.",
     )
     parser.add_argument(
+        "--backend",
+        choices=["fs", "s3"],
+        default="fs",
+        help="Blob store backend for every server in the run. 'fs' (default) "
+        "uses the container's local data dir; 's3' brings up a MinIO sidecar "
+        "on a per-run podman network and runs the WHOLE phase registry against "
+        "it (each server scoped to its own bucket prefix). Mutually exclusive "
+        "with --coverage and --reuse-from.",
+    )
+    parser.add_argument(
         "--coverage",
         action="store_true",
         help="Build instrumented binaries (-C instrument-coverage) for both "
@@ -204,6 +221,17 @@ def main() -> int:
 
     if args.reuse_from and args.state_dir:
         die("--reuse-from and --state-dir are mutually exclusive")
+
+    if args.backend == "s3":
+        # Coverage runs its own MinIO sidecar for the bespoke s3-* phases;
+        # reuse-from would need bucket state we tear down at end of run.
+        if args.coverage:
+            die("--backend s3 and --coverage are mutually exclusive")
+        if args.reuse_from:
+            die(
+                "--backend s3 can't --reuse-from: the MinIO bucket is torn "
+                "down at end of run, so its xorbs aren't there to reuse."
+            )
 
     info(f"platform: {platform.system()} {platform.release()} ({platform.machine()})")
     info(f"repo root: {REPO_ROOT}")
@@ -332,6 +360,8 @@ def main() -> int:
     timings = Timings()
     server: Optional[ServerHandle] = None
     client: Optional[ClientEnv] = None
+    s3_network: Optional[Network] = None
+    s3_minio: Optional[MinioGuard] = None
     exit_code = 0
     rev_state: dict = {}
     if reused is not None:
@@ -342,6 +372,22 @@ def main() -> int:
     try:
         client = setup_client(work_root=work_root, git_bale_bin=git_bale_bin)
         ssh_public_key = client.ssh_pub.read_text().strip()
+        # S3 mode: bring up the shared network + MinIO sidecar BEFORE any
+        # container, then arm the process-global backend so every
+        # start_container call (the shared one and each phase's) auto-wires
+        # itself to MinIO under its own bucket prefix. tmpdir is the prefix
+        # anchor — every server's data_root sits under it.
+        if args.backend == "s3":
+            info("storage backend: S3 (MinIO sidecar)")
+            with timings.measure("setup: podman network"):
+                s3_network = Network.create(rt)
+            with timings.measure("setup: minio sidecar"):
+                s3_minio = MinioGuard.start(rt, s3_network)
+            set_active_s3_backend(
+                ActiveS3Backend(
+                    minio=s3_minio, network=s3_network, prefix_anchor=tmpdir
+                )
+            )
         cas_port = pick_free_port()
         ssh_port = pick_free_port()
         with timings.measure("setup: container start"):
@@ -583,6 +629,17 @@ def main() -> int:
                 admin_token_hex=admin_token_hex,
             )
 
+        def _phase_failure_s3_conndrop() -> None:
+            phase_failure_s3_conndrop(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+
         def _phase_progress_demo() -> None:
             phase_progress_demo(
                 timings=timings,
@@ -712,6 +769,9 @@ def main() -> int:
             "failure-kill": ("g3", False, _phase_failure_kill),
             "failure-conndrop": ("g3", False, _phase_failure_conndrop),
             "failure-dbbusy": ("g3", False, _phase_failure_dbbusy),
+            # Server↔storage drop — only meaningful with a remote blob store,
+            # so it self-skips under the fs backend and runs only on --backend s3.
+            "failure-s3-conndrop": ("g3", False, _phase_failure_s3_conndrop),
             # Disaster recovery: wipe the server CAS, then re-add + force-push
             # to repopulate it. Owns its own isolated container + data dir, so
             # the wipe doesn't touch earlier phases' shared-server state.
@@ -866,6 +926,13 @@ def main() -> int:
         # deliberately do NOT do a blanket `rm -f` on every container
         # matching CONTAINER_NAME_PREFIX — that would clobber concurrent
         # runs sharing the host (CI matrices, two devs on the same box).
+        # S3 teardown comes after every server (shared + per-phase) is down,
+        # since a live container attached to the network blocks its removal.
+        set_active_s3_backend(None)
+        if s3_minio is not None:
+            s3_minio.stop()
+        if s3_network is not None:
+            s3_network.destroy()
         timings.print_report()
         if cov is not None:
             # Best-effort: don't let a broken llvm install mask phase results.

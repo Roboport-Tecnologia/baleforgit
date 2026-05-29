@@ -4,11 +4,12 @@
 Thin entry point. The harness itself lives in the `baleharness` package
 (sliced out of the former monolithic run.py so it can keep growing); this
 module just runs it and re-exports the handful of names that `s3lib.py`
-and `run_s3.py` pull in via `from run import ...`.
+pulls in via `from run import ...`.
 
 Not invoked by `cargo test` — run it directly:
 
-    python3 tests/e2e/run.py
+    python3 tests/e2e/run.py              # filesystem blob store
+    python3 tests/e2e/run.py --backend s3 # the whole suite against MinIO
 
 See `tests/e2e/README.md` for prereqs and flags.
 """
@@ -19,8 +20,8 @@ import sys
 
 from baleharness.cli import main
 
-# Backwards-compat re-exports. `s3lib.py` / `run_s3.py` do `from run import …`;
-# keep those names resolvable from this module after the package split.
+# Backwards-compat re-exports. `s3lib.py` does `from run import …`; keep those
+# names resolvable from this module after the package split.
 from baleharness.client import ClientEnv, setup_client  # noqa: F401
 from baleharness.config import (  # noqa: F401
     BIG_FILE_BYTES,

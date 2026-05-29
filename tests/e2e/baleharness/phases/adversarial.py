@@ -6,7 +6,7 @@ import os
 import secrets
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Callable
 
 from baleharness.client import ClientEnv
 from baleharness.config import (
@@ -116,6 +116,14 @@ def phase_adversarial_wrong_token(
     )
 
 
+def _fs_writer(path: Path) -> Callable[[bytes], None]:
+    return lambda data: path.write_bytes(data)
+
+
+def _s3_writer(minio, key: str) -> Callable[[bytes], None]:
+    return lambda data: minio.put_object(key, data)
+
+
 def phase_adversarial_tampered_xorb(
     *,
     timings: Timings,
@@ -124,27 +132,56 @@ def phase_adversarial_tampered_xorb(
     work_root: Path,
     rev_state: dict,
 ) -> None:
-    """Corrupt one xorb on disk (we own the bind-mounted data dir), then
-    cold-clone in a fresh worktree. The smudge must NOT silently produce
-    wrong bytes — it must either error or produce content whose sha256 the
-    test detects as wrong."""
-    xorbs_dir = server.data_root / "xorbs"
-    victim: Optional[Path] = None
-    for cur, _dirs, files in os.walk(xorbs_dir):
-        for f in files:
-            victim = Path(cur) / f
-            break
-        if victim is not None:
-            break
-    if victim is None:
-        raise TestFailure("no xorb on disk to tamper with")
-    info(f"  flipping the last byte of {victim.relative_to(server.data_root)}")
-    original = victim.read_bytes()
-    if len(original) == 0:
-        raise TestFailure("victim xorb is empty")
-    tampered = bytearray(original)
-    tampered[-1] ^= 0xFF
-    victim.write_bytes(bytes(tampered))
+    """Corrupt the stored xorbs (we own both the bind-mounted fs data dir and
+    the MinIO bucket), then cold-clone in a fresh worktree. The smudge must
+    NOT silently produce wrong bytes — it must either error or produce content
+    whose sha256 the test detects as wrong."""
+    # Backend-agnostic corrupt/restore. Corrupt EVERY stored xorb — flip a
+    # window in the middle of each. Corrupting just one is fragile: HEAD's
+    # reconstruction (rev v3 of bigfile) only reads a subset of any single
+    # xorb's chunks (e.g. the chunk at the v1 xorb's middle is exactly the
+    # region v3 replaced, so it's never read), and an xorb's trailing footer
+    # isn't covered by any chunk byte-range either. Hitting all of them
+    # guarantees at least one corrupted chunk lands on HEAD's read path. S3
+    # mode pokes bucket objects; fs mode pokes files under data_root/xorbs.
+    victims: list[tuple[str, bytes, Callable[[bytes], None]]] = []
+    if server.s3_view is not None:
+        minio = server.s3_view.minio
+        for key, size in minio.list_objects(f"{server.s3_view.prefix}xorbs/"):
+            if size <= 0:
+                continue
+            victims.append(
+                (f"s3://{key}", minio.get_object(key), _s3_writer(minio, key))
+            )
+        if not victims:
+            raise TestFailure("no xorb in bucket to tamper with")
+    else:
+        xorbs_dir = server.data_root / "xorbs"
+        for cur, _dirs, names in os.walk(xorbs_dir):
+            for name in names:
+                p = Path(cur) / name
+                if p.stat().st_size > 0:
+                    victims.append(
+                        (
+                            str(p.relative_to(server.data_root)),
+                            p.read_bytes(),
+                            _fs_writer(p),
+                        )
+                    )
+        if not victims:
+            raise TestFailure("no xorb on disk to tamper with")
+
+    def corrupt(data: bytes) -> bytes:
+        window = min(4096, len(data))
+        start = (len(data) - window) // 2
+        out = bytearray(data)
+        for i in range(start, start + window):
+            out[i] ^= 0xFF
+        return bytes(out)
+
+    for label, original, write in victims:
+        info(f"  corrupting {label} ({len(original)}B)")
+        write(corrupt(original))
 
     try:
         clone_path, env, _cache = init_repo_for_clone(
@@ -173,7 +210,8 @@ def phase_adversarial_tampered_xorb(
             )
     finally:
         # Restore so downstream phases aren't poisoned.
-        victim.write_bytes(original)
+        for _label, original, write in victims:
+            write(original)
 
 
 def phase_adversarial_quota_exceeded(

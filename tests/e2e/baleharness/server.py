@@ -26,6 +26,13 @@ from baleharness.covstate import get_coverage
 from baleharness.logutil import TestFailure, info
 from baleharness.proc import dir_size_bytes, pick_free_port
 from baleharness.runtime import Runtime
+from baleharness.s3backend import (
+    S3StorageView,
+    get_active_s3_backend,
+    prefix_for_data_root,
+    s3_run_args,
+    s3_server_env,
+)
 
 
 @dataclass
@@ -36,6 +43,9 @@ class ServerHandle:
     ssh_port: int
     data_root: Path
     public_host_url: str
+    # Set in S3 mode: a bucket-prefix view that answers disk_*_bytes from
+    # MinIO instead of the (empty) local data_root/xorbs tree.
+    s3_view: Optional[S3StorageView] = None
 
     @property
     def healthz_url(self) -> str:
@@ -76,9 +86,13 @@ class ServerHandle:
             return False
 
     def disk_xorb_bytes(self) -> int:
+        if self.s3_view is not None:
+            return self.s3_view.xorb_bytes()
         return dir_size_bytes(self.data_root / "xorbs")
 
     def disk_shard_bytes(self) -> int:
+        if self.s3_view is not None:
+            return self.s3_view.shard_bytes()
         return dir_size_bytes(self.data_root / "shards")
 
     def disk_total_bytes(self) -> int:
@@ -136,8 +150,26 @@ def start_container(
         env_kvs.append(f"BALE_DEFAULT_QUOTA_BYTES={quota_bytes}")
     if admin_token_hex is not None:
         env_kvs.append(f"BALE_ADMIN_TOKEN_HEX={admin_token_hex}")
-    # extra_env carries S3 wiring (BALE_S3_*) for run_s3.py. Existing call
-    # sites in this file pass None and behave exactly as before.
+
+    # `run.py --backend s3` sets a process-global backend; when it's active,
+    # auto-inject the BALE_S3_* env + shared-network args and derive a
+    # per-data_root bucket prefix, so the full fs phase registry runs against
+    # MinIO unchanged. A caller's explicit extra_env (the bespoke s3lib
+    # phases) wins on key conflicts and disables the auto-wiring for that key.
+    s3_view: Optional[S3StorageView] = None
+    backend = get_active_s3_backend()
+    if backend is not None:
+        prefix = prefix_for_data_root(data_root, backend.prefix_anchor)
+        merged = s3_server_env(backend.minio, prefix=prefix)
+        if extra_env:
+            merged.update(extra_env)
+        extra_env = merged
+        s3_view = S3StorageView(backend.minio, extra_env["BALE_S3_PREFIX"])
+        extra_run_args = list(extra_run_args or []) + s3_run_args(backend.network)
+
+    # extra_env carries the BALE_S3_* wiring (from the active backend above, or
+    # explicitly from the coverage s3 phases). Existing fs call sites pass None
+    # and behave exactly as before.
     if extra_env:
         for k, v in extra_env.items():
             env_kvs.append(f"{k}={v}")
@@ -172,9 +204,9 @@ def start_container(
         env_kvs.append(f"LLVM_PROFILE_FILE={get_coverage().container_profile_template}")
     for kv in env_kvs:
         cmd.extend(["-e", kv])
-    # extra_run_args lets run_s3.py attach the container to a shared podman
-    # network (for server→MinIO traffic) and inject host.containers.internal
-    # via --add-host so a TcpProxy on the host is reachable from the server.
+    # extra_run_args attaches the container to the shared podman network in S3
+    # mode (set above from the active backend, or by the coverage s3 phases) so
+    # server→MinIO traffic resolves.
     if extra_run_args:
         cmd.extend(extra_run_args)
     cmd.append(image_tag)
@@ -190,7 +222,9 @@ def start_container(
             f"stdout:\n{completed.stdout.decode('utf-8', 'replace')}\n"
             f"stderr:\n{completed.stderr.decode('utf-8', 'replace')}"
         )
-    handle = ServerHandle(rt, name, cas_port, ssh_port, data_root, public_host_url)
+    handle = ServerHandle(
+        rt, name, cas_port, ssh_port, data_root, public_host_url, s3_view
+    )
     wait_for_healthz(handle)
     wait_for_ssh(handle)
     return handle
