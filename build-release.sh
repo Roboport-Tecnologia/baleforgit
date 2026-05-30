@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Build the release binaries for every distributed target and package one
-# archive per target under dist/, plus a SHA256SUMS file — ready to drop on a
-# download list. Linux/macOS ship both binaries; Windows ships git-bale only.
+# Build the release binaries for every distributed target and package them under
+# dist/, plus a SHA256SUMS file — ready to drop on a download list. The server
+# and client ship as separate archives per target (bale-server-* and
+# bale-client-*); Linux/macOS ship both, Windows ships the client (git-bale) only.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-BINS=(baleforgit-server git-bale)
+SERVER_BIN=baleforgit-server
+CLIENT_BIN=git-bale
 LINUX_TARGETS=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
 MAC_TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
 WINDOWS_TARGETS=(x86_64-pc-windows-gnu)
@@ -18,6 +20,9 @@ STAGING="$DIST/staging"
 usage() {
   cat <<'EOF'
 Build + package the bale release binaries for every distributed target.
+
+The server and client are packaged as separate archives per target:
+bale-server-<version>-<target> and bale-client-<version>-<target>.
 
   ./build-release.sh                 build + package all targets
   ./build-release.sh --linux-only    only the Linux musl builds
@@ -60,8 +65,30 @@ GITSHA="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
 BUILT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
-pkgname() { echo "bale-${VERSION}-$1"; }
-stagedir() { echo "$STAGING/$(pkgname "$1")"; }
+# Raw build outputs (both binaries) land here per target; package() splits them
+# into one archive per component.
+rawdir() { echo "$STAGING/raw/$1"; }
+pkgname() { echo "bale-$1-${VERSION}-$2"; }       # component, target
+
+# Which components ship for a target, and the on-disk binary name for each.
+components_for() {
+  case "$1" in
+    *-windows-*) echo client ;;
+    *)           echo server client ;;
+  esac
+}
+binname() {
+  local bin
+  case "$1" in
+    server) bin="$SERVER_BIN" ;;
+    client) bin="$CLIENT_BIN" ;;
+    *) return 1 ;;
+  esac
+  case "$2" in
+    *-windows-*) echo "${bin}.exe" ;;
+    *)           echo "$bin" ;;
+  esac
+}
 
 # These functions use explicit `|| return 1` instead of relying on `set -e`:
 # bash suspends errexit inside a function whose result is tested with `if`/`||`,
@@ -75,7 +102,7 @@ platform_for() {
 }
 
 build_linux() {
-  local t="$1" plat img cid sd b
+  local t="$1" plat img cid raw b
   command -v podman >/dev/null 2>&1 || { echo "podman not found" >&2; return 1; }
   plat="$(platform_for "$t")" || { echo "no platform for $t" >&2; return 1; }
   img="localhost/bale-${t}:latest"
@@ -85,15 +112,15 @@ build_linux() {
   # podman on macOS runs in remote mode where `--output type=local` is rejected,
   # so extract via a throwaway container instead.
   cid="$(podman create "$img")" || return 1
-  sd="$(stagedir "$t")"; rm -rf "$sd"; mkdir -p "$sd"
-  for b in "${BINS[@]}"; do
-    podman cp "$cid:/$b" "$sd/$b" || { podman rm "$cid" >/dev/null 2>&1; return 1; }
+  raw="$(rawdir "$t")"; rm -rf "$raw"; mkdir -p "$raw"
+  for b in "$SERVER_BIN" "$CLIENT_BIN"; do
+    podman cp "$cid:/$b" "$raw/$b" || { podman rm "$cid" >/dev/null 2>&1; return 1; }
   done
   podman rm "$cid" >/dev/null 2>&1 || true
 }
 
 build_mac() {
-  local t="$1" sd b
+  local t="$1" raw b
   log "macOS $t (cargo)"
   rustup target add "$t" >/dev/null || return 1
   # Strip at link time via the profile, NOT a post-link `strip`: modifying the
@@ -102,15 +129,15 @@ build_mac() {
   cargo build --release --target "$t" \
       --config 'profile.release.strip="symbols"' \
       -p bale-server-bin -p git-bale || return 1
-  sd="$(stagedir "$t")"; rm -rf "$sd"; mkdir -p "$sd"
-  for b in "${BINS[@]}"; do
-    cp "target/$t/release/$b" "$sd/$b" || return 1
-    chmod 755 "$sd/$b"
+  raw="$(rawdir "$t")"; rm -rf "$raw"; mkdir -p "$raw"
+  for b in "$SERVER_BIN" "$CLIENT_BIN"; do
+    cp "target/$t/release/$b" "$raw/$b" || return 1
+    chmod 755 "$raw/$b"
   done
 }
 
 build_windows() {
-  local t="$1" img cid sd
+  local t="$1" img cid raw
   command -v podman >/dev/null 2>&1 || { echo "podman not found" >&2; return 1; }
   img="localhost/bale-${t}:latest"
   # No --platform: cargo-xwin cross-compiles to Windows, so build native (no
@@ -119,28 +146,34 @@ build_windows() {
   podman build -f Dockerfile.windows \
       --build-arg RUST_TARGET="$t" --target export -t "$img" . || return 1
   cid="$(podman create "$img")" || return 1
-  sd="$(stagedir "$t")"; rm -rf "$sd"; mkdir -p "$sd"
-  podman cp "$cid:/git-bale.exe" "$sd/git-bale.exe" \
+  raw="$(rawdir "$t")"; rm -rf "$raw"; mkdir -p "$raw"
+  podman cp "$cid:/${CLIENT_BIN}.exe" "$raw/${CLIENT_BIN}.exe" \
       || { podman rm "$cid" >/dev/null 2>&1; return 1; }
   podman rm "$cid" >/dev/null 2>&1 || true
 }
 
+# One archive per component for this target, each holding a single binary +
+# VERSION.txt. zip for Windows (what its users expect), tar.gz elsewhere.
 package() {
-  local t="$1" name sd
-  name="$(pkgname "$t")"
-  sd="$(stagedir "$t")"
-  printf 'bale %s\ncommit: %s\ntarget: %s\nbuilt:  %s\n' \
-      "$VERSION" "$GITSHA" "$t" "$BUILT" > "$sd/VERSION.txt"
-  # zip for Windows (what its users expect), tar.gz elsewhere.
-  case "$t" in
-    *-windows-*)
-      rm -f "$DIST/${name}.zip"
-      ( cd "$STAGING" && zip -qr "$DIST/${name}.zip" "$name" ) || return 1
-      ;;
-    *)
-      tar -C "$STAGING" -czf "$DIST/${name}.tar.gz" "$name" || return 1
-      ;;
-  esac
+  local t="$1" comp name sd raw bin
+  raw="$(rawdir "$t")"
+  for comp in $(components_for "$t"); do
+    name="$(pkgname "$comp" "$t")"
+    sd="$STAGING/$name"; rm -rf "$sd"; mkdir -p "$sd"
+    bin="$(binname "$comp" "$t")" || return 1
+    cp "$raw/$bin" "$sd/$bin" || return 1
+    printf 'bale %s\ncomponent: %s\ncommit: %s\ntarget: %s\nbuilt:  %s\n' \
+        "$VERSION" "$comp" "$GITSHA" "$t" "$BUILT" > "$sd/VERSION.txt"
+    case "$t" in
+      *-windows-*)
+        rm -f "$DIST/${name}.zip"
+        ( cd "$STAGING" && zip -qr "$DIST/${name}.zip" "$name" ) || return 1
+        ;;
+      *)
+        tar -C "$STAGING" -czf "$DIST/${name}.tar.gz" "$name" || return 1
+        ;;
+    esac
+  done
 }
 
 mkdir -p "$STAGING"

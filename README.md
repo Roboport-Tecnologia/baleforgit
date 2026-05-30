@@ -9,7 +9,7 @@ This repo ships two binaries:
 
 ## Install
 
-Proprietary distribution: see your release channel for the `git-bale-<version>-<target>.tar.gz` artifact for your platform, unpack, and put `git-bale` somewhere on your `PATH`.
+Proprietary distribution: see your release channel for the `bale-client-<version>-<target>.tar.gz` artifact for your platform, unpack, and put `git-bale` somewhere on your `PATH`. (The server ships separately as `bale-server-<version>-<target>.tar.gz`.)
 
 ## Usage
 
