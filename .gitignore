@@ -31,3 +31,4 @@ git-lfs
 gitea
 xet-core
 *.profraw
+dist
