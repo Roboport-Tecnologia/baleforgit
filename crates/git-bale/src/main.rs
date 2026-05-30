@@ -193,11 +193,27 @@ fn set_default_xet_cache_root() {
     }
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
+        .or_else(cache_home_fallback);
     let Some(base) = base else { return };
     let path = base.join("bale").join("xet");
     // SAFETY: called from main() before any threads or async runtime spawn.
     unsafe { std::env::set_var("HF_XET_CACHE", path) };
+}
+
+/// `~/.cache` on Unix; `%LOCALAPPDATA%` (then `%USERPROFILE%\.cache`) on
+/// Windows, where `HOME` is usually unset.
+fn cache_home_fallback() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return Some(PathBuf::from(local));
+        }
+        std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".cache"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache"))
+    }
 }
 
 fn pick_scope(system: bool, local: bool) -> Scope {

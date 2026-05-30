@@ -9,7 +9,6 @@
 //! only adds to staging; without gc, abandoned bytes linger until next push).
 
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -124,9 +123,15 @@ fn install_managed_hook(
     let body = format!("#!/bin/sh\n{HOOK_MARKER}\n# {description}\n{command}\n");
     write_atomic(&hook_path, body.as_bytes())
         .with_context(|| format!("writing {hook_name} hook to {}", hook_path.display()))?;
-    let mut perms = std::fs::metadata(&hook_path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&hook_path, perms)?;
+    // Git for Windows runs hooks through its bundled `sh` and ignores the
+    // filesystem exec bit, so the chmod is Unix-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms)?;
+    }
     Ok(())
 }
 

@@ -299,7 +299,7 @@ fn verify_stripe(
 fn read_exact_at(file: &fs::File, buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     let mut remaining = buf;
     while !remaining.is_empty() {
-        let n = pread(file, remaining, offset)?;
+        let n = crate::fs_util::pread(file, remaining, offset)?;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -310,27 +310,6 @@ fn read_exact_at(file: &fs::File, buf: &mut [u8], mut offset: u64) -> io::Result
         remaining = &mut remaining[n..];
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn pread(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    use std::os::unix::fs::FileExt;
-    file.read_at(buf, offset)
-}
-
-#[cfg(windows)]
-fn pread(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    use std::os::windows::fs::FileExt;
-    file.seek_read(buf, offset)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn pread(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    // Exotic-target fallback: emulate pread via clone + seek.
-    use std::io::{Read, Seek, SeekFrom};
-    let mut handle = file.try_clone()?;
-    handle.seek(SeekFrom::Start(offset))?;
-    handle.read(buf)
 }
 
 /// Verification order: first, last, random middle sample, then the rest —

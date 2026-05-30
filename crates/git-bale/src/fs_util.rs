@@ -1,5 +1,6 @@
 //! Small helpers shared across the `<git_dir>/bale/` cache modules.
 
+use std::fs::File;
 use std::io;
 use std::path::Path;
 
@@ -46,4 +47,27 @@ pub fn restrict_user_cache_dir(dir: &Path) -> io::Result<()> {
         let _ = dir;
     }
     Ok(())
+}
+
+/// Positional read (`pread`) that doesn't disturb a shared file cursor, so
+/// worker threads can read disjoint regions of one handle concurrently. Unix
+/// has `read_at`; Windows has `seek_read`; the fallback clones and seeks.
+#[cfg(unix)]
+pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut handle = file.try_clone()?;
+    handle.seek(SeekFrom::Start(offset))?;
+    handle.read(buf)
 }

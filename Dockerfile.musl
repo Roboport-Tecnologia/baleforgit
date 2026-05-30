@@ -1,0 +1,56 @@
+# Cross-build the two release binaries (baleforgit-server + git-bale) as fully
+# static *-unknown-linux-musl executables. build-release.sh picks --platform to
+# MATCH the musl target arch, so targeting musl is a same-arch cross and
+# musl-tools' musl-gcc is the right C compiler — the standard rust-musl-builder
+# path. aarch64 builds run native on Apple Silicon; x86_64 builds run under the
+# podman machine's amd64 emulation.
+#
+# Output is the binaries only, not a runnable image. Built per-target, e.g.:
+#   podman build --platform linux/arm64 -f Dockerfile.musl \
+#       --build-arg RUST_TARGET=aarch64-unknown-linux-musl \
+#       --target export -t localhost/bale-aarch64-unknown-linux-musl:latest .
+FROM rust:1.94-bookworm AS builder
+WORKDIR /src
+
+ARG RUST_TARGET=x86_64-unknown-linux-musl
+
+# Cap parallel rustc jobs so peak memory fits a small podman machine (the
+# default 4 GiB VM OOM-kills rustc on aws-sdk-s3 when all cores compile at
+# once — most visible on the native arm64 build, where jobs run truly in
+# parallel). Override with --build-arg CARGO_JOBS=N (or a higher N on a big VM).
+ARG CARGO_JOBS=2
+
+RUN rustup target add "${RUST_TARGET}" \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      musl-tools musl-dev cmake clang libclang-dev pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# aws-lc-sys (pulled in via reqwest's rustls) is the one dep that needs help on
+# musl: a musl-targeting C compiler, cmake to build the vendored aws-lc, and
+# libclang for bindgen (musl is not a pre-generated bindings target). musl-gcc
+# targets the container's arch, which equals the musl target arch, so
+# CC_<target>=musl-gcc is correct. The cc/cmake crates honor CC_<target>.
+#
+# Cache mounts persist downloads + per-target compiled artifacts across builds;
+# the target dir is NOT in the image layer, so binaries are copied to /out in
+# the same RUN before the export stage reads them.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build-cache \
+    set -eu; \
+    export "CC_$(echo "$RUST_TARGET" | tr - _)=musl-gcc"; \
+    export CARGO_TARGET_DIR="/build-cache/$RUST_TARGET"; \
+    export CARGO_BUILD_JOBS="$CARGO_JOBS"; \
+    cargo build --release --target "$RUST_TARGET" -p bale-server-bin -p git-bale; \
+    mkdir -p /out; \
+    cp "$CARGO_TARGET_DIR/$RUST_TARGET/release/baleforgit-server" /out/; \
+    cp "$CARGO_TARGET_DIR/$RUST_TARGET/release/git-bale" /out/; \
+    strip /out/baleforgit-server /out/git-bale
+
+FROM scratch AS export
+COPY --from=builder /out/baleforgit-server /baleforgit-server
+COPY --from=builder /out/git-bale /git-bale

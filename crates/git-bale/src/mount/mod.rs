@@ -9,8 +9,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 
 use crate::config::RawConfig;
-use crate::mount::backend::libfuse::LibfuseBackend;
-use crate::mount::backend::MountBackend;
+use crate::mount::backend::{ensure_available, MountBackend, PlatformBackend};
 use crate::mount::diff::DiffEntry;
 use crate::mount::vfs::{DiffVfs, ROOT_INODE};
 
@@ -37,7 +36,7 @@ pub struct MountRevArgs {
 }
 
 pub fn run_rev(args: MountRevArgs) -> Result<()> {
-    if let Err(e) = backend::libfuse::ensure_available() {
+    if let Err(e) = ensure_available() {
         eprintln!("{e}");
         std::process::exit(2);
     }
@@ -84,7 +83,7 @@ pub fn run_rev(args: MountRevArgs) -> Result<()> {
         args.mount_point.display(),
     );
 
-    let backend = LibfuseBackend::new();
+    let backend = PlatformBackend::new();
     backend.mount(&args.mount_point, vfs)
 }
 
@@ -110,7 +109,7 @@ fn resolve_commit_and_tree(
 
 pub fn run(args: MountDiffArgs) -> Result<()> {
     // Fail fast with an install hint before doing the diff, not at mount time.
-    if let Err(e) = backend::libfuse::ensure_available() {
+    if let Err(e) = ensure_available() {
         eprintln!("{e}");
         std::process::exit(2);
     }
@@ -165,7 +164,7 @@ pub fn run(args: MountDiffArgs) -> Result<()> {
         args.mount_point.display(),
     );
 
-    let backend = LibfuseBackend::new();
+    let backend = PlatformBackend::new();
     backend.mount(&args.mount_point, vfs)
 }
 

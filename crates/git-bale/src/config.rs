@@ -133,11 +133,33 @@ fn resolve_cache_dir(snapshot: Option<&gix::config::Snapshot<'_>>) -> Result<Pat
             return Ok(PathBuf::from(xdg).join("bale").join("chunks"));
         }
     }
-    let home = env::var("HOME").context("$HOME is unset; cannot derive default cache dir")?;
-    Ok(PathBuf::from(home)
-        .join(".cache")
-        .join("bale")
-        .join("chunks"))
+    cache_base()
+        .map(|b| b.join("bale").join("chunks"))
+        .ok_or_else(|| {
+            anyhow!("can't derive a default cache dir: set BALE_CACHE_DIR or bale.cacheDir")
+        })
+}
+
+/// Cache root when neither `BALE_CACHE_DIR`, `bale.cacheDir`, nor
+/// `XDG_CACHE_HOME` is set: `~/.cache` on Unix, `%LOCALAPPDATA%` (falling back
+/// to `%USERPROFILE%\.cache`) on Windows, where `HOME` is usually absent.
+fn cache_base() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(local) = env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(local));
+        }
+        if let Some(profile) = env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(profile).join(".cache"));
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(|h| PathBuf::from(h).join(".cache"))
+    }
 }
 
 /// "Effectively never expires" sentinel for a literal `bale.token` with no

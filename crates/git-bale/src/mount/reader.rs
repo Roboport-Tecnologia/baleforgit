@@ -4,7 +4,6 @@
 //! that repopulates it (cold), and are held in a byte-budgeted LRU (default 1 GiB).
 
 use std::collections::HashMap;
-use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -227,8 +226,7 @@ impl Reader {
                 let max = (*size - offset) as usize;
                 let want = len.min(max);
                 let mut buf = vec![0u8; want];
-                let n = file
-                    .read_at(&mut buf, offset)
+                let n = crate::fs_util::pread(file, &mut buf, offset)
                     .with_context(|| format!("pread fh={fh} off={offset} len={want}"))?;
                 buf.truncate(n);
                 Ok(Bytes::from(buf))

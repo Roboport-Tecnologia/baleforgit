@@ -18,7 +18,7 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint, c_ulong, c_void};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -26,8 +26,8 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{anyhow, Context, Result};
 use libc::{mode_t, off_t, size_t, stat as libc_stat};
 
-use crate::mount::backend::MountBackend;
-use crate::mount::vfs::{DiffVfs, Node, NodeKind, ROOT_INODE};
+use crate::mount::backend::{cstr_to_path, lookup_path, MountBackend};
+use crate::mount::vfs::{DiffVfs, NodeKind};
 
 /// Live VFS for the running mount (path callbacks get no user-data). Set right
 /// before `fuse_main_real`, never cleared.
@@ -450,25 +450,6 @@ unsafe extern "C" fn op_init(_conn: *mut fuse_conn_info) -> *mut c_void {
 }
 
 unsafe extern "C" fn op_destroy(_private: *mut c_void) {}
-
-fn cstr_to_path(p: *const c_char) -> Option<String> {
-    if p.is_null() {
-        return None;
-    }
-    // SAFETY: libfuse hands us a NUL-terminated C string from kernel input.
-    let s = unsafe { CStr::from_ptr(p) };
-    s.to_str().ok().map(|s| s.to_string())
-}
-
-/// Walk a slash-delimited path from the root; `""` and `/` resolve to the root.
-fn lookup_path(vfs: &DiffVfs, path: &str) -> Option<Node> {
-    let mut current = vfs.lookup_by_inode(ROOT_INODE)?.clone();
-    for component in path.split('/').filter(|c| !c.is_empty()) {
-        let child = vfs.lookup_child(current.inode, component)?;
-        current = child.clone();
-    }
-    Some(current)
-}
 
 unsafe extern "C" fn op_getattr(path: *const c_char, stbuf: *mut libc_stat) -> c_int {
     if stbuf.is_null() {
