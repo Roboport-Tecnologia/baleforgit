@@ -64,6 +64,18 @@ VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.
 GITSHA="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
 BUILT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# macOS stamps com.apple.provenance (and quarantine) xattrs on the binaries, and
+# Apple's bsdtar stores them as LIBARCHIVE.xattr/SCHILY.xattr pax headers by
+# default — which makes GNU tar warn ("Ignoring unknown extended header keyword")
+# and materialize ._<name> AppleDouble sidecars on extract. Strip them so the
+# Linux/Windows archives carry no Mac metadata. GNU tar (a Linux host running
+# --linux-only) neither adds those xattrs nor knows --no-mac-metadata, so the
+# flags are bsdtar-only. Unquoted expansion below is intentional word-splitting.
+case "$(tar --version 2>&1)" in
+  *bsdtar*|*libarchive*) TAR_MAC_OPTS="--no-mac-metadata --no-xattrs" ;;
+  *)                     TAR_MAC_OPTS="" ;;
+esac
+
 log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 # Raw build outputs (both binaries) land here per target; package() splits them
 # into one archive per component.
@@ -167,10 +179,11 @@ package() {
     case "$t" in
       *-windows-*)
         rm -f "$DIST/${name}.zip"
-        ( cd "$STAGING" && zip -qr "$DIST/${name}.zip" "$name" ) || return 1
+        # -X: don't store Mac extra attributes (xattrs/AppleDouble) in the zip.
+        ( cd "$STAGING" && zip -Xqr "$DIST/${name}.zip" "$name" ) || return 1
         ;;
       *)
-        tar -C "$STAGING" -czf "$DIST/${name}.tar.gz" "$name" || return 1
+        tar $TAR_MAC_OPTS -C "$STAGING" -czf "$DIST/${name}.tar.gz" "$name" || return 1
         ;;
     esac
   done
