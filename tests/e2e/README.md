@@ -29,14 +29,28 @@ python3 tests/e2e/run.py --backend s3   # the WHOLE suite against an S3 (MinIO) 
 
 - Python 3.9+. Only stdlib is used.
 - *Optional* (`mount-rev`/`mount-diff` phases only): libfuse2 on Linux,
-  fuse-t on macOS. Both phases skip cleanly when missing.
+  fuse-t on macOS, [WinFsp](https://winfsp.dev/) on Windows. On Linux/macOS
+  the mount phases skip cleanly when the driver is missing; on Windows the
+  harness **auto-installs WinFsp** (downloads the MSI and runs `msiexec /qn`,
+  which needs admin) and skips only if that can't be done.
 
-The harness is cross-platform by design (uses `pathlib`, `subprocess`,
-`urllib`, no POSIX-only assumptions). On Windows the container is still
-a Linux container under podman/docker — only the test driver runs
-natively on the host. Today `git-bale` itself uses `cfg(unix)`-only
-APIs, so the Windows host path will refuse to run with a "binary not
-found" error until that's fixed; the harness logic itself is portable.
+The harness runs natively on Linux, macOS, **and Windows** hosts (stdlib
+only — `pathlib`, `subprocess`, `urllib`). The server always runs as a
+**Linux container** under podman/docker regardless of host OS; only the
+git-bale *client* runs on the host. On a Windows host:
+
+- Install **Git for Windows** (provides `git`, `ssh`, `ssh-keygen`, and the
+  `sh` git uses for hooks + `GIT_SSH_COMMAND`) and **Docker Desktop** or
+  **podman** with a Linux-container (WSL2) backend.
+- The run/state dir (and `--git-bale` binary) must live on a drive shared
+  with the container runtime (e.g. under `C:\Users\...`) so the `/data` and
+  `/home/git` bind mounts resolve.
+- Point `--git-bale` at `target\release\git-bale.exe` (the harness looks for
+  the `.exe` automatically).
+- Windows-specific handling: SSH keys are locked via `icacls` (Win32 OpenSSH
+  rejects loose-ACL keys); no `ssh-agent` (git-bale's forge-auth `ssh` finds
+  the key via the default `%USERPROFILE%\.ssh` lookup); bind-mount paths use
+  forward slashes; mount phases use a WinFsp directory mount.
 
 ## What it covers
 

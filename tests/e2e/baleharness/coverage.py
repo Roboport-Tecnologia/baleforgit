@@ -168,7 +168,11 @@ def setup_coverage(
     profile_dir.mkdir(parents=True)
     # World-writable so the container's `bale` user (uid 10001, mapped
     # through rootless podman) can write profraws to the bind-mount.
-    os.chmod(profile_dir, 0o777)
+    # Bind-mounted into every container so the in-container `bale` user can
+    # write .profraw files. Windows ACLs differ and coverage mode isn't
+    # supported there, so guard the POSIX chmod.
+    if os.name != "nt":
+        os.chmod(profile_dir, 0o777)
     html_out = cov_root / "html"
     if html_out.exists():
         shutil.rmtree(html_out)

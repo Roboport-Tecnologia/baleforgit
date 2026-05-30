@@ -87,12 +87,18 @@ class ClientEnv:
         env["GIT_COMMITTER_NAME"] = "Bale E2E"
         env["GIT_COMMITTER_EMAIL"] = "e2e@bale.invalid"
         # GIT_SSH_COMMAND wraps ssh so git uses our isolated identity and
-        # ignores any user/system ssh config (`-F /dev/null`). The remote URL
-        # is `ssh://git@127.0.0.1:PORT/...` — port lives in the URL, so we
+        # ignores any user/system ssh config (`-F <null device>`). The remote
+        # URL is `ssh://git@127.0.0.1:PORT/...` — port lives in the URL, so we
         # don't need a per-server `Port` directive anywhere.
+        #
+        # git parses this with a shell-word splitter (sh on Git-for-Windows),
+        # so the paths are forward-slash + double-quoted (a backslash would be
+        # read as an escape), and the null device is `os.devnull` (`nul` on
+        # Windows, where `/dev/null` doesn't exist).
         env["GIT_SSH_COMMAND"] = (
-            f"ssh -F /dev/null -i {self.ssh_key} -o IdentitiesOnly=yes "
-            f"-o UserKnownHostsFile={self.known_hosts} "
+            f'ssh -F {os.devnull} -i "{self.ssh_key.as_posix()}" '
+            f"-o IdentitiesOnly=yes "
+            f'-o UserKnownHostsFile="{self.known_hosts.as_posix()}" '
             f"-o StrictHostKeyChecking=no -o BatchMode=yes"
         )
         # git-bale's forge-auth subprocess invokes bare `ssh` (no -i).
@@ -106,12 +112,38 @@ class ClientEnv:
         return env
 
 
+def _lock_private_key(path: Path) -> None:
+    """Restrict an SSH private key to the current user. ssh refuses to use a
+    key other users can read. POSIX uses mode 0600; Win32 OpenSSH ignores Unix
+    mode bits and checks the ACL instead ("UNPROTECTED PRIVATE KEY FILE"), so
+    on Windows we strip inherited ACEs and grant only the current user via
+    icacls."""
+    if os.name == "nt":
+        user = os.environ.get("USERNAME") or os.environ.get("USER")
+        subprocess.run(
+            ["icacls", str(path), "/inheritance:r"],
+            capture_output=True,
+            check=False,
+        )
+        if user:
+            subprocess.run(
+                ["icacls", str(path), "/grant:r", f"{user}:F"],
+                capture_output=True,
+                check=False,
+            )
+    else:
+        os.chmod(path, 0o600)
+
+
 def setup_client(*, work_root: Path, git_bale_bin: Path) -> ClientEnv:
     home = work_root / "home"
     ssh_dir = home / ".ssh"
     ssh_dir.mkdir(parents=True)
     # ssh refuses to offer identities from a .ssh dir with mode > 0700.
-    os.chmod(ssh_dir, 0o700)
+    # (Win32 OpenSSH checks the private key's ACL, not Unix mode bits — done
+    # per-file via _lock_private_key below.)
+    if os.name != "nt":
+        os.chmod(ssh_dir, 0o700)
     gitconfig = work_root / "gitconfig"
     gitconfig.write_text("")
     ssh_key = ssh_dir / "id_ed25519"
@@ -132,14 +164,19 @@ def setup_client(*, work_root: Path, git_bale_bin: Path) -> ClientEnv:
             "-q",
         ],
     )
-    # ssh strict-modes refuses keys with mode > 0600.
-    os.chmod(ssh_key, 0o600)
-    os.chmod(ssh_pub, 0o644)
-    # git's ssh is fully driven by GIT_SSH_COMMAND (`-F /dev/null` etc.).
-    # git-bale's ssh gets its identity from SSH_AUTH_SOCK (ssh-agent),
-    # so no ~/.ssh/config is needed at all — we leave the file unset.
-    agent = SshAgent()
-    agent.start(ssh_key)
+    # ssh strict-modes refuses a private key accessible by other users.
+    _lock_private_key(ssh_key)
+    if os.name != "nt":
+        os.chmod(ssh_pub, 0o644)
+    # git's ssh is fully driven by GIT_SSH_COMMAND. git-bale's forge-auth ssh
+    # invokes bare `ssh` (no -i): on POSIX a per-test ssh-agent hands it the
+    # key; Windows has no equivalent per-process agent, so it falls back to
+    # ssh's default identity lookup at %USERPROFILE%\.ssh\id_ed25519 — exactly
+    # where ssh-keygen placed it (USERPROFILE points at our isolated HOME).
+    agent: Optional[SshAgent] = None
+    if os.name != "nt":
+        agent = SshAgent()
+        agent.start(ssh_key)
     return ClientEnv(
         home=home,
         ssh_key=ssh_key,

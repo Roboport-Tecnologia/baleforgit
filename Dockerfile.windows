@@ -1,0 +1,47 @@
+# Cross-build git-bale.exe for x86_64-pc-windows-gnu from a Linux container
+# using the mingw-w64 toolchain — fully open, no Microsoft SDK/license (unlike
+# the cargo-xwin/MSVC path). Only git-bale ships for Windows, not the server.
+# Runs on the host's native arch (no emulation): mingw-gcc/rustc/nasm all
+# cross-compile to the Windows target regardless of container arch.
+#
+# Output is git-bale.exe only. Build + extract via build-release.sh, or:
+#   podman build -f Dockerfile.windows --target export -t localhost/bale-windows:latest .
+FROM rust:1.94-bookworm AS builder
+WORKDIR /src
+
+ARG RUST_TARGET=x86_64-pc-windows-gnu
+ARG CARGO_JOBS=2
+
+# mingw-w64 cross toolchain (compiler + linker + ar for the C deps and the final
+# link). nasm: aws-lc-sys and ring assemble their x86_64 asm with it. cmake/ninja:
+# aws-lc-sys builds vendored aws-lc with them.
+RUN rustup target add "${RUST_TARGET}" \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm cmake ninja-build \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# The gnu target links through gcc; point rustc's linker AND the cc/cmake crates
+# that build the C deps at the mingw cross tools. `-static` folds libgcc and
+# libwinpthread into the exe so it needs no mingw runtime DLLs beside it.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build-cache \
+    set -eu; \
+    export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc; \
+    export CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc; \
+    export CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++; \
+    export AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar; \
+    export CARGO_TARGET_DIR="/build-cache/$RUST_TARGET"; \
+    export CARGO_BUILD_JOBS="$CARGO_JOBS"; \
+    export RUSTFLAGS="-C target-feature=+crt-static -C link-args=-static"; \
+    cargo build --release --target "$RUST_TARGET" -p git-bale; \
+    mkdir -p /out; \
+    cp "$CARGO_TARGET_DIR/$RUST_TARGET/release/git-bale.exe" /out/; \
+    x86_64-w64-mingw32-strip /out/git-bale.exe
+
+FROM scratch AS export
+COPY --from=builder /out/git-bale.exe /git-bale.exe

@@ -12,7 +12,8 @@ from baleharness.gitutil import git, is_bale_pointer, pointer_field
 from baleharness.logutil import TestFailure, info
 from baleharness.mount import (
     MountUnavailable,
-    _LIBFUSE_HINT,
+    driver_missing,
+    ensure_fs_driver,
     mount_diff_session,
     mount_rev_session,
 )
@@ -234,7 +235,7 @@ def phase_mount_diff(
                     "error (would have mounted an empty FS instead)"
                 )
             err = completed.stderr.decode("utf-8", "replace")
-            if _LIBFUSE_HINT in err:
+            if driver_missing(err):
                 info(f"-- mount-diff pathspec: skipping ({err.splitlines()[0]})")
             elif "no files differ" not in err:
                 raise TestFailure(
@@ -510,9 +511,9 @@ def phase_mount_edge_cases(
             timeout=120.0,
         )
         err = completed.stderr.decode("utf-8", "replace")
-        if _LIBFUSE_HINT in err:
+        if driver_missing(err):
             raise MountUnavailable(
-                err.strip().splitlines()[0] if err.strip() else _LIBFUSE_HINT,
+                err.strip().splitlines()[0] if err.strip() else "FS driver missing",
                 stderr=err.strip(),
             )
         if completed.returncode == 0:
@@ -523,6 +524,9 @@ def phase_mount_edge_cases(
             )
 
     try:
+        # On Windows the first check below runs git-bale directly (no session),
+        # so provision WinFsp up front; on POSIX this is a no-op.
+        ensure_fs_driver()
         with timings.measure("mount-edge: arg/diff validation + sanitize labels"):
             # Identical labels collide (reached only after a non-empty diff).
             expect_fail(

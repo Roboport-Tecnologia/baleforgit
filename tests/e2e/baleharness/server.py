@@ -25,7 +25,7 @@ from baleharness.config import (
 from baleharness.covstate import get_coverage
 from baleharness.logutil import TestFailure, info
 from baleharness.proc import dir_size_bytes, pick_free_port
-from baleharness.runtime import Runtime
+from baleharness.runtime import Runtime, host_mount_path
 from baleharness.s3backend import (
     S3StorageView,
     get_active_s3_backend,
@@ -192,15 +192,15 @@ def start_container(
         "-p",
         f"127.0.0.1:{ssh_port}:2222",
         "-v",
-        f"{data_root}:/data",
+        f"{host_mount_path(data_root)}:/data",
         "-v",
-        f"{git_home_root}:/home/git",
+        f"{host_mount_path(git_home_root)}:/home/git",
     ]
     # In --coverage mode every container shares the same host profile dir,
     # bind-mounted as /coverage. The in-container `bale` user writes
     # .profraw files there; entrypoint.sh propagates LLVM_PROFILE_FILE.
     if get_coverage() is not None:
-        cmd.extend(["-v", f"{get_coverage().profile_dir}:/coverage"])
+        cmd.extend(["-v", f"{host_mount_path(get_coverage().profile_dir)}:/coverage"])
         env_kvs.append(f"LLVM_PROFILE_FILE={get_coverage().container_profile_template}")
     for kv in env_kvs:
         cmd.extend(["-e", kv])

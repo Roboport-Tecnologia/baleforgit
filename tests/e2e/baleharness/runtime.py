@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+from pathlib import Path
 
 from baleharness.config import E2E_DIR, REPO_ROOT
 from baleharness.logutil import TestFailure, info, skip, warn
@@ -15,6 +17,14 @@ class Runtime:
 
     def cmd(self, *args: str) -> list[str]:
         return [self.exe, *args]
+
+
+def host_mount_path(p: Path) -> str:
+    """Host side of a `-v host:container` bind mount. On Windows, podman/docker
+    want forward-slash paths — a backslash `WindowsPath` would make the `-v`
+    parser split on the wrong colon (the drive-letter `C:` vs the `:` separator).
+    The drive letter is preserved (`C:/Users/...`), which both runtimes accept."""
+    return p.as_posix() if os.name == "nt" else str(p)
 
 
 def detect_runtime() -> Runtime:

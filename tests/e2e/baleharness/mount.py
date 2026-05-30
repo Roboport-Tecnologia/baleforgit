@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 import shutil
 import subprocess
@@ -28,12 +29,38 @@ class MountUnavailable(Exception):
         self.stderr = stderr
 
 
+# git-bale's mount backends print one of these when their FS driver can't be
+# loaded — libfuse/fuse-t on POSIX, WinFsp on Windows. Either means "skip".
 _LIBFUSE_HINT = "needs libfuse at runtime"
+_WINFSP_HINT = "needs WinFsp at runtime"
+
+
+def driver_missing(err: str) -> bool:
+    return _LIBFUSE_HINT in err or _WINFSP_HINT in err
+
+
+def ensure_fs_driver() -> None:
+    """On Windows, install WinFsp if absent (downloading the MSI) so the mount
+    backend can run, raising MountUnavailable to skip if it can't be
+    provisioned. No-op on POSIX — the git-bale binary's own libfuse probe
+    drives the skip there."""
+    if os.name != "nt":
+        return
+    from baleharness import winfsp as _winfsp
+
+    try:
+        _winfsp.ensure_winfsp()
+    except _winfsp.WinfspUnavailable as e:
+        raise MountUnavailable(f"WinFsp unavailable: {e}") from e
 
 
 def _unmount_path(mount_point: Path) -> None:
     """Best-effort unmount. fusermount3 / fusermount on Linux (rootless-safe),
     plain `umount` everywhere else. Silent if not currently mounted."""
+    if os.name == "nt":
+        # WinFsp auto-unmounts when the hosting git-bale process exits, which
+        # the session's finally block triggers; there's no fusermount step.
+        return
     for cmd in (
         ["fusermount3", "-u", str(mount_point)],
         ["fusermount", "-u", str(mount_point)],
@@ -47,8 +74,15 @@ def _unmount_path(mount_point: Path) -> None:
 
 
 def _is_mounted(mount_point: Path, parent: Path) -> bool:
-    """A FUSE mount makes `mount_point`'s st_dev differ from its parent's.
-    Works on Linux + macOS (fuse-t) without parsing /proc/mounts."""
+    """Has the FS come up at `mount_point`? On POSIX a FUSE mount makes its
+    st_dev differ from the parent's. On Windows the mount point is a directory
+    WinFsp *creates* (we ensure it didn't pre-exist), so its appearance as a
+    directory is the readiness signal."""
+    if os.name == "nt":
+        try:
+            return mount_point.is_dir()
+        except OSError:
+            return False
     try:
         return mount_point.stat().st_dev != parent.stat().st_dev
     except OSError:
@@ -81,10 +115,18 @@ def _mount_session(
     mount to come up, yield the mount point. Cleans up the mount and the
     process on exit even if the body raises.
 
-    Raises MountUnavailable when libfuse/fuse-t is missing on the host so
-    the caller can skip the phase rather than failing it."""
+    Raises MountUnavailable when the FS driver (libfuse/fuse-t, or WinFsp on
+    Windows) is missing on the host so the caller can skip the phase."""
+    ensure_fs_driver()
     mount_point = mount_root / f"mnt-{secrets.token_hex(3)}"
-    mount_point.mkdir()
+    if os.name == "nt":
+        # WinFsp creates the mount directory itself and refuses a pre-existing
+        # one, so ensure the parent exists and the target does not.
+        mount_root.mkdir(parents=True, exist_ok=True)
+        if mount_point.exists():
+            shutil.rmtree(mount_point, ignore_errors=True)
+    else:
+        mount_point.mkdir()
     cmd = [str(client.git_bale_bin), *argv_tail, "--mount", str(mount_point)]
     proc = subprocess.Popen(
         cmd,
@@ -109,7 +151,7 @@ def _mount_session(
                 stdout, stderr = proc.communicate(timeout=2.0)
             err_txt = stderr.decode("utf-8", "replace") if stderr else ""
             out_txt = stdout.decode("utf-8", "replace") if stdout else ""
-            if _LIBFUSE_HINT in err_txt:
+            if driver_missing(err_txt):
                 raise MountUnavailable(
                     err_txt.strip().splitlines()[0], stderr=err_txt.strip()
                 )
