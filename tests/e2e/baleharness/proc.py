@@ -22,7 +22,15 @@ def rmtree(path: Union[str, Path]) -> None:
     if not os.path.exists(path):
         return
     for root, dirs, files in os.walk(path):
-        for name in dirs + files:
+        # Only files get the bare write bit. A directory chmod'd to write-only
+        # loses its POSIX read/execute bits, and shutil.rmtree's safe-fd path
+        # then can't os.open it to recurse (EACCES) — so dirs keep owner rwx.
+        for name in dirs:
+            try:
+                os.chmod(os.path.join(root, name), stat.S_IRWXU)
+            except OSError:
+                pass
+        for name in files:
             try:
                 os.chmod(os.path.join(root, name), stat.S_IWRITE)
             except OSError:

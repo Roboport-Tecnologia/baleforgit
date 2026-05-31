@@ -30,6 +30,8 @@ git push
 
 If you stage a change and then abandon it (`git reset`, `git checkout`) before pushing, the staged bytes are no longer needed. `git-bale gc` reclaims that orphaned staging by reconciling it against what the index and your unpushed commits still reference; `install --local` runs it automatically via post-checkout/commit/merge hooks, and it's safe to run by hand anytime.
 
+**Public repos clone without credentials.** When the forge marks a repo public and grants anonymous read (see [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md)), cloning or checking out its Bale-tracked files over HTTPS needs no login: `git-bale` asks the forge anonymously first and only falls back to `git credential fill` for a private repo, so a public clone never prompts. Uploads (`git push`) always authenticate.
+
 ### Without a forge (manual config)
 
 If you're running your own `baleforgit-server` and don't have a forge integration, pin the server URL and a token in git config:

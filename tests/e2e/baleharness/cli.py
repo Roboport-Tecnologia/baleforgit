@@ -63,6 +63,7 @@ from baleharness.phases.adversarial import (
     phase_adversarial_tampered_xorb,
     phase_adversarial_wrong_token,
 )
+from baleharness.phases.anon import phase_anonymous_public_clone
 from baleharness.phases.coverage_phases import (
     phase_authz_http_coverage,
     phase_https_origin_coverage,
@@ -638,6 +639,17 @@ def main() -> int:
                 admin_token_hex=admin_token_hex,
             )
 
+        def _phase_anon() -> None:
+            phase_anonymous_public_clone(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+
         def _phase_failure_kill() -> None:
             phase_failure_server_kill_mid_upload(
                 timings=timings,
@@ -795,6 +807,10 @@ def main() -> int:
             "mount-rev": ("g2-tail", True, _phase_mount_rev),
             "mount-diff": ("g2-tail", True, _phase_mount_diff),
             "quota": ("g3", False, _phase_quota),
+            # Public repo cloneable without credentials: the resolver probes the
+            # forge anonymously first for op=download and only falls back to
+            # `git credential fill` on 401. Own container + mock forge, so g3.
+            "anon-public-clone": ("g3", False, _phase_anon),
             # Independent (own repo + commits), so g3 — not read-only because
             # it pushes new history that other phases shouldn't see.
             "mount-diff-mixed": ("g3", False, _phase_mount_diff_mixed),

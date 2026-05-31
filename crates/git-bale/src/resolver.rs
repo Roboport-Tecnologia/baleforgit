@@ -78,11 +78,8 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
             (url, bearer)
         }
         RemoteScheme::Http | RemoteScheme::Https => {
-            // The forge verifies the password locally and returns a JWT — the
-            // password never reaches baleforgit-server (the point of this hop).
-            let (username, password) = git_credential_fill(&remote, repo_cwd)?;
             let auth =
-                authenticate_http(&remote, owner, repo_name, scope, &username, &password).await?;
+                authenticate_http_with_fallback(&remote, owner, repo_name, scope, repo_cwd).await?;
             let bearer = strip_bearer(&auth.authorization).ok_or_else(|| {
                 anyhow!("/info/bale/authenticate returned non-Bearer Authorization")
             })?;
@@ -174,16 +171,67 @@ struct AuthenticateHTTPResponse {
     header: std::collections::HashMap<String, String>,
 }
 
-/// POST `.../info/bale/authenticate?op=...` with Basic auth → forge JWT +
-/// baleforgit-server URL. See `docs/BALE_FORGE_PROTOCOL.md`.
+/// A `download` resolve (clone/smudge) of a public repo must not prompt for
+/// credentials. So for read scope we probe the forge anonymously first; only if
+/// the forge refuses anonymous access (401/403 — private repo, or anonymous read
+/// disabled) do we fall back to `git credential fill` + Basic auth. Upload scope
+/// always authenticates: anonymous writes are never granted.
+async fn authenticate_http_with_fallback(
+    remote: &RemoteUrl,
+    owner: &str,
+    repo: &str,
+    scope: Scope,
+    repo_cwd: Option<&Path>,
+) -> Result<SshAuthOutcome> {
+    if scope == Scope::Read {
+        match authenticate_http(remote, owner, repo, scope, None).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(AuthHttpError::NeedsAuth) => {} // private repo — retry with creds
+            Err(AuthHttpError::Other(e)) => return Err(e),
+        }
+    }
+    // The forge verifies the password locally and returns a JWT — the password
+    // never reaches baleforgit-server (the point of this hop).
+    let (username, password) = git_credential_fill(remote, repo_cwd)?;
+    authenticate_http(
+        remote,
+        owner,
+        repo,
+        scope,
+        Some((username.as_str(), password.as_str())),
+    )
+    .await
+    .map_err(AuthHttpError::into_anyhow)
+}
+
+enum AuthHttpError {
+    /// 401/403 from the forge — credentials are required (private repo, or the
+    /// forge doesn't grant anonymous read).
+    NeedsAuth,
+    Other(anyhow::Error),
+}
+
+impl AuthHttpError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            AuthHttpError::NeedsAuth => anyhow!(
+                "/info/bale/authenticate returned HTTP 401/403 after presenting credentials"
+            ),
+            AuthHttpError::Other(e) => e,
+        }
+    }
+}
+
+/// POST `.../info/bale/authenticate?op=...` → forge JWT + baleforgit-server URL.
+/// `creds = None` sends no `Authorization` header (the anonymous probe for
+/// public repos). See `docs/BALE_FORGE_PROTOCOL.md`.
 async fn authenticate_http(
     remote: &RemoteUrl,
     owner: &str,
     repo: &str,
     scope: Scope,
-    username: &str,
-    password: &str,
-) -> Result<SshAuthOutcome> {
+    creds: Option<(&str, &str)>,
+) -> std::result::Result<SshAuthOutcome, AuthHttpError> {
     let op = match scope {
         Scope::Read => "download",
         Scope::Write => "upload",
@@ -195,30 +243,38 @@ async fn authenticate_http(
         repo,
         op,
     );
-    let client = http_client()?;
-    let resp = client
-        .post(&url)
-        .basic_auth(username, Some(password))
+    let client = http_client().map_err(AuthHttpError::Other)?;
+    let mut req = client.post(&url);
+    if let Some((username, password)) = creds {
+        req = req.basic_auth(username, Some(password));
+    }
+    let resp = req
         .send()
         .await
-        .with_context(|| format!("POST {url}"))?;
+        .with_context(|| format!("POST {url}"))
+        .map_err(AuthHttpError::Other)?;
     let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(AuthHttpError::NeedsAuth);
+    }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!(
+        return Err(AuthHttpError::Other(anyhow!(
             "/info/bale/authenticate {url} returned HTTP {} ({})",
             status.as_u16(),
             body.trim()
-        ));
+        )));
     }
     let parsed: AuthenticateHTTPResponse = resp
         .json()
         .await
-        .with_context(|| "decoding /info/bale/authenticate body")?;
-    let authz =
-        parsed.header.get("Authorization").cloned().ok_or_else(|| {
-            anyhow!("/info/bale/authenticate response has no Authorization header")
-        })?;
+        .with_context(|| "decoding /info/bale/authenticate body")
+        .map_err(AuthHttpError::Other)?;
+    let authz = parsed.header.get("Authorization").cloned().ok_or_else(|| {
+        AuthHttpError::Other(anyhow!(
+            "/info/bale/authenticate response has no Authorization header"
+        ))
+    })?;
     Ok(SshAuthOutcome {
         href: parsed.href.trim_end_matches('/').to_string(),
         authorization: authz,

@@ -38,8 +38,11 @@ Where:
 
 - `<op>` is `download` (returns a read-scoped JWT) or `upload` (write-scoped).
 - The forge authenticates the user against its own user database (password, PAT, OAuth token — whatever it normally accepts on Basic auth). The credential **never leaves the forge**.
-- If the credential is unrecognized → `401 Unauthorized`.
+- The `Authorization` header is **optional for `op=download`**. A request with no credentials is an *anonymous* read: if the repo is **public**, return a read-scoped JWT whose subject identifies the anonymous principal (e.g. `anonymous`); if the repo is **private**, return `401 Unauthorized`. `op=upload` **must** require credentials — anonymous writes are never granted (return `401`).
+- If a credential is presented but unrecognized → `401 Unauthorized`.
 - If the user is known but lacks the requested scope on the repo → `403 Forbidden`.
+
+> **Client behaviour.** `git-bale` resolves a `download` token by calling this endpoint **anonymously first** (no `Authorization` header) and only retries with Basic auth — sourced from `git credential fill`, which may prompt — if the anonymous attempt returns `401`/`403`. So a clone or checkout of a public repo never prompts for credentials, while a private repo still falls back to the user's stored credentials. `upload` always authenticates.
 
 On success: `200 OK` with JSON body
 
@@ -63,7 +66,7 @@ ssh <user>@<host> git-bale-authenticate <owner>/<repo> <op>
 
 The forge's SSH server recognises `git-bale-authenticate` as a built-in command (alongside `git-receive-pack` / `git-upload-pack`). On success, write the same JSON body shown above to **stdout** and exit 0. On failure, exit non-zero with a human-readable message on stderr.
 
-SSH auth is identity-based (the user has already proven who they are by presenting their SSH key), so no additional credential is needed in the command line.
+SSH auth is identity-based (the user has already proven who they are by presenting their SSH key), so no additional credential is needed in the command line. Anonymous access does not apply over SSH — the transport itself requires a key, so there is no credential-less path to special-case; the anonymous-download flow above is HTTPS-only.
 
 ## 3. Discovery (optional)
 
@@ -88,6 +91,8 @@ git-bale treats the JWT as opaque — it just forwards it to baleforgit-server a
 - Claims: at minimum a user identifier; optionally repo / scope to let baleforgit-server cross-check.
 
 The forge then implements `POST /check_access` (see `bale-server-authz-http`) to verify the JWT it issued and return the user identity to baleforgit-server. Because verification and issuance live in the same process, the forge can pick whatever JWT scheme it likes — baleforgit-server never tries to parse the bearer itself.
+
+**Anonymous reads need no special handling on baleforgit-server.** An anonymous read token is just an ordinary JWT with an anonymous subject; the client still presents `Authorization: Bearer <jwt>` to the token endpoint, and `/check_access` validates it and returns the anonymous identity (read scope) for the public repo exactly as for a logged-in user. The public-vs-private decision lives entirely in the forge — baleforgit-server has no concept of repo visibility.
 
 ### Browser file download (`GET /v1/files/{file_id}`)
 

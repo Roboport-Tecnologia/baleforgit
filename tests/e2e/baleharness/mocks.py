@@ -296,11 +296,26 @@ class MockForgeServer:
     """
 
     def __init__(
-        self, *, bale_href: str, hub_token: str, port: Optional[int] = None
+        self,
+        *,
+        bale_href: str,
+        hub_token: str,
+        port: Optional[int] = None,
+        enforce_auth: bool = False,
+        public: bool = False,
     ) -> None:
         self.bale_href = bale_href.rstrip("/")
         self.hub_token = hub_token
         self.port = port or pick_free_port()
+        # enforce_auth=False (default): every authenticate succeeds regardless
+        # of credentials — a forge with no visibility model, which the
+        # https-origin phase relies on. enforce_auth=True models a real forge:
+        # an anonymous request (no Basic auth) is granted only for `op=download`
+        # on a `public` repo; private downloads and every upload demand
+        # credentials (401). `public` is mutable so one mock can serve a public
+        # then a private sub-case. See `docs/BALE_FORGE_PROTOCOL.md`.
+        self.enforce_auth = enforce_auth
+        self.public = public
         self.calls: list[tuple[str, bool]] = []  # (op, had_basic_auth)
         self._server: Optional["http.server.ThreadingHTTPServer"] = None
         self._thread: Optional[threading.Thread] = None
@@ -330,6 +345,16 @@ class MockForgeServer:
                     self.rfile.read(length)
                 with outer._lock:
                     outer.calls.append((op, had_basic))
+                # Anonymous (no Basic auth) is granted only for a public-repo
+                # download; private downloads and every upload get 401. This is
+                # what lets the resolver's anon-first download path resolve a
+                # public repo and fall back to Basic auth on a private one.
+                if outer.enforce_auth and not had_basic:
+                    if not (op == "download" and outer.public):
+                        self.send_response(401)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
                 body = json.dumps(
                     {
                         "href": outer.bale_href,
