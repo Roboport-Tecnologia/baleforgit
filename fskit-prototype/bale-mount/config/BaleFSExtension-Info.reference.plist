@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  REFERENCE ONLY. Xcode's "File System Extension" template generates the real
+  Info.plist for the appex (with the correct ExtensionKit extension-point
+  declaration). After creating the target, DIFF the template's plist against
+  this and make sure these FSKit keys are present / correct. Do not blindly
+  replace the template's plist with this file.
+-->
+<plist version="1.0">
+<dict>
+	<!-- ExtensionKit point identifier for an FSKit module. Confirm against the
+	     template output — this is the key most likely to differ by Xcode version. -->
+	<key>EXAppExtensionAttributes</key>
+	<dict>
+		<key>EXExtensionPointIdentifier</key>
+		<string>com.apple.fskit.fsmodule</string>
+	</dict>
+
+	<!-- Unary (non-block) filesystem: synthetic content, no backing block device. -->
+	<key>FSSupportsBlockResources</key>
+	<false/>
+
+	<!-- The `mount -F -t <name>` type and Settings display name. -->
+	<key>FSShortName</key>
+	<string>balefs</string>
+	<key>FSName</key>
+	<string>Bale</string>
+</dict>
+</plist>

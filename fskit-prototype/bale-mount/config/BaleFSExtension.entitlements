@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Restricted: must be authorized by the provisioning profile (paid team;
+	     request via the portal's "additional entitlements" flow). -->
+	<key>com.apple.developer.fskit.fsmodule</key>
+	<true/>
+
+	<!-- FSKit extensions run sandboxed. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+
+	<!-- Cold-path reconstruction downloads xorbs/shards from the Bale server. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+
+	<!-- OPEN QUESTION (the sandbox-access risk): the extension must read the
+	     repo ODB, ~/.cache/bale/chunks, and .git/bale/staging. user-selected
+	     read-only + security-scoped bookmarks passed through the mount's
+	     FSTaskOptions is the likely mechanism; verify this actually reaches
+	     those paths before trusting it. -->
+	<key>com.apple.security.files.user-selected.read-only</key>
+	<true/>
+</dict>
+</plist>

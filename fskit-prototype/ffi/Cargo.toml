@@ -1,0 +1,16 @@
+[package]
+name = "bale-mount-ffi"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone feasibility prototype, excluded from the workspace (see root
+# Cargo.toml `exclude`). It deliberately depends on nothing from git-bale yet —
+# the point is to prove the C-ABI boundary the Swift FSKit shim links against.
+# A static lib so the .appex links it directly (cdylib would also work).
+[lib]
+name = "bale_mount_ffi"
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "unwind" # catch_unwind at the FFI edge requires unwinding, not abort

@@ -2,6 +2,7 @@
 resolver = "2"
 exclude = [
     "xet-core",
+    "fskit-prototype/ffi",
 ]
 members = [
     "crates/bale-server-core",

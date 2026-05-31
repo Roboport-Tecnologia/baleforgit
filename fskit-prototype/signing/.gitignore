@@ -1,0 +1,7 @@
+# Signing material — never commit
+*.key
+*.p12
+*.cer
+*.pem
+*.mobileprovision
+*.provisionprofile
