@@ -1544,8 +1544,10 @@ def _churn_put_bale(repo: Path, files: dict, all_names: set, name: str, payload:
 
 
 def _churn_put_plain(repo: Path, files: dict, all_names: set, name: str, text: str):
-    (repo / name).write_text(text)
+    # write_bytes, not write_text: on Windows write_text translates \n -> \r\n,
+    # but the expected sha/size below come from the untranslated text.encode().
     blob = text.encode()
+    (repo / name).write_bytes(blob)
     files[name] = (sha256_bytes(blob), len(blob))
     all_names.add(name)
 

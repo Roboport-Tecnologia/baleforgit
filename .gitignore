@@ -12,6 +12,10 @@
 *.swo
 *~
 
+# Python bytecode cache (the e2e harness under tests/e2e/ is Python)
+__pycache__/
+*.pyc
+
 # Default runtime data root for `xet-server` (see XET_DATA_ROOT in bin/main.rs)
 /xet-data/
 

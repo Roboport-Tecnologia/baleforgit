@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from pathlib import Path
 
 from baleharness.logutil import TestFailure
-from baleharness.proc import run, sha256_file
+from baleharness.proc import rmtree, run, sha256_file
 from baleharness.storage import staging_files
 
 
@@ -190,10 +189,10 @@ def force_resmudge_cold(
     """
     manifests = repo / ".git" / "bale" / "manifests"
     if manifests.exists():
-        shutil.rmtree(manifests)
+        rmtree(manifests)
     cache_dir = get_bale_cache_dir(repo, env)
     if cache_dir.exists():
-        shutil.rmtree(cache_dir)
+        rmtree(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     if _has_any_file(cache_dir):
         raise TestFailure(
@@ -243,10 +242,10 @@ def force_resmudge_lukewarm(
         raise TestFailure(f"[{label}] staging dir empty — lukewarm needs a staged file")
     manifests = repo / ".git" / "bale" / "manifests"
     if manifests.exists():
-        shutil.rmtree(manifests)
+        rmtree(manifests)
     cache_dir = get_bale_cache_dir(repo, env)
     if cache_dir.exists():
-        shutil.rmtree(cache_dir)
+        rmtree(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     if _has_any_file(cache_dir):
         raise TestFailure(f"[{label}] chunk cache {cache_dir} not empty after wipe")

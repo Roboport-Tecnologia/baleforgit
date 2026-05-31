@@ -124,9 +124,15 @@ chmod 755 /usr/local/bin/git-bale-authenticate
 # ---------------------------------------------------------------------------
 # Start sshd. Foreground (-D) backgrounded with `&` so the script can keep
 # going; `-e` sends log to stderr so `podman logs` picks it up.
+#
+# StrictModes=no: /home/git is bind-mounted from the host, and on a Windows
+# host the podman VM's mount can't represent Unix ownership/modes — the
+# `chmod 600` above is a no-op there, so authorized_keys looks world-writable
+# and StrictModes would refuse it ("bad ownership or modes"), denying every
+# publickey auth. Harmless on Linux/macOS where the modes are already correct.
 # ---------------------------------------------------------------------------
 log "starting sshd on :2222"
-/usr/sbin/sshd -D -e &
+/usr/sbin/sshd -D -e -o StrictModes=no &
 SSHD_PID=$!
 
 # Trap so `podman stop` (SIGTERM) kills sshd too, not just the server.

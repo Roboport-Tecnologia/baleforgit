@@ -4,6 +4,18 @@ from __future__ import annotations
 
 import sys
 
+# On Windows the default stdio codec is the locale ANSI codepage (cp1252),
+# which can't encode the glyphs the harness prints (≈, →, —) — print() then
+# raises UnicodeEncodeError and aborts the suite mid-phase. Force UTF-8 with a
+# replacement fallback so output can never crash the run, on any host.
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
 
 class TestFailure(Exception):
     pass

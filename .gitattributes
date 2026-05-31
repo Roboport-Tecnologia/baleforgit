@@ -1,0 +1,8 @@
+# Files executed inside Linux containers must stay LF even when checked out on
+# Windows (core.autocrlf=true). A CRLF shebang makes the kernel look for an
+# interpreter like `/bin/sh\r`, which exec()s fail with the misleading
+# "No such file or directory" — the container then exits before serving.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+Dockerfile.* text eol=lf
+entrypoint.sh text eol=lf

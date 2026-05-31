@@ -51,7 +51,16 @@ git-bale *client* runs on the host. On a Windows host:
 - Windows-specific handling: SSH keys are locked via `icacls` (Win32 OpenSSH
   rejects loose-ACL keys); no `ssh-agent` (git-bale's forge-auth `ssh` finds
   the key via the default `%USERPROFILE%\.ssh` lookup); bind-mount paths use
-  forward slashes; mount phases use a WinFsp directory mount.
+  forward slashes; mount phases use a WinFsp directory mount. `GIT_SSH_COMMAND`
+  passes `-F <empty file>` (not the null device — Git-for-Windows's bundled
+  MSYS `ssh` reads bare `nul` as a relative filename). The container's sshd runs
+  with `StrictModes=no` because the `/home/git` bind mount on a Windows host
+  can't represent Unix modes, so `authorized_keys` looks world-writable and
+  StrictModes would deny every publickey auth.
+- Repo-root `.gitattributes` pins `*.sh` and the Dockerfiles to `eol=lf`: with
+  `core.autocrlf=true` a Windows checkout would otherwise give `entrypoint.sh` a
+  CRLF shebang, and the container would exit at startup ("exec ... no such file
+  or directory") before it could serve.
 
 ## What it covers
 

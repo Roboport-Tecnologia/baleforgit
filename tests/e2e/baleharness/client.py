@@ -69,6 +69,7 @@ class ClientEnv:
     ssh_pub: Path
     known_hosts: Path
     gitconfig: Path
+    ssh_config: Path
     git_bale_bin: Path
     ssh_agent: Optional[SshAgent] = None
 
@@ -93,10 +94,12 @@ class ClientEnv:
         #
         # git parses this with a shell-word splitter (sh on Git-for-Windows),
         # so the paths are forward-slash + double-quoted (a backslash would be
-        # read as an escape), and the null device is `os.devnull` (`nul` on
-        # Windows, where `/dev/null` doesn't exist).
+        # read as an escape). `-F` points at a real empty file rather than the
+        # null device: Git-for-Windows resolves bare `ssh` to its bundled MSYS
+        # OpenSSH, which treats `nul` as a relative filename (not the Windows
+        # null device) and dies with "Can't open user config file nul".
         env["GIT_SSH_COMMAND"] = (
-            f'ssh -F {os.devnull} -i "{self.ssh_key.as_posix()}" '
+            f'ssh -F "{self.ssh_config.as_posix()}" -i "{self.ssh_key.as_posix()}" '
             f"-o IdentitiesOnly=yes "
             f'-o UserKnownHostsFile="{self.known_hosts.as_posix()}" '
             f"-o StrictHostKeyChecking=no -o BatchMode=yes"
@@ -150,6 +153,9 @@ def setup_client(*, work_root: Path, git_bale_bin: Path) -> ClientEnv:
     ssh_pub = ssh_dir / "id_ed25519.pub"
     known_hosts = ssh_dir / "known_hosts"
     known_hosts.touch()
+    # Empty config so `-F` neutralizes any user/system ssh config portably.
+    ssh_config = ssh_dir / "config"
+    ssh_config.write_text("")
     run(
         [
             "ssh-keygen",
@@ -183,6 +189,7 @@ def setup_client(*, work_root: Path, git_bale_bin: Path) -> ClientEnv:
         ssh_pub=ssh_pub,
         known_hosts=known_hosts,
         gitconfig=gitconfig,
+        ssh_config=ssh_config,
         git_bale_bin=git_bale_bin,
         ssh_agent=agent,
     )

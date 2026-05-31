@@ -241,7 +241,7 @@ def start_container(
         f"starting container {name} (cas=:{cas_port}, ssh=:{ssh_port}, "
         f"data={data_root})"
     )
-    completed = subprocess.run(cmd, capture_output=True, check=False)
+    completed = _run_container_start(rt, cmd, name)
     if completed.returncode != 0:
         raise TestFailure(
             "container start failed:\n"
@@ -254,6 +254,35 @@ def start_container(
     wait_for_healthz(handle)
     wait_for_ssh(handle)
     return handle
+
+
+def _is_port_bind_conflict(stderr: str) -> bool:
+    s = stderr.lower()
+    return (
+        "address already in use" in s
+        or "couldn't listen on requested" in s
+        or ("pasta failed" in s and "listen failed" in s)
+    )
+
+
+def _run_container_start(rt: Runtime, cmd: list[str], name: str):
+    # podman-on-Windows occasionally can't bind a host port that
+    # pick_free_port just saw as free: pasta's teardown of a prior --rm'd
+    # container lags, so its host-side forward still holds the port. The
+    # port is load-bearing (restart phases bake the ssh port into the git
+    # remote URL), so we can't re-pick — wait for the stale forward to clear
+    # and retry the same command, clearing any half-created container first.
+    attempts = 6
+    completed = subprocess.run(cmd, capture_output=True, check=False)
+    for i in range(1, attempts):
+        if completed.returncode == 0:
+            return completed
+        if not _is_port_bind_conflict(completed.stderr.decode("utf-8", "replace")):
+            return completed
+        subprocess.run(rt.cmd("rm", "-f", name), capture_output=True, check=False)
+        time.sleep(0.5 * i)
+        completed = subprocess.run(cmd, capture_output=True, check=False)
+    return completed
 
 
 def wait_for_healthz(handle: ServerHandle) -> None:

@@ -6,11 +6,28 @@ import hashlib
 import os
 import shutil
 import socket
+import stat
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from baleharness.logutil import TestFailure
+
+
+def rmtree(path: Union[str, Path]) -> None:
+    """`shutil.rmtree` that also works on Windows git trees. Git writes loose
+    objects read-only, and Windows refuses `os.unlink` on a read-only file
+    (WinError 5), so clear the read-only bit across the tree first. No-op on
+    a missing path."""
+    if not os.path.exists(path):
+        return
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                os.chmod(os.path.join(root, name), stat.S_IWRITE)
+            except OSError:
+                pass
+    shutil.rmtree(path)
 
 
 def run(

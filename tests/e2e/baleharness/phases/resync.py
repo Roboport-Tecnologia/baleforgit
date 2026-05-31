@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import secrets
-import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -12,7 +11,7 @@ from baleharness.config import E2E_OWNER, E2E_REPO_RESYNC
 from baleharness.gitutil import git, verify_pointer_at, verify_worktree
 from baleharness.logutil import TestFailure, info
 from baleharness.payloads import deterministic_payload
-from baleharness.proc import pick_free_port, run, sha256_bytes
+from baleharness.proc import pick_free_port, rmtree, run, sha256_bytes
 from baleharness.repo import init_repo_for_clone, init_repo_for_push
 from baleharness.runtime import Runtime
 from baleharness.server import ServerHandle, start_container
@@ -117,7 +116,7 @@ def phase_resync_after_cas_wipe(
         # Back in the original working tree (asset.bin + .gitattributes are
         # still on disk): nuke .git, re-init, re-install the filter, re-add.
         info("  deleting .git and re-initializing the working repo")
-        shutil.rmtree(repo / ".git")
+        rmtree(repo / ".git")
         cache_dir = work_root / "cache-resync-client"  # outside .git, survived
         git(["init", "-b", "main", "."], cwd=repo, env=env)
         run([str(client.git_bale_bin), "install", "--local"], cwd=repo, env=env)
