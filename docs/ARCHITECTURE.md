@@ -184,8 +184,8 @@ CAS API (all behind `RepoAuthz::verify_bale_token`):
 |--------|------|-------|---------|
 | GET | `/v1/reconstructions/{file_id}` | read | File reconstruction metadata |
 | GET | `/v1/chunks/{prefix}/{chunk_hash}` | read | Global dedup query |
-| POST | `/v1/xorbs/default/{xorb_hash}` | write | Xorb upload (rejects with 413 if over the owner's quota) |
-| POST | `/shards` | write | Shard upload + indexing (rejects with 413 if over the owner's quota) |
+| POST | `/v1/xorbs/default/{xorb_hash}` | write | Xorb upload (rejects with 429 if over the owner's quota) |
+| POST | `/shards` | write | Shard upload + indexing (rejects with 429 if over the owner's quota) |
 | GET | `/v1/usage/{owner}` | read or admin | Per-owner accounting — accepts either a Bale JWT scoped to the owner OR `BALE_ADMIN_TOKEN_HEX`. See "Owner accounting and quotas". |
 | GET | `/v1/usage/repo/{owner}/{repo}` | read or admin | Per-repo accounting — same auth as `/v1/usage/{owner}` (token's `repo.owner()` must match `{owner}`, or admin bearer). Returns `{repo_id, raw_bytes, stored_bytes, dedup_savings_bytes}`. Unknown repos return zeros, not 404. |
 
@@ -466,14 +466,16 @@ Two numbers, both queryable by `GET /v1/usage/{owner}` (which returns JSON `{own
 
 Quotas are **soft** — under concurrent uploads two writers can both pass the check then both succeed, slightly overshooting. That tradeoff buys us no extra locking on the hot path. Two enforcement points:
 
-1. **At `POST /v1/xorbs/{prefix}/{hash}`**: if the xorb already exists in CAS, the call is content-addressed-idempotent and skipped — re-pushes never reject. Otherwise we conservatively check `stored_bytes_for_owner + body.len() ≤ quota` and 413 on miss. This blocks the obvious "upload terabytes" failure mode at the door.
-2. **At `POST /shards`**: after xorb metadata is registered but *before* `register_files` (the atomic batch), we compute the projected post-commit stored bytes — current stored plus the on-disk sizes of xorbs the owner doesn't already reference (`unaccounted_xorb_bytes_for_owner`). 413 on miss, and `register_files` never runs, so no file rows are left behind.
+1. **At `POST /v1/xorbs/{prefix}/{hash}`**: if the xorb already exists in CAS, the call is content-addressed-idempotent and skipped — re-pushes never reject. Otherwise we conservatively check `stored_bytes_for_owner + body.len() ≤ quota` and 429 on miss. This blocks the obvious "upload terabytes" failure mode at the door.
+2. **At `POST /shards`**: after xorb metadata is registered but *before* `register_files` (the atomic batch), we compute the projected post-commit stored bytes — current stored plus the on-disk sizes of xorbs the owner doesn't already reference (`unaccounted_xorb_bytes_for_owner`). 429 on miss, and `register_files` never runs, so no file rows are left behind.
 
 The second check is load-bearing because the first one's "skip if exists" shortcut would otherwise let an owner gain attributable bytes by referencing someone else's xorb without paying.
 
 ### Configuration
 
 `BALE_DEFAULT_QUOTA_BYTES` sets the fallback limit applied when no per-owner override exists. Per-owner overrides (set via `PUT /v1/quotas/{owner}`) take precedence; `null` clears the override and falls back to the default. If neither is set, the owner is unlimited.
+
+Over-quota uploads reject with **429 Too Many Requests** (not 413): a 413 reads to clients as "this one request's body is too big", but over-quota is an account-state condition, so 429 with a `quota exceeded` message names it explicitly. Caveat: xet treats 429 as transient and retries it to exhaustion before surfacing the error, so an over-quota push takes a while to fail and the error chain is long — `git-bale`'s `explain_quota_exceeded` collapses it to a single user-facing line.
 
 The admin endpoint is gated by `BALE_ADMIN_TOKEN_HEX` (a 64-char hex string decoding to 32 bytes). When unset, the route returns 404 — the wire surface advertises that admin is disabled rather than 401-ing. Comparison is constant-time. The admin bearer is **not** a Bale JWT and the endpoint sits outside the JWT middleware.
 

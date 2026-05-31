@@ -19,6 +19,7 @@ from baleharness.config import (
 )
 from baleharness.gitutil import git, verify_pointer_at, verify_worktree
 from baleharness.logutil import TestFailure, fmt_bytes, info
+from baleharness.phases.failure import fail_fast_xet_env
 from baleharness.payloads import deterministic_payload
 from baleharness.proc import sha256_bytes, sha256_file
 from baleharness.repo import init_repo_for_clone, init_repo_for_push
@@ -281,11 +282,20 @@ def phase_adversarial_quota_exceeded(
             completed = git(
                 ["push", "-u", "origin", "main"],
                 cwd=repo,
-                env=env,
+                # 429 is retried by xet; fail-fast keeps the phase from hanging ~tens of seconds.
+                env=fail_fast_xet_env(env),
                 expect_fail=True,
             )
         if completed.returncode == 0:
             raise TestFailure("push past the 1 KiB quota unexpectedly succeeded")
+        push_output = (completed.stdout or b"") + (completed.stderr or b"")
+        push_text = push_output.decode(errors="replace")
+        if "over your storage quota" not in push_text.lower():
+            raise TestFailure(
+                "over-quota push did not surface the client-friendly quota "
+                "message (429 → rewrite path broken); push output was:\n"
+                f"{push_text[:2000]}"
+            )
         # Server should still be healthy after the rejected push.
         with urllib.request.urlopen(server.healthz_url, timeout=5) as resp:
             if resp.status != 200:

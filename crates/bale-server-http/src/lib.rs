@@ -271,10 +271,15 @@ async fn effective_quota<M: MetadataStore>(
 }
 
 fn quota_exceeded(owner: &str, used: u64, quota: u64, would_add: u64) -> ApiError {
+    // 429, not 413: a 413 reads to clients as "this one request's body is too
+    // big". Over-quota is an account-state condition, so we return 429 with a
+    // message that names it explicitly. (`git-bale` rewrites this into a
+    // user-facing hint; see push_pending::explain_quota_exceeded.)
     ApiError(
-        StatusCode::PAYLOAD_TOO_LARGE,
+        StatusCode::TOO_MANY_REQUESTS,
         format!(
-            "owner '{owner}' quota exceeded: used {used} + new {would_add} > limit {quota} bytes"
+            "storage quota exceeded for owner '{owner}': {used} bytes stored + {would_add} new \
+             would exceed the {quota}-byte limit"
         ),
     )
 }

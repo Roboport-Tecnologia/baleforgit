@@ -116,7 +116,12 @@ pub fn run() -> Result<()> {
 
     let outcome = result
         .map_err(|e| anyhow!("xet runtime error during push-pending: {e:?}"))
-        .and_then(|inner| inner.map_err(|e| explain_dedup_cache_mismatch(e, &server_url)));
+        .and_then(|inner| {
+            inner.map_err(|e| {
+                let e = explain_quota_exceeded(e, &server_url);
+                explain_dedup_cache_mismatch(e, &server_url)
+            })
+        });
     // finish() prints the persistent "…done." summary, so only on success; on
     // error the Drop impl clears the live line instead of leaving a misleading
     // 100% sitting above the actual failure.
@@ -175,6 +180,30 @@ async fn re_translate_one(
         );
     }
     Ok(())
+}
+
+// Over-quota uploads surface from xet as a noisy HTTP error: the bale server
+// returns 429, xet treats 429 as transient and retries it to exhaustion, so the
+// chain we finally see is long. Collapse it to one actionable line. xet drops
+// the response body before we ever see it, so the only reliable signal is the
+// status code in reqwest's Display ("HTTP status client error (429) for url ..").
+// Match the parenthesised status, not a bare "429" — a hex hash in the request
+// URL can contain those digits. ("quota exceeded"/"Too Many Requests" are kept
+// as harmless future-proofing if a later xet ever surfaces body/reason.) A 429
+// from a bale server only ever means over-quota; no other endpoint returns it.
+fn explain_quota_exceeded(err: anyhow::Error, server_url: &str) -> anyhow::Error {
+    let chain = format!("{err:#}");
+    let is_quota = chain.contains("(429")
+        || chain.contains("Too Many Requests")
+        || chain.contains("quota exceeded");
+    if !is_quota {
+        return err;
+    }
+    err.context(format!(
+        "push to {server_url} was rejected: you are over your storage quota. Free up \
+         space by removing large tracked files from history (or ask an administrator \
+         to raise your quota), then push again."
+    ))
 }
 
 // Turn the opaque "400 Bad Request on /shards" that xet surfaces into an
