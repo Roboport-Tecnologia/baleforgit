@@ -50,7 +50,7 @@ The repo ships one client: the native `git-bale` filter in `crates/git-bale/`, a
    │   ┌───────┴───────┐    ┌─────┴─────┐      ┌─────┴───────────────┐  │
    │   │ filesystem    │    │ SQLite    │      │ AlwaysAllow         │  │
    │   │ S3            │    │ Postgres  │      │ ConfigAuthz         │  │
-   │   │ Azure (later) │    │ (later)   │      │ HttpAuthz (upstream)│  │
+   │   │ Azure (later) │    │           │      │ HttpAuthz (upstream)│  │
    │   └───────────────┘    └───────────┘      └─────────────────────┘  │
    └────────────────────────────────────────────────────────────────────┘
 ```
@@ -168,12 +168,12 @@ pub trait RepoAuthz: Send + Sync {
 | `BlobStore` | `bale-server-storage-mem` | `MemBlobStore` — `RwLock<HashMap>`, used for tests and the pluggability check |
 | `BlobStore` | `bale-server-storage-s3` | `S3BlobStore` — AWS SDK against any S3-compatible API (AWS S3, MinIO, R2, B2); real presigned `GET` URLs returned from `presign_xorb_range`, so reconstruction bytes never flow through the server's HTTP layer |
 | `MetadataStore` | `bale-server-meta-sqlite` | `SqliteMetadataStore` — runtime `sqlx` queries (no compile-time DB) |
+| `MetadataStore` | `bale-server-meta-postgres` | `PostgresMetadataStore` — same schema/queries ported to the Postgres dialect (`$n` placeholders, `ON CONFLICT`, `BYTEA`/`BIGINT`, `SUM(...)::BIGINT`); selected when `BALE_POSTGRES_URL` is set. Migrations run under a `pg_advisory_xact_lock` so concurrent server startups don't race the DDL |
 | `RepoAuthz` | `bale-server-authz-mem` | `AlwaysAllow` (tests) and `ConfigAuthz` (static map of hub bearers → users → repo scopes) |
 | `RepoAuthz` | `bale-server-authz-http` | `HttpAuthz` — delegates `check_repo_access` to a small `POST /check_access` upstream contract. The contract is intentionally generic: any service that knows about users and repos (a git forge, an identity provider, a custom proxy) can implement it. Bale token mint/verify stays local. |
 
 ### Planned implementations
 
-- `MetadataStore` on Postgres (only required when we outgrow SQLite — the schema is portable).
 - `RepoAuthz` that talks directly to a specific upstream's APIs (e.g. `/api/v4/user` + project-member lookups for a particular git forge), as an alternative to going through the generic `HttpAuthz` shim. Useful when bringing the access-decision logic in-process saves a hop, or when richer upstream concepts (groups, scopes, OAuth) don't fit cleanly behind the minimal `/check_access` contract.
 
 ## Wire surface
@@ -420,6 +420,16 @@ owner_quotas (owner TEXT PK, limit_bytes INTEGER NOT NULL)
 
 This is the minimum needed to answer reconstruction queries, global-dedup queries, and per-owner accounting. Migrations run automatically on connection open (idempotent `CREATE TABLE IF NOT EXISTS ...`).
 
+### Postgres `MetadataStore`
+
+`bale-server-meta-postgres` is the same schema and the same queries ported to Postgres; it's selected when `BALE_POSTGRES_URL` is set (otherwise the server uses the local SQLite store). The portability the SQLite schema was designed for, made concrete. The dialect differences that matter:
+
+- **Column types.** `BLOB` → `BYTEA`, `INTEGER` → `BIGINT` (every integer column binds an `i64`; Postgres `INTEGER` is 32-bit and would reject the wider binds).
+- **Upserts.** `INSERT OR IGNORE` → `INSERT ... ON CONFLICT DO NOTHING`; `INSERT OR REPLACE INTO files` → `INSERT ... ON CONFLICT (file_hash, repo_id) DO UPDATE SET ...`. Same content-addressed idempotency, same "re-register carries identical terms, so `DO NOTHING` never exposes an empty term list to a concurrent reader".
+- **Placeholders.** `?` → `$1, $2, …` in the hand-written queries (`QueryBuilder` emits the right form for either driver automatically).
+- **Aggregates.** Postgres widens `SUM` over a `bigint` column to `numeric`, which `try_get::<i64>` can't decode, so every `SUM(...)` in the accounting/quota queries is wrapped `COALESCE(SUM(...), 0)::BIGINT`. The cast also turns an 8-EiB overflow into a hard error rather than the silent wrap the `nonneg_i64_to_u64` guard catches on SQLite.
+- **Migration concurrency.** Postgres `CREATE TABLE/INDEX IF NOT EXISTS` can race in `pg_catalog` when two server instances start at once, so the whole schema runs inside one transaction guarded by a `pg_advisory_xact_lock`. As with SQLite there is no backfill path — point it at an empty database (or one previously initialised by this server).
+
 ## Auth flow
 
 Two layers:
@@ -536,6 +546,7 @@ Server side:
 | In-memory blob store (pluggability) | `crates/bale-server-storage-mem/src/lib.rs` |
 | S3-compatible blob store | `crates/bale-server-storage-s3/src/lib.rs` |
 | SQLite metadata store | `crates/bale-server-meta-sqlite/src/lib.rs` |
+| Postgres metadata store | `crates/bale-server-meta-postgres/src/lib.rs` |
 | Static authz (`AlwaysAllow`, `ConfigAuthz`) | `crates/bale-server-authz-mem/src/lib.rs` |
 | HTTP-delegating authz (`HttpAuthz`) | `crates/bale-server-authz-http/src/lib.rs` |
 | JWT mint/verify | `crates/bale-server-tokens/src/lib.rs` |

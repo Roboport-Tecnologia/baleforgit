@@ -42,7 +42,8 @@ docker run --rm -p 8080:8080 \
 |----------|---------|-------|
 | `BALE_LISTEN` | `127.0.0.1:8080` | host:port to bind |
 | `BALE_DATA_ROOT` | `./xet-data` | blob storage root |
-| `BALE_DB_PATH` | `<BALE_DATA_ROOT>/meta.db` | SQLite metadata path |
+| `BALE_DB_PATH` | `<BALE_DATA_ROOT>/meta.db` | SQLite metadata path. Ignored when `BALE_POSTGRES_URL` is set. |
+| `BALE_POSTGRES_URL` | none | If set, store metadata in Postgres instead of SQLite. libpq connection string, e.g. `postgres://user:pass@host:5432/baledb`. Append `?sslmode=require` (or `disable`) to control TLS. The target database must already exist; the schema is created on first connect. |
 | `BALE_PUBLIC_URL` | `http://<BALE_LISTEN>` | absolute base URL written into signed download URLs |
 | `BALE_JWT_SECRET_HEX` | **required** | HS256 secret for Xet JWTs (≥ 32 bytes hex) |
 | `BALE_TRANSFER_SECRET_HEX` | **required** | HMAC secret for signed download URLs (exactly 32 bytes hex / 64 chars) |

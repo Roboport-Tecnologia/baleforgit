@@ -26,11 +26,14 @@ from baleharness.covstate import get_coverage
 from baleharness.logutil import TestFailure, info
 from baleharness.proc import dir_size_bytes, pick_free_port
 from baleharness.runtime import Runtime, host_mount_path
+from baleharness.pgbackend import (
+    db_for_data_root,
+    get_active_postgres_backend,
+)
 from baleharness.s3backend import (
     S3StorageView,
     get_active_s3_backend,
     prefix_for_data_root,
-    s3_run_args,
     s3_server_env,
 )
 
@@ -151,21 +154,44 @@ def start_container(
     if admin_token_hex is not None:
         env_kvs.append(f"BALE_ADMIN_TOKEN_HEX={admin_token_hex}")
 
-    # `run.py --backend s3` sets a process-global backend; when it's active,
-    # auto-inject the BALE_S3_* env + shared-network args and derive a
-    # per-data_root bucket prefix, so the full fs phase registry runs against
-    # MinIO unchanged. A caller's explicit extra_env (the bespoke s3lib
-    # phases) wins on key conflicts and disables the auto-wiring for that key.
+    # `run.py --backend s3` and/or `--meta postgres` set process-global backends;
+    # when active, auto-inject their env + the shared-network arg for every
+    # container so the full fs phase registry runs against MinIO / Postgres
+    # unchanged. A caller's explicit extra_env (the bespoke s3lib / coverage
+    # phases) wins on key conflicts. Both backends share one podman network, so
+    # the `--network` arg is added exactly once even when both are active.
     s3_view: Optional[S3StorageView] = None
-    backend = get_active_s3_backend()
-    if backend is not None:
-        prefix = prefix_for_data_root(data_root, backend.prefix_anchor)
-        merged = s3_server_env(backend.minio, prefix=prefix)
+    networks: list[str] = []
+    s3_backend = get_active_s3_backend()
+    if s3_backend is not None:
+        prefix = prefix_for_data_root(data_root, s3_backend.prefix_anchor)
+        merged = s3_server_env(s3_backend.minio, prefix=prefix)
         if extra_env:
             merged.update(extra_env)
         extra_env = merged
-        s3_view = S3StorageView(backend.minio, extra_env["BALE_S3_PREFIX"])
-        extra_run_args = list(extra_run_args or []) + s3_run_args(backend.network)
+        s3_view = S3StorageView(s3_backend.minio, extra_env["BALE_S3_PREFIX"])
+        networks.append(s3_backend.network.name)
+
+    # Postgres metadata store: derive a per-data_root database (the metadata
+    # analogue of the S3 per-data_root bucket prefix), create it, and point the
+    # server at it. The fs/s3 blob store is unaffected — only the MetadataStore
+    # changes.
+    pg_backend = get_active_postgres_backend()
+    if pg_backend is not None:
+        dbname = db_for_data_root(data_root, pg_backend.prefix_anchor)
+        pg_backend.guard.ensure_database(dbname)
+        merged = {"BALE_POSTGRES_URL": pg_backend.guard.url_for_db(dbname)}
+        if extra_env:
+            merged.update(extra_env)
+        extra_env = merged
+        if pg_backend.network.name not in networks:
+            networks.append(pg_backend.network.name)
+
+    if networks:
+        with_net = list(extra_run_args or [])
+        for net in networks:
+            with_net += ["--network", net]
+        extra_run_args = with_net
 
     # extra_env carries the BALE_S3_* wiring (from the active backend above, or
     # explicitly from the coverage s3 phases). Existing fs call sites pass None
@@ -204,9 +230,9 @@ def start_container(
         env_kvs.append(f"LLVM_PROFILE_FILE={get_coverage().container_profile_template}")
     for kv in env_kvs:
         cmd.extend(["-e", kv])
-    # extra_run_args attaches the container to the shared podman network in S3
-    # mode (set above from the active backend, or by the coverage s3 phases) so
-    # server→MinIO traffic resolves.
+    # extra_run_args attaches the container to the shared podman network in S3 /
+    # Postgres mode (set above from the active backend, or by the coverage s3
+    # phases) so server→MinIO / server→Postgres traffic resolves.
     if extra_run_args:
         cmd.extend(extra_run_args)
     cmd.append(image_tag)

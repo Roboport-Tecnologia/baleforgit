@@ -3,13 +3,14 @@ mod telemetry;
 use anyhow::{bail, Context, Result};
 use bale_server_authz_http::HttpAuthz;
 use bale_server_authz_mem::ConfigAuthz;
-use bale_server_core::{BlobStore, Scope};
+use bale_server_core::{BlobStore, MetadataStore, Scope};
 use bale_server_http::{router, Service};
+use bale_server_meta_postgres::PostgresMetadataStore;
 use bale_server_meta_sqlite::SqliteMetadataStore;
 use bale_server_storage_fs::FsBlobStore;
 use bale_server_storage_s3::{S3BlobStore, S3Config};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -79,14 +80,70 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("creating data root {}", data_root.display()))?;
 
-    let meta = Arc::new(
-        SqliteMetadataStore::open_path(&db_path)
-            .await
-            .map_err(anyhow_from_core)?,
-    );
-
     let listener = tokio::net::TcpListener::bind(&listen).await?;
 
+    // Metadata store: Postgres when BALE_POSTGRES_URL is set, else local SQLite.
+    if let Ok(pg_url) = env::var("BALE_POSTGRES_URL") {
+        let pg_url = pg_url.trim();
+        if pg_url.is_empty() {
+            bail!("BALE_POSTGRES_URL is set but empty");
+        }
+        tracing::info!(%listen, metadata = "postgres", "metadata store: postgres");
+        let meta = Arc::new(
+            PostgresMetadataStore::open_url(pg_url)
+                .await
+                .map_err(anyhow_from_core)?,
+        );
+        run(
+            listener,
+            meta,
+            &data_root,
+            jwt_secret,
+            transfer_secret,
+            public_url,
+            default_quota_bytes,
+            admin_token,
+        )
+        .await?;
+    } else {
+        tracing::info!(%listen, metadata = "sqlite", db = %db_path.display(), "metadata store: sqlite");
+        let meta = Arc::new(
+            SqliteMetadataStore::open_path(&db_path)
+                .await
+                .map_err(anyhow_from_core)?,
+        );
+        run(
+            listener,
+            meta,
+            &data_root,
+            jwt_secret,
+            transfer_secret,
+            public_url,
+            default_quota_bytes,
+            admin_token,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// Select the blob store (S3 when BALE_S3_BUCKET is set, else filesystem) and
+// serve. Generic over the metadata store so either backend pairs with either
+// blob store.
+#[allow(clippy::too_many_arguments)]
+async fn run<M>(
+    listener: tokio::net::TcpListener,
+    meta: Arc<M>,
+    data_root: &Path,
+    jwt_secret: Vec<u8>,
+    transfer_secret: [u8; 32],
+    public_url: String,
+    default_quota_bytes: Option<u64>,
+    admin_token: Option<[u8; 32]>,
+) -> Result<()>
+where
+    M: MetadataStore + 'static,
+{
     if let Ok(bucket) = env::var("BALE_S3_BUCKET") {
         if bucket.is_empty() {
             bail!("BALE_S3_BUCKET is set but empty");
@@ -105,7 +162,6 @@ async fn main() -> Result<()> {
         let endpoint_for_log = s3_cfg.endpoint_url.clone();
         let blobs = Arc::new(S3BlobStore::open(s3_cfg).await.map_err(anyhow_from_core)?);
         tracing::info!(
-            %listen,
             backend = "s3",
             bucket = %bucket,
             endpoint = ?endpoint_for_log,
@@ -125,12 +181,11 @@ async fn main() -> Result<()> {
         .await?;
     } else {
         let blobs = Arc::new(
-            FsBlobStore::open(&data_root)
+            FsBlobStore::open(data_root)
                 .await
                 .map_err(anyhow_from_core)?,
         );
         tracing::info!(
-            %listen,
             backend = "fs",
             data_root = %data_root.display(),
             %public_url,
@@ -152,10 +207,10 @@ async fn main() -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn serve<B>(
+async fn serve<B, M>(
     listener: tokio::net::TcpListener,
     blobs: Arc<B>,
-    meta: Arc<SqliteMetadataStore>,
+    meta: Arc<M>,
     jwt_secret: Vec<u8>,
     transfer_secret: [u8; 32],
     public_url: String,
@@ -164,6 +219,7 @@ async fn serve<B>(
 ) -> Result<()>
 where
     B: BlobStore + 'static,
+    M: MetadataStore + 'static,
 {
     if default_quota_bytes.is_some() {
         tracing::info!(

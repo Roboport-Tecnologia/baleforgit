@@ -25,6 +25,7 @@ bale-server-http.workspace = true
 bale-server-storage-fs.workspace = true
 bale-server-storage-s3.workspace = true
 bale-server-meta-sqlite.workspace = true
+bale-server-meta-postgres.workspace = true
 bale-server-authz-mem.workspace = true
 bale-server-authz-http.workspace = true
 bale-server-tokens.workspace = true

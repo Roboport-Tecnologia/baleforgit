@@ -150,15 +150,32 @@ def main() -> int:
         "end, so the preserved-state permutations don't apply; the matrix "
         "collapses to a single forward, clean-slate invocation.",
     )
+    parser.add_argument(
+        "--postgres",
+        action="store_true",
+        help="Run the whole suite with the Postgres metadata store "
+        "(`run.py --meta postgres`). Like --s3, the sidecar is torn down at "
+        "end of run so preserved-state permutations don't apply; the matrix "
+        "collapses to one invocation. Composes with --s3 (runs both flags).",
+    )
     args = parser.parse_args()
 
-    if args.s3:
-        # --backend s3 can't --reuse-from (the bucket is torn down per run),
+    if args.s3 or args.postgres:
+        # Neither sidecar survives the run (bucket + database are torn down),
         # so the ordering/preserved-state permutations collapse to one run.
-        _info("S3 mode: running `run.py --backend s3` once (no permutations apply)")
+        extra: list[str] = []
+        labels: list[str] = []
+        if args.s3:
+            extra += ["--backend", "s3"]
+            labels.append("s3 blob store")
+        if args.postgres:
+            extra += ["--meta", "postgres"]
+            labels.append("postgres metadata")
+        desc = " + ".join(labels)
+        _info(f"{desc}: running `run.py {' '.join(extra)}` once (no permutations)")
         r = _invoke(
-            label="s3 suite (full)",
-            extra_args=["--backend", "s3"],
+            label=f"{desc} suite (full)",
+            extra_args=extra,
             runner=RUN_PY,
             stream=not args.quiet,
             output_file=None,

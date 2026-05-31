@@ -18,6 +18,7 @@ from baleharness.payloads import deterministic_payload
 from baleharness.proc import pick_free_port, sha256_bytes
 from baleharness.repo import init_repo_for_clone, init_repo_for_push
 from baleharness.runtime import Runtime
+from baleharness.pgbackend import get_active_postgres_backend
 from baleharness.s3backend import S3_PROXY_THROTTLE_BPS, get_active_s3_backend
 from baleharness.server import ServerHandle, start_container
 from baleharness.storage import staging_files
@@ -429,6 +430,12 @@ def phase_failure_transient_db(
     released — and asserts the wallclock is ≥ the lock-hold duration, which
     is what proves the server actually waited for the busy DB instead of
     racing past it on a separate connection."""
+    # SQLite-specific: it locks the server's meta.db via a sidecar sqlite3
+    # shell. Under --meta postgres there is no meta.db, and Postgres MVCC
+    # doesn't need the busy_timeout this exercises, so skip cleanly.
+    if get_active_postgres_backend() is not None:
+        info("-- failure-dbbusy: SQLite busy_timeout test; skipping under postgres")
+        return
     phase_root = work_root / "failure-dbbusy"
     phase_root.mkdir()
     data_root = phase_root / "data"

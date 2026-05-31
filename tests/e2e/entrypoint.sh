@@ -39,6 +39,9 @@ export BALE_PUBLIC_URL BALE_GRANTS
 [ -n "${BALE_DEFAULT_QUOTA_BYTES:-}" ] && export BALE_DEFAULT_QUOTA_BYTES
 [ -n "${BALE_ADMIN_TOKEN_HEX:-}" ] && export BALE_ADMIN_TOKEN_HEX
 [ -n "${RUST_LOG:-}" ] && export RUST_LOG
+# Postgres metadata store. Setting BALE_POSTGRES_URL flips the server from the
+# local SQLite meta.db to Postgres. The harness (run.py --meta postgres) sets it.
+[ -n "${BALE_POSTGRES_URL:-}" ] && export BALE_POSTGRES_URL
 # Coverage mode: run.py --coverage sets this to a /coverage/... path so
 # the instrumented baleforgit-server writes .profraw files to the
 # bind-mounted host dir. Unset in prod mode — no-op.

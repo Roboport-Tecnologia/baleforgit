@@ -1,0 +1,16 @@
+[package]
+name = "bale-server-meta-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+# Postgres driver + TLS are enabled here, not in the workspace sqlx, so the
+# sqlite store doesn't drag them in when built on its own. Cargo unifies the
+# feature set for any build that includes both crates (e.g. the server binary).
+sqlx = { workspace = true, features = ["postgres", "tls-rustls-ring-webpki"] }
+tracing.workspace = true
+bale-server-core.workspace = true

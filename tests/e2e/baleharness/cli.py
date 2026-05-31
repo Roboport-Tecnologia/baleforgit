@@ -109,6 +109,11 @@ from baleharness.phases.track import phase_track
 from baleharness.proc import pick_free_port, tool_on_path
 from baleharness.registry import PHASE_GROUPS_ORDER, order_within_group
 from baleharness.runtime import build_image, detect_runtime, image_exists
+from baleharness.pgbackend import (
+    ActivePostgresBackend,
+    PostgresGuard,
+    set_active_postgres_backend,
+)
 from baleharness.s3backend import (
     ActiveS3Backend,
     MinioGuard,
@@ -201,6 +206,18 @@ def main() -> int:
         "with --coverage and --reuse-from.",
     )
     parser.add_argument(
+        "--meta",
+        choices=["sqlite", "postgres"],
+        default="sqlite",
+        help="Metadata store for every server in the run. 'sqlite' (default) "
+        "uses the container's local meta.db; 'postgres' brings up a Postgres "
+        "sidecar on the per-run podman network and runs the WHOLE phase "
+        "registry against it (each server scoped to its own database, the "
+        "metadata analogue of the --backend s3 per-data_root bucket prefix). "
+        "Composes with --backend. Mutually exclusive with --reuse-from (the "
+        "sidecar is torn down at end of run).",
+    )
+    parser.add_argument(
         "--coverage",
         action="store_true",
         help="Build instrumented binaries (-C instrument-coverage) for both "
@@ -231,6 +248,19 @@ def main() -> int:
             die(
                 "--backend s3 can't --reuse-from: the MinIO bucket is torn "
                 "down at end of run, so its xorbs aren't there to reuse."
+            )
+
+    if args.meta == "postgres":
+        # Coverage's bespoke phases stand up their own containers without the
+        # global backend; postgres metadata adds little there and complicates
+        # the SIGKILL-skip logic. reuse-from would need the sidecar's database,
+        # which is torn down at end of run.
+        if args.coverage:
+            die("--meta postgres and --coverage are mutually exclusive")
+        if args.reuse_from:
+            die(
+                "--meta postgres can't --reuse-from: the Postgres sidecar is "
+                "torn down at end of run, so its metadata isn't there to reuse."
             )
 
     info(f"platform: {platform.system()} {platform.release()} ({platform.machine()})")
@@ -360,8 +390,10 @@ def main() -> int:
     timings = Timings()
     server: Optional[ServerHandle] = None
     client: Optional[ClientEnv] = None
-    s3_network: Optional[Network] = None
+    # S3 and Postgres sidecars share one per-run podman network.
+    shared_network: Optional[Network] = None
     s3_minio: Optional[MinioGuard] = None
+    pg_guard: Optional[PostgresGuard] = None
     exit_code = 0
     rev_state: dict = {}
     if reused is not None:
@@ -377,15 +409,25 @@ def main() -> int:
         # start_container call (the shared one and each phase's) auto-wires
         # itself to MinIO under its own bucket prefix. tmpdir is the prefix
         # anchor — every server's data_root sits under it.
+        if args.backend == "s3" or args.meta == "postgres":
+            with timings.measure("setup: podman network"):
+                shared_network = Network.create(rt)
         if args.backend == "s3":
             info("storage backend: S3 (MinIO sidecar)")
-            with timings.measure("setup: podman network"):
-                s3_network = Network.create(rt)
             with timings.measure("setup: minio sidecar"):
-                s3_minio = MinioGuard.start(rt, s3_network)
+                s3_minio = MinioGuard.start(rt, shared_network)
             set_active_s3_backend(
                 ActiveS3Backend(
-                    minio=s3_minio, network=s3_network, prefix_anchor=tmpdir
+                    minio=s3_minio, network=shared_network, prefix_anchor=tmpdir
+                )
+            )
+        if args.meta == "postgres":
+            info("metadata store: Postgres (sidecar)")
+            with timings.measure("setup: postgres sidecar"):
+                pg_guard = PostgresGuard.start(rt, shared_network)
+            set_active_postgres_backend(
+                ActivePostgresBackend(
+                    guard=pg_guard, network=shared_network, prefix_anchor=tmpdir
                 )
             )
         cas_port = pick_free_port()
@@ -926,13 +968,18 @@ def main() -> int:
         # deliberately do NOT do a blanket `rm -f` on every container
         # matching CONTAINER_NAME_PREFIX — that would clobber concurrent
         # runs sharing the host (CI matrices, two devs on the same box).
-        # S3 teardown comes after every server (shared + per-phase) is down,
-        # since a live container attached to the network blocks its removal.
+        # S3 / Postgres teardown comes after every server (shared + per-phase)
+        # is down, since a live container attached to the network blocks its
+        # removal. The shared network is destroyed last, once both sidecars are
+        # gone.
         set_active_s3_backend(None)
+        set_active_postgres_backend(None)
         if s3_minio is not None:
             s3_minio.stop()
-        if s3_network is not None:
-            s3_network.destroy()
+        if pg_guard is not None:
+            pg_guard.stop()
+        if shared_network is not None:
+            shared_network.destroy()
         timings.print_report()
         if cov is not None:
             # Best-effort: don't let a broken llvm install mask phase results.

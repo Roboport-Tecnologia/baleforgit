@@ -36,6 +36,7 @@ crates/
 ├── bale-server-storage-mem/  # BlobStore in memory (test / pluggability check)
 ├── bale-server-storage-s3/   # BlobStore on any S3-compatible API (real presigned URLs)
 ├── bale-server-meta-sqlite/  # MetadataStore on SQLite
+├── bale-server-meta-postgres/# MetadataStore on Postgres (BALE_POSTGRES_URL)
 ├── bale-server-authz-mem/    # In-memory RepoAuthz (AlwaysAllow, ConfigAuthz)
 ├── bale-server-authz-http/   # RepoAuthz that delegates check_repo_access to an HTTP upstream
 ├── bale-server-tokens/       # HS256 Xet JWT mint/verify

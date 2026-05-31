@@ -11,8 +11,9 @@ verified against the on-disk numbers and the `/v1/usage` API.
 **Not run by `cargo test`.** Invoke it directly:
 
 ```bash
-python3 tests/e2e/run.py                # filesystem blob store (the default)
+python3 tests/e2e/run.py                # filesystem blob store + SQLite (the defaults)
 python3 tests/e2e/run.py --backend s3   # the WHOLE suite against an S3 (MinIO) blob store
+python3 tests/e2e/run.py --meta postgres # the WHOLE suite against a Postgres metadata store
 ```
 
 ## Prereqs
@@ -76,7 +77,7 @@ git-bale *client* runs on the host. On a Windows host:
 | `quota`         | A server brought up with `BALE_DEFAULT_QUOTA_BYTES=1024` rejects a 35 MB push cleanly.              |
 | `failure-kill`     | Server is SIGKILL'd mid-upload; restart on the same data dir and a retry `git push` recovers cleanly. |
 | `failure-conndrop` | A TCP proxy in front of the CAS port is killed mid-upload (server stays up); retry succeeds.        |
-| `failure-dbbusy`   | A sidecar `sqlite3` shell holds an IMMEDIATE write lock on `meta.db`; the user-side push still succeeds because sqlx's busy_timeout waits the lock out. |
+| `failure-dbbusy`   | A sidecar `sqlite3` shell holds an IMMEDIATE write lock on `meta.db`; the user-side push still succeeds because sqlx's busy_timeout waits the lock out. **Self-skips under `--meta postgres`** (no `meta.db`). |
 | `failure-s3-conndrop` | **S3-only** (self-skips on fs): the server↔MinIO TCP link is dropped mid-PUT via a host-side `TcpProxy`; the AWS SDK's retries and/or a client retry on the recovered link converge, and the file reconstructs from the bucket with one copy stored. |
 | `gc-abandon-checkout` | `git-bale gc`: push a baseline, stage a change, abandon it (`git reset` + `git checkout`); the post-checkout hook's gc fully wipes the orphaned staging. The user-reported bug. |
 | `gc-keeps-unpushed`   | DATA-LOSS GUARD: two stacked *unpushed* commits (tip names only v2); manual `git-bale gc` must NOT drop v1's staging. Push + cold-clone then reconstructs every revision byte-for-byte. |
@@ -118,6 +119,40 @@ The one S3 scenario with no fs analogue — a **server↔MinIO** TCP drop mid-PU
 `failure-s3-conndrop`. It self-skips under the fs backend and runs only under
 `--backend s3`.
 
+### Running the whole suite on Postgres
+
+```bash
+python3 tests/e2e/run.py --meta postgres
+```
+
+`--meta postgres` brings up a Postgres sidecar (`postgres:16-alpine`) on the
+same kind of per-run podman network, then runs the **entire phase registry**
+against a server that uses Postgres as its `MetadataStore` instead of the
+in-container SQLite `meta.db` — same flows, same assertions, just the metadata
+backend swapped. It composes with `--skip` / `--only` / `--order` **and** with
+`--backend s3` (the two sidecars share one network, so `--backend s3 --meta
+postgres` swaps both the blob store and the metadata store at once).
+
+How it works mirrors the S3 backend exactly: a process-global backend (set once
+in `cli.main`) makes `start_container` inject `BALE_POSTGRES_URL` + the
+shared-network arg for *every* container it launches. Each server gets its own
+**database** (e.g. `bale_server_data_<hash>`) derived from its `data_root` —
+stable across a restart on the same dir (so `failure-kill` / `offline-restart`
+land on the same database and its metadata persists) and distinct across phases
+(the database-level analogue of the fs suite's per-phase `meta.db`). The
+harness provisions each database via `podman exec psql` before the server
+starts; the server connects over the published port via the host's primary IP
+(the same bridge→host route MinIO uses). The blob store is untouched, so
+`ServerHandle.disk_*_bytes()` and every storage-accounting assertion
+(`bigfile`, `usage`-vs-disk, `dedup`, quota, churn monotonicity) work
+unchanged — they now cross-check the Postgres accounting queries against the
+on-disk bytes.
+
+The one SQLite-specific scenario — `failure-dbbusy`, which locks `meta.db` via
+a sidecar `sqlite3` shell to exercise sqlx's `busy_timeout` — **self-skips under
+`--meta postgres`** (there is no `meta.db`, and Postgres MVCC doesn't need that
+wait). Every other phase runs.
+
 A timing summary (per-phase wallclock + throughput on the
 bytes-relevant phases) prints at the end of every run.
 
@@ -156,6 +191,16 @@ python3 tests/e2e/run.py [--git-bale PATH] [--image-tag TAG] [--no-build]
   analogue of the fs suite's per-phase data dirs. Mutually exclusive with
   `--coverage` and `--reuse-from` (the bucket is torn down at end of run).
   See [Running the whole suite on S3](#running-the-whole-suite-on-s3) below.
+- `--meta {sqlite,postgres}` — metadata store for **every** server in the run.
+  `sqlite` (default) is the in-container local `meta.db`. `postgres` brings up a
+  Postgres sidecar on the per-run podman network and runs the *whole* phase
+  registry against it — each server scoped to its own database derived from its
+  `data_root` (the metadata analogue of `--backend s3`'s per-`data_root` bucket
+  prefix). Composes with `--backend`, so `--backend s3 --meta postgres` runs the
+  suite with both swapped out at once. Mutually exclusive with `--coverage` and
+  `--reuse-from` (the sidecar's databases are torn down at end of run). See
+  [Running the whole suite on Postgres](#running-the-whole-suite-on-postgres)
+  below.
 - `--coverage` — see [Coverage mode](#coverage-mode) below.
 - `--coverage-dir PATH` — override the coverage output directory
   (implies `--coverage`). Defaults to `<repo>/target/coverage-e2e/`.
@@ -305,9 +350,10 @@ testing and coverage measurement stay separate.
 | `run.py`                   | Entry point: runs `baleharness.cli.main` (the fs *and* `--backend s3` suites) and re-exports the names `s3lib.py` imports via `from run import …`. |
 | `baleharness/`             | The harness itself, split into focused modules (see below). `cli.py` owns the phase registry + `main()` + the `--backend` flag; `phases/` holds one module per phase category (`scenario`, `mount`, `adversarial`, `failure`, `coverage_phases`, `gc`, `progress`). |
 | `baleharness/s3backend.py` | `MinioGuard`, `Network`, `S3StorageView`, the `BALE_S3_*` env/run-arg helpers, the `data_root`→prefix derivation, and the process-global "active S3 backend" that makes `start_container` S3-aware under `--backend s3`. Importable without `run`, so `server.py` uses it without a cycle. |
+| `baleharness/pgbackend.py` | The metadata-store analogue of `s3backend.py`: `PostgresGuard` (sidecar + per-database provisioning), the `data_root`→database-name derivation, and the process-global "active Postgres backend" that makes `start_container` inject `BALE_POSTGRES_URL` under `--meta postgres`. Reuses `s3backend.Network` so the two sidecars share one podman network. |
 | `run_legacy.py`            | Frozen copy of the pre-split monolithic `run.py`, kept only to validate the refactor against. Delete once parity is confirmed. |
 | `s3lib.py`                 | Two S3 phases (`phase_s3_basic`, `phase_s3_dedup`) that coverage mode runs against the instrumented image; re-exports the infra from `baleharness.s3backend`. No standalone entry point — the whole suite on S3 is `run.py --backend s3`. |
-| `run_matrix.py`            | Multi-run driver for `run.py`. Pass `--s3` to run the whole suite on the S3 backend. |
+| `run_matrix.py`            | Multi-run driver for `run.py`. Pass `--s3` to run the whole suite on the S3 backend, `--postgres` for the Postgres metadata store, or both. |
 | `README.md`                | This file.                                                             |
 
 ## Reproducibility
