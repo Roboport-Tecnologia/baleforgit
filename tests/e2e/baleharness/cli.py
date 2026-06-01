@@ -83,7 +83,11 @@ from baleharness.phases.gc import (
 )
 from baleharness.phases.local import (
     phase_local_basic,
+    phase_local_cache_hit_gc_race,
+    phase_local_clean_gc_race,
+    phase_local_concurrent_stress,
     phase_local_gc_abandon,
+    phase_local_gc_grace,
     phase_local_prune_shared,
     phase_local_shared_dedup,
 )
@@ -795,6 +799,24 @@ def main() -> int:
                 timings=timings, client=client, work_root=work_root
             )
 
+        def _phase_local_race() -> None:
+            phase_local_clean_gc_race(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_stress() -> None:
+            phase_local_concurrent_stress(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_cachehit() -> None:
+            phase_local_cache_hit_gc_race(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_grace() -> None:
+            phase_local_gc_grace(timings=timings, client=client, work_root=work_root)
+
         # name -> (group, read_only, fn)
         REGISTRY: dict[str, tuple[str, bool, Callable[[], None]]] = {
             "basic": ("g1", False, _phase_basic),
@@ -881,6 +903,20 @@ def main() -> int:
             "local-gc-abandon": ("g3", False, _phase_local_gc),
             "local-shared-dedup": ("g3", False, _phase_local_shared),
             "local-prune-shared": ("g3", False, _phase_local_prune),
+            # Demonstrates the clean-vs-gc data race: gc fires in the window
+            # between xorb written and marker written, sweeping the only copy.
+            # Fails until gc respects the store lock (Task 15).
+            "local-clean-gc-race": ("g3", False, _phase_local_race),
+            # Natural-timing concurrent stress: per-repo add+gc races and shared
+            # add+prune races under no artificial delay. Proves no deadlock and
+            # no data loss under real contention.
+            "local-concurrent-stress": ("g3", False, _phase_local_stress),
+            # Cache-hit clean vs gc data race: a re-add that hits the clean-cache
+            # must hold the store lock across the emit window, otherwise gc can
+            # sweep the object copy between the cache-hit check and git's index
+            # update. Fails without the lock-before-cache-load fix.
+            "local-cache-hit-gc-race": ("g3", False, _phase_local_cachehit),
+            "local-gc-grace": ("g3", False, _phase_local_grace),
         }
 
         # Build the within-group lists in declaration order, then apply

@@ -25,8 +25,7 @@ use crate::config::RawConfig;
 use crate::progress::{UploadProgress, UploadSnapshot};
 use crate::resolver;
 use crate::staging::{
-    clear_file_markers, list_staged_files, remove_all_staged_objects, remove_empty_dirs,
-    staging_root,
+    list_staged_files, remove_all_staged_objects, remove_empty_dirs, remove_marker, staging_root,
 };
 
 pub fn run() -> Result<()> {
@@ -93,6 +92,11 @@ pub fn run() -> Result<()> {
         }
     });
 
+    // The staging READ/re-translate loop below runs without the store lock.
+    // A gc sweeping staging mid-drain only makes this push fail (it reconstructs
+    // from staging, which is fail-closed) — never corruption. Holding the lock
+    // across a network upload would block concurrent `git add` for the whole push.
+    // Only the final marker-removal + sweep (below) takes the lock.
     let slot_for_async = session_slot;
     let result = rt.bridge_sync(async move {
         let upload_session = FileUploadSession::new(Arc::new(online_cfg)).await?;
@@ -138,14 +142,33 @@ pub fn run() -> Result<()> {
         }
     }
 
-    // Server now holds the reconstruction info; safe to drop staging.
-    if let Err(e) = clear_file_markers(&git_dir) {
-        tracing::warn!("clearing file markers in {}: {e}", staging.display());
+    // Under the store lock so a `git add` racing this drain isn't blanket-swept:
+    // remove only the markers we actually uploaded, then sweep shared objects
+    // only if no marker remains (a concurrently-added file keeps its marker, which
+    // keeps its objects). Objects are deduped across files, so per-file object
+    // deletion is unsafe — hence the all-or-nothing sweep.
+    match crate::store::StoreLock::acquire_exclusive(&staging) {
+        Ok(_lock) => {
+            for (file_hex, _) in &staged_files {
+                if let Err(e) = remove_marker(&git_dir, file_hex) {
+                    tracing::warn!("removing marker {file_hex} in {}: {e}", staging.display());
+                }
+            }
+            let remaining = list_staged_files(&git_dir).map(|v| v.len()).unwrap_or(0);
+            if remaining == 0 {
+                if let Err(e) = remove_all_staged_objects(&staging) {
+                    tracing::warn!("removing staged objects under {}: {e}", staging.display());
+                }
+            }
+            let _ = remove_empty_dirs(&staging);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "push-pending: could not lock store {} for cleanup: {e}; leaving staging intact",
+                staging.display()
+            );
+        }
     }
-    if let Err(e) = remove_all_staged_objects(&staging) {
-        tracing::warn!("removing staged objects under {}: {e}", staging.display());
-    }
-    let _ = remove_empty_dirs(&staging);
 
     Ok(())
 }

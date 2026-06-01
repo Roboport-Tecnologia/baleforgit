@@ -87,6 +87,11 @@ class ClientEnv:
         env["GIT_AUTHOR_EMAIL"] = "e2e@bale.invalid"
         env["GIT_COMMITTER_NAME"] = "Bale E2E"
         env["GIT_COMMITTER_EMAIL"] = "e2e@bale.invalid"
+        # gc's reclaim grace (production default 600s) defers reclaiming a
+        # just-abandoned marker. Tests assert prompt reclamation, so disable it
+        # by default; the `local-gc-grace` phase overrides this to prove the
+        # grace actually protects recently-cleaned content.
+        env["BALE_GC_GRACE_SECS"] = "0"
         # GIT_SSH_COMMAND wraps ssh so git uses our isolated identity and
         # ignores any user/system ssh config (`-F <null device>`). The remote
         # URL is `ssh://git@127.0.0.1:PORT/...` — port lives in the URL, so we

@@ -13,6 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use fs4::fs_std::FileExt;
 
 use crate::config::RawConfig;
 use crate::staging::staging_root;
@@ -139,4 +140,76 @@ fn registry_key(abs: &Path) -> String {
         .to_hex()
         .as_str()
         .to_owned()
+}
+
+/// Sibling lockfile for `store`, OUTSIDE the dir so a `prune` swap (which
+/// renames the store dir) never moves it. All store-mutating ops lock this.
+pub fn lock_path(store: &Path) -> PathBuf {
+    let parent = store.parent().unwrap_or_else(|| Path::new("."));
+    let name = store
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("store");
+    parent.join(format!(".{name}.lock"))
+}
+
+/// Exclusive advisory lock serializing mutations to one store (clean writes,
+/// gc sweeps, prune swaps, push-pending drains). Held only around local
+/// filesystem work. The OS releases the lock when the process dies, so a crash
+/// never leaves a stale lock (unlike a create_new lockfile). Reads (smudge) do
+/// not lock. Different stores have different lockfiles, so unrelated repos never
+/// contend. `acquire_exclusive` blocks; `try_exclusive` returns None immediately
+/// if the lock is held. Use the try variant in best-effort contexts (post-commit
+/// gc hooks) where blocking would deadlock against the filter that holds the lock.
+pub struct StoreLock {
+    // Holding the File keeps the flock; dropping it (closing the fd) releases.
+    _file: std::fs::File,
+}
+
+impl StoreLock {
+    pub fn acquire_exclusive(store: &Path) -> Result<Self> {
+        let path = lock_path(store);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating lock dir {}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening store lock {}", path.display()))?;
+        // Blocks until any other holder releases. flock(2) on unix,
+        // LockFileEx on Windows — both released when the fd closes.
+        <std::fs::File as FileExt>::lock_exclusive(&file)
+            .with_context(|| format!("acquiring exclusive store lock {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
+
+    /// Non-blocking variant: returns `None` immediately if another holder has
+    /// the lock. `Some(lock)` on success. Errors on open/syscall failure (not
+    /// on lock contention — that returns `None`).
+    pub fn try_exclusive(store: &Path) -> Result<Option<Self>> {
+        let path = lock_path(store);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating lock dir {}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening store lock {}", path.display()))?;
+        match <std::fs::File as FileExt>::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            // EWOULDBLOCK (unix) / ERROR_LOCK_VIOLATION (Windows): lock is held.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => {
+                Err(e).with_context(|| format!("trying exclusive store lock {}", path.display()))
+            }
+        }
+    }
 }

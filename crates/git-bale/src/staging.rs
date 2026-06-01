@@ -40,6 +40,35 @@ pub fn file_is_staged(git_dir: &Path, file_hex: &str) -> bool {
     file_marker_path(git_dir, file_hex).exists()
 }
 
+/// Modification time of a `<file_hex>` marker, i.e. when its content was last
+/// cleaned (clean refreshes the marker on every add, hit or miss). `None` if the
+/// marker is absent or unstattable. Used by gc's reclaim grace.
+pub fn marker_mtime(git_dir: &Path, file_hex: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(file_marker_path(git_dir, file_hex))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// Bump an existing marker's mtime to now, WITHOUT creating it. Used by the
+/// clean-cache-hit path so gc's reclaim grace keys on the most recent add. Must
+/// not create a missing marker: a hit can re-emit a pointer for content whose
+/// objects were already drained (server mode, post-push), and a marker with no
+/// staged backing would make `push-pending` try to re-translate from empty
+/// staging. Returns whether a marker was present. Preserves the size body.
+pub fn touch_marker_if_exists(git_dir: &Path, file_hex: &str) -> std::io::Result<bool> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .open(file_marker_path(git_dir, file_hex))
+    {
+        Ok(f) => {
+            f.set_modified(std::time::SystemTime::now())?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Every `(file_hex, file_size)` in `file-index/`; an empty/malformed body
 /// yields `None` (push-pending can't prime FileDownloadSession, so it warns).
 pub fn list_staged_files(git_dir: &Path) -> std::io::Result<Vec<(String, Option<u64>)>> {

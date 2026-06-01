@@ -2,8 +2,8 @@
 //! down to the files reachable across every registered repo.
 //!
 //! Must run when no `git add` operations are in flight on any registered repo:
-//! it holds a sibling lockfile (excludes other prunes) and aborts if the store
-//! changes mid-run, but is not safe to run concurrently with `git add`.
+//! it holds the shared `StoreLock` (excludes gc/clean/push-pending/other prunes)
+//! and aborts if the store changes mid-run (defense-in-depth fingerprint guard).
 //!
 //! Precise per-xorb CAS sweeping would require parsing xet shards; instead we
 //! rebuild the store: reconstruct each live file from the old store and re-clean
@@ -35,7 +35,8 @@ pub fn run(force: bool) -> Result<()> {
     }
     let store = object_store_root(&raw)?;
 
-    let _lock = LockFile::acquire(&store)?;
+    let _store_lock = crate::store::StoreLock::acquire_exclusive(&store)
+        .context("locking shared store for prune")?;
     let repos = store::registered_repos(&store)?;
     if repos.is_empty() {
         bail!("no repos registered against {}", store.display());
@@ -298,45 +299,4 @@ fn copy_registry(src: &Path, dst: &Path) -> Result<()> {
             .with_context(|| format!("copying registry entry {}", entry.path().display()))?;
     }
     Ok(())
-}
-
-/// Exclusive lock so two prunes don't race the swap. Placed as a sibling of
-/// `store` so a rename of `store` never moves or removes it. A stale lock from
-/// a crashed prune is surfaced, not silently stolen.
-struct LockFile {
-    path: std::path::PathBuf,
-}
-
-impl LockFile {
-    fn acquire(store: &Path) -> Result<Self> {
-        let parent = store.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)?;
-        let name = store
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("store");
-        let path = parent.join(format!(".{name}.prune.lock"));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                use std::io::Write;
-                let _ = writeln!(f, "{}", std::process::id());
-                Ok(Self { path })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
-                "another prune holds {} (remove it if no prune is running)",
-                path.display()
-            )),
-            Err(e) => Err(e).context("creating prune lock"),
-        }
-    }
-}
-
-impl Drop for LockFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
 }

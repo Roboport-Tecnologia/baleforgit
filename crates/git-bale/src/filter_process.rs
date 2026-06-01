@@ -28,7 +28,7 @@ const DRAIN_PAYLOAD_CAP: u64 = 64 * 1024 * 1024;
 use crate::pointer;
 use crate::remote_manifest::fetch_manifest;
 use crate::resolver;
-use crate::staging::{file_is_staged, mark_file_staged, staging_root};
+use crate::staging::{file_is_staged, mark_file_staged, staging_root, touch_marker_if_exists};
 
 const VERSION: &str = "version=2";
 
@@ -216,6 +216,33 @@ fn max_inline_clean() -> usize {
         .unwrap_or(MAX_INLINE_CLEAN)
 }
 
+/// TEST-ONLY: widen the window between "objects written" and "marker written"
+/// so the e2e harness can deterministically drive the gc/clean race. A no-op
+/// unless `BALE_TEST_CLEAN_MARKER_DELAY_MS` is set. Mirrors the existing
+/// `BALE_MAX_INLINE_CLEAN` test knob convention.
+fn maybe_test_marker_delay() {
+    if let Ok(v) = std::env::var("BALE_TEST_CLEAN_MARKER_DELAY_MS") {
+        if let Ok(ms) = v.parse::<u64>() {
+            if ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
+    }
+}
+
+/// TEST-ONLY: widen the cache-HIT emit window so the e2e harness can
+/// deterministically drive the cache-hit-clean vs gc race. No-op unless
+/// `BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS` is set.
+fn maybe_test_cache_hit_delay() {
+    if let Ok(v) = std::env::var("BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS") {
+        if let Ok(ms) = v.parse::<u64>() {
+            if ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
+    }
+}
+
 enum CleanPayload {
     InMemory(Vec<u8>),
     Spilled(NamedTempFile),
@@ -284,7 +311,10 @@ fn do_clean<R: Read, W: Write>(
     let cache_key = clean_cache::path_key(pathname);
 
     // `git status`/`git diff` re-invoke clean on every command for a modified
-    // bale file; short-circuit on size, then sample-verify chunks.
+    // bale file; short-circuit on size, then sample-verify chunks. A cache HIT
+    // writes nothing to the store, so it takes no lock: the only window it could
+    // expose (gc sweeping the existing objects before git records the re-add) is
+    // closed by gc skipping while `index.lock` is held — see `crate::gc`.
     match clean_cache::load(git_dir, &cache_key) {
         Ok(Some(entry)) => {
             if entry.size != file_size {
@@ -303,6 +333,24 @@ fn do_clean<R: Read, W: Write>(
                 };
                 match verified {
                     Ok(true) => {
+                        // Bump the marker mtime (if one exists) under the store
+                        // lock so gc's reclaim grace keys on the most recent add:
+                        // a stash/abandon of cache-hit content whose marker had
+                        // aged past the grace could otherwise be swept in gc's
+                        // brief lock-free window. Touch-if-exists, never create —
+                        // a hit can re-emit a pointer for content already drained
+                        // to the server (post-push), where a marker with no staged
+                        // backing would make push-pending re-translate from empty
+                        // staging. Best-effort: a failed touch only narrows the
+                        // grace for this one file.
+                        let _store_lock = crate::store::StoreLock::acquire_exclusive(&store)
+                            .context("locking object store for clean-cache hit")?;
+                        if let Ok(info) = pointer::parse_pointer(entry.pointer.as_bytes()) {
+                            if let Err(e) = touch_marker_if_exists(git_dir, info.hash()) {
+                                tracing::debug!("clean-cache hit: touching marker: {e}");
+                            }
+                        }
+                        maybe_test_cache_hit_delay();
                         writer.write_text_list(&["status=success"])?;
                         writer.write_all_then_flush(entry.pointer.as_bytes())?;
                         writer.write_text_list(&["status=success"])?;
@@ -320,6 +368,15 @@ fn do_clean<R: Read, W: Write>(
     }
 
     let rt = ensure_runtime(rt_slot)?;
+    // Brief per-file lock across {write objects → write marker}, so a concurrent
+    // gc/prune/push-pending sweep can't delete a half-written file's only copy.
+    // Scoped to THIS file's write, not the filter-process lifetime: a long hold
+    // deadlocks when a git porcelain op (stash/commit) nests another clean while
+    // this filter still holds the lock. The separate marker-vs-index gap (marker
+    // on disk, git's index not yet updated) is closed by gc skipping while
+    // `index.lock` is held — see `crate::gc`, not by widening this lock.
+    let _store_lock = crate::store::StoreLock::acquire_exclusive(&store)
+        .context("locking object store for clean")?;
     match payload {
         CleanPayload::InMemory(buf) => handle_clean_in_memory(
             rt, git_dir, &store, buf, writer, pathname, &cache_key, file_size,
@@ -370,6 +427,7 @@ fn handle_clean_in_memory<W: Write>(
         })
         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 
+    maybe_test_marker_delay();
     if let Err(e) = mark_file_staged(git_dir, &file_hex, file_size) {
         tracing::warn!("failed to mark {file_hex} staged: {e}");
     }
@@ -432,6 +490,7 @@ fn handle_clean<W: Write>(
         })
         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 
+    maybe_test_marker_delay();
     // Marker gates the lukewarm smudge fallback. Without it, a smudge for a
     // not-staged file_hash (e.g. `git stash`'s HEAD-restore) returns zero terms
     // and trips a `debug_assert_eq!` in xet-data's progress tracker. Best-effort:

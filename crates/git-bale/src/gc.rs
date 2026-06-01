@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use gix::ObjectId;
@@ -73,6 +74,44 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
 
     let store = crate::store::object_store_root(&raw).unwrap_or_else(|_| staging_root(&git_dir));
 
+    // Hold the store lock across {read markers → remove dead → sweep objects} so
+    // a concurrent `clean` (which holds the same lock across its per-file
+    // object+marker write) can't have a just-written object swept before its
+    // marker lands. Try-lock (non-blocking): if it's held, a `git add` is mid
+    // write — skip. gc hooks fire via `|| true`, so skipping never fails the op.
+    let _store_lock = match crate::store::StoreLock::try_exclusive(&store) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            tracing::debug!(
+                "git-bale gc: store {} locked by a concurrent add; skipping",
+                store.display()
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(
+                "git-bale gc: could not lock store {}: {e}; skipping",
+                store.display()
+            );
+            return Ok(());
+        }
+    };
+
+    // Checked AFTER taking the store lock — order is load-bearing. A git op that
+    // is cleaning content and recording it (add/commit/stash) holds a `*.lock`
+    // for its index/ref write; gc reads liveness from that index+refs, so a stale
+    // read makes a file whose objects+marker are already on disk — but whose
+    // index/ref entry hasn't landed — look abandoned, and gc would sweep its only
+    // copy. With the store lock already held, any clean that wrote its marker has
+    // either released the store lock (so its op's lock is still present here → we
+    // skip) or is blocked acquiring it (so it hasn't written a marker we'd see).
+    // Checking before the store lock would leave a gap: a clean could slip in,
+    // write+release between the check and the marker read, and be swept.
+    if git_op_in_flight(&git_dir) {
+        tracing::debug!("git-bale gc: a git index/ref update is in flight; skipping");
+        return Ok(());
+    }
+
     let staging = staging_root(&git_dir);
 
     let staged = list_staged_files(&git_dir).unwrap_or_default();
@@ -94,9 +133,20 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
     } else {
         reachable_hashes(&repo, &want, &local_tips, &remote_tips)
     };
+    // Reclaim grace: never drop/sweep a marker whose content was cleaned within
+    // the grace window. This is the backstop for the one window `git_op_in_flight`
+    // can't see — a `git stash`'s lock-free commit-object write — and for any
+    // other brief gap between a clean writing/refreshing a marker and git
+    // recording the content. clean refreshes the marker mtime on every add (hit
+    // or miss), so "marker age" == "time since last cleaned". An unreferenced but
+    // recent marker is treated as live this run; a later gc reclaims it once it
+    // ages past the grace and is still unreferenced.
+    let grace = reclaim_grace();
+    let now = SystemTime::now();
     let dead: Vec<String> = want
         .iter()
         .filter(|h| !live.contains(*h))
+        .filter(|h| marker_age_exceeds(&git_dir, h, grace, now))
         .cloned()
         .collect();
     if dead.is_empty() {
@@ -345,6 +395,84 @@ pub fn reachable_all(repo: &gix::Repository, want: &BTreeSet<String>) -> HashSet
     let mut all = local_tips;
     all.extend(remote_tips);
     reachable_hashes(repo, want, &all, &[])
+}
+
+/// True if any git operation that could be cleaning bale content and recording
+/// it (in the index or a ref) is in flight, detected by its `*.lock` file. gc
+/// reads liveness from the index + refs, both of which lag the clean filter, so
+/// it must defer while any such write is in progress or it may classify an
+/// in-flight file as dead and sweep its only copy.
+///
+/// Covers `git add`/`commit` (`index.lock`), `git stash`/`stash push` (a
+/// temporary index `index.<temp>.lock` during the clean, then `refs/stash.lock`
+/// during the ref write — `git stash` does NOT use the main `index.lock`, and gc
+/// is a separate process so it can't see the stash's `GIT_INDEX_FILE`), and ref
+/// updates generally. A tiny lock-free residual remains — the commit-object
+/// write between a stash's temp-index unlock and its `refs/stash.lock` — see the
+/// note in `docs/ARCHITECTURE.md`.
+fn git_op_in_flight(git_dir: &Path) -> bool {
+    // An explicit GIT_INDEX_FILE (rare for gc itself, but be precise).
+    if let Some(idx) = std::env::var_os("GIT_INDEX_FILE") {
+        let mut lock = idx;
+        lock.push(".lock");
+        if Path::new(&lock).exists() {
+            return true;
+        }
+    }
+    // Top-level locks: index.lock, index.<temp>.lock (stash et al.), HEAD.lock,
+    // packed-refs.lock, ORIG_HEAD.lock, config.lock …
+    if dir_has_lock(git_dir, false) {
+        return true;
+    }
+    // Loose-ref update locks (refs/stash.lock, refs/heads/*.lock) and the
+    // reftable backend's lock.
+    dir_has_lock(&git_dir.join("refs"), true) || dir_has_lock(&git_dir.join("reftable"), true)
+}
+
+/// Whether `dir` contains a `*.lock` file (recursively if `recurse`). Best-effort:
+/// an unreadable dir is treated as "no lock" (gc degrades to its other guards).
+fn dir_has_lock(dir: &Path, recurse: bool) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            if recurse && dir_has_lock(&path, true) {
+                return true;
+            }
+        } else if path.extension().is_some_and(|e| e == "lock") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Grace before an unreferenced marker may be reclaimed. `BALE_GC_GRACE_SECS`
+/// overrides; default 10 minutes — generous margin over any clean→git-records
+/// gap, traded against abandoned content lingering that long before reclaim.
+fn reclaim_grace() -> Duration {
+    let secs = std::env::var("BALE_GC_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_GRACE_SECS);
+    Duration::from_secs(secs)
+}
+
+const DEFAULT_GRACE_SECS: u64 = 600;
+
+/// Whether `h`'s marker is older than `grace`. Fail-safe: if the mtime can't be
+/// read or is in the future (clock skew), treat the marker as too young to
+/// reclaim (returns false) — never sweep on an uncertain age.
+fn marker_age_exceeds(git_dir: &Path, h: &str, grace: Duration, now: SystemTime) -> bool {
+    match crate::staging::marker_mtime(git_dir, h) {
+        Some(mtime) => now
+            .duration_since(mtime)
+            .map(|age| age > grace)
+            .unwrap_or(false),
+        None => false,
+    }
 }
 
 fn is_commit(repo: &gix::Repository, oid: ObjectId) -> bool {
