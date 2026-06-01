@@ -58,6 +58,11 @@ E2E_REPO_GC3 = "gc-mixed"
 # phase's `main` collides.
 E2E_REPO_MR_A = "multi-remote-a"
 E2E_REPO_MR_B = "multi-remote-b"
+# Third repo for the "target already has the commits but not the bale objects"
+# case (a remote populated by an older/argless client): pushing a new branch to
+# it must re-register the objects under its scope, NOT skip them because its
+# remote-tracking refs already cover the history.
+E2E_REPO_MR_C = "multi-remote-c"
 # The resync-after-wipe phase owns its own isolated container; this is the bare
 # repo it force-pushes to after the server's CAS is wiped out from under it.
 E2E_REPO_RESYNC = "resync-wipe"

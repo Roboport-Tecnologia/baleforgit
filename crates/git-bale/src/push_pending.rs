@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use gix::ObjectId;
@@ -99,7 +100,7 @@ pub fn run(args: Args) -> Result<()> {
     // being pushed). Re-sourced from another remote that still holds them.
     let from_refs: BTreeMap<String, u64> = if args.remote_name.is_some() {
         let updates = read_ref_updates_from_stdin()?;
-        reachable_pointers(&cwd, args.remote_name.as_deref(), &updates)
+        reachable_pointers(&cwd, &updates)
             .into_iter()
             .filter(|(h, _)| !staged.contains_key(h))
             .collect()
@@ -144,6 +145,12 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     let server_url = auth.server_url.clone();
+    // For the per-file "already registered on the target?" probe (below): the
+    // target's server + write token. A write token is accepted on GET
+    // reconstruction, and reconstruction 404s unless the file is registered
+    // under *this* token's repo — exactly the signal we want.
+    let probe_server = auth.server_url.trim_end_matches('/').to_string();
+    let probe_token = auth.token.clone();
     let total = staged.len() + from_refs.len();
 
     // Reports upload progress once work runs past ~200ms. The session is created
@@ -188,10 +195,28 @@ pub fn run(args: Args) -> Result<()> {
             }
         }
 
-        // (2) already-pushed-elsewhere files → re-source from another remote.
+        // (2) already-pushed-elsewhere files → re-source from another remote,
+        // skipping any the target already has registered (so a push to a remote
+        // that's already fully populated doesn't re-download its whole history).
         if !from_refs.is_empty() {
+            // One client for all probes; if it can't be built, skip probing and
+            // attempt every file (re-translate is idempotent — just less cheap).
+            let probe = reqwest::Client::builder()
+                .user_agent(concat!("git-bale/", env!("CARGO_PKG_VERSION")))
+                .timeout(Duration::from_secs(15))
+                .build()
+                .ok();
             let mut sources = SourceSessions::new(raw_for_async, source_remotes);
             for (file_hex, file_size) in &from_refs {
+                if let Some(probe) = probe.as_ref() {
+                    if file_registered_on_target(probe, &probe_server, &probe_token, file_hex).await
+                    {
+                        tracing::debug!(
+                            "push-pending: {file_hex} already on target repo; skipping"
+                        );
+                        continue;
+                    }
+                }
                 sources
                     .re_translate_from_any(upload.clone(), file_hex, *file_size)
                     .await
@@ -391,6 +416,30 @@ async fn build_read_session(
     Ok(FileDownloadSession::new(Arc::new(cfg), None).await?)
 }
 
+/// True iff `file_hex` is already registered under the target repo, via
+/// `GET /v1/reconstructions/{hash}` with the target write token. The server 404s
+/// unless the file is in *this token's* repo (the per-repo scope check), so a 200
+/// means "already here, no need to re-source." Any non-200 — 404, an auth hiccup,
+/// a network error — returns false so we attempt the (idempotent) re-translate
+/// rather than wrongly skip a file the target lacks.
+async fn file_registered_on_target(
+    client: &reqwest::Client,
+    server_url: &str,
+    token: &str,
+    file_hex: &str,
+) -> bool {
+    let url = format!("{server_url}/v1/reconstructions/{file_hex}");
+    match client
+        .get(&url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
 /// Parse pre-push stdin lines (`<local ref> <local sha> <remote ref> <remote
 /// sha>`) into `(local_oid, remote_oid)`. Deletes (zero local sha) are skipped;
 /// a zero/invalid remote sha (new ref) yields `None`.
@@ -425,12 +474,20 @@ fn parse_oid(s: &str) -> Option<ObjectId> {
 }
 
 /// All bale pointers (`file_hex -> file_size`) introduced by the commits being
-/// pushed: walk `tips` (local shas) hiding `remote_tracking + remote shas`, and
-/// for each commit collect Added/Modified blobs that parse as pointers. With no
-/// hidden tips (first push to a fresh remote) this enumerates the full history.
+/// pushed: walk `tips` (local shas) hiding only the *remote shas git reports on
+/// stdin* (what the pushed ref currently points to on the remote), and for each
+/// commit collect Added/Modified blobs that parse as pointers. A new ref (remote
+/// sha = zero) hides nothing → the full history is enumerated.
+///
+/// Deliberately does NOT hide the remote's `refs/remotes/<name>/*`: git refs
+/// being present on a remote says nothing about whether the *bale objects* were
+/// ever registered under that remote's repo (the server scopes registration
+/// per-repo, and an old client — or this very bug — could have pushed the
+/// commits without the objects). Hiding them would skip exactly the files this
+/// drain must register. The per-file server probe in `run` keeps the resulting
+/// over-walk cheap by not re-uploading files already registered on the target.
 fn reachable_pointers(
     start_dir: &Path,
-    remote_name: Option<&str>,
     updates: &[(ObjectId, Option<ObjectId>)],
 ) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
@@ -451,10 +508,7 @@ fn reachable_pointers(
         return out;
     }
 
-    let mut hidden: Vec<ObjectId> = updates.iter().filter_map(|(_, r)| *r).collect();
-    if let Some(name) = remote_name {
-        hidden.extend(remote_tracking_tips(&repo, name));
-    }
+    let hidden: Vec<ObjectId> = updates.iter().filter_map(|(_, r)| *r).collect();
 
     // A bad hidden tip (remote sha not present locally) would abort the walk; if
     // hidden-walk fails, retry with none hidden so we over-upload rather than
@@ -555,30 +609,6 @@ fn consider_blob(repo: &gix::Repository, oid: ObjectId, out: &mut BTreeMap<Strin
             out.insert(info.hash().to_string(), size);
         }
     }
-}
-
-fn remote_tracking_tips(repo: &gix::Repository, remote_name: &str) -> Vec<ObjectId> {
-    let prefix = format!("refs/remotes/{remote_name}/");
-    let mut tips = Vec::new();
-    let Ok(platform) = repo.references() else {
-        return tips;
-    };
-    let Ok(iter) = platform.all() else {
-        return tips;
-    };
-    for r in iter {
-        let Ok(mut r) = r else { continue };
-        if !r.name().as_bstr().starts_with(prefix.as_bytes()) {
-            continue;
-        }
-        if let Ok(id) = r.peel_to_id() {
-            let id = id.detach();
-            if is_commit(repo, id) {
-                tips.push(id);
-            }
-        }
-    }
-    tips
 }
 
 fn is_commit(repo: &gix::Repository, oid: ObjectId) -> bool {

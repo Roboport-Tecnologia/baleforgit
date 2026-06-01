@@ -40,6 +40,7 @@ from baleharness.config import (
     E2E_REPO_GC3,
     E2E_REPO_MR_A,
     E2E_REPO_MR_B,
+    E2E_REPO_MR_C,
     E2E_REPO_OFFLINE,
     E2E_REPO_SPILL,
     E2E_USER,
@@ -382,6 +383,58 @@ def phase_multi_remote_push(
             f"multi-remote: repo B clone sha mismatch: got {got}, want {payload_sha}"
         )
     info("  repo B clone reconstructed shared.bin OK")
+
+    # --- Part 2: target already has the commits, but not the bale objects -----
+    # Reproduces the real-world report: a remote populated earlier by an
+    # argless/old client has the git history (so its remote-tracking refs cover
+    # it) but never received the bale objects. Pushing a NEW branch to it must
+    # re-register the objects under its scope, not skip them on the false premise
+    # that "the commits are already there, so the objects must be too".
+    #
+    # Simulate the stale remote by neutering the pre-push hook for one push (so
+    # only git objects land on repo C, no bale upload), then restoring it.
+    git(
+        [
+            "remote",
+            "add",
+            "staleobj",
+            remote_url_ssh(
+                ssh_port=server.ssh_port, owner=E2E_OWNER, repo=E2E_REPO_MR_C
+            ),
+        ],
+        cwd=repo,
+        env=env,
+    )
+    hook = repo / ".git" / "hooks" / "pre-push"
+    hook_bak = hook.with_name("pre-push.disabled")
+    hook.rename(hook_bak)
+    with timings.measure("multi-remote: seed repo C with commits only (no objects)"):
+        git(["push", "staleobj", "main"], cwd=repo, env=env)
+    hook_bak.rename(hook)
+
+    # Now push a NEW branch. The commits already exist on C (delta 0) and
+    # refs/remotes/staleobj/main covers them — the exact state the buggy
+    # remote-tracking-hiding skipped. The fix walks the full reachable set,
+    # probes C (404 → not registered), and re-sources shared.bin from origin.
+    with timings.measure("multi-remote: push new branch to stale-object repo C"):
+        git(["push", "staleobj", "main:revive"], cwd=repo, env=env)
+
+    revive_clone, revive_env, _ = init_repo_for_clone(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_MR_C,
+        name="multi-c-clone",
+    )
+    with timings.measure("multi-remote: cold clone+checkout of repo C branch"):
+        git(["checkout", "revive"], cwd=revive_clone, env=revive_env)
+    got_c = sha256_file(revive_clone / "shared.bin")
+    if got_c != payload_sha:
+        raise TestFailure(
+            f"multi-remote: repo C clone sha mismatch: got {got_c}, want {payload_sha}"
+        )
+    info("  repo C (stale-object remote) reconstructed shared.bin OK")
 
 
 def phase_offline_no_network(
