@@ -46,6 +46,12 @@ enum Command {
     MountDiff(MountDiffCliArgs),
     /// Mount a read-only virtual FS exposing the files at one revision.
     Mount(MountCliArgs),
+    /// Put this repo into fully-local (no-server) mode: durable object store on
+    /// disk, no server required. See `--shared` for a cross-repo store.
+    InitLocal(InitLocalArgs),
+    /// Reclaim a shared local store (delete objects no registered repo
+    /// references). Only meaningful with `--shared`.
+    Prune(PruneArgs),
 }
 
 #[derive(Args, Debug)]
@@ -115,6 +121,29 @@ struct MountCliArgs {
     paths: Vec<String>,
 }
 
+#[derive(Args, Debug)]
+struct InitLocalArgs {
+    /// Object store directory. Default: `.git/bale/store` (per-repo), or
+    /// `~/bale-local` when `--shared` is given with no path.
+    #[arg(long)]
+    store: Option<PathBuf>,
+    /// Share one store across all local repos. With no `--store`, defaults to
+    /// `~/bale-local`. Registers this repo for `git-bale prune --shared`.
+    #[arg(long)]
+    shared: bool,
+}
+
+#[derive(Args, Debug)]
+struct PruneArgs {
+    /// Reclaim the shared store (required — per-repo stores are reclaimed by gc).
+    #[arg(long)]
+    shared: bool,
+    /// Proceed even if a registered repo's path is missing (its objects may be
+    /// deleted). Default: abort, to avoid deleting another repo's only copy.
+    #[arg(long)]
+    force: bool,
+}
+
 fn main() -> Result<()> {
     set_default_xet_cache_root();
     let cli = Cli::parse();
@@ -173,6 +202,27 @@ fn main() -> Result<()> {
             mount_point: a.mount,
             paths: a.paths,
         }),
+        Command::InitLocal(a) => {
+            let cwd = std::env::current_dir()?;
+            let store = git_bale::store::resolve_init_store(&cwd, a.store.as_deref(), a.shared)?;
+            install::init_local(Some(cwd.as_path()), &store, a.shared)?;
+            if a.shared {
+                let git_dir = git_bale::store::repo_git_dir(&cwd)?;
+                git_bale::store::register_repo(&store, &git_dir)?;
+            }
+            println!(
+                "git-bale local mode enabled (store: {}{})",
+                store.display(),
+                if a.shared { ", shared" } else { "" }
+            );
+            Ok(())
+        }
+        Command::Prune(a) => {
+            if !a.shared {
+                anyhow::bail!("`git-bale prune` currently only supports --shared");
+            }
+            git_bale::prune::run(a.force)
+        }
     }
 }
 

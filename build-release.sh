@@ -29,6 +29,8 @@ bale-server-<version>-<target> and bale-client-<version>-<target>.
   ./build-release.sh --mac-only      only the macOS builds
   ./build-release.sh --windows-only  only the Windows build
   ./build-release.sh --no-windows    everything except Windows  (also --no-linux / --no-mac)
+  ./build-release.sh --no-sign       don't sign macOS binaries (ship plain .tar.gz)
+  ./build-release.sh --no-notarize   sign + build .pkg but skip notarization/stapling
 
 Targets:
   x86_64-unknown-linux-musl    static, podman in an emulated linux/amd64 container
@@ -39,12 +41,20 @@ Targets:
 
 Linux/Windows targets need podman + a running podman machine (amd64 emulation
 for the x86_64 Linux target; the Windows build cross-compiles, no emulation).
+
+macOS signing (when a "Developer ID Application" identity is in the keychain):
+each binary is signed with hardened runtime, then — if a "Developer ID
+Installer" identity is also present — packaged as a signed .pkg, notarized via
+the BALE_NOTARY_PROFILE keychain profile (default "bale-notary"), and stapled.
+Without those certs the macOS targets fall back to a plain .tar.gz.
 EOF
 }
 
 DO_LINUX=1
 DO_MAC=1
 DO_WIN=1
+MAC_SIGN=1
+MAC_NOTARIZE=1
 only() { DO_LINUX=0; DO_MAC=0; DO_WIN=0; }
 for arg in "$@"; do
   case "$arg" in
@@ -54,10 +64,20 @@ for arg in "$@"; do
     --no-linux)     DO_LINUX=0 ;;
     --no-mac)       DO_MAC=0 ;;
     --no-windows)   DO_WIN=0 ;;
+    --no-sign)      MAC_SIGN=0 ;;
+    --no-notarize)  MAC_NOTARIZE=0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
+
+# macOS signing config, auto-detected once below. An empty identity means "not
+# available — skip that step": no Developer ID Application -> unsigned .tar.gz;
+# Application but no Installer -> signed binary in a .tar.gz (no .pkg).
+APP_IDENTITY=""
+INSTALLER_IDENTITY=""
+NOTARY_PROFILE="${BALE_NOTARY_PROFILE:-bale-notary}"
+ENTITLEMENTS="$ROOT/packaging/macos/git-bale.entitlements"
 
 VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
 [ -n "${VERSION:-}" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
@@ -81,6 +101,32 @@ log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 # into one archive per component.
 rawdir() { echo "$STAGING/raw/$1"; }
 pkgname() { echo "bale-$1-${VERSION}-$2"; }       # component, target
+
+# Populate APP_IDENTITY / INSTALLER_IDENTITY from the keychain. -p codesigning
+# only lists code-signing identities (the Application cert); Installer certs
+# aren't in that policy, so they need a plain `find-identity -v`.
+detect_mac_signing() {
+  [ "$MAC_SIGN" = 1 ] || { log "macOS signing disabled (--no-sign)"; return; }
+  command -v codesign >/dev/null 2>&1 || return
+  APP_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+      | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+  INSTALLER_IDENTITY="$(security find-identity -v 2>/dev/null \
+      | sed -n 's/.*"\(Developer ID Installer: [^"]*\)".*/\1/p' | head -1)"
+  if [ -n "$APP_IDENTITY" ]; then log "signing as: $APP_IDENTITY"
+  else log "no 'Developer ID Application' identity — macOS binaries unsigned"; fi
+  [ -z "$APP_IDENTITY" ] || [ -n "$INSTALLER_IDENTITY" ] \
+      || log "no 'Developer ID Installer' identity — shipping signed .tar.gz, no .pkg"
+}
+
+# Sign one Mach-O with hardened runtime + secure timestamp. git-bale gets the
+# library-validation opt-out so its dlopened FUSE dylib can load.
+sign_mac_binary() {
+  local bin="$1" ent=()
+  [ "$(basename "$bin")" = "$CLIENT_BIN" ] && ent=(--entitlements "$ENTITLEMENTS")
+  codesign --force --timestamp --options runtime "${ent[@]}" \
+      --sign "$APP_IDENTITY" "$bin" || return 1
+  codesign --verify --strict "$bin" || return 1
+}
 
 # Which components ship for a target, and the on-disk binary name for each.
 components_for() {
@@ -145,7 +191,11 @@ build_mac() {
   for b in "$SERVER_BIN" "$CLIENT_BIN"; do
     cp "target/$t/release/$b" "$raw/$b" || return 1
     chmod 755 "$raw/$b"
+    # Sign last — codesign is the binary's final mutation (it replaces the
+    # linker's ad-hoc signature); anything after it invalidates the signature.
+    [ -n "$APP_IDENTITY" ] && { sign_mac_binary "$raw/$b" || return 1; }
   done
+  return 0
 }
 
 build_windows() {
@@ -164,15 +214,43 @@ build_windows() {
   podman rm "$cid" >/dev/null 2>&1 || true
 }
 
-# One archive per component for this target, each holding a single binary +
-# VERSION.txt. zip for Windows (what its users expect), tar.gz elsewhere.
+# Build a signed .pkg that installs one (already-signed) binary to
+# /usr/local/bin, then notarize + staple it. Unlike a bare Mach-O, a .pkg can
+# carry a stapled notarization ticket, so Gatekeeper verifies it offline.
+build_pkg() {
+  local t="$1" comp="$2" bin="$3" name="$4"
+  local raw root pkg
+  raw="$(rawdir "$t")"
+  root="$STAGING/pkgroot-$name"; rm -rf "$root"; mkdir -p "$root/usr/local/bin"
+  cp "$raw/$bin" "$root/usr/local/bin/$bin" || return 1
+  pkg="$DIST/${name}.pkg"; rm -f "$pkg"
+  pkgbuild --root "$root" --identifier "com.davidriosgomes.baleforgit.$comp" \
+      --version "$VERSION" --install-location / \
+      --sign "$INSTALLER_IDENTITY" "$pkg" || return 1
+  rm -rf "$root"
+  if [ "$MAC_NOTARIZE" = 1 ]; then
+    log "notarize ${name}.pkg (profile: $NOTARY_PROFILE)"
+    xcrun notarytool submit "$pkg" --keychain-profile "$NOTARY_PROFILE" --wait \
+        || return 1
+    xcrun stapler staple "$pkg" || return 1
+  fi
+}
+
+# One artifact per component for this target. Signed macOS targets -> stapled
+# .pkg; Windows -> .zip; everything else (and unsigned macOS) -> .tar.gz, each
+# holding a single binary + VERSION.txt.
 package() {
   local t="$1" comp name sd raw bin
   raw="$(rawdir "$t")"
   for comp in $(components_for "$t"); do
     name="$(pkgname "$comp" "$t")"
-    sd="$STAGING/$name"; rm -rf "$sd"; mkdir -p "$sd"
     bin="$(binname "$comp" "$t")" || return 1
+    if [ -n "$APP_IDENTITY" ] && [ -n "$INSTALLER_IDENTITY" ] \
+        && [[ "$t" == *-apple-darwin ]]; then
+      build_pkg "$t" "$comp" "$bin" "$name" || return 1
+      continue
+    fi
+    sd="$STAGING/$name"; rm -rf "$sd"; mkdir -p "$sd"
     cp "$raw/$bin" "$sd/$bin" || return 1
     printf 'bale %s\ncomponent: %s\ncommit: %s\ntarget: %s\nbuilt:  %s\n' \
         "$VERSION" "$comp" "$GITSHA" "$t" "$BUILT" > "$sd/VERSION.txt"
@@ -190,6 +268,7 @@ package() {
 }
 
 mkdir -p "$STAGING"
+[ "$DO_MAC" = 1 ] && detect_mac_signing
 targets=()
 [ "$DO_LINUX" = 1 ] && targets+=("${LINUX_TARGETS[@]}")
 [ "$DO_MAC" = 1 ] && targets+=("${MAC_TARGETS[@]}")
@@ -215,12 +294,12 @@ if [ ${#built[@]} -gt 0 ]; then
   log "checksums"
   ( cd "$DIST"
     shopt -s nullglob
-    files=(bale-*.tar.gz bale-*.zip)
+    files=(bale-*.tar.gz bale-*.zip bale-*.pkg)
     if command -v shasum >/dev/null 2>&1; then shasum -a 256 "${files[@]}"
     else sha256sum "${files[@]}"; fi > SHA256SUMS )
   rm -rf "$STAGING"
   log "artifacts in dist/"
-  ( cd "$DIST" && ls -lh bale-*.tar.gz bale-*.zip SHA256SUMS 2>/dev/null )
+  ( cd "$DIST" && ls -lh bale-*.tar.gz bale-*.zip bale-*.pkg SHA256SUMS 2>/dev/null )
 fi
 
 if [ ${#failed[@]} -gt 0 ]; then

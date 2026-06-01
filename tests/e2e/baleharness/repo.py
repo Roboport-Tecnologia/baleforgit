@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 from baleharness.client import ClientEnv, remote_url_ssh
 from baleharness.gitutil import git
@@ -46,6 +47,34 @@ def init_repo_for_push(
     (work / ".gitattributes").write_text("*.bin filter=bale -text\n")
     git(["add", ".gitattributes"], cwd=work, env=env)
     git(["commit", "-m", "enable bale filter"], cwd=work, env=env)
+    return work, env
+
+
+def init_repo_local(
+    *,
+    work_root: Path,
+    client: ClientEnv,
+    name: str,
+    shared_store: Optional[Path] = None,
+    track_glob: str = "*.bin",
+) -> tuple[Path, dict]:
+    """Init a working repo in fully-local mode. No server remote is configured.
+    With `shared_store`, all such repos point at one store dir."""
+    work = work_root / name
+    work.mkdir(parents=True)
+    env = client.make_env()
+    # Remove server-targeting vars so the smudge filter never tries a network
+    # path even if the harness env happened to carry stale server coordinates.
+    env.pop("BALE_SERVER_URL", None)
+    env.pop("BALE_TOKEN", None)
+    git(["init", "-b", "main", "."], cwd=work, env=env)
+    cmd = [str(client.git_bale_bin), "init-local"]
+    if shared_store is not None:
+        cmd += ["--shared", "--store", str(shared_store)]
+    run(cmd, cwd=work, env=env)
+    run([str(client.git_bale_bin), "track", track_glob], cwd=work, env=env)
+    git(["add", ".gitattributes"], cwd=work, env=env)
+    git(["commit", "-m", "track"], cwd=work, env=env)
     return work, env
 
 

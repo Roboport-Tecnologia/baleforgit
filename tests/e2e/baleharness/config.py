@@ -20,6 +20,7 @@ JWT_TTL_YEARS = 100
 BIG_FILE_BYTES = 35 * 1024 * 1024  # 35 MB (~547 chunks at 64 KiB target).
 SMALL_FILE_BYTES = 8 * 1024
 GC_PAYLOAD_BYTES = 256 * 1024  # a handful of CDC chunks → real xorbs/shards staged
+LOCAL_PAYLOAD_BYTES = 6 * 1024 * 1024  # big enough to chunk into several xorbs
 # The clean filter holds payloads in RAM up to a 4 GiB default, so no realistic
 # e2e file ever spills to a tmpfile. The spilled-clean phase caps the threshold
 # via BALE_MAX_INLINE_CLEAN and pushes a file above it to drive `handle_clean`'s

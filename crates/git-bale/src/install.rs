@@ -62,6 +62,30 @@ pub fn install(scope: Scope, repo: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Put the repo at `repo` (or cwd) into fully-local mode: register the filter,
+/// install only the gc hooks (no pre-push drain — nothing to drain), and write
+/// `bale.local*` config. `store` is the resolved, tilde-expanded store path;
+/// `shared` marks it as a cross-repo store.
+pub fn init_local(repo: Option<&Path>, store: &Path, shared: bool) -> Result<()> {
+    set_config(Scope::Local, repo, "process", PROCESS_VALUE)?;
+    set_config(Scope::Local, repo, "required", "true")?;
+    set_bale_config(Scope::Local, repo, "local", "true")?;
+    set_bale_config(Scope::Local, repo, "localStore", &store.to_string_lossy())?;
+    if shared {
+        set_bale_config(Scope::Local, repo, "localShared", "true")?;
+    }
+    for hook in GC_HOOKS {
+        install_managed_hook(
+            repo,
+            hook,
+            "git-bale gc || true",
+            "Reclaim local-store objects for bale files that were unstaged or discarded.",
+            OnConflict::Skip,
+        )?;
+    }
+    Ok(())
+}
+
 pub fn uninstall(scope: Scope, repo: Option<&Path>) -> Result<()> {
     // --unset-all clears duplicate entries from older installs in one pass.
     let _ = unset_config(scope, repo, "process");
@@ -212,6 +236,19 @@ fn run_git_config(
     cmd.args(args);
     let out = cmd.output().with_context(|| "spawning git config")?;
     Ok(out)
+}
+
+fn set_bale_config(scope: Scope, repo: Option<&Path>, key: &str, value: &str) -> Result<()> {
+    let full_key = format!("bale.{key}");
+    let out = run_git_config(scope, repo, &[&full_key, value])?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git config {} {full_key} {value} failed: {}",
+            scope_flag(scope),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 fn set_config(scope: Scope, repo: Option<&Path>, key: &str, value: &str) -> Result<()> {

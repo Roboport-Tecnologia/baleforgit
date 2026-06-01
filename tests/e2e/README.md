@@ -95,6 +95,10 @@ git-bale *client* runs on the host. On a Windows host:
 | `resync-wipe`         | Disaster recovery: push a binary, restart the server with a BLANK CAS (fresh data dir, same bare repo), then delete `.git`, re-init, re-add, and `git push -f`. The first push is *rejected* — every chunk dedups against the client's stale xet cache, so the xorbs the blank server lacks are never re-uploaded — and the client surfaces a plain-language cache-mismatch explanation (naming the active cache dir + `BALE_XET_CACHE`), not a bare `400 Bad Request on /shards`; the rejected push leaves staging intact and writes nothing to the server. Recovery then follows that advice: a second `git push -f` with `BALE_XET_CACHE` pointed at a fresh dir re-uploads everything and succeeds, and a cold clone reconstructs the file byte-for-byte. |
 | `spilled-clean`       | Caps `BALE_MAX_INLINE_CLEAN` at 1 MiB so a 5 MiB `git add` drives the clean filter's spill-to-tmpfile path; an unstage + re-add hits the file-backed clean-cache verify, then push + cold/hot resmudge round-trips the spilled file. |
 | `global-dedup-shard`  | The server's `GET /v1/chunks` dedup shard must ingest without crashing the upload session. Seeds a repo, fetches the dedup shard for a known chunk straight from the endpoint and asserts its footer is well-formed (lookup offsets == `footer_offset`, never 0), then plants that shard into the client's xet `shard-cache/` and pushes again — the second push's `FileUploadSession` scans + ingests it via `read_all_truncated_hashes`, the path that underflowed (debug panic / release OOM) when `file_lookup_offset` was 0. Deterministic: doesn't rely on the 1/1024 global-dedup chunk sampling, which the release binary can't lower. |
+| `local-basic`         | **No-server.** `git-bale init-local` sets up a per-repo store (`bale.local=true`, `bale.localStore=.git/bale/store`). A `git add` + `git commit` writes xorbs/shards to the durable store (no staging drain needed); a fresh checkout with manifests wiped reconstructs the file byte-for-byte from the store alone, with no server running. |
+| `local-gc-abandon`    | **No-server.** Stage a file, then abandon it (`git reset` + `git checkout`); the post-checkout gc hook drops the orphaned markers and clean-cache entry. A re-add + checkout reconstructs correctly (no stale pointer). |
+| `local-shared-dedup`  | **No-server.** Two repos share one store at `~/bale-local` (`--shared`). Adding the same content in both repos results in zero additional xorb bytes in the shared store — chunk-level dedup works cross-repo through the shared store. |
+| `local-prune-shared`  | **No-server.** With a shared store, commit a file in repo A (live) and a file in repo B then drop repo B's reference (dead). `git-bale prune --shared` removes the dead object and leaves the live one intact; repo A can still reconstruct its file after prune. |
 
 ### Running the whole suite on S3
 
@@ -357,7 +361,7 @@ testing and coverage measurement stay separate.
 | `entrypoint.sh`            | Generates ssh host keys + authorized_keys + bare repos + the fake     |
 |                            | `git-bale-authenticate` script, starts sshd, execs `baleforgit-server`. Also pass-through for `BALE_S3_*` env vars when set. |
 | `run.py`                   | Entry point: runs `baleharness.cli.main` (the fs *and* `--backend s3` suites) and re-exports the names `s3lib.py` imports via `from run import …`. |
-| `baleharness/`             | The harness itself, split into focused modules (see below). `cli.py` owns the phase registry + `main()` + the `--backend` flag; `phases/` holds one module per phase category (`scenario`, `mount`, `adversarial`, `failure`, `coverage_phases`, `gc`, `progress`). |
+| `baleharness/`             | The harness itself, split into focused modules (see below). `cli.py` owns the phase registry + `main()` + the `--backend` flag; `phases/` holds one module per phase category (`scenario`, `mount`, `adversarial`, `failure`, `coverage_phases`, `gc`, `progress`, `local`). |
 | `baleharness/s3backend.py` | `MinioGuard`, `Network`, `S3StorageView`, the `BALE_S3_*` env/run-arg helpers, the `data_root`→prefix derivation, and the process-global "active S3 backend" that makes `start_container` S3-aware under `--backend s3`. Importable without `run`, so `server.py` uses it without a cycle. |
 | `baleharness/pgbackend.py` | The metadata-store analogue of `s3backend.py`: `PostgresGuard` (sidecar + per-database provisioning), the `data_root`→database-name derivation, and the process-global "active Postgres backend" that makes `start_container` inject `BALE_POSTGRES_URL` under `--meta postgres`. Reuses `s3backend.Network` so the two sidecars share one podman network. |
 | `run_legacy.py`            | Frozen copy of the pre-split monolithic `run.py`, kept only to validate the refactor against. Delete once parity is confirmed. |
@@ -477,7 +481,8 @@ The `REGISTRY` dict in `baleharness/cli.py` maps each phase name to its
 group + `read_only` flag + thunk; `--skip` drops a named phase. Phases
 that depend on earlier state (e.g. `usage` needs the pushes from
 `bigfile`) live in group `g2-tail` and auto-skip when `rev_state` is
-empty. `offline-restart` is a *merged* phase that
+empty. The four `local-*` phases live in group `g3`; they never touch the
+shared server (no container needed), so they run in an isolated work dir and compose cleanly with `--backend` and `--meta`. `offline-restart` is a *merged* phase that
 deliberately can't be split: it stops the server, runs an offline
 smudge, then starts a fresh container against the same data dir. If you
 add a phase between offline-smudge and restart, restructure the merged

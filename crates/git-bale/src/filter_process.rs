@@ -280,6 +280,7 @@ fn do_clean<R: Read, W: Write>(
     let git_dir = raw.git_dir.as_deref().ok_or_else(|| {
         anyhow!("clean: cannot stage upload — no git directory resolved from cwd")
     })?;
+    let store = crate::store::object_store_root(raw).context("resolving object store root")?;
     let cache_key = clean_cache::path_key(pathname);
 
     // `git status`/`git diff` re-invoke clean on every command for a modified
@@ -320,32 +321,37 @@ fn do_clean<R: Read, W: Write>(
 
     let rt = ensure_runtime(rt_slot)?;
     match payload {
-        CleanPayload::InMemory(buf) => {
-            handle_clean_in_memory(rt, git_dir, buf, writer, pathname, &cache_key, file_size)
-        }
-        CleanPayload::Spilled(tmp) => {
-            handle_clean(rt, git_dir, tmp, writer, pathname, &cache_key, file_size)
-        }
+        CleanPayload::InMemory(buf) => handle_clean_in_memory(
+            rt, git_dir, &store, buf, writer, pathname, &cache_key, file_size,
+        ),
+        CleanPayload::Spilled(tmp) => handle_clean(
+            rt, git_dir, &store, tmp, writer, pathname, &cache_key, file_size,
+        ),
     }
 }
 
 /// In-memory variant of [`handle_clean`]: avoids the tmp-file write plus the
 /// re-reads `clean_file`/`compute_chunks` would do, building the chunk index
 /// from the buffer already in RAM.
+#[allow(clippy::too_many_arguments)]
 fn handle_clean_in_memory<W: Write>(
     rt: &Arc<XetRuntime>,
     git_dir: &Path,
+    store: &Path,
     bytes: Vec<u8>,
     writer: &mut PktWriter<W>,
     pathname: &str,
     cache_key: &PathKey,
     file_size: u64,
 ) -> Result<()> {
+    // Markers stay per-repo under .git/bale/staging/file-index even when the
+    // object store is shared; only xorbs/shards go to `store`.
     crate::fs_util::create_bale_subdir(git_dir, "staging")
         .with_context(|| format!("creating staging dir under {}", git_dir.display()))?;
-    let staging = staging_root(git_dir);
+    std::fs::create_dir_all(store)
+        .with_context(|| format!("creating object store {}", store.display()))?;
     let translator =
-        TranslatorConfig::local_config(&staging).context("building local TranslatorConfig")?;
+        TranslatorConfig::local_config(store).context("building local TranslatorConfig")?;
     // Build the index before clean_bytes consumes the Vec.
     let chunks = clean_cache::compute_chunks_from_slice(&bytes);
     let (pointer_string, file_hex) = rt
@@ -385,9 +391,11 @@ fn handle_clean_in_memory<W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_clean<W: Write>(
     rt: &Arc<XetRuntime>,
     git_dir: &Path,
+    store: &Path,
     tmp: NamedTempFile,
     writer: &mut PktWriter<W>,
     pathname: &str,
@@ -396,11 +404,14 @@ fn handle_clean<W: Write>(
 ) -> Result<()> {
     // Stage chunks/xorbs/shards locally via xet-data's LocalClient instead of
     // uploading; `git-bale push-pending` drains staging at push time.
+    // Markers stay per-repo under .git/bale/staging/file-index even when the
+    // object store is shared; only xorbs/shards go to `store`.
     crate::fs_util::create_bale_subdir(git_dir, "staging")
         .with_context(|| format!("creating staging dir under {}", git_dir.display()))?;
-    let staging = staging_root(git_dir);
+    std::fs::create_dir_all(store)
+        .with_context(|| format!("creating object store {}", store.display()))?;
     let translator =
-        TranslatorConfig::local_config(&staging).context("building local TranslatorConfig")?;
+        TranslatorConfig::local_config(store).context("building local TranslatorConfig")?;
     // Moving `tmp` into the closure would unlink it before compute_chunks below;
     // pass only the path and keep `tmp` owned out here.
     let tmp_path = tmp.path().to_path_buf();
@@ -530,16 +541,17 @@ fn handle_smudge<R: Read, W: Write>(
         false
     };
 
-    // Lukewarm path: bytes still staged locally, not yet pushed. Gated on the
-    // per-file marker — reconstructing without it trips a `debug_assert_eq!` in
-    // xet-data on an empty term list (see `staging::mark_file_staged`).
+    // Lukewarm path (server mode only): bytes still staged locally, not yet
+    // pushed. Gated on the per-file marker (see staging::mark_file_staged).
     let staging_hit = if !cache_hit
+        && !raw.local_mode
         && raw
             .git_dir
             .as_deref()
             .is_some_and(|gd| file_is_staged(gd, &file_id_hex))
     {
-        match try_smudge_from_staging(rt, raw, &info, file_size, &tmp) {
+        let gd = raw.git_dir.as_deref().unwrap();
+        match try_smudge_from_store(rt, &staging_root(gd), &info, file_size, &tmp) {
             Ok(true) => true,
             Ok(false) => false,
             Err(e) => {
@@ -550,6 +562,41 @@ fn handle_smudge<R: Read, W: Write>(
     } else {
         false
     };
+
+    // Local mode: reconstruct only from the durable store. No network, no auth,
+    // no silent fallback — a miss or short read is a hard error.
+    if raw.local_mode && !cache_hit {
+        let store = crate::store::object_store_root(raw).context("resolving object store root")?;
+        // Reset any partial bytes from a failed hot-path attempt.
+        let mut trunc = tmp.reopen()?;
+        trunc.set_len(0)?;
+        std::io::Seek::seek(&mut trunc, std::io::SeekFrom::Start(0))?;
+        drop(trunc);
+
+        let ok = try_smudge_from_store(rt, &store, &info, file_size, &tmp)
+            .with_context(|| format!("reconstructing {file_id_hex} from local store"))?;
+        let written = std::fs::metadata(tmp.path()).map(|m| m.len()).unwrap_or(0);
+        if !ok || written != file_size {
+            return Err(anyhow!(
+                "local store at {} cannot reconstruct {} ({} of {} bytes); the object \
+                 data is missing — was this repo copied without its store, or the store pruned?",
+                store.display(),
+                file_id_hex,
+                written,
+                file_size
+            ));
+        }
+        if let Some(git_dir) = raw.git_dir.as_deref() {
+            populate_clean_cache_from_smudge(
+                git_dir,
+                pathname,
+                tmp.path(),
+                &pointer_buf,
+                file_size,
+            );
+        }
+        return finish_smudge(writer, tmp.path());
+    }
 
     // Cold path: delegate to xet-data.
     if !cache_hit && !staging_hit {
@@ -661,24 +708,21 @@ fn populate_clean_cache_from_smudge(
     }
 }
 
-/// Reconstruct from staging. `Ok(false)` means no usable staging dir; on-disk
-/// errors propagate so the caller falls through to the cold path.
-fn try_smudge_from_staging(
+/// Reconstruct from a local store dir. `Ok(false)` means the store dir does not
+/// exist; on-disk/runtime errors propagate so callers can fall through (server
+/// mode) or hard-error (local mode).
+fn try_smudge_from_store(
     rt: &Arc<XetRuntime>,
-    raw: &crate::config::RawConfig,
+    store: &Path,
     info: &xet_data::processing::XetFileInfo,
     file_size: u64,
     tmp: &NamedTempFile,
 ) -> Result<bool> {
-    let Some(git_dir) = raw.git_dir.as_deref() else {
-        return Ok(false);
-    };
-    let staging = staging_root(git_dir);
-    if !staging.exists() {
+    if !store.exists() {
         return Ok(false);
     }
     let translator =
-        TranslatorConfig::local_config(&staging).context("building local TranslatorConfig")?;
+        TranslatorConfig::local_config(store).context("building local TranslatorConfig")?;
     let dest_file = tmp.reopen()?;
     let info_for_dl = info.clone();
     rt.bridge_sync(async move {

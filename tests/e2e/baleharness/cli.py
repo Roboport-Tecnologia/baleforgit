@@ -81,6 +81,12 @@ from baleharness.phases.gc import (
     phase_gc_keeps_unpushed,
     phase_gc_mixed,
 )
+from baleharness.phases.local import (
+    phase_local_basic,
+    phase_local_gc_abandon,
+    phase_local_prune_shared,
+    phase_local_shared_dedup,
+)
 from baleharness.phases.mount import (
     phase_mount_diff,
     phase_mount_diff_mixed,
@@ -773,6 +779,22 @@ def main() -> int:
                 huge_minutes=huge_minutes,
             )
 
+        def _phase_local_basic() -> None:
+            phase_local_basic(timings=timings, client=client, work_root=work_root)
+
+        def _phase_local_gc() -> None:
+            phase_local_gc_abandon(timings=timings, client=client, work_root=work_root)
+
+        def _phase_local_shared() -> None:
+            phase_local_shared_dedup(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_prune() -> None:
+            phase_local_prune_shared(
+                timings=timings, client=client, work_root=work_root
+            )
+
         # name -> (group, read_only, fn)
         REGISTRY: dict[str, tuple[str, bool, Callable[[], None]]] = {
             "basic": ("g1", False, _phase_basic),
@@ -853,6 +875,12 @@ def main() -> int:
             # fixed variants and asserts the captured summary; `--only
             # progress-demo` instead runs the env-driven interactive visual demo.
             "progress-demo": ("g3", False, _phase_progress_demo),
+            # Fully-local (no-server) mode: init-local → add + commit a big file
+            # → fresh checkout reconstructs from .git/bale/store. No server, so g3.
+            "local-basic": ("g3", False, _phase_local_basic),
+            "local-gc-abandon": ("g3", False, _phase_local_gc),
+            "local-shared-dedup": ("g3", False, _phase_local_shared),
+            "local-prune-shared": ("g3", False, _phase_local_prune),
         }
 
         # Build the within-group lists in declaration order, then apply

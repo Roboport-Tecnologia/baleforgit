@@ -290,6 +290,53 @@ While the upload runs, `crates/git-bale/src/progress.rs` draws a single-line, gi
 
 `git-bale install --local` writes managed git hooks, each carrying a `bale-marker:` line so `git-bale uninstall --local` can remove it without clobbering a hand-written hook. A `pre-push` hook `exec`s `git-bale push-pending`; `post-checkout`, `post-commit`, and `post-merge` hooks run `git-bale gc || true`. The pre-push hook is correctness-critical, so install **fails** if a foreign (unmarked) pre-push hook already exists; the gc hooks are best-effort, so install **skips with a warning** rather than clobbering a foreign hook of the same name. Global / system-scope installs don't touch hooks — hooks are inherently per-repo. The hook path comes from gix (`git_dir().join("hooks")`, honoring `core.hooksPath` from the merged config snapshot) so worktrees and overrides resolve correctly.
 
+### Fully-local mode
+
+`git-bale init-local [--store <path>] [--shared]` puts a repo into fully-local (no-server) mode. It:
+
+- Installs the `bale` filter driver + the gc hooks into local git config (same as the filter/gc portions of `install --local`, without the pre-push hook — nothing to drain).
+- Writes `bale.local=true` and `bale.localStore=<store>` into the repo's local git config.
+- With `--shared`: also sets `bale.localShared=true` and registers the repo in `<store>/repos/` for `git-bale prune --shared`.
+
+Note: the existing `git-bale install --local` is unrelated — its `--local` refers to the git-config scope (as opposed to `--global`/`--system`); `init-local` is the command that enables no-server operation.
+
+**Config keys** (env overrides git-config in all cases):
+
+| git-config key     | env var            | type | meaning |
+|--------------------|--------------------|------|---------|
+| `bale.local`       | `BALE_LOCAL`       | bool | enables fully-local mode |
+| `bale.localStore`  | `BALE_LOCAL_STORE` | path (tilde-expanded) | explicit store directory |
+| `bale.localShared` | `BALE_LOCAL_SHARED`| bool | store is shared across repos |
+
+**Object store resolution** (`crate::store::object_store_root`):
+
+| mode | `bale.localStore` set? | result |
+|------|------------------------|--------|
+| server | — | `.git/bale/staging/` (transient) |
+| local | no | `.git/bale/store` (per-repo durable) |
+| local | yes | `<bale.localStore>` (explicit, tilde-expanded) |
+| local + `--shared` + no `--store` | no | `~/bale-local` |
+
+**Per-repo markers stay per-repo.** The `file-index/` markers, the clean-cache, and the manifest cache always live under `.git/bale/` — they track *this repo's* reachable content. Only xorbs/shards relocate to the configured store. A shared store must never hold one repo's markers; `gc` and `prune` both enforce this.
+
+**Clean (`git add`)** writes xorbs/shards to `object_store_root` (durable in local mode). The offline `LocalClient` path is identical to server-mode staging: content-addressed + atomic writes, so re-adds dedup.
+
+**Smudge:** hot path (manifest + chunk cache) → store reconstruct → **hard error**. In local mode there is no lukewarm staging path and no network fallback. If the store cannot fully reconstruct the file, smudge returns an error rather than a partial file or a silent empty read.
+
+**push-pending:** no-op in local mode. Objects are already durable; `git push` to a git remote moves only the small pointer commits. Large-file data stays machine-local and never reaches the server.
+
+**gc** in local mode: liveness = reachable from any local ref + index + stash (remote-tracking refs are *not* hidden, because there is no server to fall back to). Dead markers are dropped and clean-cache entries for truly-orphaned hashes are invalidated, same as server mode. Shared store: gc is append-only — it never deletes objects or markers from the shared store, because another registered repo may reference the same objects. `git-bale prune --shared` reclaims.
+
+**`git-bale prune --shared`** compacts a shared store:
+
+1. Acquires a lockfile at `<store>/.prune.lock` (aborts if held by another process).
+2. Computes the union of file-hashes reachable across all registered repos (`<store>/repos/`).
+3. **Aborts if any registered repo path is missing** — its objects may be the only copy. Pass `--force` to skip missing repos.
+4. Reconstructs each live file from the old store and re-cleans it into a fresh temp store (deterministic CDC re-dedups). Asserts the round-trip hash matches before swapping.
+5. Atomically renames the old store aside and moves the new store into place. The old store is removed on success; a swap failure rolls back so the store is never absent.
+
+Run `git-bale prune --shared` when idle: it is not safe to run against a shared store while another process is doing `git add` to the same store.
+
 ### Staging reconciliation (`git-bale gc`)
 
 `clean` only ever *adds* to staging; only a successful `push-pending` drains it. So if you `git add` a change and then abandon it (`git reset`, `git checkout`, switch branches), its staged xorbs/shards used to linger forever — and worse, the next `push-pending` would upload that orphaned content even though no commit references it. `git-bale gc` (`crates/git-bale/src/gc.rs`) reconciles staging against git reachability.
@@ -532,6 +579,7 @@ These are the easy-to-get-wrong parts of the protocol. Calling them out explicit
 - **64 MiB limits** on both xorbs and shards — enforced via `DefaultBodyLimit`.
 - **Shard magic tag** — the 32-byte `MDB_SHARD_HEADER_TAG` is `b"HFRepoMetaData" + [0, 85, 105, 103, 69, 106, 123, 129, 87, 131, 165, 189, 217, 92, 205, 209, 74, 169]`, lifted verbatim from xet-core's `mdb_shard::shard_format::MDB_SHARD_HEADER_TAG` at the `git-xet-v0.2.1` tag. Our parser still accepts any 32-byte tag (so shards from older toolchains round-trip), but the serializer emits this canonical value so xet-core's strict header check accepts what we produce.
 - **Token `exp` is UTC unix seconds and is compared against the *local* clock — client and server clocks must agree (NTP).** Tokens are short-lived (`DEFAULT_TOKEN_TTL_SECS` = 5 min, UTC, in `bale-server-authz-{mem,http}`). xet's `TokenProvider` checks `expiration <= local_now + 30s` and, when true, calls the token refresher. git-bale supplies `resolver::ForgeTokenRefresher`, which re-runs the full forge resolution (`resolve`) to re-mint — wired into **every** CAS client (`push-pending`, the cold smudge path, `mount`, and `fetch_manifest`) via `resolver::forge_refresher(raw, scope)`. This is what lets a single operation outlive one token's TTL, and why a 5-minute TTL is safe. The failure mode it does **not** paper over is clock skew: the server mints `exp` on *its* clock, so if the client's clock runs more than the TTL ahead of the server's, a freshly minted, server-valid token looks already-expired on arrival and re-minting just yields another equally-"expired" one. To avoid storming the forge forever, `ForgeTokenRefresher` counts consecutive re-mints that come back already-expired (within xet's 30 s `REFRESH_BUFFER_SEC`) and, after `MAX_EXPIRED_REFRESHES` (3), fails with an explicit "clocks differ by more than the TTL — sync clocks (NTP)" error instead. This bit hard under podman on macOS, whose VM clock lags the host after sleep — keep the server's clock NTP-synced. The old `ErrTokenRefresher` (no refresher wired up) turned the very first tripped check into a hard `RefreshFunctionNotCallable` error with no recovery.
+- **A per-repo local store (`.git/bale/store`) is NOT carried by `git clone`.** `git clone` copies the object database and refs, not `.git/bale/`. A clone of a repo with a per-repo store cannot reconstruct its Bale-tracked files: the store is on the original machine only. Use `--shared` (store at `~/bale-local`) when you need multiple working copies on one machine.
 - **Dedup-shard footer lookup offsets must be non-zero even with no lookup tables.** `get_dedup_chunk`'s shard omits the file/xorb/chunk lookup tables (`*_num_entry = 0`), but `serialize` must still write each lookup *offset* as `footer_offset` (the section end), not 0. The client runs `read_all_truncated_hashes` on every dedup shard it ingests into its `ShardFileManager`; for a table-less shard it computes the xorb-info byte range as `(xorb_info_offset, file_lookup_offset)` and a 0 there underflows `file_lookup_offset - xorb_info_offset` → panic (debug) / multi-exabyte alloc → OOM (release), killing the push. xet's own serializer sets the offset even when the table is absent; we match it. Guarded by the `global-dedup-shard` e2e phase.
 
 ## Where to look in the code
@@ -575,7 +623,10 @@ Client side (`crates/git-bale/`):
 | Forge auth resolver | `crates/git-bale/src/resolver.rs` |
 | `git-bale install` / `git-bale uninstall` (+ pre-push / post-checkout / post-commit / post-merge hooks) | `crates/git-bale/src/install.rs` |
 | `git-bale push-pending` (drain `.git/bale/staging/`) | `crates/git-bale/src/push_pending.rs` |
-| `git-bale gc` (reconcile `.git/bale/staging/` against git reachability) | `crates/git-bale/src/gc.rs` |
+| `git-bale gc` (reconcile staging / local store against git reachability) | `crates/git-bale/src/gc.rs` |
+| `git-bale prune --shared` (compact shared local store) | `crates/git-bale/src/prune.rs` |
+| Object store root resolution + shared-store registry | `crates/git-bale/src/store.rs` |
+| `git-bale init-local` (no-server setup) | `crates/git-bale/src/install.rs`, `src/store.rs` |
 | Local staging-dir path + cleanup helpers | `crates/git-bale/src/staging.rs` |
 | `git-bale track` (`.gitattributes` writer) | `crates/git-bale/src/track.rs` |
 | `git-bale mount-diff` (read-only FUSE diff view) | `crates/git-bale/src/mount/` |

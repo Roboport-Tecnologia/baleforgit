@@ -20,7 +20,7 @@
 //! is unsafe: the object sweep runs only once no marker remains.
 
 use std::collections::{BTreeSet, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use gix::ObjectId;
@@ -48,6 +48,31 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
         }
     };
     let git_dir = repo.git_dir().to_path_buf();
+
+    let raw = crate::config::RawConfig::load(Some(start_dir)).unwrap_or_else(|e| {
+        tracing::debug!("git-bale gc: config load failed ({e}); assuming server mode");
+        crate::config::RawConfig {
+            server_url: None,
+            token: None,
+            token_expiration: None,
+            cache_dir: PathBuf::from("."),
+            git_dir: Some(git_dir.clone()),
+            local_mode: false,
+            local_store: None,
+            local_shared: false,
+        }
+    });
+
+    // Shared local store: append-only. gc must not delete objects another repo
+    // may reference, and markers are the only record of what's in the store, so
+    // keep them too. `git-bale prune --shared` reclaims. Just tidy empty dirs.
+    if raw.local_mode && raw.local_shared {
+        let _ = remove_empty_dirs(&staging_root(&git_dir));
+        return Ok(());
+    }
+
+    let store = crate::store::object_store_root(&raw).unwrap_or_else(|_| staging_root(&git_dir));
+
     let staging = staging_root(&git_dir);
 
     let staged = list_staged_files(&git_dir).unwrap_or_default();
@@ -59,7 +84,16 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
     let want: BTreeSet<String> = staged.into_iter().map(|(h, _)| h).collect();
 
     let (local_tips, remote_tips) = ref_tips(&repo);
-    let live = reachable_hashes(&repo, &want, &local_tips, &remote_tips);
+    // Local mode: the store is the only copy, so liveness = reachable from ANY
+    // ref (no remote-tracking hiding) + index. Server mode: hide remotes (the
+    // server is the source of truth for already-pushed content).
+    let live = if raw.local_mode {
+        let mut all = local_tips.clone();
+        all.extend(remote_tips.iter().copied());
+        reachable_hashes(&repo, &want, &all, &[])
+    } else {
+        reachable_hashes(&repo, &want, &local_tips, &remote_tips)
+    };
     let dead: Vec<String> = want
         .iter()
         .filter(|h| !live.contains(*h))
@@ -85,7 +119,7 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
     // those worktree bytes to the pointer — so a later `git add` short-circuits
     // to a pointer with no backing (the stage→unstage→stash data-loss bug).
     // Invalidate them; pushed hashes keep their cache (smudge falls to server).
-    let orphaned: BTreeSet<String> = if remote_tips.is_empty() {
+    let orphaned: BTreeSet<String> = if raw.local_mode || remote_tips.is_empty() {
         dead.iter().cloned().collect()
     } else {
         let mut all_tips = local_tips;
@@ -108,10 +142,13 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
     let remaining = list_staged_files(&git_dir).map(|v| v.len()).unwrap_or(0);
     if remaining == 0 {
         let _ = clear_file_markers(&git_dir);
-        if let Err(e) = remove_all_staged_objects(&staging) {
-            tracing::warn!("git-bale gc: sweeping staged objects: {e}");
+        if let Err(e) = remove_all_staged_objects(&store) {
+            tracing::warn!("git-bale gc: sweeping store objects: {e}");
         }
-        let _ = remove_empty_dirs(&staging);
+        let _ = remove_empty_dirs(&store);
+        if store != staging {
+            let _ = remove_empty_dirs(&staging);
+        }
     }
     Ok(())
 }
@@ -299,6 +336,15 @@ fn consider_blob(
             live.insert(h);
         }
     }
+}
+
+/// File-hashes in `want` reachable from `repo`'s index or ANY ref (no hiding).
+/// Shared by `git-bale prune`.
+pub fn reachable_all(repo: &gix::Repository, want: &BTreeSet<String>) -> HashSet<String> {
+    let (local_tips, remote_tips) = ref_tips(repo);
+    let mut all = local_tips;
+    all.extend(remote_tips);
+    reachable_hashes(repo, want, &all, &[])
 }
 
 fn is_commit(repo: &gix::Repository, oid: ObjectId) -> bool {

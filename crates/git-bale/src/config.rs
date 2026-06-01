@@ -26,6 +26,16 @@ pub struct RawConfig {
     pub token_expiration: Option<u64>,
     pub cache_dir: PathBuf,
     pub git_dir: Option<PathBuf>,
+    /// Fully-local (no-server) mode: `bale.local` / `BALE_LOCAL`.
+    pub local_mode: bool,
+    /// Configured durable object store (`bale.localStore` / `BALE_LOCAL_STORE`),
+    /// tilde-expanded. `None` means "use the per-repo default" — resolved lazily
+    /// by `store::object_store_root` so a missing git_dir is a per-call error,
+    /// not a load() failure.
+    pub local_store: Option<PathBuf>,
+    /// `bale.localShared` / `BALE_LOCAL_SHARED`: the store is shared across
+    /// repos, so gc must not delete objects (see `prune`).
+    pub local_shared: bool,
 }
 
 impl RawConfig {
@@ -62,12 +72,20 @@ impl RawConfig {
             None => None,
         };
 
+        let local_mode = bool_from("BALE_LOCAL", snapshot.as_ref(), "bale.local");
+        let local_shared = bool_from("BALE_LOCAL_SHARED", snapshot.as_ref(), "bale.localShared");
+        let local_store = env_or_cfg("BALE_LOCAL_STORE", snapshot.as_ref(), "bale.localStore")
+            .map(|s| expand_tilde(&s));
+
         Ok(Self {
             server_url,
             token,
             token_expiration,
             cache_dir: resolve_cache_dir(snapshot.as_ref())?,
             git_dir,
+            local_mode,
+            local_store,
+            local_shared,
         })
     }
 }
@@ -173,4 +191,44 @@ fn far_future_epoch() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     now + 100 * 365 * 24 * 60 * 60
+}
+
+fn bool_from(env_key: &str, snapshot: Option<&gix::config::Snapshot<'_>>, key: &str) -> bool {
+    match env_or_cfg(env_key, snapshot, key) {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
+}
+
+/// Expand a leading `~` to the home dir. Leaves the path unchanged if there is
+/// no home (the caller will surface a clear error when it can't be created).
+pub fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/").or_else(|| (s == "~").then_some("")) {
+        if let Some(home) = home_dir() {
+            return if rest.is_empty() {
+                home
+            } else {
+                home.join(rest)
+            };
+        }
+    }
+    PathBuf::from(s)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        env::var_os("USERPROFILE")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
 }

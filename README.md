@@ -43,6 +43,24 @@ git config --local bale.token "<a Bale JWT minted out-of-band>"
 
 Same env-var equivalents exist for ephemeral overrides: `BALE_SERVER_URL`, `BALE_TOKEN`.
 
+### Fully local (no server)
+
+If you don't have (or want) a `baleforgit-server`, `git-bale init-local` puts a repo into fully-local mode: large-file objects are stored on disk and never uploaded.
+
+```bash
+git init myrepo && cd myrepo
+git-bale init-local            # per-repo store at .git/bale/store, no server needed
+git-bale init-local --shared   # shared store at ~/bale-local, usable by all local repos
+git-bale track '*.bin'
+git add big.bin && git commit -m "add"   # data stays local, no upload
+git push                                 # only pointer commits move; large-file data doesn't
+git-bale prune --shared        # compact a shared store (per-repo stores are managed by gc)
+```
+
+`git add` writes xorbs/shards to the durable store (no staging, no drain step). Checkout reconstructs from the store with a hard error if objects are missing — there is no network fallback. `git-bale gc` reclaims objects for abandoned changes, same as in server mode.
+
+**Limitation:** a per-repo store (`.git/bale/store`) is not carried by `git clone`. Cloning the repo elsewhere leaves the large-file data behind. Use `--shared` (store at `~/bale-local`) when you need multiple working copies on the same machine.
+
 ### Mounting a diff or a single rev
 
 `git-bale mount-diff` exposes both sides of `git diff <revA> <revB>` as a read-only filesystem, with the revision label folded into each filename. Useful for piping a diff through external tools (Beyond Compare, Meld, vimdiff over directories, etc.) without checking out either side.
@@ -84,6 +102,12 @@ Requires a userspace filesystem driver at runtime (not at build time): `libfuse2
 | git config | `bale.token`            | Same as `BALE_TOKEN`                                          |
 | git config | `bale.tokenExpiration`  | Same as `BALE_TOKEN_EXPIRATION`                               |
 | git config | `bale.cacheDir`         | Same as `BALE_CACHE_DIR`                                      |
+| env        | `BALE_LOCAL`            | Enable fully-local (no-server) mode                           |
+| env        | `BALE_LOCAL_STORE`      | Object store directory (overrides `init-local` default)       |
+| env        | `BALE_LOCAL_SHARED`     | Mark the store as shared across repos                         |
+| git config | `bale.local`            | Same as `BALE_LOCAL`                                          |
+| git config | `bale.localStore`       | Same as `BALE_LOCAL_STORE`                                    |
+| git config | `bale.localShared`      | Same as `BALE_LOCAL_SHARED`                                   |
 
 Defaults: cache directory is `$XDG_CACHE_HOME/bale/chunks` if set, otherwise `~/.cache/bale/chunks`. No default server URL or token — without forge auto-resolve, one of the env/config settings above is required.
 

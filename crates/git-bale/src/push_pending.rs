@@ -32,6 +32,11 @@ use crate::staging::{
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let raw = RawConfig::load(Some(cwd.as_path()))?;
+    if raw.local_mode {
+        // Objects are already durable in the local store; nothing to upload.
+        tracing::debug!("git-bale push-pending: local mode, nothing to drain");
+        return Ok(());
+    }
     let git_dir = raw
         .git_dir
         .clone()

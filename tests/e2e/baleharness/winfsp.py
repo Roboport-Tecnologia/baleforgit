@@ -65,9 +65,7 @@ def winfsp_present() -> bool:
 
 def _latest_msi_url() -> str:
     try:
-        req = urllib.request.Request(
-            _RELEASES_API, headers={"User-Agent": "bale-e2e"}
-        )
+        req = urllib.request.Request(_RELEASES_API, headers={"User-Agent": "bale-e2e"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         for asset in data.get("assets", []):
@@ -111,7 +109,5 @@ def ensure_winfsp() -> None:
             "installing WinFsp needs administrator privileges"
         )
     if not _dll_loads():
-        raise WinfspUnavailable(
-            "WinFsp installed but its DLL still isn't loadable"
-        )
+        raise WinfspUnavailable("WinFsp installed but its DLL still isn't loadable")
     info("WinFsp installed")
