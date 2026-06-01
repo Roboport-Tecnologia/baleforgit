@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- git-bale dlopens a third-party FUSE dylib (libfuse-t.dylib) for `mount`.
+       Under hardened runtime, library validation rejects any dylib not signed
+       by Apple or our Team ID, which would kill every mount. This opts out. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>
