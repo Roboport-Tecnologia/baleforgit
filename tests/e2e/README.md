@@ -224,14 +224,17 @@ git-bale's pre-push hook draws a live, git-styled
 `Uploading bales: 47% (4/8), … | …/s` line on stderr once an upload runs past
 ~200 ms, then finalizes it in place to
 `Uploading bales: 100% (N/N), <size> | <rate>, done.` (the summary prints even
-when the push was too fast to ever show the live line). The `progress-demo`
-phase exercises it two ways:
+when the push was too fast to ever show the live line). The size shown is the
+bytes actually transferred (net of dedup); when dedup skipped some of the push
+the summary appends ` (+ <size> deduped)`, and a push whose content the server
+already had reports `<size> already on server, done.` instead of an upload
+size. The `progress-demo` phase exercises it two ways:
 
 - **In a normal sweep** it pushes a couple of fixed variants through
   `git-bale push-pending` with stderr *captured* and asserts the summary line —
   one fresh multi-file push (size clause present) and one byte-identical,
-  fully-deduped push (`100% (1/1), done.`, no size). No env vars, no live bar,
-  nothing printed to the screen.
+  fully-deduped push (`100% (1/1), <size> already on server, done.`). No env
+  vars, no live bar, nothing printed to the screen.
 - **Via `--only progress-demo`** it becomes a hand-driven *visual* demo:
 
   ```bash

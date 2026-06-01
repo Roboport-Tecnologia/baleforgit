@@ -182,9 +182,39 @@ async fn write_file_in_tx(
     .await
     .map_err(|e| CoreError::Internal(format!("insert file: {e}")))?;
 
-    // Terms are content-addressed by file_hash, so re-register carries identical
-    // terms — DO NOTHING, not DELETE+INSERT, which would briefly expose an empty
-    // term list to a concurrent reader.
+    // The term list for a file_hash is NOT canonical: global dedup segments the
+    // same content into a different *number* of xorb-referencing terms depending on
+    // which pre-existing xorbs it matches. file_terms is global (keyed by file_hash,
+    // not repo), so a per-term ON CONFLICT DO NOTHING would *merge* two
+    // differently-segmented registrations — keeping the old terms where indices
+    // collide and appending the longer list's tail — yielding Σunpacked > file_size
+    // and corrupting every reconstruction of this hash (xet's last-term trim then
+    // underflows). Register write-once: the first complete list fully describes the
+    // content, so skip insertion if any terms already exist. Under READ COMMITTED two
+    // concurrent *first* registrations wouldn't see each other's uncommitted rows, so
+    // serialize same-hash registers with a tx-scoped advisory lock (auto-released at
+    // commit/rollback); cross-hash key collisions only cost a little extra blocking.
+    let lock_key = hash_to_blob(&file_hash.0)
+        .get(..8)
+        .and_then(|s| s.try_into().ok())
+        .map(i64::from_le_bytes)
+        .unwrap_or(0);
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| CoreError::Internal(format!("advisory lock: {e}")))?;
+
+    let terms_exist = sqlx::query("SELECT 1 FROM file_terms WHERE file_hash = $1 LIMIT 1")
+        .bind(hash_to_blob(&file_hash.0))
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| CoreError::Internal(format!("probe existing terms: {e}")))?
+        .is_some();
+    if terms_exist {
+        return Ok(());
+    }
+
     let indexed: Vec<(usize, &FileTerm)> = terms.iter().enumerate().collect();
     for batch in indexed.chunks(CHUNK_INSERT_BATCH) {
         let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
@@ -372,6 +402,31 @@ impl MetadataStore for PostgresMetadataStore {
                 unpacked_segment_bytes: unp as u32,
                 verification: ver.as_deref().map(blob_to_hash).transpose()?,
             });
+        }
+
+        // Defense in depth: the terms must sum to the file's recorded size. A
+        // mismatch means the term list is internally inconsistent (e.g. legacy data
+        // from before terms were registered write-once, where two differently-
+        // segmented registrations got merged into an over-describing list). Serving
+        // it would underflow xet's last-term trim and panic the client, so error.
+        let term_sum: u64 = terms.iter().map(|t| t.unpacked_segment_bytes as u64).sum();
+        let recorded: Option<i64> =
+            sqlx::query("SELECT total_bytes FROM files WHERE file_hash = $1 LIMIT 1")
+                .bind(hash_to_blob(&file_hash.0))
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| CoreError::Internal(format!("select file size: {e}")))?
+                .map(|r| r.try_get("total_bytes"))
+                .transpose()
+                .map_err(internal)?;
+        if let Some(total) = recorded {
+            let total = nonneg_i64_to_u64(total, "files.total_bytes")?;
+            if term_sum != total {
+                return Err(CoreError::Internal(format!(
+                    "file term list sums to {term_sum} but recorded size is {total}; \
+                     refusing to serve an inconsistent reconstruction (re-register this file)"
+                )));
+            }
         }
         Ok(Some(terms))
     }

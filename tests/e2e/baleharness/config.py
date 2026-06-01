@@ -63,6 +63,14 @@ E2E_REPO_MR_B = "multi-remote-b"
 # it must re-register the objects under its scope, NOT skip them because its
 # remote-tracking refs already cover the history.
 E2E_REPO_MR_C = "multi-remote-c"
+# The term-list-merge phase guards the server's term-list consistency check. A
+# pre-fix per-term INSERT OR IGNORE could merge two differently-segmented
+# registrations of one file_hash (file_terms is global), leaving Σterms >
+# file_size — which underflows xet's last-term trim and panics the client on
+# reconstruction. The phase reproduces that corrupt state by injecting duplicate
+# terms via the server's meta.db, then asserts the guard rejects it cleanly.
+E2E_REPO_MERGE_A = "term-merge-a"
+MERGE_FILE_BYTES = 4 * 1024 * 1024
 # The resync-after-wipe phase owns its own isolated container; this is the bare
 # repo it force-pushes to after the server's CAS is wiped out from under it.
 E2E_REPO_RESYNC = "resync-wipe"

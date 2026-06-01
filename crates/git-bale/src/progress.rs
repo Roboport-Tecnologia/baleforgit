@@ -33,6 +33,9 @@ pub struct UploadSnapshot {
     /// Total new bytes to upload; 0 when nothing new yet or still preparing.
     pub bytes_total: u64,
     pub rate_bytes_per_sec: Option<f64>,
+    /// Logical bytes skipped via dedup (local + global). Known only once all files
+    /// are re-cleaned, so 0 during the live bar and meaningful in the summary.
+    pub bytes_deduped: u64,
 }
 
 pub struct UploadProgress {
@@ -154,17 +157,34 @@ fn render(s: &UploadSnapshot, file_count: usize) -> String {
 
 fn summary(s: &UploadSnapshot, file_count: usize) -> String {
     if s.bytes_uploaded == 0 {
-        // Nothing new transferred (full dedup) — no size clause, like git's
+        // Nothing new transferred (full dedup) — name the bytes the server already
+        // had so a 0-byte upload doesn't read as "nothing happened", like git's
         // "Counting objects: 100% (13/13), done.".
-        format!("Uploading bales: 100% ({file_count}/{file_count}), done.")
+        match s.bytes_deduped {
+            0 => format!("Uploading bales: 100% ({file_count}/{file_count}), done."),
+            d => format!(
+                "Uploading bales: 100% ({file_count}/{file_count}), {} already on server, done.",
+                fmt_bytes(d),
+            ),
+        }
     } else {
         // Keep the size + rate, like git's "Writing objects: 100% (6/6),
-        // 622 bytes | 622.00 KiB/s, done.".
+        // 622 bytes | 622.00 KiB/s, done.", and append what dedup saved so a
+        // partial re-upload is distinguishable from a full one.
         format!(
-            "Uploading bales: 100% ({file_count}/{file_count}), {}{}, done.",
+            "Uploading bales: 100% ({file_count}/{file_count}), {}{}{}, done.",
             fmt_bytes(s.bytes_uploaded),
             rate_clause(s),
+            dedup_clause(s),
         )
+    }
+}
+
+// " (+ 68.0 MiB deduped)" when dedup skipped real bytes; empty otherwise.
+fn dedup_clause(s: &UploadSnapshot) -> String {
+    match s.bytes_deduped {
+        0 => String::new(),
+        d => format!(" (+ {} deduped)", fmt_bytes(d)),
     }
 }
 

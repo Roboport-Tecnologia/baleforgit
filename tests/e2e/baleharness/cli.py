@@ -43,6 +43,7 @@ from baleharness.config import (
     E2E_REPO_GC1,
     E2E_REPO_GC2,
     E2E_REPO_GC3,
+    E2E_REPO_MERGE_A,
     E2E_REPO_MR_A,
     E2E_REPO_MR_B,
     E2E_REPO_MR_C,
@@ -118,6 +119,7 @@ from baleharness.phases.scenario import (
     phase_push_idempotency,
     phase_repeated_churn,
     phase_spilled_clean,
+    phase_term_list_merge,
     phase_usage_api,
 )
 from baleharness.phases.track import phase_track
@@ -468,6 +470,7 @@ def main() -> int:
                     f"{E2E_OWNER}/{E2E_REPO_MR_A}",
                     f"{E2E_OWNER}/{E2E_REPO_MR_B}",
                     f"{E2E_OWNER}/{E2E_REPO_MR_C}",
+                    f"{E2E_OWNER}/{E2E_REPO_MERGE_A}",
                 ],
                 cas_port=cas_port,
                 ssh_port=ssh_port,
@@ -490,6 +493,14 @@ def main() -> int:
 
         def _phase_multi_remote() -> None:
             phase_multi_remote_push(
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+            )
+
+        def _phase_term_merge() -> None:
+            phase_term_list_merge(
                 timings=timings,
                 server=server,
                 client=client,
@@ -838,6 +849,12 @@ def main() -> int:
             # Two repos on one server: push to origin (A), then to a second
             # remote (B). Independent (own repos + commits), so g1.
             "multi-remote": ("g1", False, _phase_multi_remote),
+            # file_terms consistency guard: push F, then inject duplicate terms
+            # into its global term list via meta.db so Σterms > |F| (the corrupt
+            # shape a per-term merge produced), and assert a cold clone is rejected
+            # cleanly by the lookup_file guard instead of panicking the client.
+            # Own repo + direct DB fault injection, so g1.
+            "term-merge": ("g1", False, _phase_term_merge),
             "wrong-token": ("g1", False, _phase_wrong_token),
             # Routes git-bale's CAS traffic through a counting proxy and asserts
             # only push/pull cross it. Own repo + commits, so g1 (independent).

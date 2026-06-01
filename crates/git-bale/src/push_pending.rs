@@ -33,6 +33,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use gix::ObjectId;
 use tempfile::NamedTempFile;
+use xet_data::deduplication::DeduplicationMetrics;
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::{clean_file, default_config};
 use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy, XetFileInfo};
@@ -158,6 +159,12 @@ pub fn run(args: Args) -> Result<()> {
     // (empty = "preparing", before the session exists).
     let session_slot: Arc<Mutex<Option<Arc<FileUploadSession>>>> = Arc::new(Mutex::new(None));
     let slot_for_poll = session_slot.clone();
+    // Dedup breakdown, filled in once all files are re-cleaned (before finalize).
+    // The live bar ignores it; the completion summary reads it to split the bytes
+    // into uploaded-vs-deduped, so a push whose content the server already had
+    // doesn't read as a full re-upload of the whole file.
+    let metrics_slot: Arc<Mutex<DeduplicationMetrics>> = Arc::new(Mutex::new(Default::default()));
+    let metrics_for_poll = metrics_slot.clone();
     let progress = UploadProgress::start(total, move || {
         let session = slot_for_poll.lock().unwrap().clone();
         let Some(session) = session else {
@@ -168,6 +175,7 @@ pub fn run(args: Args) -> Result<()> {
             bytes_uploaded: r.total_transfer_bytes_completed,
             bytes_total: r.total_transfer_bytes,
             rate_bytes_per_sec: r.total_transfer_bytes_completion_rate,
+            bytes_deduped: metrics_for_poll.lock().unwrap().deduped_bytes,
         }
     });
 
@@ -176,6 +184,7 @@ pub fn run(args: Args) -> Result<()> {
     // this push fail (fail-closed), never corrupts. Only the final marker-removal
     // + sweep takes the lock.
     let slot_for_async = session_slot;
+    let metrics_for_async = metrics_slot;
     let raw_for_async = raw.clone();
     let staging_for_async = staging.clone();
     let staged_for_async = staged.clone();
@@ -183,15 +192,19 @@ pub fn run(args: Args) -> Result<()> {
         let upload = FileUploadSession::new(Arc::new(online_cfg)).await?;
         *slot_for_async.lock().unwrap() = Some(upload.clone());
 
+        let mut metrics = DeduplicationMetrics::default();
+
         // (1) staged files → reconstruct from staging.
         if !staged_for_async.is_empty() {
             let local_cfg = TranslatorConfig::local_config(&staging_for_async)
                 .context("building local TranslatorConfig for staging reconstruction")?;
             let staging_dl = FileDownloadSession::new(Arc::new(local_cfg), None).await?;
             for (file_hex, file_size) in &staged_for_async {
-                re_translate_one(&staging_dl, upload.clone(), file_hex, *file_size, "local")
-                    .await
-                    .with_context(|| format!("re-translating staged file {file_hex}"))?;
+                let m =
+                    re_translate_one(&staging_dl, upload.clone(), file_hex, *file_size, "local")
+                        .await
+                        .with_context(|| format!("re-translating staged file {file_hex}"))?;
+                metrics.merge_in(&m);
             }
         }
 
@@ -217,14 +230,27 @@ pub fn run(args: Args) -> Result<()> {
                         continue;
                     }
                 }
-                sources
+                let m = sources
                     .re_translate_from_any(upload.clone(), file_hex, *file_size)
                     .await
                     .with_context(|| {
                         format!("ensuring already-pushed file {file_hex} reaches the push target")
                     })?;
+                metrics.merge_in(&m);
             }
         }
+
+        // Publish for the completion summary before finalize() (shards upload there
+        // and don't change the dedup split the summary reports).
+        *metrics_for_async.lock().unwrap() = metrics;
+        tracing::debug!(
+            total_bytes = metrics.total_bytes,
+            new_bytes = metrics.new_bytes,
+            deduped_bytes = metrics.deduped_bytes,
+            deduped_bytes_by_global_dedup = metrics.deduped_bytes_by_global_dedup,
+            xorb_bytes_uploaded = metrics.xorb_bytes_uploaded,
+            "push-pending dedup breakdown"
+        );
 
         upload.finalize().await?;
         Ok::<(), anyhow::Error>(())
@@ -283,7 +309,8 @@ pub fn run(args: Args) -> Result<()> {
 /// through `upload_session`, and assert the round-tripped hash matches. The
 /// online upload session POSTs only genuinely-new xorbs and always its
 /// per-session reconstruction shard, so this both uploads new content and
-/// registers the file under the upload token's repo scope.
+/// registers the file under the upload token's repo scope. Returns the dedup
+/// metrics so the caller can report uploaded-vs-deduped bytes.
 async fn re_translate_one(
     download_session: &Arc<FileDownloadSession>,
     upload_session: Arc<FileUploadSession>,
@@ -293,7 +320,7 @@ async fn re_translate_one(
     // into the reconstruct-failure message — the corrupt-staging e2e phase keys
     // on "local reconstruct" to confirm a missing staged xorb fails *here*.
     source: &str,
-) -> Result<()> {
+) -> Result<DeduplicationMetrics> {
     // Via a temp file because `clean_file` takes a path (it reads twice —
     // hashing then chunking — and needs random access), so we can't stream
     // download straight into upload.
@@ -307,7 +334,7 @@ async fn re_translate_one(
         .await
         .with_context(|| format!("{source} reconstruct of {file_hex} failed"))?;
 
-    let (new_info, _metrics) = clean_file(upload_session, tmp.path(), Sha256Policy::Compute)
+    let (new_info, metrics) = clean_file(upload_session, tmp.path(), Sha256Policy::Compute)
         .await
         .with_context(|| format!("re-cleaning {file_hex} through online session"))?;
 
@@ -318,7 +345,7 @@ async fn re_translate_one(
             new_info.hash(),
         );
     }
-    Ok(())
+    Ok(metrics)
 }
 
 /// Lazily-built read sessions for each configured remote, used to re-source the
@@ -371,7 +398,7 @@ impl SourceSessions {
         upload_session: Arc<FileUploadSession>,
         file_hex: &str,
         file_size: u64,
-    ) -> Result<()> {
+    ) -> Result<DeduplicationMetrics> {
         for i in 0..self.remotes.len() {
             let Some(dl) = self.session(i).await else {
                 continue;
@@ -381,7 +408,7 @@ impl SourceSessions {
             // merkle hash, so a *successful* download then cleanly round-trips.
             let label = format!("remote '{}'", self.remotes[i].0);
             match re_translate_one(&dl, upload_session.clone(), file_hex, file_size, &label).await {
-                Ok(()) => return Ok(()),
+                Ok(metrics) => return Ok(metrics),
                 Err(e) => tracing::debug!(
                     "push-pending: remote {} could not provide {file_hex}: {e:#}",
                     self.remotes[i].0

@@ -8,7 +8,8 @@ never touch other phases' shared-server state:
     push-pending` with stderr *captured*, and asserts the git-styled summary
     line it leaves behind. No TTY, no live bar drawn; we only check the final
     `Uploading bales: 100% (N/N), …, done.` line (and that the deduped variant
-    drops the size clause). Nothing is printed to the screen.
+    reports the already-present bytes instead of an upload size). Nothing is
+    printed to the screen.
 
   * `--only progress-demo` (`from_only=True`) — a hand-driven *visual* demo.
     It reads FILE_TIMER / FILE_COUNT and pushes with capture turned OFF so the
@@ -241,20 +242,21 @@ def _validation_variants(
         "progress-demo: variant fresh", bytes_moved=3 * VARIANT_FILE_BYTES
     ):
         res = run([git_bale, "push-pending"], cwd=repo, env=env)
-    _assert_summary(res.stderr, count=3, with_size=True, label="fresh")
+    _assert_summary(res.stderr, count=3, kind="uploaded", label="fresh")
     if staging_files(repo):
         raise TestFailure(
             "progress-demo[fresh]: staging not drained after push-pending"
         )
 
     # Variant 2: a byte-identical copy of v0 → fully deduped against content the
-    # server already holds, so the summary drops the size (`100% (1/1), done.`).
+    # server already holds, so nothing is uploaded and the summary names the
+    # already-present bytes (`100% (1/1), <size> already on server, done.`).
     (repo / "dup.bin").write_bytes((repo / "v0.bin").read_bytes())
     git(["add", "dup.bin"], cwd=repo, env=env)
     git(["commit", "-m", "duplicate of v0"], cwd=repo, env=env)
     with timings.measure("progress-demo: variant dedup"):
         res = run([git_bale, "push-pending"], cwd=repo, env=env)
-    _assert_summary(res.stderr, count=1, with_size=False, label="dedup")
+    _assert_summary(res.stderr, count=1, kind="deduped", label="dedup")
     if staging_files(repo):
         raise TestFailure(
             "progress-demo[dedup]: staging not drained after push-pending"
@@ -282,9 +284,13 @@ def _validation_variants(
     info("progress-demo: fresh + deduped summary variants validated")
 
 
-def _assert_summary(
-    stderr_bytes: bytes, *, count: int, with_size: bool, label: str
-) -> None:
+def _assert_summary(stderr_bytes: bytes, *, count: int, kind: str, label: str) -> None:
+    """Validate the git-styled push-pending summary line.
+
+    `kind` selects the expected remainder after `100% (N/N),`:
+      * "uploaded" — a real upload: `<size>[ | <rate>][ (+ <size> deduped)], done.`
+      * "deduped"  — nothing new (full dedup): `<size> already on server, done.`
+    """
     text = stderr_bytes.decode("utf-8", "replace")
     line = next(
         (
@@ -305,17 +311,15 @@ def _assert_summary(
             f"progress-demo[{label}]: summary line {line!r} doesn't match "
             f"{prefix!r} … 'done.'"
         )
-    # Remainder is "done." (deduped, no new bytes) or "<size>[ | <rate>], done.".
     remainder = line[len(prefix) :].strip()
-    had_size = remainder != "done."
-    if had_size != with_size:
+    if kind == "uploaded":
+        pattern = r"[\d.]+ \w+( \| [\d.]+ \w+/s)?( \(\+ [\d.]+ \w+ deduped\))?, done\."
+    elif kind == "deduped":
+        pattern = r"[\d.]+ \w+ already on server, done\."
+    else:
+        raise TestFailure(f"progress-demo[{label}]: unknown summary kind {kind!r}")
+    if not re.fullmatch(pattern, remainder):
         raise TestFailure(
-            f"progress-demo[{label}]: summary size-clause present={had_size}, "
-            f"expected {with_size}: {line!r}"
-        )
-    if had_size and not re.fullmatch(
-        r"[\d.]+ \w+( \| [\d.]+ \w+/s)?, done\.", remainder
-    ):
-        raise TestFailure(
-            f"progress-demo[{label}]: size clause not git-styled: {remainder!r}"
+            f"progress-demo[{label}]: summary remainder {remainder!r} doesn't "
+            f"match expected {kind!r} shape {pattern!r}"
         )

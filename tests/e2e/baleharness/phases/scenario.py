@@ -38,10 +38,12 @@ from baleharness.config import (
     E2E_REPO_GC1,
     E2E_REPO_GC2,
     E2E_REPO_GC3,
+    E2E_REPO_MERGE_A,
     E2E_REPO_MR_A,
     E2E_REPO_MR_B,
     E2E_REPO_MR_C,
     E2E_REPO_OFFLINE,
+    MERGE_FILE_BYTES,
     E2E_REPO_SPILL,
     E2E_USER,
     GC_PAYLOAD_BYTES,
@@ -435,6 +437,171 @@ def phase_multi_remote_push(
             f"multi-remote: repo C clone sha mismatch: got {got_c}, want {payload_sha}"
         )
     info("  repo C (stale-object remote) reconstructed shared.bin OK")
+
+
+def _sqlite(server: ServerHandle, sql: str):
+    """Run one SQL statement against the server's meta.db inside its container."""
+    return run(
+        server.rt.cmd(
+            "exec",
+            server.name,
+            "sqlite3",
+            "-noheader",
+            "-separator",
+            "|",
+            "/data/meta.db",
+            sql,
+        ),
+        capture=True,
+    )
+
+
+def _file_term_sum(server: ServerHandle, repo_id: str) -> tuple[str, int, int, int]:
+    """(hash, recorded size, Σ term unpacked_bytes, term count) for the single file
+    registered under `repo_id`, read straight from the server's meta.db. The sum is
+    over the GLOBAL (cross-repo) file_terms rows — the set a per-term merge would
+    corrupt."""
+    res = _sqlite(
+        server,
+        "SELECT lower(hex(ft.file_hash)), "
+        "(SELECT total_bytes FROM files WHERE file_hash = ft.file_hash LIMIT 1), "
+        "SUM(ft.unpacked_bytes), COUNT(*) "
+        "FROM file_terms ft "
+        f"WHERE ft.file_hash IN (SELECT file_hash FROM files WHERE repo_id = '{repo_id}') "
+        "GROUP BY ft.file_hash;",
+    )
+    lines = [ln for ln in res.stdout.decode().splitlines() if ln.strip()]
+    if len(lines) != 1:
+        raise TestFailure(
+            f"term-merge: expected exactly one file under {repo_id}, got: {lines!r}"
+        )
+    h, size, term_sum, n = lines[0].split("|")
+    return h, int(size), int(term_sum), int(n)
+
+
+def phase_term_list_merge(
+    *,
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+) -> None:
+    """Regression for the server's term-list consistency guard (corruption
+    containment).
+
+    `file_terms` is keyed by file_hash alone and shared across repos, but a file's
+    term list is NOT canonical: re-cleaning the same content can segment it into a
+    different *number* of xorb-referencing terms. The pre-fix per-term INSERT OR
+    IGNORE could MERGE two registrations — keeping the old terms and appending the
+    longer list's tail — leaving Σterms > file_size. Reconstructing such a file
+    underflows xet's last-term trim (shrinkage = Σterms − file_size) and panics the
+    client with a ~2^64-byte slice (the symptom that started this).
+
+    That segmentation divergence can't be driven through the client (xet cuts xorbs
+    at file boundaries and the server pins a file's layout at first registration,
+    so re-pushes are byte-stable). So — like the tampered-xorb phase corrupts a
+    blob on disk — we reproduce the corrupt *state* directly: append duplicate
+    terms to the file's global term list in meta.db so Σterms = 3×|F|, the exact
+    over-describing shape the merge produced. Write-once registration prevents this
+    state; the lookup_file guard is the catch-all that refuses to serve it. We
+    assert a cold clone is rejected cleanly by the guard instead of handing the
+    client an over-describing reconstruction that panics."""
+    repo, env = init_repo_for_push(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_MERGE_A,
+        name="merge-a",
+    )
+    f_payload = deterministic_payload(MERGE_FILE_BYTES, seed=b"term-merge-F")
+    f_sha = sha256_bytes(f_payload)
+    (repo / "f.bin").write_bytes(f_payload)
+    git(["add", "f.bin"], cwd=repo, env=env)
+    git(["commit", "-m", "add f.bin"], cwd=repo, env=env)
+    with timings.measure("term-merge: push F", bytes_moved=MERGE_FILE_BYTES):
+        git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+    repo_id = f"{E2E_OWNER}/{E2E_REPO_MERGE_A}"
+    _, size, term_sum, _ = _file_term_sum(server, repo_id)
+    if term_sum != size:
+        raise TestFailure(
+            f"term-merge: a clean push already left Σterms({term_sum}) != size({size})"
+        )
+
+    # Baseline: a fresh cold clone reconstructs F before any corruption.
+    clean_clone, clean_env, _ = init_repo_for_clone(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_MERGE_A,
+        name="merge-clone-clean",
+    )
+    git(["checkout", "main"], cwd=clean_clone, env=clean_env)
+    if sha256_file(clean_clone / "f.bin") != f_sha:
+        raise TestFailure("term-merge: baseline cold clone reconstructed F wrong")
+
+    # Inject the corrupt state: append F's term 0 twice at the tail of its GLOBAL
+    # term list, so Σterms = 3×|F| and the over-sum (2×|F|) exceeds the last term
+    # (|F|) — the precise shape that underflows xet's trim. This is what the buggy
+    # per-term merge produced when a longer second registration arrived.
+    for _ in range(2):
+        _sqlite(
+            server,
+            "INSERT INTO file_terms (file_hash, term_index, xorb_hash, "
+            "chunk_idx_start, chunk_idx_end, unpacked_bytes, verification) "
+            "SELECT ft.file_hash, "
+            "(SELECT MAX(term_index) + 1 FROM file_terms x WHERE x.file_hash = ft.file_hash), "
+            "ft.xorb_hash, ft.chunk_idx_start, ft.chunk_idx_end, ft.unpacked_bytes, ft.verification "
+            "FROM file_terms ft "
+            f"WHERE ft.file_hash IN (SELECT file_hash FROM files WHERE repo_id = '{repo_id}') "
+            "AND ft.term_index = 0;",
+        )
+    _, size, term_sum, nterms = _file_term_sum(server, repo_id)
+    if term_sum <= size:
+        raise TestFailure(
+            f"term-merge: injection didn't over-sum (Σ={term_sum}, size={size}, "
+            f"terms={nterms}); test would be vacuous"
+        )
+    info(
+        f"  injected corrupt term list: {nterms} terms summing to "
+        f"{fmt_bytes(term_sum)} for a {fmt_bytes(size)} file"
+    )
+
+    # The proof: a fresh cold clone of the now-corrupt file must NOT panic the
+    # client. With the fix's guard the server returns a clean error (lookup_file
+    # refuses the inconsistent term list); without it the client slices past the
+    # reconstructed buffer and panics with a ~2^64 range end.
+    bad_clone, bad_env, _ = init_repo_for_clone(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_MERGE_A,
+        name="merge-clone-corrupt",
+    )
+    # The guard answers 5xx, which xet's client retries with backoff; trim the
+    # budget so the clean rejection surfaces in ~1s instead of minutes.
+    bad_env = dict(bad_env)
+    bad_env["HF_XET_CLIENT_RETRY_MAX_ATTEMPTS"] = "1"
+    bad_env["HF_XET_CLIENT_RETRY_BASE_DELAY"] = "100ms"
+    bad_env["HF_XET_CLIENT_RETRY_MAX_DURATION"] = "2s"
+    with timings.measure("term-merge: cold clone of corrupted file"):
+        res = git(
+            ["checkout", "main"],
+            cwd=bad_clone,
+            env=bad_env,
+            capture=True,
+            expect_fail=True,
+        )
+    out = (res.stdout + res.stderr).decode("utf-8", "replace")
+    if "panicked" in out or "range end out of bounds" in out:
+        raise TestFailure(
+            "term-merge: server served the inconsistent (over-summing) term list "
+            "and the client PANICKED reconstructing it — the lookup_file "
+            f"consistency guard is missing. checkout output:\n{out}"
+        )
+    info("  corrupt term list rejected by the server guard; client did not panic")
 
 
 def phase_offline_no_network(
