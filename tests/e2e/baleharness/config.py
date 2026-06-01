@@ -71,6 +71,24 @@ E2E_REPO_MR_C = "multi-remote-c"
 # terms via the server's meta.db, then asserts the guard rejects it cleanly.
 E2E_REPO_MERGE_A = "term-merge-a"
 MERGE_FILE_BYTES = 4 * 1024 * 1024
+# The cold-repush phase measures whether re-pushing content already on the server
+# (with the local dedup cache wiped, so only the server's global-dedup query can
+# save it) RE-STORES that content. A big file goes to repo A alone, then is
+# re-pushed to repo B bundled with a small new file so it repacks into fresh xorb
+# hashes — if global dedup doesn't recognize it, the server stores it again. The
+# phase reads the server's on-disk xorb growth to tell double-storage from a clean
+# re-registration. Big ≫ small so the verdict is unambiguous from disk growth.
+E2E_REPO_COLD_A = "cold-repush-a"
+E2E_REPO_COLD_B = "cold-repush-b"
+COLD_BIG_BYTES = 16 * 1024 * 1024
+COLD_SMALL_BYTES = 1 * 1024 * 1024
+# Staged variant of cold-repush, reproducing the exact reported scenario: push a
+# file, wipe the cache, APPEND to it and commit WITHOUT pushing (so the modified
+# file is staged, not re-sourced from a server — staged files clean before any
+# from-refs download can repopulate the cache), then push to a fresh repo. Most
+# at-risk path for re-storing the unchanged prefix; measured via server disk.
+E2E_REPO_COLD_STAGED_A = "cold-staged-a"
+E2E_REPO_COLD_STAGED_B = "cold-staged-b"
 # The resync-after-wipe phase owns its own isolated container; this is the bare
 # repo it force-pushes to after the server's CAS is wiped out from under it.
 E2E_REPO_RESYNC = "resync-wipe"

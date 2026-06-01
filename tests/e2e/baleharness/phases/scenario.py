@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import random
 import secrets
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,8 @@ from baleharness.config import (
     CHURN_FILE_A_BYTES,
     CHURN_FILE_B_BYTES,
     CHURN_ROUNDS,
+    COLD_BIG_BYTES,
+    COLD_SMALL_BYTES,
     E2E_HUB_TOKEN,
     HUGE_CHURN_ADD_PROB,
     HUGE_CHURN_BASE_FILES,
@@ -35,6 +38,10 @@ from baleharness.config import (
     E2E_REPO_2,
     E2E_REPO_3,
     E2E_REPO_CHURN,
+    E2E_REPO_COLD_A,
+    E2E_REPO_COLD_B,
+    E2E_REPO_COLD_STAGED_A,
+    E2E_REPO_COLD_STAGED_B,
     E2E_REPO_GC1,
     E2E_REPO_GC2,
     E2E_REPO_GC3,
@@ -58,6 +65,7 @@ from baleharness.gitutil import (
     force_resmudge_and_verify,
     force_resmudge_cold,
     force_resmudge_lukewarm,
+    get_bale_cache_dir,
     git,
     pointer_field,
     verify_pointer_at,
@@ -602,6 +610,228 @@ def phase_term_list_merge(
             f"consistency guard is missing. checkout output:\n{out}"
         )
     info("  corrupt term list rejected by the server guard; client did not panic")
+
+
+def phase_cold_cache_repush(
+    *,
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+) -> None:
+    """Measure whether a cold-cache re-push of content the server already has
+    RE-STORES it (double storage) or merely wastes upload bandwidth.
+
+    Push a big file to repo A alone. Wipe every local dedup index, then re-push it
+    to repo B bundled with a small new file — bundling forces the big file's chunks
+    to repack into a *fresh* xorb hash, so xorb-level content-addressing can't catch
+    the duplicate; only the server's global-dedup query could. We read the server's
+    on-disk xorb growth (ground truth, independent of the client's flaky
+    upload counters) to tell the two cases apart:
+      * growth ≈ small file → global dedup recognized the big file; not re-stored.
+      * growth ≈ big + small → the big file was re-stored (double storage).
+    Also logs the client's reported breakdown so we can see how far the client's
+    `total_bytes_uploaded` is from the on-disk truth."""
+    repo, env = init_repo_for_push(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_COLD_A,
+        name="cold-a",
+    )
+    big = deterministic_payload(COLD_BIG_BYTES, seed=b"cold-repush-big")
+    big_sha = sha256_bytes(big)
+    (repo / "big.bin").write_bytes(big)
+    git(["add", "big.bin"], cwd=repo, env=env)
+    git(["commit", "-m", "add big.bin"], cwd=repo, env=env)
+    with timings.measure("cold-repush: push big to A", bytes_moved=COLD_BIG_BYTES):
+        git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+    disk_before = server.disk_xorb_bytes()
+
+    # Wipe every local dedup index so only the server's global-dedup query can
+    # prevent a re-store — this is the "fresh machine / cleared cache" condition.
+    cache_dir = get_bale_cache_dir(repo, env)
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(repo / ".git" / "bale" / "manifests", ignore_errors=True)
+    shutil.rmtree(repo / ".git" / "bale" / "clean-cache", ignore_errors=True)
+
+    # A small NEW file so the re-push bundles big.bin into a fresh session xorb
+    # (repack) instead of re-emitting big.bin's original solo xorb verbatim.
+    small = deterministic_payload(COLD_SMALL_BYTES, seed=b"cold-repush-small")
+    small_sha = sha256_bytes(small)
+    (repo / "small.bin").write_bytes(small)
+    git(["add", "small.bin"], cwd=repo, env=env)
+    git(["commit", "-m", "add small.bin"], cwd=repo, env=env)
+
+    git(
+        [
+            "remote",
+            "add",
+            "mirror",
+            remote_url_ssh(
+                ssh_port=server.ssh_port, owner=E2E_OWNER, repo=E2E_REPO_COLD_B
+            ),
+        ],
+        cwd=repo,
+        env=env,
+    )
+    push_env = dict(env)
+    push_env["RUST_LOG"] = "git_bale=debug"
+    with timings.measure(
+        "cold-repush: re-push big+small to B (cold cache)",
+        bytes_moved=COLD_BIG_BYTES + COLD_SMALL_BYTES,
+    ):
+        res = git(["push", "mirror", "main"], cwd=repo, env=push_env, capture=True)
+    disk_after = server.disk_xorb_bytes()
+    growth = disk_after - disk_before
+
+    out = (res.stdout + res.stderr).decode("utf-8", "replace")
+    for line in out.splitlines():
+        if "dedup breakdown" in line or line.strip().startswith("Uploading bales:"):
+            info(f"  {line.strip()}")
+    info(
+        f"  server xorb storage grew {fmt_bytes(growth)} on the cold re-push "
+        f"(big={fmt_bytes(COLD_BIG_BYTES)}, small={fmt_bytes(COLD_SMALL_BYTES)})"
+    )
+    # The unchanged big file must NOT be re-stored: re-sourcing it repopulates the
+    # chunk cache (the dedup index), so its xorbs dedup and only the genuinely-new
+    # small file lands. Growth approaching the big file's size would mean a cold
+    # re-push double-stores content already on the server — a real regression.
+    if growth >= COLD_BIG_BYTES * 3 // 4:
+        raise TestFailure(
+            f"cold-repush: server xorb storage grew {fmt_bytes(growth)} re-pushing a "
+            f"{fmt_bytes(COLD_BIG_BYTES)} file already on the server — it was RE-STORED "
+            "(double storage), not deduped"
+        )
+    info(
+        f"  the unchanged {fmt_bytes(COLD_BIG_BYTES)} file was not re-stored "
+        f"(server grew {fmt_bytes(growth)} ≈ the new small file only)"
+    )
+
+    # Integrity is non-negotiable regardless of the storage verdict: a cold clone of
+    # repo B must reconstruct both files correctly.
+    clone_path, clone_env, _ = init_repo_for_clone(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_COLD_B,
+        name="cold-b-clone",
+    )
+    with timings.measure("cold-repush: cold clone+checkout B"):
+        git(["checkout", "main"], cwd=clone_path, env=clone_env)
+    if sha256_file(clone_path / "big.bin") != big_sha:
+        raise TestFailure("cold-repush: repo B clone big.bin sha mismatch")
+    if sha256_file(clone_path / "small.bin") != small_sha:
+        raise TestFailure("cold-repush: repo B clone small.bin sha mismatch")
+    info("  repo B reconstructed both files correctly")
+
+
+def phase_cold_cache_repush_staged(
+    *,
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+) -> None:
+    """Staged-path variant of cold-repush — the exact reported scenario.
+
+    Push a file, wipe every local dedup index, then APPEND to it and commit
+    WITHOUT pushing (so the modified file is *staged*, not re-sourced from a
+    server) and push to a fresh repo. Unlike the from-refs path, a staged file is
+    cleaned before any download repopulates the cache, so with a cold cache its
+    chunks aren't deduped; a sub-xorb file then forms a single new xorb and the
+    unchanged prefix is re-stored. We MEASURE the server's disk growth to quantify
+    that, and assert only data integrity (whether cold-cache double-store is worth
+    avoiding is a separate, xet-level question — it doesn't happen with a warm
+    cache, which is the normal `git add` → push flow)."""
+    repo, env = init_repo_for_push(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_COLD_STAGED_A,
+        name="cold-staged-a",
+    )
+    v1 = deterministic_payload(COLD_BIG_BYTES, seed=b"cold-staged-big")
+    (repo / "big.bin").write_bytes(v1)
+    git(["add", "big.bin"], cwd=repo, env=env)
+    git(["commit", "-m", "add big.bin v1"], cwd=repo, env=env)
+    with timings.measure("cold-staged: push v1 to A", bytes_moved=COLD_BIG_BYTES):
+        git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+    disk_before = server.disk_xorb_bytes()
+
+    cache_dir = get_bale_cache_dir(repo, env)
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(repo / ".git" / "bale" / "manifests", ignore_errors=True)
+    shutil.rmtree(repo / ".git" / "bale" / "clean-cache", ignore_errors=True)
+
+    # Append + commit WITHOUT pushing → the modified file is staged.
+    v2 = v1 + deterministic_payload(COLD_SMALL_BYTES, seed=b"cold-staged-tail")
+    v2_sha = sha256_bytes(v2)
+    (repo / "big.bin").write_bytes(v2)
+    git(["add", "big.bin"], cwd=repo, env=env)
+    git(["commit", "-m", "append a little to big.bin (not pushed)"], cwd=repo, env=env)
+
+    git(
+        [
+            "remote",
+            "add",
+            "mirror",
+            remote_url_ssh(
+                ssh_port=server.ssh_port, owner=E2E_OWNER, repo=E2E_REPO_COLD_STAGED_B
+            ),
+        ],
+        cwd=repo,
+        env=env,
+    )
+    push_env = dict(env)
+    push_env["RUST_LOG"] = "git_bale=debug"
+    with timings.measure(
+        "cold-staged: push modified (staged) to B (cold cache)",
+        bytes_moved=COLD_BIG_BYTES + COLD_SMALL_BYTES,
+    ):
+        res = git(["push", "mirror", "main"], cwd=repo, env=push_env, capture=True)
+    growth = server.disk_xorb_bytes() - disk_before
+
+    out = (res.stdout + res.stderr).decode("utf-8", "replace")
+    for line in out.splitlines():
+        if "dedup breakdown" in line or line.strip().startswith("Uploading bales:"):
+            info(f"  {line.strip()}")
+    re_stored = growth - COLD_SMALL_BYTES  # growth beyond the genuinely-new tail
+    info(
+        f"  server xorb storage grew {fmt_bytes(growth)} (tail added "
+        f"{fmt_bytes(COLD_SMALL_BYTES)}); ~{fmt_bytes(max(0, re_stored))} of the "
+        f"unchanged {fmt_bytes(COLD_BIG_BYTES)} prefix was re-stored"
+    )
+    # Even cold and staged, the unchanged prefix must not be re-stored: the
+    # original file is reachable from the pushed history (from-refs) and the
+    # modified copy dedups against it in-session, so only the new tail lands.
+    if growth >= COLD_BIG_BYTES * 3 // 4:
+        raise TestFailure(
+            f"cold-staged: server xorb storage grew {fmt_bytes(growth)} re-pushing a "
+            f"modified {fmt_bytes(COLD_BIG_BYTES)} file — its unchanged prefix was "
+            "RE-STORED (double storage)"
+        )
+    info("  the unchanged prefix was not re-stored — only the new tail landed")
+
+    # Integrity is the hard requirement regardless of the storage cost.
+    clone_path, clone_env, _ = init_repo_for_clone(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_COLD_STAGED_B,
+        name="cold-staged-b-clone",
+    )
+    with timings.measure("cold-staged: cold clone+checkout B"):
+        git(["checkout", "main"], cwd=clone_path, env=clone_env)
+    if sha256_file(clone_path / "big.bin") != v2_sha:
+        raise TestFailure("cold-staged: repo B clone big.bin (v2) sha mismatch")
+    info("  repo B reconstructed the modified file correctly")
 
 
 def phase_offline_no_network(

@@ -42,6 +42,10 @@ from baleharness.config import (
     E2E_REPO_CHURN,
     E2E_REPO_GC1,
     E2E_REPO_GC2,
+    E2E_REPO_COLD_A,
+    E2E_REPO_COLD_B,
+    E2E_REPO_COLD_STAGED_A,
+    E2E_REPO_COLD_STAGED_B,
     E2E_REPO_GC3,
     E2E_REPO_MERGE_A,
     E2E_REPO_MR_A,
@@ -112,6 +116,8 @@ from baleharness.phases.scenario import (
     phase_big_file_dedup,
     phase_browser_file_download,
     phase_clone_and_verify_history,
+    phase_cold_cache_repush,
+    phase_cold_cache_repush_staged,
     phase_dedup_duplicate_file,
     phase_multi_remote_push,
     phase_offline_and_restart,
@@ -471,6 +477,10 @@ def main() -> int:
                     f"{E2E_OWNER}/{E2E_REPO_MR_B}",
                     f"{E2E_OWNER}/{E2E_REPO_MR_C}",
                     f"{E2E_OWNER}/{E2E_REPO_MERGE_A}",
+                    f"{E2E_OWNER}/{E2E_REPO_COLD_A}",
+                    f"{E2E_OWNER}/{E2E_REPO_COLD_B}",
+                    f"{E2E_OWNER}/{E2E_REPO_COLD_STAGED_A}",
+                    f"{E2E_OWNER}/{E2E_REPO_COLD_STAGED_B}",
                 ],
                 cas_port=cas_port,
                 ssh_port=ssh_port,
@@ -501,6 +511,22 @@ def main() -> int:
 
         def _phase_term_merge() -> None:
             phase_term_list_merge(
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+            )
+
+        def _phase_cold_repush() -> None:
+            phase_cold_cache_repush(
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+            )
+
+        def _phase_cold_repush_staged() -> None:
+            phase_cold_cache_repush_staged(
                 timings=timings,
                 server=server,
                 client=client,
@@ -855,6 +881,15 @@ def main() -> int:
             # cleanly by the lookup_file guard instead of panicking the client.
             # Own repo + direct DB fault injection, so g1.
             "term-merge": ("g1", False, _phase_term_merge),
+            # Measures whether a cold-cache re-push of content already on the
+            # server double-stores it (reads server-side xorb disk growth) — the
+            # ground-truth answer to "is it bandwidth or storage being wasted".
+            # Own repos, so g1.
+            "cold-repush": ("g1", False, _phase_cold_repush),
+            # The staged variant: reproduces the reported "modify + commit (don't
+            # push) + push to a new remote with a cold cache" path and measures how
+            # much of the unchanged prefix gets re-stored. Own repos, so g1.
+            "cold-repush-staged": ("g1", False, _phase_cold_repush_staged),
             "wrong-token": ("g1", False, _phase_wrong_token),
             # Routes git-bale's CAS traffic through a counting proxy and asserts
             # only push/pull cross it. Own repo + commits, so g1 (independent).
