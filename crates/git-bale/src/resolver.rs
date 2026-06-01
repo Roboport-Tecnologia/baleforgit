@@ -49,7 +49,21 @@ pub struct ResolvedAuth {
 }
 
 pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
-    // Fast path: both pieces locally configured.
+    resolve_for_remote(raw, scope, None).await
+}
+
+/// Like [`resolve`], but auth is minted against `remote_override` instead of
+/// `origin`. The pre-push hook passes the remote git is actually pushing to so
+/// the token (and thus the server-side repo scope of any upload) matches the
+/// push target — not whichever repo `origin` happens to name. `None` falls back
+/// to `origin` (manual invocation, smudge, gc).
+pub async fn resolve_for_remote(
+    raw: &RawConfig,
+    scope: Scope,
+    remote_override: Option<RemoteUrl>,
+) -> Result<ResolvedAuth> {
+    // Fast path: both pieces locally configured. (A literal `bale.serverUrl` +
+    // `bale.token` overrides every remote, so the override is moot here.)
     if let (Some(url), Some(tok)) = (raw.server_url.as_ref(), raw.token.as_ref()) {
         return Ok(ResolvedAuth {
             server_url: url.clone(),
@@ -59,8 +73,11 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
     }
 
     let repo_cwd = raw.git_dir.as_deref().and_then(|p| p.parent());
-    let remote = parse_origin(repo_cwd)
-        .context("auto-resolving Bale auth: failed to read git remote 'origin'")?;
+    let remote = match remote_override {
+        Some(r) => r,
+        None => parse_origin(repo_cwd)
+            .context("auto-resolving Bale auth: failed to read git remote 'origin'")?,
+    };
     let (owner, repo_name) = remote.owner_and_repo()?;
     // Interpolated into a URL and into the ssh command (re-shell-parsed by the
     // server), so reject anything outside a safe alphabet first.
@@ -124,9 +141,21 @@ const MAX_EXPIRED_REFRESHES: u32 = 3;
 /// ~30s before the short-lived current one lapses (`is_expired`), instead of
 /// hard-failing — and so a single operation can outlive one token's TTL.
 pub fn forge_refresher(raw: &RawConfig, scope: Scope) -> Arc<dyn TokenRefresher> {
+    forge_refresher_for_remote(raw, scope, None)
+}
+
+/// [`forge_refresher`] bound to a specific remote (see [`resolve_for_remote`]),
+/// so a token re-mint during a push to a non-`origin` remote stays scoped to
+/// that remote's repo.
+pub fn forge_refresher_for_remote(
+    raw: &RawConfig,
+    scope: Scope,
+    remote: Option<RemoteUrl>,
+) -> Arc<dyn TokenRefresher> {
     Arc::new(ForgeTokenRefresher {
         raw: raw.clone(),
         scope,
+        remote,
         consecutive_expired: AtomicU32::new(0),
     })
 }
@@ -134,6 +163,7 @@ pub fn forge_refresher(raw: &RawConfig, scope: Scope) -> Arc<dyn TokenRefresher>
 struct ForgeTokenRefresher {
     raw: RawConfig,
     scope: Scope,
+    remote: Option<RemoteUrl>,
     consecutive_expired: AtomicU32,
 }
 
@@ -144,7 +174,7 @@ impl TokenRefresher for ForgeTokenRefresher {
         // self` on the TokenProvider), so this throttles a near-expiry or
         // skew-driven retry from hammering the forge before the cap below trips.
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let resolved = resolve(&self.raw, self.scope)
+        let resolved = resolve_for_remote(&self.raw, self.scope, self.remote.clone())
             .await
             .map_err(|e| AuthError::token_refresh_failure(format!("{e:#}")))?;
         let now = now_utc();

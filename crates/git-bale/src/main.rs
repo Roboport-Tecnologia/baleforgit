@@ -34,9 +34,11 @@ enum Command {
     Track(TrackArgs),
     /// Run the long-running filter protocol. Invoked by Git, not by users.
     FilterProcess,
-    /// Upload any xorbs/shards staged by `clean` (`git add`) to the configured
-    /// bale server. Invoked from the pre-push hook installed by `git-bale install`.
-    PushPending,
+    /// Ensure every bale file the push advertises is present on (and scoped to)
+    /// the remote being pushed to. Invoked from the pre-push hook installed by
+    /// `git-bale install`, which passes the remote name + URL and pipes git's
+    /// ref-update lines on stdin.
+    PushPending(PushPendingArgs),
     /// Reconcile the staging area: forget xorbs/shards/markers that no longer
     /// belong to the index or an unpushed commit. Invoked from the
     /// post-checkout/post-commit/post-merge hooks installed by `git-bale
@@ -76,6 +78,16 @@ struct UninstallArgs {
     local: bool,
     #[arg(long)]
     path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct PushPendingArgs {
+    /// Remote name git is pushing to (pre-push hook `$1`). Omitted on manual
+    /// invocation, where auth falls back to `origin`.
+    remote_name: Option<String>,
+    /// Remote URL git is pushing to (pre-push hook `$2`). Determines the
+    /// server-side repo scope of any upload.
+    remote_url: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -187,7 +199,10 @@ fn main() -> Result<()> {
             track::track(&cwd, &a.patterns)
         }
         Command::FilterProcess => filter_process::run(),
-        Command::PushPending => push_pending::run(),
+        Command::PushPending(a) => push_pending::run(push_pending::Args {
+            remote_name: a.remote_name,
+            remote_url: a.remote_url,
+        }),
         Command::Gc => gc::run(),
         Command::MountDiff(a) => mount::run(MountDiffArgs {
             rev_a: a.rev_a,

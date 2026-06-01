@@ -44,9 +44,10 @@ pub fn install(scope: Scope, repo: Option<&Path>) -> Result<()> {
         install_managed_hook(
             repo,
             "pre-push",
-            "exec git-bale push-pending",
-            "Drain xorbs/shards staged by `git add` to the bale server before\n\
-             # git pushes refs that reference them. Aborts the push on failure.",
+            "exec git-bale push-pending \"$@\"",
+            "Ensure xorbs/shards for every bale file this push advertises reach the\n\
+             # target remote (\"$@\" = remote name + URL; ref updates arrive on stdin)\n\
+             # before git pushes refs that reference them. Aborts the push on failure.",
             OnConflict::Fail,
         )?;
         for hook in GC_HOOKS {

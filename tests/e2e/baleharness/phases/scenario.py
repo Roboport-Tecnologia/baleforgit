@@ -8,7 +8,7 @@ import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
-from baleharness.client import ClientEnv
+from baleharness.client import ClientEnv, remote_url_ssh
 from baleharness.config import (
     BIG_FILE_BYTES,
     BROWSER_DL_FILENAME,
@@ -38,6 +38,8 @@ from baleharness.config import (
     E2E_REPO_GC1,
     E2E_REPO_GC2,
     E2E_REPO_GC3,
+    E2E_REPO_MR_A,
+    E2E_REPO_MR_B,
     E2E_REPO_OFFLINE,
     E2E_REPO_SPILL,
     E2E_USER,
@@ -306,6 +308,80 @@ def phase_basic_user_ops(
             expected_size=SMALL_FILE_BYTES,
             label="basic:hot-resmudge-after-push",
         )
+
+
+def phase_multi_remote_push(
+    *,
+    timings: Timings,
+    server: ServerHandle,
+    client: ClientEnv,
+    work_root: Path,
+) -> None:
+    """Push a bale file to `origin` (repo A), then add a second remote (repo B
+    on the same server) and push to it. The pre-push hook must register the
+    file under B's repo scope — even though staging was drained by the first
+    push — so a fresh clone of B can check it out. Before the multi-remote fix,
+    B's push uploaded nothing and B's clone 404'd on reconstruction."""
+    repo, env = init_repo_for_push(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_MR_A,
+        name="multi-a",
+    )
+    payload = deterministic_payload(SMALL_FILE_BYTES, seed=b"multi-remote")
+    payload_sha = sha256_bytes(payload)
+    (repo / "shared.bin").write_bytes(payload)
+    git(["add", "shared.bin"], cwd=repo, env=env)
+    git(["commit", "-m", "add shared.bin"], cwd=repo, env=env)
+
+    with timings.measure("multi-remote: push to origin (repo A)"):
+        git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+    # Staging must drain after the origin push — that's precisely the state that
+    # forces the second push to re-source the bytes from a server.
+    if staging_files(repo):
+        raise TestFailure("multi-remote: staging not drained after origin push")
+    if server.disk_total_bytes() == 0:
+        raise TestFailure("multi-remote: server disk still zero after origin push")
+
+    # Add a second remote pointing at repo B on the SAME server and push to it.
+    git(
+        [
+            "remote",
+            "add",
+            "mirror",
+            remote_url_ssh(
+                ssh_port=server.ssh_port, owner=E2E_OWNER, repo=E2E_REPO_MR_B
+            ),
+        ],
+        cwd=repo,
+        env=env,
+    )
+    with timings.measure("multi-remote: push to second remote (repo B)"):
+        # The pre-push hook re-sources shared.bin from repo A and re-registers
+        # it under repo B. Staging is empty here, so this exercises the
+        # reachable-from-refs source path, not the staged-files path.
+        git(["push", "mirror", "main"], cwd=repo, env=env)
+
+    # The proof: a cold clone of repo B must reconstruct shared.bin. A 404 here
+    # is the bug — B's server scope never learned about the file.
+    clone_path, clone_env, _cache = init_repo_for_clone(
+        work_root=work_root,
+        client=client,
+        server=server,
+        owner=E2E_OWNER,
+        repo=E2E_REPO_MR_B,
+        name="multi-b-clone",
+    )
+    with timings.measure("multi-remote: cold clone+checkout of repo B"):
+        git(["checkout", "main"], cwd=clone_path, env=clone_env)
+    got = sha256_file(clone_path / "shared.bin")
+    if got != payload_sha:
+        raise TestFailure(
+            f"multi-remote: repo B clone sha mismatch: got {got}, want {payload_sha}"
+        )
+    info("  repo B clone reconstructed shared.bin OK")
 
 
 def phase_offline_no_network(

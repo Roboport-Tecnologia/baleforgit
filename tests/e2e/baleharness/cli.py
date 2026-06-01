@@ -43,6 +43,8 @@ from baleharness.config import (
     E2E_REPO_GC1,
     E2E_REPO_GC2,
     E2E_REPO_GC3,
+    E2E_REPO_MR_A,
+    E2E_REPO_MR_B,
     E2E_REPO_OFFLINE,
     E2E_REPO_SPILL,
     E2E_USER,
@@ -109,6 +111,7 @@ from baleharness.phases.scenario import (
     phase_browser_file_download,
     phase_clone_and_verify_history,
     phase_dedup_duplicate_file,
+    phase_multi_remote_push,
     phase_offline_and_restart,
     phase_offline_no_network,
     phase_push_idempotency,
@@ -461,6 +464,8 @@ def main() -> int:
                     f"{E2E_OWNER}/{E2E_REPO_GC1}",
                     f"{E2E_OWNER}/{E2E_REPO_GC2}",
                     f"{E2E_OWNER}/{E2E_REPO_GC3}",
+                    f"{E2E_OWNER}/{E2E_REPO_MR_A}",
+                    f"{E2E_OWNER}/{E2E_REPO_MR_B}",
                 ],
                 cas_port=cas_port,
                 ssh_port=ssh_port,
@@ -475,6 +480,14 @@ def main() -> int:
 
         def _phase_basic() -> None:
             phase_basic_user_ops(
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+            )
+
+        def _phase_multi_remote() -> None:
+            phase_multi_remote_push(
                 timings=timings,
                 server=server,
                 client=client,
@@ -820,6 +833,9 @@ def main() -> int:
         # name -> (group, read_only, fn)
         REGISTRY: dict[str, tuple[str, bool, Callable[[], None]]] = {
             "basic": ("g1", False, _phase_basic),
+            # Two repos on one server: push to origin (A), then to a second
+            # remote (B). Independent (own repos + commits), so g1.
+            "multi-remote": ("g1", False, _phase_multi_remote),
             "wrong-token": ("g1", False, _phase_wrong_token),
             # Routes git-bale's CAS traffic through a counting proxy and asserts
             # only push/pull cross it. Own repo + commits, so g1 (independent).

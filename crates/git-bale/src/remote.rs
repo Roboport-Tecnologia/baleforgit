@@ -141,6 +141,48 @@ fn strip_dot_git(p: &str) -> &str {
         .unwrap_or(p.trim_start_matches('/'))
 }
 
+/// Every configured remote as `(name, parsed url)`, `origin` first, then the
+/// rest alphabetically; unparseable remotes are skipped. Used by `push-pending`
+/// to source a file's bytes from whichever remote already holds it when staging
+/// has been drained.
+pub fn parse_all_remotes(repo: Option<&Path>) -> Vec<(String, RemoteUrl)> {
+    let start_dir = match repo
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::current_dir().ok())
+    {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let gix_repo = match gix::discover(&start_dir) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut names: Vec<String> = gix_repo
+        .remote_names()
+        .into_iter()
+        .map(|n| n.to_string())
+        .collect();
+    names.sort_by(|a, b| match (a.as_str(), b.as_str()) {
+        ("origin", "origin") => std::cmp::Ordering::Equal,
+        ("origin", _) => std::cmp::Ordering::Less,
+        (_, "origin") => std::cmp::Ordering::Greater,
+        _ => a.cmp(b),
+    });
+    let mut out = Vec::new();
+    for name in names {
+        let Ok(remote) = gix_repo.find_remote(name.as_str()) else {
+            continue;
+        };
+        let Some(url) = remote.url(gix::remote::Direction::Fetch) else {
+            continue;
+        };
+        if let Ok(parsed) = parse_remote(&url.to_bstring().to_string()) {
+            out.push((name, parsed));
+        }
+    }
+    out
+}
+
 /// Look up and parse `origin`'s fetch URL via gix (no `git remote` subprocess).
 pub fn parse_origin(repo: Option<&Path>) -> Result<RemoteUrl> {
     let start_dir = repo

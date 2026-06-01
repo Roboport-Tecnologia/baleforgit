@@ -51,6 +51,13 @@ E2E_REPO_OFFLINE = "offline-net"
 E2E_REPO_GC1 = "gc-abandon"
 E2E_REPO_GC2 = "gc-keep"
 E2E_REPO_GC3 = "gc-mixed"
+# The multi-remote phase pushes the same content to two repos on one server: an
+# `origin` (A) and a second remote (B) added afterwards. It proves the second
+# push registers the file under B's repo scope so a clone of B can check out
+# (the per-repo scope check would otherwise 404). Dedicated repos so no other
+# phase's `main` collides.
+E2E_REPO_MR_A = "multi-remote-a"
+E2E_REPO_MR_B = "multi-remote-b"
 # The resync-after-wipe phase owns its own isolated container; this is the bare
 # repo it force-pushes to after the server's CAS is wiped out from under it.
 E2E_REPO_RESYNC = "resync-wipe"
