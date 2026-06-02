@@ -728,12 +728,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bale-server-meta-common"
+version = "0.1.0"
+dependencies = [
+ "bale-server-core",
+ "sqlx",
+]
+
+[[package]]
 name = "bale-server-meta-postgres"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bale-server-core",
+ "bale-server-meta-common",
  "sqlx",
  "tracing",
 ]
@@ -745,6 +754,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bale-server-core",
+ "bale-server-meta-common",
  "sqlx",
  "tracing",
 ]

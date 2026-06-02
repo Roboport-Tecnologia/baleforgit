@@ -1,15 +1,24 @@
 //! SQLite-backed `MetadataStore` implementation.
+//!
+//! Dialect-free helpers and row decoders live in `bale-server-meta-common`; this
+//! crate holds the SQLite SQL (`?` placeholders, `INSERT OR IGNORE`/`OR REPLACE`,
+//! `BLOB`/`INTEGER` DDL) and its concurrency model (write-once term registration
+//! serialized by the enclosing transaction).
 
 use async_trait::async_trait;
 use bale_server_core::{
     ChunkHash, ChunkLocation, ChunkOffsetRow, ChunkRow, CoreError, CoreResult, FileHash, FileTerm,
-    Hash32, MetadataStore, RepoRef, XorbFrameRow, XorbHash, XorbInfo, HASH_LEN,
+    MetadataStore, RepoRef, XorbFrameRow, XorbHash, XorbInfo,
+};
+use bale_server_meta_common::{
+    blob_to_hash, dedup_sorted_xorbs, hash_to_blob, internal, nonneg_i64_to_u64, now_unix,
+    row_to_chunk_location, row_to_chunk_offset, row_to_file_term, row_to_frame, row_to_xorb_info,
+    CHUNK_INSERT_BATCH,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, QueryBuilder, Row, Sqlite};
 use std::path::Path;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS xorbs (
@@ -77,9 +86,6 @@ CREATE TABLE IF NOT EXISTS file_terms (
 CREATE INDEX IF NOT EXISTS file_terms_by_xorb ON file_terms(xorb_hash);
 "#;
 
-// SQLite caps bound params at ~32k; biggest row binds 7, so 500 rows stays well under.
-const CHUNK_INSERT_BATCH: usize = 500;
-
 pub struct SqliteMetadataStore {
     pool: Pool<Sqlite>,
 }
@@ -141,17 +147,6 @@ impl SqliteMetadataStore {
         }
         Ok(Self { pool })
     }
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn hash_to_blob(h: &Hash32) -> Vec<u8> {
-    h.as_bytes().to_vec()
 }
 
 // Shared per-file writes for register_file (one tx per file) and register_files
@@ -220,30 +215,6 @@ async fn write_file_in_tx(
             .map_err(|e| CoreError::Internal(format!("insert terms: {e}")))?;
     }
     Ok(())
-}
-
-// A negative SUM means i64 overflow; `.max(0)` would mask it to 0 and quietly
-// vanish the quota limit, so error instead.
-fn nonneg_i64_to_u64(n: i64, label: &'static str) -> CoreResult<u64> {
-    if n < 0 {
-        return Err(CoreError::Internal(format!(
-            "{label}: aggregate overflowed i64 (got {n}); database is corrupt or owner exceeds 8 EiB"
-        )));
-    }
-    Ok(n as u64)
-}
-
-fn blob_to_hash(b: &[u8]) -> CoreResult<Hash32> {
-    if b.len() != HASH_LEN {
-        return Err(CoreError::Internal(format!(
-            "bad hash blob length {} (want {})",
-            b.len(),
-            HASH_LEN
-        )));
-    }
-    let mut out = [0u8; HASH_LEN];
-    out.copy_from_slice(b);
-    Ok(Hash32(out))
 }
 
 #[async_trait]
@@ -369,19 +340,8 @@ impl MetadataStore for SqliteMetadataStore {
             return Ok(None);
         }
         let mut terms = Vec::with_capacity(rows.len());
-        for r in rows {
-            let xorb_blob: Vec<u8> = r.try_get("xorb_hash").map_err(internal)?;
-            let cs: i64 = r.try_get("chunk_idx_start").map_err(internal)?;
-            let ce: i64 = r.try_get("chunk_idx_end").map_err(internal)?;
-            let unp: i64 = r.try_get("unpacked_bytes").map_err(internal)?;
-            let ver: Option<Vec<u8>> = r.try_get("verification").map_err(internal)?;
-            terms.push(FileTerm {
-                xorb: XorbHash(blob_to_hash(&xorb_blob)?),
-                chunk_idx_start: cs as u32,
-                chunk_idx_end: ce as u32,
-                unpacked_segment_bytes: unp as u32,
-                verification: ver.as_deref().map(blob_to_hash).transpose()?,
-            });
+        for r in &rows {
+            terms.push(row_to_file_term(r)?);
         }
 
         // Defense in depth: the terms must sum to the file's recorded size. A
@@ -455,9 +415,7 @@ impl MetadataStore for SqliteMetadataStore {
             return Ok(std::collections::HashMap::new());
         }
         // One IN query instead of N round-trips.
-        let mut uniq: Vec<XorbHash> = xorbs.to_vec();
-        uniq.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-        uniq.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+        let uniq = dedup_sorted_xorbs(xorbs);
 
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT xorb_hash, frame_index, on_disk_start, on_disk_len, uncompressed_len
@@ -477,19 +435,10 @@ impl MetadataStore for SqliteMetadataStore {
 
         let mut out: std::collections::HashMap<XorbHash, Vec<XorbFrameRow>> =
             std::collections::HashMap::new();
-        for r in rows {
+        for r in &rows {
             let xorb_blob: Vec<u8> = r.try_get("xorb_hash").map_err(internal)?;
             let xorb = XorbHash(blob_to_hash(&xorb_blob)?);
-            let fi: i64 = r.try_get("frame_index").map_err(internal)?;
-            let s: i64 = r.try_get("on_disk_start").map_err(internal)?;
-            let l: i64 = r.try_get("on_disk_len").map_err(internal)?;
-            let u: i64 = r.try_get("uncompressed_len").map_err(internal)?;
-            out.entry(xorb).or_default().push(XorbFrameRow {
-                frame_index: fi as u32,
-                on_disk_start: s as u32,
-                on_disk_len: l as u32,
-                uncompressed_len: u as u32,
-            });
+            out.entry(xorb).or_default().push(row_to_frame(r)?);
         }
         Ok(out)
     }
@@ -504,17 +453,8 @@ impl MetadataStore for SqliteMetadataStore {
         .await
         .map_err(|e| CoreError::Internal(format!("select frames: {e}")))?;
         let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let fi: i64 = r.try_get("frame_index").map_err(internal)?;
-            let s: i64 = r.try_get("on_disk_start").map_err(internal)?;
-            let l: i64 = r.try_get("on_disk_len").map_err(internal)?;
-            let u: i64 = r.try_get("uncompressed_len").map_err(internal)?;
-            out.push(XorbFrameRow {
-                frame_index: fi as u32,
-                on_disk_start: s as u32,
-                on_disk_len: l as u32,
-                uncompressed_len: u as u32,
-            });
+        for r in &rows {
+            out.push(row_to_frame(r)?);
         }
         Ok(out)
     }
@@ -532,16 +472,7 @@ impl MetadataStore for SqliteMetadataStore {
         let Some(r) = row else {
             return Ok(None);
         };
-        let xorb_blob: Vec<u8> = r.try_get("xorb_hash").map_err(internal)?;
-        let ci: i64 = r.try_get("chunk_index").map_err(internal)?;
-        let bs: i64 = r.try_get("byte_start").map_err(internal)?;
-        let unp: i64 = r.try_get("unpacked_bytes").map_err(internal)?;
-        Ok(Some(ChunkLocation {
-            xorb: XorbHash(blob_to_hash(&xorb_blob)?),
-            chunk_index: ci as u32,
-            byte_start: bs as u32,
-            unpacked_segment_bytes: unp as u32,
-        }))
+        Ok(Some(row_to_chunk_location(&r)?))
     }
 
     async fn xorbs_near_chunk(
@@ -568,16 +499,8 @@ impl MetadataStore for SqliteMetadataStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| CoreError::Internal(format!("xorb meta: {e}")))?;
-        let nc: i64 = row.try_get("num_chunks").map_err(internal)?;
-        let nb_cas: i64 = row.try_get("num_bytes_in_cas").map_err(internal)?;
-        let nb_disk: i64 = row.try_get("num_bytes_on_disk").map_err(internal)?;
 
-        let mut out = vec![XorbInfo {
-            xorb,
-            num_chunks: nc as u32,
-            num_bytes_in_cas: nb_cas as u32,
-            num_bytes_on_disk: nb_disk as u32,
-        }];
+        let mut out = vec![row_to_xorb_info(&row, xorb)?];
         out.truncate(limit);
         Ok(out)
     }
@@ -719,10 +642,7 @@ impl MetadataStore for SqliteMetadataStore {
         if candidates.is_empty() {
             return Ok(0);
         }
-        // Dedup so the IN clause stays compact.
-        let mut uniq: Vec<&XorbHash> = candidates.iter().collect();
-        uniq.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-        uniq.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+        let uniq = dedup_sorted_xorbs(candidates);
 
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT COALESCE(SUM(num_bytes_on_disk), 0) AS n FROM xorbs WHERE hash IN (",
@@ -760,22 +680,9 @@ impl MetadataStore for SqliteMetadataStore {
         .await
         .map_err(|e| CoreError::Internal(format!("xorb offsets: {e}")))?;
         let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let chunk_blob: Vec<u8> = r.try_get("chunk_hash").map_err(internal)?;
-            let ci: i64 = r.try_get("chunk_index").map_err(internal)?;
-            let bs: i64 = r.try_get("byte_start").map_err(internal)?;
-            let unp: i64 = r.try_get("unpacked_bytes").map_err(internal)?;
-            out.push(ChunkOffsetRow {
-                chunk_hash: ChunkHash(blob_to_hash(&chunk_blob)?),
-                chunk_index: ci as u32,
-                byte_start: bs as u32,
-                unpacked_segment_bytes: unp as u32,
-            });
+        for r in &rows {
+            out.push(row_to_chunk_offset(r)?);
         }
         Ok(out)
     }
-}
-
-fn internal<E: std::fmt::Display>(e: E) -> CoreError {
-    CoreError::Internal(format!("row decode: {e}"))
 }

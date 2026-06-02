@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import secrets
 import struct
-import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -21,6 +20,7 @@ from baleharness.config import (
 from baleharness.gitutil import git
 from baleharness.jwtutil import mint_bale_jwt
 from baleharness.logutil import TestFailure, info
+from baleharness.mocks import meta_db_query
 from baleharness.payloads import deterministic_payload
 from baleharness.proc import sha256_bytes
 from baleharness.repo import init_repo_for_push
@@ -163,20 +163,14 @@ def _fetch_dedup_shard(server: ServerHandle, jwt_secret_hex: str) -> bytes:
 
 
 def _server_chunk_hash(server: ServerHandle) -> bytes:
-    """Read one raw chunk hash from the server's SQLite store, querying INSIDE
-    the container: rootless podman bind mounts go through a VM on macOS, so a
+    """Read one raw chunk hash from the server's metadata store, querying INSIDE
+    a container: rootless podman bind mounts go through a VM on macOS, so a
     host-side read of the WAL-mode meta.db is unreliable (same reason
     hold_db_writer_lock execs sqlite3 in the container)."""
-    out = subprocess.run(
-        server.rt.cmd(
-            "exec",
-            server.name,
-            "sqlite3",
-            "/data/meta.db",
-            "SELECT hex(chunk_hash) FROM chunks LIMIT 1;",
-        ),
-        capture_output=True,
-        check=False,
+    out = meta_db_query(
+        server,
+        sqlite_sql="SELECT hex(chunk_hash) FROM chunks LIMIT 1;",
+        pg_sql="SELECT encode(chunk_hash, 'hex') FROM chunks LIMIT 1;",
     )
     text = out.stdout.decode("utf-8", "replace").strip()
     if out.returncode != 0 or not text:

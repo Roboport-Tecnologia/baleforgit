@@ -13,6 +13,11 @@ from contextlib import contextmanager
 from typing import Callable, Iterator, Optional
 
 from baleharness.logutil import TestFailure
+from baleharness.pgbackend import (
+    PG_USER,
+    db_for_data_root,
+    get_active_postgres_backend,
+)
 from baleharness.proc import host_primary_ip, pick_free_port
 from baleharness.server import ServerHandle
 
@@ -531,3 +536,49 @@ def hold_db_writer_lock(server: ServerHandle, hold_seconds: float) -> Iterator[N
         # The detached sqlite3 will COMMIT and exit on its own once
         # `sleep hold_seconds` elapses; nothing to clean up here.
         pass
+
+
+def meta_db_query(
+    server: ServerHandle,
+    *,
+    sqlite_sql: str,
+    pg_sql: str,
+) -> subprocess.CompletedProcess:
+    """Run one statement against the server's metadata store, picking the engine
+    the run is using, and return the raw CompletedProcess. Rows come back
+    '|'-separated, one per line, headerless. The query runs INSIDE a container
+    (the server's for SQLite, the sidecar's for Postgres) because rootless podman
+    bind mounts go through a VM on macOS where a host-side meta.db read is
+    unreliable. Statements differ only where the dialect does (e.g. `hex(x)` vs
+    `encode(x,'hex')`), so callers pass both forms; for dialect-neutral SQL pass
+    the same string twice."""
+    pg = get_active_postgres_backend()
+    if pg is not None:
+        # Same per-data_root database start_container pointed this server at.
+        dbname = db_for_data_root(server.data_root, pg.prefix_anchor)
+        cmd = server.rt.cmd(
+            "exec",
+            pg.guard.container,
+            "psql",
+            "-U",
+            PG_USER,
+            "-d",
+            dbname,
+            "-tA",  # tuples-only, unaligned: bare `val|val` rows, no header/padding
+            "-F",
+            "|",
+            "-c",
+            pg_sql,
+        )
+    else:
+        cmd = server.rt.cmd(
+            "exec",
+            server.name,
+            "sqlite3",
+            "-noheader",
+            "-separator",
+            "|",
+            "/data/meta.db",
+            sqlite_sql,
+        )
+    return subprocess.run(cmd, capture_output=True, check=False)

@@ -14,3 +14,4 @@ async-trait.workspace = true
 sqlx = { workspace = true, features = ["postgres", "tls-rustls-ring-webpki"] }
 tracing.workspace = true
 bale-server-core.workspace = true
+bale-server-meta-common.workspace = true

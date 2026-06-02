@@ -10,6 +10,7 @@ members = [
     "crates/bale-server-storage-fs",
     "crates/bale-server-storage-mem",
     "crates/bale-server-storage-s3",
+    "crates/bale-server-meta-common",
     "crates/bale-server-meta-sqlite",
     "crates/bale-server-meta-postgres",
     "crates/bale-server-authz-mem",
@@ -70,6 +71,7 @@ bale-server-shard = { path = "crates/bale-server-shard" }
 bale-server-storage-fs = { path = "crates/bale-server-storage-fs" }
 bale-server-storage-mem = { path = "crates/bale-server-storage-mem" }
 bale-server-storage-s3 = { path = "crates/bale-server-storage-s3" }
+bale-server-meta-common = { path = "crates/bale-server-meta-common" }
 bale-server-meta-sqlite = { path = "crates/bale-server-meta-sqlite" }
 bale-server-meta-postgres = { path = "crates/bale-server-meta-postgres" }
 bale-server-authz-mem = { path = "crates/bale-server-authz-mem" }

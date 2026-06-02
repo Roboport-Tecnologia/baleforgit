@@ -73,7 +73,7 @@ from baleharness.gitutil import (
 )
 from baleharness.jwtutil import mint_bale_jwt
 from baleharness.logutil import TestFailure, fmt_bytes, info
-from baleharness.mocks import TcpProxy
+from baleharness.mocks import TcpProxy, meta_db_query
 from baleharness.payloads import deterministic_payload, modify_bytes, replace_region
 from baleharness.proc import pick_free_port, run, sha256_bytes, sha256_file
 from baleharness.repo import init_repo_for_clone, init_repo_for_push
@@ -447,37 +447,33 @@ def phase_multi_remote_push(
     info("  repo C (stale-object remote) reconstructed shared.bin OK")
 
 
-def _sqlite(server: ServerHandle, sql: str):
-    """Run one SQL statement against the server's meta.db inside its container."""
-    return run(
-        server.rt.cmd(
-            "exec",
-            server.name,
-            "sqlite3",
-            "-noheader",
-            "-separator",
-            "|",
-            "/data/meta.db",
-            sql,
-        ),
-        capture=True,
-    )
-
-
 def _file_term_sum(server: ServerHandle, repo_id: str) -> tuple[str, int, int, int]:
     """(hash, recorded size, Σ term unpacked_bytes, term count) for the single file
-    registered under `repo_id`, read straight from the server's meta.db. The sum is
-    over the GLOBAL (cross-repo) file_terms rows — the set a per-term merge would
-    corrupt."""
-    res = _sqlite(
-        server,
-        "SELECT lower(hex(ft.file_hash)), "
-        "(SELECT total_bytes FROM files WHERE file_hash = ft.file_hash LIMIT 1), "
-        "SUM(ft.unpacked_bytes), COUNT(*) "
+    registered under `repo_id`, read straight from the server's metadata store. The
+    sum is over the GLOBAL (cross-repo) file_terms rows — the set a per-term merge
+    would corrupt. Only the hex-encode function differs by dialect."""
+    size_sub = "(SELECT total_bytes FROM files WHERE file_hash = ft.file_hash LIMIT 1)"
+    tail = (
         "FROM file_terms ft "
         f"WHERE ft.file_hash IN (SELECT file_hash FROM files WHERE repo_id = '{repo_id}') "
-        "GROUP BY ft.file_hash;",
+        "GROUP BY ft.file_hash;"
     )
+    res = meta_db_query(
+        server,
+        sqlite_sql=(
+            f"SELECT lower(hex(ft.file_hash)), {size_sub}, "
+            f"SUM(ft.unpacked_bytes), COUNT(*) {tail}"
+        ),
+        pg_sql=(
+            f"SELECT encode(ft.file_hash, 'hex'), {size_sub}, "
+            f"SUM(ft.unpacked_bytes), COUNT(*) {tail}"
+        ),
+    )
+    if res.returncode != 0:
+        raise TestFailure(
+            f"term-merge: metadata query failed (rc={res.returncode}): "
+            f"{res.stderr.decode('utf-8', 'replace')}"
+        )
     lines = [ln for ln in res.stdout.decode().splitlines() if ln.strip()]
     if len(lines) != 1:
         raise TestFailure(
@@ -553,18 +549,23 @@ def phase_term_list_merge(
     # term list, so Σterms = 3×|F| and the over-sum (2×|F|) exceeds the last term
     # (|F|) — the precise shape that underflows xet's trim. This is what the buggy
     # per-term merge produced when a longer second registration arrived.
+    inject_sql = (
+        "INSERT INTO file_terms (file_hash, term_index, xorb_hash, "
+        "chunk_idx_start, chunk_idx_end, unpacked_bytes, verification) "
+        "SELECT ft.file_hash, "
+        "(SELECT MAX(term_index) + 1 FROM file_terms x WHERE x.file_hash = ft.file_hash), "
+        "ft.xorb_hash, ft.chunk_idx_start, ft.chunk_idx_end, ft.unpacked_bytes, ft.verification "
+        "FROM file_terms ft "
+        f"WHERE ft.file_hash IN (SELECT file_hash FROM files WHERE repo_id = '{repo_id}') "
+        "AND ft.term_index = 0;"
+    )
     for _ in range(2):
-        _sqlite(
-            server,
-            "INSERT INTO file_terms (file_hash, term_index, xorb_hash, "
-            "chunk_idx_start, chunk_idx_end, unpacked_bytes, verification) "
-            "SELECT ft.file_hash, "
-            "(SELECT MAX(term_index) + 1 FROM file_terms x WHERE x.file_hash = ft.file_hash), "
-            "ft.xorb_hash, ft.chunk_idx_start, ft.chunk_idx_end, ft.unpacked_bytes, ft.verification "
-            "FROM file_terms ft "
-            f"WHERE ft.file_hash IN (SELECT file_hash FROM files WHERE repo_id = '{repo_id}') "
-            "AND ft.term_index = 0;",
-        )
+        res = meta_db_query(server, sqlite_sql=inject_sql, pg_sql=inject_sql)
+        if res.returncode != 0:
+            raise TestFailure(
+                f"term-merge: corrupt-term injection failed (rc={res.returncode}): "
+                f"{res.stderr.decode('utf-8', 'replace')}"
+            )
     _, size, term_sum, nterms = _file_term_sum(server, repo_id)
     if term_sum <= size:
         raise TestFailure(
