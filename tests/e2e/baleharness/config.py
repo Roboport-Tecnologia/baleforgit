@@ -89,6 +89,13 @@ COLD_SMALL_BYTES = 1 * 1024 * 1024
 # at-risk path for re-storing the unchanged prefix; measured via server disk.
 E2E_REPO_COLD_STAGED_A = "cold-staged-a"
 E2E_REPO_COLD_STAGED_B = "cold-staged-b"
+# The compression phase pushes two compressible files — one xet stores as plain
+# LZ4 (scheme 1), one as BG4-LZ4 (scheme 2) — so the server's xorb decompress
+# arms (verify on upload, decompress on browser download) get exercised. The
+# default sha256-chained payloads are incompressible, so every other phase only
+# ever stores scheme-0 (uncompressed) frames. Own repo + commits.
+E2E_REPO_COMPRESS = "compression"
+COMPRESS_FILE_BYTES = 4 * 1024 * 1024  # a few CDC chunks per file
 # The resync-after-wipe phase owns its own isolated container; this is the bare
 # repo it force-pushes to after the server's CAS is wiped out from under it.
 E2E_REPO_RESYNC = "resync-wipe"

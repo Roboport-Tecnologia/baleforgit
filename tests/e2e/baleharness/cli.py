@@ -46,6 +46,7 @@ from baleharness.config import (
     E2E_REPO_COLD_B,
     E2E_REPO_COLD_STAGED_A,
     E2E_REPO_COLD_STAGED_B,
+    E2E_REPO_COMPRESS,
     E2E_REPO_GC3,
     E2E_REPO_MERGE_A,
     E2E_REPO_MR_A,
@@ -72,6 +73,7 @@ from baleharness.phases.adversarial import (
     phase_adversarial_wrong_token,
 )
 from baleharness.phases.anon import phase_anonymous_public_clone
+from baleharness.phases.compression import phase_compression_schemes
 from baleharness.phases.coverage_phases import (
     phase_authz_http_coverage,
     phase_https_origin_coverage,
@@ -482,6 +484,7 @@ def main() -> int:
                     f"{E2E_OWNER}/{E2E_REPO_COLD_B}",
                     f"{E2E_OWNER}/{E2E_REPO_COLD_STAGED_A}",
                     f"{E2E_OWNER}/{E2E_REPO_COLD_STAGED_B}",
+                    f"{E2E_OWNER}/{E2E_REPO_COMPRESS}",
                 ],
                 cas_port=cas_port,
                 ssh_port=ssh_port,
@@ -570,6 +573,14 @@ def main() -> int:
         def _phase_track() -> None:
             phase_track(
                 timings=timings,
+                client=client,
+                work_root=work_root,
+            )
+
+        def _phase_compression() -> None:
+            phase_compression_schemes(
+                timings=timings,
+                server=server,
                 client=client,
                 work_root=work_root,
             )
@@ -902,6 +913,11 @@ def main() -> int:
             # `git-bale track` .gitattributes editing. Pure-local (no server),
             # own scratch dirs, so g1 (independent).
             "track": ("g1", False, _phase_track),
+            # Pushes two compressible files (one stored LZ4, one BG4-LZ4) and
+            # downloads them over HTTP, covering the server's xorb decompress
+            # arms that the incompressible default payloads never reach. Own
+            # repo + commits, so g1 (independent).
+            "compression": ("g1", False, _phase_compression),
             "bigfile": ("g2-head", False, _phase_bigfile),
             "usage": ("g2-tail", True, _phase_usage),
             # Dereferences rev_state["repo_path"]/["env"] (the live bigfile
