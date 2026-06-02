@@ -68,18 +68,6 @@ impl HttpAuthz {
             jwt_secret: jwt_secret.into(),
         })
     }
-
-    pub fn with_client(
-        base_url: impl AsRef<str>,
-        jwt_secret: impl Into<Vec<u8>>,
-        client: reqwest::Client,
-    ) -> CoreResult<Self> {
-        Ok(Self {
-            check_access_url: build_check_access_url(base_url.as_ref())?,
-            client,
-            jwt_secret: jwt_secret.into(),
-        })
-    }
 }
 
 #[derive(Serialize)]

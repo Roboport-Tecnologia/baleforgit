@@ -356,8 +356,6 @@ removal; re-evaluate each as a deletion candidate.
 - `bale-server-authz-mem` — whole `AlwaysAllow` impl. Used only by
   cargo tests; `bale-server-bin` constructs the grants-table impl.
   Keep as test helper.
-- `bale-server-authz-http:74-84` — `HttpAuthz::with_client`.
-  Production uses `::new`. Keep as test ctor.
 - `bale-server-core:24-26, 49-51` — `Hash32::from_bytes` and newtype
   `from_bytes` helpers. Keep as test ctors.
 - `meta-sqlite:114` — `":memory:"` → `"sqlite::memory:"` open-path
