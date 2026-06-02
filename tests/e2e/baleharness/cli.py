@@ -76,6 +76,7 @@ from baleharness.phases.coverage_phases import (
     phase_authz_http_coverage,
     phase_https_origin_coverage,
     phase_otlp_telemetry,
+    phase_postgres_coverage,
 )
 from baleharness.phases.dedup_shard import phase_global_dedup_shard
 from baleharness.phases.failure import (
@@ -1016,6 +1017,7 @@ def main() -> int:
             "authz-http",
             "https-origin",
             "otlp",
+            "postgres",
         }
         valid_phase_names = set(REGISTRY) | coverage_only_phases
         unknown_only = [n for n in args.only if n not in valid_phase_names]
@@ -1088,6 +1090,7 @@ def main() -> int:
                 ("authz-http", phase_authz_http_coverage),
                 ("https-origin", phase_https_origin_coverage),
                 ("otlp", phase_otlp_telemetry),
+                ("postgres", phase_postgres_coverage),
             ):
                 reason = filtered_out(cov_name)
                 if reason is not None:

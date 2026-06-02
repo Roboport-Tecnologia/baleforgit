@@ -1,4 +1,4 @@
-"""Coverage-only phases (https-origin, authz-http, otlp telemetry)."""
+"""Coverage-only phases (https-origin, authz-http, otlp telemetry, postgres)."""
 
 from __future__ import annotations
 
@@ -10,16 +10,32 @@ from pathlib import Path
 from typing import Optional
 
 from baleharness.client import ClientEnv
-from baleharness.config import E2E_HUB_TOKEN, E2E_OWNER, E2E_REPO, SMALL_FILE_BYTES
-from baleharness.gitutil import force_resmudge_cold, git
+from baleharness.config import (
+    E2E_HUB_TOKEN,
+    E2E_OWNER,
+    E2E_REPO,
+    E2E_USER,
+    JWT_TTL_YEARS,
+    SMALL_FILE_BYTES,
+)
+from baleharness.gitutil import (
+    force_resmudge_cold,
+    git,
+    verify_pointer_at,
+    verify_worktree,
+)
+from baleharness.jwtutil import mint_bale_jwt
 from baleharness.logutil import TestFailure, info
 from baleharness.mocks import MockAuthzServer, MockForgeServer, OtlpCollector
 from baleharness.payloads import deterministic_payload
+from baleharness.pgbackend import PostgresGuard
 from baleharness.proc import run, sha256_bytes
-from baleharness.repo import init_repo_for_push
+from baleharness.repo import init_repo_for_clone, init_repo_for_push
 from baleharness.runtime import Runtime
+from baleharness.s3backend import Network
 from baleharness.server import ServerHandle, start_container
 from baleharness.timing import Timings
+from baleharness.usage import fetch_repo_usage
 
 
 AUTHZ_HTTP_REPOS = ["authz-http/allow", "authz-http/denied", "authz-http/error"]
@@ -58,16 +74,19 @@ def phase_https_origin_coverage(
     admin_token_hex: str,
 ) -> None:
     """Drive the git-bale resolver's HTTP(S)-origin auth branch. When `origin`
-    is an `http://` URL the resolver gets Basic creds from `git credential
-    fill`, POSTs the forge's `/info/bale/authenticate`, then exchanges the
-    forge bearer for a bale token — versus the SSH `git-bale-authenticate`
-    command every other phase uses. Covers resolver.rs `Http | Https` arm,
-    `authenticate_http`, and `git_credential_fill`.
+    is an `http://` URL the resolver POSTs the forge's `/info/bale/authenticate`
+    then exchanges the forge bearer for a bale token — versus the SSH
+    `git-bale-authenticate` command every other phase uses. The mock forge runs
+    with enforce_auth (private repo), so this covers resolver.rs `Http | Https`
+    arm, `authenticate_http` (both the anonymous probe and the credential'd
+    retry), `authenticate_http_with_fallback`'s 401→retry branch, and
+    `git_credential_fill`.
 
     `git-bale push-pending` (op=upload) and a cold smudge (op=download) both
-    read `origin` and take the HTTP branch, exercising both scope arms. Neither
-    transfers git refs, so a single mock endpoint suffices — no git smart-HTTP
-    server needed.
+    read `origin` and take the HTTP branch. Upload goes straight to Basic;
+    download probes anonymously first, gets 401, then falls back to Basic —
+    exercising both scope arms. Neither transfers git refs, so a single mock
+    endpoint suffices — no git smart-HTTP server needed.
     """
     owner, name = HTTP_ORIGIN_REPO.split("/", 1)
     phase_root = work_root / "https-origin"
@@ -91,8 +110,13 @@ def phase_https_origin_coverage(
                 admin_token_hex=admin_token_hex,
                 name_suffix="https-origin",
             )
+        # enforce_auth=True + private (public=False): the download scope's
+        # anonymous probe gets 401, forcing the resolver's git_credential_fill
+        # fallback — the branch a public-repo (anon-accepted) forge never hits.
         forge = MockForgeServer(
-            bale_href=server.public_host_url, hub_token=E2E_HUB_TOKEN
+            bale_href=server.public_host_url,
+            hub_token=E2E_HUB_TOKEN,
+            enforce_auth=True,
         )
         forge.start()
         info(f"https-origin: mock forge at {forge.base_url}")
@@ -150,20 +174,31 @@ def phase_https_origin_coverage(
                 label="https-origin",
             )
 
-        ops = {op for op, _ in forge.calls}
-        if "upload" not in ops or "download" not in ops:
+        upload = [had_basic for op, had_basic in forge.calls if op == "upload"]
+        download = [had_basic for op, had_basic in forge.calls if op == "download"]
+        if not upload or not download:
             raise TestFailure(
-                f"https-origin: forge ops {sorted(ops)} missing upload/download "
-                "— the HTTP resolver branch didn't drive both scopes"
+                f"https-origin: forge ops {sorted({o for o, _ in forge.calls})} "
+                "missing upload/download — the HTTP resolver branch didn't drive "
+                "both scopes"
             )
-        if not forge.calls or not all(had_basic for _, had_basic in forge.calls):
+        # Upload never probes anonymously: every upload authenticate must be Basic.
+        if not all(upload):
             raise TestFailure(
-                "https-origin: a forge authenticate call arrived without Basic "
-                "auth — git_credential_fill path not exercised"
+                "https-origin: an upload authenticate arrived without Basic auth "
+                "— upload must skip the anon probe and use git_credential_fill"
+            )
+        # Download must show the anon-first probe (no Basic) AND the
+        # git_credential_fill fallback after the 401 (Basic) — the whole point
+        # of this phase post anon-first.
+        if not (any(not b for b in download) and any(b for b in download)):
+            raise TestFailure(
+                "https-origin: download didn't exercise anon-probe → "
+                f"git_credential_fill fallback (download had_basic flags: {download})"
             )
         info(
-            f"https-origin: forge recorded {len(forge.calls)} authenticate "
-            f"calls, ops={sorted(ops)}"
+            f"https-origin: forge recorded {len(forge.calls)} authenticate calls "
+            f"(upload={upload}, download={download})"
         )
     finally:
         if forge is not None:
@@ -375,3 +410,150 @@ def phase_otlp_telemetry(
         if server is not None:
             server.stop()
         collector.stop()
+
+
+def phase_postgres_coverage(
+    *,
+    timings: Timings,
+    rt: Runtime,
+    image_tag: str,
+    work_root: Path,
+    client: ClientEnv,
+    ssh_public_key: str,
+    admin_token_hex: str,
+) -> None:
+    """Drive a server backed by the Postgres `MetadataStore` so
+    `bale-server-meta-postgres` shows up in the report. The whole suite runs on
+    Postgres via `run.py --meta postgres`, but that's mutually exclusive with
+    `--coverage`; this is the metadata-store analogue of the s3-basic/s3-dedup
+    phases — one focused push + re-push + cold clone + usage query against an
+    instrumented server with `BALE_POSTGRES_URL` set, covering register_files
+    (insert + content-addressed dedup), the reconstruction lookup, and the
+    usage aggregation SQL.
+
+    The blob store stays fs (the container's local data dir) — only the
+    metadata path is swapped to Postgres. The sidecar is brought up on its own
+    podman network and the server is attached to it so it reaches Postgres via
+    the host bridge route (same trick as the s3/MinIO and --meta postgres
+    plumbing in pgbackend.py)."""
+    phase_root = work_root / "postgres"
+    phase_root.mkdir()
+    data_root = phase_root / "data"
+    data_root.mkdir()
+    jwt_secret = secrets.token_bytes(32).hex()
+    transfer_secret = secrets.token_bytes(32).hex()
+    network: Optional[Network] = None
+    pg: Optional[PostgresGuard] = None
+    server: Optional[ServerHandle] = None
+    try:
+        with timings.measure("postgres: sidecar"):
+            network = Network.create(rt)
+            pg = PostgresGuard.start(rt, network)
+            dbname = "bale_coverage"
+            pg.ensure_database(dbname)
+        with timings.measure("postgres: container start"):
+            server = start_container(
+                rt,
+                image_tag=image_tag,
+                data_root=data_root,
+                jwt_secret_hex=jwt_secret,
+                transfer_secret_hex=transfer_secret,
+                ssh_public_key=ssh_public_key,
+                test_repos=[f"{E2E_OWNER}/{E2E_REPO}"],
+                admin_token_hex=admin_token_hex,
+                name_suffix="postgres",
+                extra_env={"BALE_POSTGRES_URL": pg.url_for_db(dbname)},
+                extra_run_args=["--network", network.name],
+            )
+
+        repo, env = init_repo_for_push(
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO,
+            name="postgres-client",
+        )
+
+        # v1 → push: exercises register_files INSERT + blob registration.
+        payload_v1 = deterministic_payload(SMALL_FILE_BYTES, seed=b"pg-cov-v1")
+        sha_v1 = sha256_bytes(payload_v1)
+        (repo / "f.bin").write_bytes(payload_v1)
+        with timings.measure("postgres: v1 push", bytes_moved=SMALL_FILE_BYTES):
+            git(["add", "f.bin"], cwd=repo, env=env)
+            verify_pointer_at(
+                repo,
+                env,
+                spec=":f.bin",
+                expected_sha=sha_v1,
+                expected_size=SMALL_FILE_BYTES,
+                label="postgres:after-stage",
+            )
+            git(["commit", "-m", "postgres v1"], cwd=repo, env=env)
+            git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+
+        # v2 (8-byte poke) → re-push: a distinct file_hash that shares chunks,
+        # so register_files takes the content-addressed dedup path.
+        payload_v2 = (
+            payload_v1[:1024] + b"\xde\xad\xbe\xef\x01\x02\x03\x04" + payload_v1[1032:]
+        )
+        sha_v2 = sha256_bytes(payload_v2)
+        if sha_v2 == sha_v1:
+            raise TestFailure("postgres v2: sha256 unchanged after poke")
+        (repo / "f.bin").write_bytes(payload_v2)
+        with timings.measure("postgres: v2 push", bytes_moved=SMALL_FILE_BYTES):
+            git(["add", "f.bin"], cwd=repo, env=env)
+            git(["commit", "-m", "postgres v2"], cwd=repo, env=env)
+            git(["push", "origin", "main"], cwd=repo, env=env)
+
+        # Cold clone HEAD: the smudge hits /v1/reconstructions/ → the Postgres
+        # reconstruction lookup must reassemble v2's bytes.
+        with timings.measure(
+            "postgres: cold clone + checkout", bytes_moved=SMALL_FILE_BYTES
+        ):
+            clone_path, clone_env, _ = init_repo_for_clone(
+                work_root=work_root,
+                client=client,
+                server=server,
+                owner=E2E_OWNER,
+                repo=E2E_REPO,
+                name="postgres-clone",
+            )
+            git(["checkout", "main"], cwd=clone_path, env=clone_env)
+        verify_worktree(
+            clone_path,
+            "f.bin",
+            expected_sha=sha_v2,
+            expected_size=SMALL_FILE_BYTES,
+            label="postgres:after-clone",
+        )
+
+        # /v1/usage/repo: exercises the Postgres usage-aggregation SQL.
+        admin_jwt = mint_bale_jwt(
+            secret=bytes.fromhex(jwt_secret),
+            sub=E2E_USER,
+            repo_type="model",
+            repo_id=f"{E2E_OWNER}/{E2E_REPO}",
+            revision="main",
+            scope="write",
+            ttl_secs=JWT_TTL_YEARS * 365 * 24 * 3600,
+        )
+        usage = fetch_repo_usage(
+            server, token=admin_jwt, owner=E2E_OWNER, repo=E2E_REPO
+        )
+        if int(usage["raw_bytes"]) <= 0 or int(usage["stored_bytes"]) <= 0:
+            raise TestFailure(
+                f"postgres: /v1/usage/repo returned non-positive bytes — the "
+                f"Postgres usage aggregation isn't seeing the two pushes: {usage}"
+            )
+        info(
+            f"postgres: usage raw={usage['raw_bytes']} stored={usage['stored_bytes']}, "
+            "register/reconstruct/usage paths exercised"
+        )
+    finally:
+        if server is not None:
+            server.stop()
+        if pg is not None:
+            pg.stop()
+        if network is not None:
+            network.destroy()

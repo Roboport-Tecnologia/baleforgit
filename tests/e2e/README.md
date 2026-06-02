@@ -211,7 +211,9 @@ python3 tests/e2e/run.py [--git-bale PATH] [--image-tag TAG] [--no-build]
   `data_root` (the metadata analogue of `--backend s3`'s per-`data_root` bucket
   prefix). Composes with `--backend`, so `--backend s3 --meta postgres` runs the
   suite with both swapped out at once. Mutually exclusive with `--coverage` and
-  `--reuse-from` (the sidecar's databases are torn down at end of run). See
+  `--reuse-from` (the sidecar's databases are torn down at end of run) — under
+  `--coverage`, the dedicated `postgres` extra phase covers
+  `bale-server-meta-postgres` instead. See
   [Running the whole suite on Postgres](#running-the-whole-suite-on-postgres)
   below.
 - `--coverage` — see [Coverage mode](#coverage-mode) below.
@@ -325,13 +327,23 @@ covers every pluggable trait impl:
   the mock can return 200 / 403 / 500 per repo; one direct token-mint
   probe with an unknown hub bearer for the 401 branch.
 - `https-origin` — drives the `git-bale` resolver's HTTP-origin auth
-  branch (`MockForgeServer` + a canned `credential.helper`) so both the
-  upload and download scopes resolve over HTTP instead of SSH.
+  branch (`MockForgeServer` with `enforce_auth` + a canned
+  `credential.helper`) so both the upload and download scopes resolve
+  over HTTP instead of SSH; the download's anonymous probe gets a 401 so
+  the `git_credential_fill` fallback (`authenticate_http_with_fallback`)
+  is exercised, not just the anon-accepted public path.
 - `otlp` — boots a server with `OTEL_EXPORTER_OTLP_ENDPOINT` /
   `_TRACES_ENDPOINT` pointed at a host-side `OtlpCollector`, pushes a
   small file, and asserts the collector receives a `/v1/traces` export —
   exercising `bale-server-bin::telemetry`'s exporter init + signal-URL
   resolution, which are no-ops whenever the OTLP env is unset.
+- `postgres` — exercises `bale-server-meta-postgres`. The whole suite on
+  Postgres (`run.py --meta postgres`) is mutually exclusive with
+  `--coverage`, so this is the metadata-store analogue of the s3 phases:
+  a `PostgresGuard` sidecar on its own network, one instrumented server
+  with `BALE_POSTGRES_URL` set (blob store stays fs), and a v1 push →
+  v2 re-push → cold clone → `/v1/usage/repo` query covering register_files
+  (insert + dedup), the reconstruction lookup, and the usage aggregation.
 
 Coverage mode **auto-skips** phases that SIGKILL the server (`failure-
 kill`, `failure-conndrop`, `failure-dbbusy`) — LLVM's atexit hook can't
