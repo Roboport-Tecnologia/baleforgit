@@ -12,13 +12,12 @@
 
 use async_trait::async_trait;
 use bale_server_core::{
-    ChunkHash, ChunkLocation, ChunkOffsetRow, ChunkRow, CoreError, CoreResult, FileHash, FileTerm,
-    MetadataStore, RepoRef, XorbFrameRow, XorbHash, XorbInfo,
+    ChunkHash, ChunkOffsetRow, ChunkRow, CoreError, CoreResult, FileHash, FileTerm, MetadataStore,
+    RepoRef, XorbFrameRow, XorbHash, XorbInfo,
 };
 use bale_server_meta_common::{
     blob_to_hash, dedup_sorted_xorbs, hash_to_blob, internal, nonneg_i64_to_u64, now_unix,
-    row_to_chunk_location, row_to_chunk_offset, row_to_file_term, row_to_frame, row_to_xorb_info,
-    CHUNK_INSERT_BATCH,
+    row_to_chunk_offset, row_to_file_term, row_to_frame, row_to_xorb_info, CHUNK_INSERT_BATCH,
 };
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres, QueryBuilder, Row};
@@ -92,24 +91,6 @@ pub struct PostgresMetadataStore {
 }
 
 impl PostgresMetadataStore {
-    pub async fn count_xorbs(&self) -> CoreResult<u64> {
-        let row = sqlx::query("SELECT COUNT(*) AS n FROM xorbs")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| CoreError::Internal(format!("count xorbs: {e}")))?;
-        let n: i64 = row.try_get("n").map_err(internal)?;
-        Ok(n as u64)
-    }
-
-    pub async fn count_files(&self) -> CoreResult<u64> {
-        let row = sqlx::query("SELECT COUNT(*) AS n FROM files")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| CoreError::Internal(format!("count files: {e}")))?;
-        let n: i64 = row.try_get("n").map_err(internal)?;
-        Ok(n as u64)
-    }
-
     /// `url` is a libpq connection string (`postgres://user:pass@host/db`).
     pub async fn open_url(url: &str) -> CoreResult<Self> {
         let pool = PgPoolOptions::new()
@@ -475,22 +456,6 @@ impl MetadataStore for PostgresMetadataStore {
             out.push(row_to_frame(r)?);
         }
         Ok(out)
-    }
-
-    async fn lookup_chunk(&self, chunk_hash: &ChunkHash) -> CoreResult<Option<ChunkLocation>> {
-        let row = sqlx::query(
-            "SELECT xorb_hash, chunk_index, byte_start, unpacked_bytes
-             FROM chunks WHERE chunk_hash = $1 LIMIT 1",
-        )
-        .bind(hash_to_blob(&chunk_hash.0))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CoreError::Internal(format!("select chunk: {e}")))?;
-
-        let Some(r) = row else {
-            return Ok(None);
-        };
-        Ok(Some(row_to_chunk_location(&r)?))
     }
 
     async fn xorbs_near_chunk(

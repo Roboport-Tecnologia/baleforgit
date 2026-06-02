@@ -125,7 +125,6 @@ pub trait MetadataStore: Send + Sync {
     async fn lookup_file(&self, file_hash: &FileHash) -> CoreResult<Option<Vec<FileTerm>>>;
     // Scope check: true iff `file_hash` is registered in `repo_id`.
     async fn file_in_repo(&self, file_hash: &FileHash, repo_id: &str) -> CoreResult<bool>;
-    async fn lookup_chunk(&self, chunk_hash: &ChunkHash) -> CoreResult<Option<ChunkLocation>>;
     async fn xorbs_near_chunk(&self, chunk_hash: &ChunkHash, limit: usize)
         -> CoreResult<Vec<XorbInfo>>;
     async fn xorb_chunk_offsets(&self, xorb: &XorbHash) -> CoreResult<Vec<ChunkOffsetRow>>;

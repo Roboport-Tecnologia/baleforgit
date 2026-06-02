@@ -360,8 +360,6 @@ removal; re-evaluate each as a deletion candidate.
   Production uses `::new`. Keep as test ctor.
 - `bale-server-core:24-26, 49-51` — `Hash32::from_bytes` and newtype
   `from_bytes` helpers. Keep as test ctors.
-- `meta-sqlite:91-106` — `count_xorbs`, `count_files`. Explicit
-  test/diagnostics helpers.
 - `meta-sqlite:114` — `":memory:"` → `"sqlite::memory:"` open-path
   branch. Cargo tests only.
 - `clean_cache.rs:108, 111, 150-209` — defensive guards (version

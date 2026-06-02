@@ -8,8 +8,8 @@
 //! control (Postgres' `pg_advisory_xact_lock` vs SQLite's tx serialization).
 
 use bale_server_core::{
-    ChunkHash, ChunkLocation, ChunkOffsetRow, CoreError, CoreResult, FileTerm, Hash32,
-    XorbFrameRow, XorbHash, XorbInfo, HASH_LEN,
+    ChunkHash, ChunkOffsetRow, CoreError, CoreResult, FileTerm, Hash32, XorbFrameRow, XorbHash,
+    XorbInfo, HASH_LEN,
 };
 use sqlx::{ColumnIndex, Decode, Row, Type};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -121,15 +121,6 @@ pub fn row_to_frame<R: DecodeRow>(r: &R) -> CoreResult<XorbFrameRow> {
         on_disk_start: r.get_u32("on_disk_start")?,
         on_disk_len: r.get_u32("on_disk_len")?,
         uncompressed_len: r.get_u32("uncompressed_len")?,
-    })
-}
-
-pub fn row_to_chunk_location<R: DecodeRow>(r: &R) -> CoreResult<ChunkLocation> {
-    Ok(ChunkLocation {
-        xorb: XorbHash(r.get_hash("xorb_hash")?),
-        chunk_index: r.get_u32("chunk_index")?,
-        byte_start: r.get_u32("byte_start")?,
-        unpacked_segment_bytes: r.get_u32("unpacked_bytes")?,
     })
 }
 

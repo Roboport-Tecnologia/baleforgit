@@ -136,14 +136,6 @@ pub struct XorbInfo {
     pub num_bytes_on_disk: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChunkLocation {
-    pub xorb: XorbHash,
-    pub chunk_index: u32,
-    pub byte_start: u32,
-    pub unpacked_segment_bytes: u32,
-}
-
 /// `byte_start` / `unpacked_segment_bytes` are *uncompressed* coordinates —
 /// NOT on-disk offsets; never build HTTP byte ranges from them. Use [`XorbFrameRow`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,7 +252,6 @@ pub trait MetadataStore: Send + Sync {
     /// `repo_id`. The same hash can be registered in many repos (cross-repo
     /// dedup); each registration independently grants read.
     async fn file_in_repo(&self, file_hash: &FileHash, repo_id: &str) -> CoreResult<bool>;
-    async fn lookup_chunk(&self, chunk_hash: &ChunkHash) -> CoreResult<Option<ChunkLocation>>;
     async fn xorbs_near_chunk(
         &self,
         chunk_hash: &ChunkHash,
