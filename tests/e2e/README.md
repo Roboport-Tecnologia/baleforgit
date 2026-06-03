@@ -84,6 +84,7 @@ git-bale *client* runs on the host. On a Windows host:
 | `wrong-token`   | Push with a bogus `bale.token` is rejected and does not corrupt the data dir.                       |
 | `tampered-xorb` | A xorb whose bytes were flipped on disk does NOT produce matching content via cold smudge.          |
 | `quota`         | A server brought up with `BALE_DEFAULT_QUOTA_BYTES=1024` rejects a 35 MB push cleanly.              |
+| `upload-guards` | Direct-HTTP negative tests of the server's load-bearing guards: a real xorb body POSTed under a wrong URL hash (and a length-tampered body) is rejected by `verify_xorb_body` with 400 and stores nothing; a read-scope token POSTing gets 403; and (fs only) a signed transfer URL with a forged sig, a past expiry, or a mismatched `Range` each gets 401. |
 | `failure-kill`     | Server is SIGKILL'd mid-upload; restart on the same data dir and a retry `git push` recovers cleanly. |
 | `failure-conndrop` | A TCP proxy in front of the CAS port is killed mid-upload (server stays up); retry succeeds.        |
 | `failure-dbbusy`   | A sidecar `sqlite3` shell holds an IMMEDIATE write lock on `meta.db`; the user-side push still succeeds because sqlx's busy_timeout waits the lock out. **Self-skips under `--meta postgres`** (no `meta.db`). |

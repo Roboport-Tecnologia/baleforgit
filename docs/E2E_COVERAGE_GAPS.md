@@ -360,11 +360,27 @@ removal; re-evaluate each as a deletion candidate.
   `from_bytes` helpers. Keep as test ctors.
 - `meta-sqlite:114` — `":memory:"` → `"sqlite::memory:"` open-path
   branch. Cargo tests only.
+- `bale-server-shard:serialize` — the `for f in &s.files` body (file-info
+  section). The lone live caller, `get_dedup_chunk`, serializes a
+  files-less shard (`files: vec![]`, only `cas_blocks` populated), so the
+  loop never iterates. Keep: it's the serialize half of a round-trip-faithful
+  parser, load-bearing for format correctness even though no server path
+  emits a file-bearing shard. Can't be marked inline — llvm-cov honors no
+  EXCL comment, and `#[coverage(off)]` is nightly-only + whole-function
+  (would also hide the covered `cas_blocks` loop).
 - `clean_cache.rs:108, 111, 150-209` — defensive guards (version
   mismatch, malformed JSON, empty-file zero-chunk, defensive false
   returns in `verify_chunks_in_memory`).
 - `manifest_cache.rs:54, 58, 61` — three defensive arms (IO error,
   malformed JSON, version mismatch).
+- `bale-server-shard/src/xorb.rs:162-166` — `verify_xorb_body`'s
+  `DecompressFailed` arm. The `upload-guards` phase reaches every other
+  `verify_xorb_body` rejection (HashMismatch, LengthMismatch via a tampered
+  declared length), but a true decompression *error* isn't reachable by
+  black-box body corruption — xet's LZ4/BG4 decoders tolerate garbage and emit
+  right-length output (so corruption lands on HashMismatch/LengthMismatch, not
+  a decode error). Forcing it would need a frame-format-coupled invalid-block
+  craft; not worth the fragility.
 - `pktline.rs` — most protocol-error arms (L36-48, L91-95, L117-129).
 - `remote.rs:47-50, 99, 109` — `parse_remote` error arms covered by
   unit tests.
@@ -478,9 +494,13 @@ run for those phases.
 6. **Wire-level security probes** (§3 cross-repo M12 scope, JWT-owner
    mismatch, signed-URL tampering). Small in lines, but load-bearing
    for the invariants called out in CLAUDE.md. The `authz-http` coverage
-   phase already added a 401 token-mint probe; the M12 404 check
-   (`bale-server-http/src/lib.rs:516,697`) and the JWT owner-mismatch
-   (`lib.rs:1111`) are the highest-value remaining ones.
+   phase added a 401 token-mint probe; the `upload-guards` phase now covers
+   signed-URL tampering (forged/expired/Range-mismatch → 401), the upload-time
+   `verify_xorb_body` integrity gate, and write-scope enforcement (read token
+   POST → 403). Remaining highest-value: the M12 404 check
+   (`bale-server-http/src/lib.rs:527,704`) and the JWT owner-mismatch on the
+   usage/quota admin endpoints (`require_admin_or_owner`, `lib.rs:1113-1117`).
+   See `docs/E2E_COVERAGE_TODO.md` for the full prioritized remainder.
 7. **Trim dead code** (§4 deletion candidates + §5) — **DEFERRED, do not
    act yet** (per request, 2026-05-28 re-assessment). All candidates still
    exist; re-confirm "no production caller" before any future removal. Listed

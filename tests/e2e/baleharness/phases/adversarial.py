@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import os
 import secrets
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from baleharness.client import ClientEnv
 from baleharness.config import (
@@ -14,10 +19,12 @@ from baleharness.config import (
     E2E_OWNER,
     E2E_REPO,
     E2E_REPO_2,
+    E2E_USER,
     SIZE_TOLERANCE_BYTES,
     SMALL_FILE_BYTES,
 )
-from baleharness.gitutil import git, verify_pointer_at, verify_worktree
+from baleharness.gitutil import git, pointer_hash_at, verify_pointer_at, verify_worktree
+from baleharness.jwtutil import mint_bale_jwt
 from baleharness.logutil import TestFailure, fmt_bytes, info
 from baleharness.phases.failure import fail_fast_xet_env
 from baleharness.payloads import deterministic_payload
@@ -327,5 +334,285 @@ def phase_adversarial_quota_exceeded(
             expected_size=BIG_FILE_BYTES,
             label="quota:after-failed-push",
         )
+    finally:
+        server.stop()
+
+
+def _http(
+    method: str,
+    url: str,
+    *,
+    bearer: Optional[str] = None,
+    body: Optional[bytes] = None,
+    headers: Optional[dict[str, str]] = None,
+    timeout: int = 30,
+) -> tuple[int, bytes]:
+    """Raw HTTP that returns (status, body) for both 2xx and 4xx so the caller
+    can assert on rejections."""
+    h = dict(headers or {})
+    if bearer is not None:
+        h["Authorization"] = f"Bearer {bearer}"
+    req = urllib.request.Request(url, data=body, method=method, headers=h)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def _sign_transfer(secret: bytes, hash_hex: str, s: int, e: int, x: int) -> str:
+    # Must byte-for-byte match the server's `sign()` in bale-server-http:
+    # HMAC-SHA256 over `hash_hex | start | end_inclusive | exp`, lowercase hex.
+    msg = b"|".join(
+        [hash_hex.encode(), str(s).encode(), str(e).encode(), str(x).encode()]
+    )
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
+
+def _one_stored_xorb_body(server: ServerHandle) -> bytes:
+    """Read one real, well-formed xorb body straight out of the blob store
+    (fs file or S3 object). A genuine body parses into frames, so POSTing it
+    under a *wrong* URL hash reaches `verify_xorb_body`'s HashMismatch arm
+    rather than dying earlier in `parse_xorb_frames`."""
+    if server.s3_view is not None:
+        minio = server.s3_view.minio
+        for key, size in minio.list_objects(f"{server.s3_view.prefix}xorbs/"):
+            if size > 0:
+                return minio.get_object(key)
+        raise TestFailure("no xorb in bucket to read")
+    for cur, _dirs, names in os.walk(server.data_root / "xorbs"):
+        for name in names:
+            p = Path(cur) / name
+            if p.stat().st_size > 0:
+                return p.read_bytes()
+    raise TestFailure("no xorb on disk to read")
+
+
+def _corrupt_frame_length(body: bytes) -> Optional[bytes]:
+    """Flip the low bit of the first frame's declared *uncompressed_length*
+    (header bytes 5-7), leaving the compressed payload and every framing length
+    intact. `parse_xorb_frames` still succeeds, but `verify_xorb_body`
+    decompresses to the real length and the `declared != actual` check fires —
+    the LengthMismatch arm (a `verify_xorb_body` rejection distinct from
+    HashMismatch). xet's decompressors tolerate raw payload corruption and emit
+    right-length garbage, so tampering the declared length is the deterministic
+    way to reach this arm. Mirrors the 8-byte frame header in xorb.rs. Returns
+    None if the body has no parseable leading frame."""
+    out = bytearray(body)
+    if len(out) < 8 or out[0] != 0:
+        return None
+    out[5] ^= 0x01
+    return bytes(out)
+
+
+def phase_adversarial_upload_guards(
+    *,
+    timings: Timings,
+    rt: Runtime,
+    image_tag: str,
+    work_root: Path,
+    client: ClientEnv,
+    ssh_public_key: str,
+    admin_token_hex: str,
+) -> None:
+    """Negative tests for the server's load-bearing auth/integrity guards that
+    the happy-path suite never trips (see docs/E2E_COVERAGE_TODO.md, Tier 1):
+
+      1. Upload-time CAS integrity gate — `verify_xorb_body` rejection. POSTing
+         a real xorb body under a wrong URL hash (HashMismatch), or a corrupted
+         body, must 400 and write nothing. The `tampered-xorb` phase only tests
+         the *download* side; this is the *upload* gate that stops CAS poisoning.
+      2. Signed transfer-URL enforcement — forged sig, expired, and Range
+         mismatch must each 401 (fs backend only; S3 presigns bypass the
+         handler).
+      3. Scope enforcement — a read-scope token doing a POST must 403.
+
+    Own container + data dir (g3) so the direct uploads can't perturb other
+    phases' storage-accounting assertions.
+    """
+    phase_root = work_root / "upload-guards"
+    phase_root.mkdir()
+    data_root = phase_root / "data"
+    data_root.mkdir()
+    jwt_secret = secrets.token_bytes(32).hex()
+    transfer_secret = secrets.token_bytes(32).hex()
+    server = start_container(
+        rt,
+        image_tag=image_tag,
+        data_root=data_root,
+        jwt_secret_hex=jwt_secret,
+        transfer_secret_hex=transfer_secret,
+        ssh_public_key=ssh_public_key,
+        test_repos=[f"{E2E_OWNER}/{E2E_REPO}"],
+        admin_token_hex=admin_token_hex,
+        name_suffix="upload-guards",
+    )
+    try:
+        # Seed one real file so the store holds well-formed xorbs and a
+        # registered file (needed for the reconstruction in part 2).
+        repo, env = init_repo_for_push(
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO,
+            name="upload-guards-client",
+        )
+        payload = deterministic_payload(SMALL_FILE_BYTES, seed=b"upload-guards")
+        (repo / "g.bin").write_bytes(payload)
+        with timings.measure("upload-guards: seed push"):
+            git(["add", "g.bin"], cwd=repo, env=env)
+            git(["commit", "-m", "seed"], cwd=repo, env=env)
+            git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+        file_id = pointer_hash_at(repo, env, "HEAD:g.bin", label="upload-guards:seed")
+
+        secret = bytes.fromhex(jwt_secret)
+        write_jwt = mint_bale_jwt(
+            secret=secret,
+            sub=E2E_USER,
+            repo_type="model",
+            repo_id=f"{E2E_OWNER}/{E2E_REPO}",
+            revision="main",
+            scope="write",
+            ttl_secs=3600,
+        )
+        read_jwt = mint_bale_jwt(
+            secret=secret,
+            sub=E2E_USER,
+            repo_type="model",
+            repo_id=f"{E2E_OWNER}/{E2E_REPO}",
+            revision="main",
+            scope="read",
+            ttl_secs=3600,
+        )
+        base = server.public_host_url
+        wrong_hex = "11" * 32
+
+        # --- Part 3: a read-scope token must not be allowed to POST. ---
+        with timings.measure("upload-guards: read token write rejected (403)"):
+            status, _ = _http(
+                "POST",
+                f"{base}/v1/xorbs/default/{wrong_hex}",
+                bearer=read_jwt,
+                body=b"",
+            )
+            if status != 403:
+                raise TestFailure(
+                    f"read-scope token POST to /v1/xorbs returned {status}, "
+                    "want 403 — write-scope enforcement is broken"
+                )
+
+        # --- Part 1: upload-time xorb integrity gate. ---
+        good_body = _one_stored_xorb_body(server)
+        disk_before = server.disk_total_bytes()
+        with timings.measure("upload-guards: xorb body vs wrong hash (400)"):
+            status, resp = _http(
+                "POST",
+                f"{base}/v1/xorbs/default/{wrong_hex}",
+                bearer=write_jwt,
+                body=good_body,
+            )
+            text = resp.decode(errors="replace").lower()
+            if status != 400 or "does not match url hash" not in text:
+                raise TestFailure(
+                    "valid xorb body under a wrong URL hash should 400 "
+                    f"'does not match URL hash'; got {status}: {text[:300]}"
+                )
+        # A body that parses but whose first frame's declared uncompressed
+        # length is wrong must be rejected by verify_xorb_body's length check
+        # (the LengthMismatch arm, distinct from HashMismatch). Fall back to a
+        # plain byte flip if the body has no parseable leading frame.
+        corrupt = _corrupt_frame_length(good_body)
+        if corrupt is None:
+            tmp = bytearray(good_body)
+            tmp[len(tmp) * 3 // 4] ^= 0xFF
+            corrupt = bytes(tmp)
+        with timings.measure("upload-guards: corrupted xorb body (400)"):
+            status, resp = _http(
+                "POST",
+                f"{base}/v1/xorbs/default/{'22' * 32}",
+                bearer=write_jwt,
+                body=corrupt,
+            )
+            if status != 400:
+                raise TestFailure(
+                    f"corrupted xorb body should 400; got {status}: "
+                    f"{resp.decode(errors='replace')[:300]}"
+                )
+        disk_after = server.disk_total_bytes()
+        if disk_after - disk_before > SIZE_TOLERANCE_BYTES:
+            raise TestFailure(
+                "rejected xorb uploads grew server disk by "
+                f"{fmt_bytes(disk_after - disk_before)} — the integrity gate "
+                "is letting unverified bytes through to the blob store"
+            )
+
+        # --- Part 2: signed transfer-URL enforcement (fs backend only). ---
+        # S3 presigns its own URLs, so get_xorb_transfer (and its guards) is
+        # never on the path there.
+        if server.s3_view is None:
+            recon = _http(
+                "GET",
+                f"{base}/v1/reconstructions/{file_id}",
+                bearer=write_jwt,
+            )
+            if recon[0] != 200:
+                raise TestFailure(
+                    f"reconstruction of seed file returned {recon[0]}, want 200"
+                )
+            fetch_info = json.loads(recon[1].decode("utf-8")).get("fetch_info", {})
+            if not fetch_info:
+                raise TestFailure("reconstruction response had no fetch_info")
+            xorb_hex, infos = next(iter(fetch_info.items()))
+            rng = infos[0]["url_range"]
+            s, e = int(rng["start"]), int(rng["end"])
+            tsecret = bytes.fromhex(transfer_secret)
+
+            def transfer(s_: int, e_: int, x_: int, sig_: str, range_hdr: str):
+                url = f"{base}/xorb/default/{xorb_hex}?s={s_}&e={e_}&x={x_}&sig={sig_}"
+                return _http("GET", url, headers={"Range": range_hdr})
+
+            now = int(time.time())
+            range_hdr = f"bytes={s}-{e}"
+
+            # Happy path first — proves our request shape matches the server's
+            # signing, so the negative assertions below are meaningful.
+            valid_x = now + 3600
+            valid_sig = _sign_transfer(tsecret, xorb_hex, s, e, valid_x)
+            with timings.measure("upload-guards: signed URL happy (206)"):
+                status, _ = transfer(s, e, valid_x, valid_sig, range_hdr)
+                if status != 206:
+                    raise TestFailure(
+                        f"correctly-signed transfer URL returned {status}, want 206"
+                    )
+
+            with timings.measure("upload-guards: forged signature (401)"):
+                bad_sig = valid_sig[:-1] + ("0" if valid_sig[-1] != "0" else "1")
+                status, _ = transfer(s, e, valid_x, bad_sig, range_hdr)
+                if status != 401:
+                    raise TestFailure(
+                        f"forged transfer signature returned {status}, want 401 "
+                        "— constant-time signature check not enforcing"
+                    )
+
+            with timings.measure("upload-guards: expired signature (401)"):
+                # Sign over a past exp so the sig check passes and the expiry
+                # branch is what rejects.
+                past_x = now - 3600
+                past_sig = _sign_transfer(tsecret, xorb_hex, s, e, past_x)
+                status, _ = transfer(s, e, past_x, past_sig, range_hdr)
+                if status != 401:
+                    raise TestFailure(
+                        f"expired transfer URL returned {status}, want 401"
+                    )
+
+            with timings.measure("upload-guards: Range mismatch (401)"):
+                # Validly signed for s..e, but the Range header asks for s..e+1.
+                status, _ = transfer(s, e, valid_x, valid_sig, f"bytes={s}-{e + 1}")
+                if status != 401:
+                    raise TestFailure(
+                        f"Range not matching the signed range returned {status}, "
+                        "want 401 — signed-Range binding not enforced"
+                    )
     finally:
         server.stop()

@@ -70,6 +70,7 @@ from baleharness.logutil import TestFailure, die, info, skip, warn
 from baleharness.phases.adversarial import (
     phase_adversarial_quota_exceeded,
     phase_adversarial_tampered_xorb,
+    phase_adversarial_upload_guards,
     phase_adversarial_wrong_token,
 )
 from baleharness.phases.anon import phase_anonymous_public_clone
@@ -713,6 +714,17 @@ def main() -> int:
                 admin_token_hex=admin_token_hex,
             )
 
+        def _phase_upload_guards() -> None:
+            phase_adversarial_upload_guards(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+
         def _phase_anon() -> None:
             phase_anonymous_public_clone(
                 timings=timings,
@@ -938,6 +950,9 @@ def main() -> int:
             "mount-rev": ("g2-tail", True, _phase_mount_rev),
             "mount-diff": ("g2-tail", True, _phase_mount_diff),
             "quota": ("g3", False, _phase_quota),
+            # Direct HTTP negative tests of the upload integrity gate, signed
+            # transfer-URL guards, and write-scope enforcement. Own container, g3.
+            "upload-guards": ("g3", False, _phase_upload_guards),
             # Public repo cloneable without credentials: the resolver probes the
             # forge anonymously first for op=download and only falls back to
             # `git credential fill` on 401. Own container + mock forge, so g3.
