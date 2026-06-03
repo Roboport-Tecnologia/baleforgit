@@ -85,7 +85,12 @@ from baleharness.storage import (
     staging_files,
 )
 from baleharness.timing import Timings
-from baleharness.usage import fetch_repo_usage, fetch_usage, http_get_file
+from baleharness.usage import (
+    fetch_repo_usage,
+    fetch_usage,
+    http_get_file,
+    usage_status,
+)
 
 
 def phase_basic_user_ops(
@@ -1493,10 +1498,15 @@ def phase_usage_api(
     timings: Timings,
     server: ServerHandle,
     bale_admin_token: str,
+    admin_token_hex: str,
+    jwt_secret_hex: str,
     rev_state: dict,
 ) -> None:
     """Verifies `GET /v1/usage/{owner}` and `GET /v1/usage/repo/{owner}/{repo}`
-    against the on-disk numbers.
+    against the on-disk numbers, plus the two `require_admin_or_owner` authz
+    arms the owner-scoped happy path never hits (TODO item 7): the hex admin
+    bearer is accepted, and a JWT scoped to a *different* owner is forbidden
+    from reading this owner's usage.
 
     Contract from the wire types: `raw_bytes` = sum of file sizes registered
     for that scope (counting every revision separately), `stored_bytes` =
@@ -1577,6 +1587,33 @@ def phase_usage_api(
                     f"{blob['dedup_savings_bytes']}, expected raw - stored = "
                     f"{expected_savings}"
                 )
+
+    with timings.measure("usage api: admin-token + cross-owner authz"):
+        # The hex admin bearer is accepted regardless of owner (the operator
+        # path); the owner-scoped JWT above always took the JWT branch, so this
+        # is the first call to exercise the admin-accept arm.
+        status = usage_status(server, token=admin_token_hex, owner=E2E_OWNER)
+        if status != 200:
+            raise TestFailure(
+                f"hex admin token on /v1/usage/{E2E_OWNER} returned {status}, want 200"
+            )
+        # A validly-signed JWT scoped to a *different* owner must not read this
+        # owner's usage — the cross-owner FORBIDDEN arm.
+        intruder_jwt = mint_bale_jwt(
+            secret=bytes.fromhex(jwt_secret_hex),
+            sub="intruder",
+            repo_type="model",
+            repo_id="intruder/repo",
+            revision="main",
+            scope="read",
+            ttl_secs=3600,
+        )
+        status = usage_status(server, token=intruder_jwt, owner=E2E_OWNER)
+        if status != 403:
+            raise TestFailure(
+                f"JWT scoped to a different owner reading /v1/usage/{E2E_OWNER} "
+                f"returned {status}, want 403 — cross-owner usage authz is broken"
+            )
 
 
 def phase_browser_file_download(

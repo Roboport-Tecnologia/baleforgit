@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 import subprocess
 import time
@@ -10,7 +11,16 @@ from pathlib import Path
 from typing import Optional
 
 from baleharness.client import ClientEnv
-from baleharness.config import BIG_FILE_BYTES, E2E_OWNER, E2E_REPO
+from baleharness.config import (
+    BIG_FILE_BYTES,
+    E2E_OWNER,
+    E2E_REPO,
+    E2E_REPO_CPUT_A,
+    E2E_REPO_CPUT_B,
+    E2E_REPO_WRITEFAIL,
+    FS_CPUT_BYTES,
+    FS_WRITEFAIL_BYTES,
+)
 from baleharness.gitutil import git, verify_pointer_at, verify_worktree
 from baleharness.logutil import TestFailure, fmt_bytes, info
 from baleharness.mocks import TcpProxy, hold_db_writer_lock
@@ -23,6 +33,13 @@ from baleharness.s3backend import S3_PROXY_THROTTLE_BPS, get_active_s3_backend
 from baleharness.server import ServerHandle, start_container
 from baleharness.storage import staging_files
 from baleharness.timing import Timings
+
+
+def _dir_entry_count(root: Path) -> int:
+    """Count regular files anywhere under `root` (0 if `root` is absent)."""
+    if not root.exists():
+        return 0
+    return sum(len(files) for _cur, _dirs, files in os.walk(root))
 
 
 def _start_push_background(repo: Path, env: dict) -> subprocess.Popen:
@@ -699,4 +716,270 @@ def phase_failure_s3_conndrop(
         info(f"  failure-s3-conndrop: final stored xorb bytes = {fmt_bytes(stored)}")
     finally:
         proxy.kill()
+        server.stop()
+
+
+def phase_failure_fs_write_fail(
+    *,
+    timings: Timings,
+    rt: Runtime,
+    image_tag: str,
+    work_root: Path,
+    client: ClientEnv,
+    ssh_public_key: str,
+    admin_token_hex: str,
+) -> None:
+    """The fs analogue of `failure-s3-conndrop`: a blob *write* failure must
+    leave nothing behind. `write_atomic` writes to `tmp/<uuid>`, fsyncs, then
+    renames onto the content-addressed path. If the write/fsync fails it must
+    remove the tmp file and surface the error — never leaving a half-written
+    xorb at the addressed path nor a leaked tmp. That cleanup arm runs 0× in a
+    healthy suite, and ENOSPC can't be injected without putting tmp/ on a
+    different filesystem than xorbs/ (which would break the same-fs rename on
+    the happy path too), so we drive it with the server-side
+    BALE_TEST_FS_WRITE_FAIL hook: every blob write takes the failure arm.
+
+    Push a file → it must fail with nothing stored (xorbs/ and tmp/ both empty).
+    Then restart the server *without* the hook and re-push: the content-addressed
+    path is still writable, the file round-trips, proving the failure left no
+    poison behind. fs-backend only — under S3 the FsBlobStore isn't used."""
+    if get_active_s3_backend() is not None:
+        info("-- failure-fs-writefail: fs BlobStore write path is S3-skipped")
+        return
+    phase_root = work_root / "failure-fs-writefail"
+    phase_root.mkdir()
+    data_root = phase_root / "data"
+    data_root.mkdir()
+    jwt_secret = secrets.token_bytes(32).hex()
+    transfer_secret = secrets.token_bytes(32).hex()
+    repo_id = f"{E2E_OWNER}/{E2E_REPO_WRITEFAIL}"
+    # Pin the ports so the restarted (hook-off) server reuses them and the
+    # repo's origin remote still resolves after the recovery restart.
+    cas_port = pick_free_port()
+    ssh_port = pick_free_port()
+    server = start_container(
+        rt,
+        image_tag=image_tag,
+        data_root=data_root,
+        jwt_secret_hex=jwt_secret,
+        transfer_secret_hex=transfer_secret,
+        ssh_public_key=ssh_public_key,
+        test_repos=[repo_id],
+        cas_port=cas_port,
+        ssh_port=ssh_port,
+        admin_token_hex=admin_token_hex,
+        name_suffix=f"fs-writefail-{secrets.token_hex(3)}",
+        extra_env={"BALE_TEST_FS_WRITE_FAIL": "1"},
+    )
+    new_server: Optional[ServerHandle] = None
+    try:
+        repo, env = init_repo_for_push(
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO_WRITEFAIL,
+            name="fs-writefail-client",
+        )
+        env = fail_fast_xet_env(env)
+        payload = deterministic_payload(FS_WRITEFAIL_BYTES, seed=b"fs-writefail")
+        payload_sha = sha256_bytes(payload)
+        (repo / "wf.bin").write_bytes(payload)
+        with timings.measure(
+            "failure-fs-writefail: stage + commit", bytes_moved=FS_WRITEFAIL_BYTES
+        ):
+            git(["add", "wf.bin"], cwd=repo, env=env)
+            git(["commit", "-m", "write-fail"], cwd=repo, env=env)
+
+        with timings.measure("failure-fs-writefail: push (must fail)"):
+            res = git(
+                ["push", "-u", "origin", "main"],
+                cwd=repo,
+                env=env,
+                capture=True,
+                expect_fail=True,
+            )
+        if res.returncode == 0:
+            raise TestFailure(
+                "failure-fs-writefail: push succeeded despite forced write failure"
+            )
+
+        # The load-bearing assertion: the rejected write left NOTHING — no
+        # half-written blob at the addressed path, no leaked tmp.
+        xorb_files = _dir_entry_count(data_root / "xorbs")
+        shard_files = _dir_entry_count(data_root / "shards")
+        tmp_files = _dir_entry_count(data_root / "tmp")
+        if xorb_files or shard_files:
+            raise TestFailure(
+                f"failure-fs-writefail: write failed but blobs landed anyway "
+                f"(xorbs={xorb_files}, shards={shard_files}) — half-write visible"
+            )
+        if tmp_files:
+            raise TestFailure(
+                f"failure-fs-writefail: {tmp_files} tmp file(s) leaked under "
+                "tmp/ after a failed write — write_atomic didn't clean up"
+            )
+        info("  forced write failure stored nothing; tmp/ clean")
+
+        # Restart without the hook (same data_root) and prove recovery: the
+        # content-addressed path is still writable and the file round-trips.
+        server.stop()
+        new_server = start_container(
+            rt,
+            image_tag=image_tag,
+            data_root=data_root,
+            jwt_secret_hex=jwt_secret,
+            transfer_secret_hex=transfer_secret,
+            ssh_public_key=ssh_public_key,
+            test_repos=[repo_id],
+            cas_port=cas_port,
+            ssh_port=ssh_port,
+            admin_token_hex=admin_token_hex,
+            name_suffix=f"fs-writefail-recover-{secrets.token_hex(3)}",
+        )
+        with timings.measure(
+            "failure-fs-writefail: re-push after clean restart",
+            bytes_moved=FS_WRITEFAIL_BYTES,
+        ):
+            git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+        if staging_files(repo):
+            raise TestFailure(
+                "failure-fs-writefail: staging not drained after recovery push"
+            )
+        with timings.measure(
+            "failure-fs-writefail: cold clone after recovery",
+            bytes_moved=FS_WRITEFAIL_BYTES,
+        ):
+            clone_path, clone_env, _ = init_repo_for_clone(
+                work_root=work_root,
+                client=client,
+                server=new_server,
+                owner=E2E_OWNER,
+                repo=E2E_REPO_WRITEFAIL,
+                name="fs-writefail-clone",
+            )
+            git(["checkout", "main"], cwd=clone_path, env=clone_env)
+        verify_worktree(
+            clone_path,
+            "wf.bin",
+            expected_sha=payload_sha,
+            expected_size=FS_WRITEFAIL_BYTES,
+            label="failure-fs-writefail:after-recovery-clone",
+        )
+    finally:
+        if new_server is not None:
+            new_server.stop()
+        else:
+            server.stop()
+
+
+def phase_failure_fs_concurrent_put(
+    *,
+    timings: Timings,
+    rt: Runtime,
+    image_tag: str,
+    work_root: Path,
+    client: ClientEnv,
+    ssh_public_key: str,
+    admin_token_hex: str,
+) -> None:
+    """Two byte-identical pushes racing `write_atomic` on the same
+    content-addressed dst must converge: both succeed, exactly one copy lands,
+    no tmp leaks. Identical content → identical xorb hashes, so two concurrent
+    pushes (to two repos, to dodge a git ref collision) POST the same xorb paths
+    at the same instant. The loser hits either the pre-rename existence
+    fast-path (`Ok(false)`) or the rename-replace — both content-preserving. (On
+    Linux `rename(2)` over an existing file replaces atomically, so the
+    `Err(_) if dst exists` race-loser arm is a non-Linux/Windows defensive guard
+    and isn't expected to fire here; the property under test is convergence, not
+    that specific arm.)
+
+    Asserts both pushes exit 0, on-disk xorb bytes stay ≈ one payload (not 2×),
+    tmp/ is empty, and both repos cold-clone to the original bytes. fs-only."""
+    if get_active_s3_backend() is not None:
+        info("-- failure-fs-cput: fs BlobStore write path is S3-skipped")
+        return
+    phase_root = work_root / "failure-fs-cput"
+    phase_root.mkdir()
+    data_root = phase_root / "data"
+    data_root.mkdir()
+    jwt_secret = secrets.token_bytes(32).hex()
+    transfer_secret = secrets.token_bytes(32).hex()
+    repo_a = f"{E2E_OWNER}/{E2E_REPO_CPUT_A}"
+    repo_b = f"{E2E_OWNER}/{E2E_REPO_CPUT_B}"
+    server = start_container(
+        rt,
+        image_tag=image_tag,
+        data_root=data_root,
+        jwt_secret_hex=jwt_secret,
+        transfer_secret_hex=transfer_secret,
+        ssh_public_key=ssh_public_key,
+        test_repos=[repo_a, repo_b],
+        admin_token_hex=admin_token_hex,
+        name_suffix=f"fs-cput-{secrets.token_hex(3)}",
+    )
+    try:
+        # Same payload bytes in both repos → same xorb hashes → same dst paths.
+        payload = deterministic_payload(FS_CPUT_BYTES, seed=b"fs-cput")
+        payload_sha = sha256_bytes(payload)
+        repos = []
+        for repo_name, suffix in ((E2E_REPO_CPUT_A, "a"), (E2E_REPO_CPUT_B, "b")):
+            repo, env = init_repo_for_push(
+                work_root=work_root,
+                client=client,
+                server=server,
+                owner=E2E_OWNER,
+                repo=repo_name,
+                name=f"fs-cput-{suffix}",
+            )
+            (repo / "c.bin").write_bytes(payload)
+            git(["add", "c.bin"], cwd=repo, env=env)
+            git(["commit", "-m", "concurrent put"], cwd=repo, env=env)
+            repos.append((repo, env))
+
+        # Fire both pushes at once and let write_atomic race on shared dsts.
+        with timings.measure(
+            "failure-fs-cput: two concurrent pushes", bytes_moved=2 * FS_CPUT_BYTES
+        ):
+            procs = [_start_push_background(repo, env) for repo, env in repos]
+            rcs = [_wait_push(p, timeout_s=120.0) for p in procs]
+        if any(rc != 0 for rc in rcs):
+            raise TestFailure(
+                f"failure-fs-cput: a concurrent push failed (rcs={rcs}) — "
+                "write_atomic didn't converge under a same-content race"
+            )
+
+        # Content-addressed dedup must hold under the race: ~one stored copy,
+        # not two; and no tmp leaked from the losing writer.
+        stored = server.disk_xorb_bytes()
+        if stored > FS_CPUT_BYTES * 3 // 2:
+            raise TestFailure(
+                f"failure-fs-cput: stored xorb bytes {fmt_bytes(stored)} exceeds "
+                f"1.5× payload ({fmt_bytes(FS_CPUT_BYTES)}) — the race double-wrote"
+            )
+        tmp_files = _dir_entry_count(data_root / "tmp")
+        if tmp_files:
+            raise TestFailure(
+                f"failure-fs-cput: {tmp_files} tmp file(s) leaked after the race"
+            )
+        info(f"  concurrent pushes converged: stored {fmt_bytes(stored)}, tmp/ clean")
+
+        for repo_name, suffix in ((E2E_REPO_CPUT_A, "a"), (E2E_REPO_CPUT_B, "b")):
+            clone_path, clone_env, _ = init_repo_for_clone(
+                work_root=work_root,
+                client=client,
+                server=server,
+                owner=E2E_OWNER,
+                repo=repo_name,
+                name=f"fs-cput-clone-{suffix}",
+            )
+            git(["checkout", "main"], cwd=clone_path, env=clone_env)
+            verify_worktree(
+                clone_path,
+                "c.bin",
+                expected_sha=payload_sha,
+                expected_size=FS_CPUT_BYTES,
+                label=f"failure-fs-cput:clone-{suffix}",
+            )
+    finally:
         server.stop()

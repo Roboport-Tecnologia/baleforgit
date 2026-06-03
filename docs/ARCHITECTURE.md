@@ -436,7 +436,7 @@ Limitation:
 └── tmp/<uuid>                     # staging for atomic rename
 ```
 
-`<aa>` / `<bb>` are bytes 0 / 1 of the hash in plain (not Xet) lowercase hex — just for sane directory fan-out, not exposed on the wire. Writes go through `tmp/<uuid>` then `rename(2)` for atomicity.
+`<aa>` / `<bb>` are bytes 0 / 1 of the hash in plain (not Xet) lowercase hex — just for sane directory fan-out, not exposed on the wire. Writes go through `tmp/<uuid>` then `rename(2)` for atomicity: a write/fsync failure removes the tmp and errors (never a half-written blob at the addressed path), and a concurrent same-content write converges (the `rename(2)` replaces or the pre-rename existence check returns early). Test-only: setting `BALE_TEST_FS_WRITE_FAIL` forces `write_atomic` to take the failure-cleanup arm on every write — there's no way to inject ENOSPC without putting `tmp/` on a different filesystem than `xorbs/` (which would break the same-fs rename on the happy path), so the e2e `failure-fs-writefail` phase uses this hook; it is inert in production (the var is never set).
 
 ### S3 `BlobStore`
 

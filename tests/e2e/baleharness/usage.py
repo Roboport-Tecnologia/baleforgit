@@ -31,6 +31,20 @@ def fetch_repo_usage(
         return json.loads(resp.read().decode("utf-8"))
 
 
+def usage_status(handle: ServerHandle, *, token: str, owner: str) -> int:
+    """GET /v1/usage/{owner}; return the HTTP status (even for 4xx) without
+    parsing the body — for the require_admin_or_owner authz negative tests."""
+    req = urllib.request.Request(
+        f"{handle.public_host_url}/v1/usage/{owner}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
 def http_get_file(
     handle: ServerHandle,
     *,

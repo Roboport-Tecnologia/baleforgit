@@ -68,7 +68,9 @@ from baleharness.covstate import set_coverage
 from baleharness.jwtutil import mint_bale_jwt
 from baleharness.logutil import TestFailure, die, info, skip, warn
 from baleharness.phases.adversarial import (
+    phase_adversarial_quota_admin,
     phase_adversarial_quota_exceeded,
+    phase_adversarial_shard_stage_quota,
     phase_adversarial_tampered_xorb,
     phase_adversarial_upload_guards,
     phase_adversarial_wrong_token,
@@ -84,6 +86,8 @@ from baleharness.phases.coverage_phases import (
 from baleharness.phases.dedup_shard import phase_global_dedup_shard
 from baleharness.phases.failure import (
     phase_failure_connection_drop_mid_upload,
+    phase_failure_fs_concurrent_put,
+    phase_failure_fs_write_fail,
     phase_failure_s3_conndrop,
     phase_failure_server_kill_mid_upload,
     phase_failure_transient_db,
@@ -609,6 +613,8 @@ def main() -> int:
                 timings=timings,
                 server=server,
                 bale_admin_token=admin_jwt,
+                admin_token_hex=admin_token_hex,
+                jwt_secret_hex=jwt_secret_hex,
                 rev_state=rev_state,
             )
 
@@ -714,6 +720,28 @@ def main() -> int:
                 admin_token_hex=admin_token_hex,
             )
 
+        def _phase_quota_admin() -> None:
+            phase_adversarial_quota_admin(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+
+        def _phase_shard_quota() -> None:
+            phase_adversarial_shard_stage_quota(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+
         def _phase_upload_guards() -> None:
             phase_adversarial_upload_guards(
                 timings=timings,
@@ -771,6 +799,28 @@ def main() -> int:
 
         def _phase_failure_s3_conndrop() -> None:
             phase_failure_s3_conndrop(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+
+        def _phase_failure_fs_writefail() -> None:
+            phase_failure_fs_write_fail(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+
+        def _phase_failure_fs_cput() -> None:
+            phase_failure_fs_concurrent_put(
                 timings=timings,
                 rt=rt,
                 image_tag=image_tag,
@@ -950,6 +1000,15 @@ def main() -> int:
             "mount-rev": ("g2-tail", True, _phase_mount_rev),
             "mount-diff": ("g2-tail", True, _phase_mount_diff),
             "quota": ("g3", False, _phase_quota),
+            # PUT /v1/quotas/{owner} admin endpoint: 404 when disabled, 401 on
+            # missing/non-hex/wrong bearer, 204 set+clear, each proven to take
+            # effect on a push. Two own containers, g3.
+            "quota-admin": ("g3", False, _phase_quota_admin),
+            # Isolates upload_shard's delta-quota gate: owner A seeds content
+            # unlimited, owner B (capped below it) pushes the same bytes → B's
+            # xorbs dedup (no disk growth) so only the shard-stage check can
+            # reject. Two owners, own container, g3.
+            "shard-quota": ("g3", False, _phase_shard_quota),
             # Direct HTTP negative tests of the upload integrity gate, signed
             # transfer-URL guards, and write-scope enforcement. Own container, g3.
             "upload-guards": ("g3", False, _phase_upload_guards),
@@ -976,6 +1035,13 @@ def main() -> int:
             # Server↔storage drop — only meaningful with a remote blob store,
             # so it self-skips under the fs backend and runs only on --backend s3.
             "failure-s3-conndrop": ("g3", False, _phase_failure_s3_conndrop),
+            # fs BlobStore write_atomic integrity: a forced write failure must
+            # leave nothing (no half-write, no tmp leak), then a clean restart
+            # recovers; and two concurrent same-content pushes must converge to
+            # one stored copy. Both self-skip under --backend s3 (FsBlobStore
+            # unused there). Own isolated containers → g3.
+            "failure-fs-writefail": ("g3", False, _phase_failure_fs_writefail),
+            "failure-fs-cput": ("g3", False, _phase_failure_fs_cput),
             # Disaster recovery: wipe the server CAS, then re-add + force-push
             # to repopulate it. Owns its own isolated container + data dir, so
             # the wipe doesn't touch earlier phases' shared-server state.

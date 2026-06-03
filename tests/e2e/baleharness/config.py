@@ -102,6 +102,32 @@ E2E_REPO_RESYNC = "resync-wipe"
 # The global-dedup-shard phase owns its own isolated container; this is the bare
 # repo it seeds, then re-pushes after planting a server dedup shard in the cache.
 E2E_REPO_DEDUP_SHARD = "dedup-shard"
+# The fs write-failure phase owns an isolated container started with
+# BALE_TEST_FS_WRITE_FAIL=1, so every blob write hits write_atomic's tmp-cleanup
+# arm. It pushes here, asserts nothing landed (xorbs/ + tmp/ empty), then proves
+# a clean restart recovers and round-trips the same content.
+E2E_REPO_WRITEFAIL = "fs-writefail"
+# The fs concurrent-put phase pushes byte-identical content to two repos at the
+# same instant, racing write_atomic on the same content-addressed dst; it asserts
+# both pushes succeed, exactly one copy lands, and tmp/ is empty (no leak, no
+# double-store under concurrency).
+E2E_REPO_CPUT_A = "fs-cput-a"
+E2E_REPO_CPUT_B = "fs-cput-b"
+FS_WRITEFAIL_BYTES = 512 * 1024  # a few CDC chunks → a real xorb POST to fail
+FS_CPUT_BYTES = 4 * 1024 * 1024  # large enough to overlap the two pushes in time
+# The shard-stage quota phase (TODO item 9) isolates the SECOND quota gate (in
+# upload_shard) from the xorb-stage one. Owner A uploads content unlimited; owner
+# B — capped below that content's size via the admin quota API — then pushes the
+# SAME bytes. B's xorbs all dedup against A's (xorb-stage skipped, zero disk
+# growth), so the only thing that can reject B's push is the shard-stage
+# delta-quota check (unaccounted_xorb_bytes_for_owner). Distinct owners so B's cap
+# never touches A.
+SHARDQ_OWNER_A = "shardq-a"
+SHARDQ_REPO_A = "src"
+SHARDQ_OWNER_B = "shardq-b"
+SHARDQ_REPO_B = "recv"
+SHARDQ_FILE_BYTES = 1024 * 1024  # 1 MiB shared content
+SHARDQ_QUOTA_BYTES = 256 * 1024  # B's cap, well below the 1 MiB it tries to register
 E2E_USER = "e2e"
 # The browser-download phase downloads bigfile.bin (pushed to repo2) through
 # GET /v1/files/{id}, using this JWT to exercise the filename-binding branch.

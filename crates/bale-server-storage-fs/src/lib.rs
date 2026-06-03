@@ -82,6 +82,12 @@ impl FsBlobStore {
             .map_err(|e| CoreError::Internal(format!("create tmp: {e}")))?;
         if let Err(e) = async {
             f.write_all(body.as_ref()).await?;
+            // Test-only: simulate a write/fsync failure to exercise the tmp-cleanup
+            // path below (no e2e-reachable way to force ENOSPC without breaking the
+            // same-fs rename). Inert in production — the var is never set there.
+            if std::env::var_os("BALE_TEST_FS_WRITE_FAIL").is_some() {
+                return Err(std::io::Error::other("BALE_TEST_FS_WRITE_FAIL"));
+            }
             f.sync_all().await
         }
         .await
