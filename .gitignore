@@ -28,7 +28,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
-.claude/settings.local.json
+# Local Claude Code config
+.claude/
 lfs-adapter/lfs-adapter
 
 git-lfs
