@@ -43,9 +43,9 @@ LFS_JWT_SECRET_BASE64URL={jwt_b64url}
 # HMAC key for baleforgit-server signed download URLs (exactly 32 bytes hex).
 BALE_TRANSFER_SECRET_HEX={secrets.token_bytes(32).hex()}
 
-# Bearer for the quota admin endpoint (PUT /v1/quotas/{{owner}}). Only used if
-# you uncomment BALE_ADMIN_TOKEN_HEX in compose.yml; otherwise that endpoint
-# stays disabled (404).
+# Admin bearer shared by the server (BALE_ADMIN_TOKEN_HEX) and gitea
+# (GITEA__bale__ADMIN_TOKEN): gitea reads GET /v1/usage/{{owner}} for the repo
+# storage panel, and it gates PUT /v1/quotas/{{owner}}.
 BALE_ADMIN_TOKEN_HEX={secrets.token_bytes(32).hex()}
 
 # gitea session/cookie key.

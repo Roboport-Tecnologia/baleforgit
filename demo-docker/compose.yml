@@ -107,6 +107,14 @@ services:
       # Public base URL clients use to reach baleforgit-server. The client runs
       # on the host, so this is the host-side address, not the internal one.
       GITEA__bale__SERVER_URL: http://localhost:${BALE_HTTP_PORT:-8080}
+      # Server-to-server address gitea uses for the storage-usage API. SERVER_URL
+      # is localhost (host-side), unreachable from inside this container, so point
+      # at the service name. Without it the usage call falls back to SERVER_URL
+      # and fails. Pairs with the ADMIN_TOKEN below.
+      GITEA__bale__INTERNAL_SERVER_URL: http://baleforgit-server:8080
+      # Lets gitea query GET /v1/usage/{owner} for the repo storage panel. Must
+      # match the server's BALE_ADMIN_TOKEN_HEX (uncommented below).
+      GITEA__bale__ADMIN_TOKEN: ${BALE_ADMIN_TOKEN_HEX}
     ports:
       - "${GITEA_HTTP_PORT:-3000}:3000"
       - "${GITEA_SSH_PORT:-2222}:${GITEA_SSH_PORT:-2222}"
@@ -155,9 +163,12 @@ services:
       BALE_S3_DISABLE_SSE: "true"
       BALE_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       BALE_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
-      # Uncomment to demo per-owner quotas (admin token gates PUT /v1/quotas):
+      # Gitea uses this admin token to read GET /v1/usage/{owner} for the repo
+      # storage panel; it also gates PUT /v1/quotas/{owner}. Must match
+      # GITEA__bale__ADMIN_TOKEN above.
+      BALE_ADMIN_TOKEN_HEX: ${BALE_ADMIN_TOKEN_HEX}
+      # Uncomment to demo per-owner quotas:
       # BALE_DEFAULT_QUOTA_BYTES: ${BALE_DEFAULT_QUOTA_BYTES}
-      # BALE_ADMIN_TOKEN_HEX: ${BALE_ADMIN_TOKEN_HEX}
     ports:
       - "${BALE_HTTP_PORT:-8080}:8080"
     volumes:
