@@ -1,0 +1,171 @@
+# Self-contained demo stack: gitea (Bale-enabled fork) + baleforgit-server + MinIO.
+#
+#   - gitea  ............ forge, SQLite DB, ships the Bale forge-auth endpoints
+#   - baleforgit-server . CAS server, SQLite metadata + S3 blobs, BUILT FROM
+#                         ../Dockerfile so the demo always runs your working tree
+#   - minio  ............ bundled S3-compatible blob backend (no external S3)
+#
+# One command end-to-end: the first `compose up` writes .env with fresh secrets
+# and exits non-zero; the second creates the bucket and starts everything. See
+# README.md for the one /etc/hosts line MinIO's presigned URLs need.
+
+services:
+  # First-run guard. Generates .env (with paired JWT secrets) when missing,
+  # then exits non-zero so dependent services don't start with the empty env
+  # vars compose already substituted. Operator reruns `compose up`; second
+  # time around .env exists, this exits 0, and the stack starts normally.
+  bootstrap:
+    image: python:3-alpine
+    volumes:
+      - ./:/work:Z
+    working_dir: /work
+    init: true
+    command: ["python3", "/work/scripts/bootstrap.py"]
+    restart: "no"
+
+  minio:
+    image: minio/minio:latest
+    init: true
+    # The S3 port must be the SAME number inside and out: presigned URLs embed
+    # `minio:<port>`, and both the server (in-network) and the client (on the
+    # host, via /etc/hosts) have to reach MinIO at that exact port — so MinIO
+    # listens on MINIO_S3_PORT and it's published 1:1 below.
+    command: server /data --address ":${MINIO_S3_PORT:-9000}" --console-address ":9001"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      # S3 port published 1:1 (see above). The console has no such tie, so its
+      # host port is free to differ from the container's 9001.
+      - "${MINIO_S3_PORT:-9000}:${MINIO_S3_PORT:-9000}"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_S3_PORT: ${MINIO_S3_PORT:-9000}
+      BALE_S3_BUCKET: ${BALE_S3_BUCKET}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        # minio/minio ships no usable healthcheck binary, so poll from inside mc
+        # (needed anyway) until the server answers, then make the bucket. Bounded
+        # and chatty: a misconfig (e.g. the S3 port already taken on the host, so
+        # minio never binds) fails loudly here instead of hanging silently.
+        i=0
+        until mc alias set local "http://minio:$$MINIO_S3_PORT" "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do
+          i=$$((i + 1))
+          if [ "$$i" -ge 60 ]; then
+            echo "ERROR: minio unreachable at minio:$$MINIO_S3_PORT after 60s — check 'compose logs minio'" >&2
+            exit 1
+          fi
+          echo "waiting for minio at minio:$$MINIO_S3_PORT (try $$i/60) ..."
+          sleep 1
+        done
+        mc mb --ignore-existing "local/$$BALE_S3_BUCKET"
+        echo "bucket ready: $$BALE_S3_BUCKET"
+    restart: "no"
+
+  gitea:
+    image: ghcr.io/davidrios/gitea:bale-support-v1.26
+    init: true
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__server__DOMAIN: localhost
+      GITEA__server__SSH_DOMAIN: localhost
+      GITEA__server__ROOT_URL: http://localhost:${GITEA_HTTP_PORT:-3000}/
+      GITEA__server__HTTP_PORT: "3000"
+      # gitea's built-in SSH listens on (and advertises in clone URLs) this
+      # port, so it's published 1:1 below.
+      GITEA__server__SSH_PORT: "${GITEA_SSH_PORT:-2222}"
+      # Bale replaces git-lfs, but the JWT signing key is shared: gitea mints the
+      # JWT under server.LFS_JWT_SECRET and baleforgit-server verifies it with
+      # the same 32 bytes (as BALE_JWT_SECRET_HEX).
+      GITEA__server__LFS_START_SERVER: "false"
+      GITEA__server__LFS_JWT_SECRET: ${LFS_JWT_SECRET_BASE64URL}
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__security__SECRET_KEY: ${GITEA_SECRET_KEY}
+      # Open sign-ups so you can register a user straight away.
+      GITEA__service__DISABLE_REGISTRATION: "false"
+      GITEA__bale__ENABLED: "true"
+      # Public base URL clients use to reach baleforgit-server. The client runs
+      # on the host, so this is the host-side address, not the internal one.
+      GITEA__bale__SERVER_URL: http://localhost:${BALE_HTTP_PORT:-8080}
+    ports:
+      - "${GITEA_HTTP_PORT:-3000}:3000"
+      - "${GITEA_SSH_PORT:-2222}:${GITEA_SSH_PORT:-2222}"
+    volumes:
+      - gitea-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  baleforgit-server:
+    # Built from the repo root Dockerfile so the demo always runs your
+    # working-tree code. Rebuild with `compose build baleforgit-server`.
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      gitea:
+        condition: service_started
+    environment:
+      BALE_LISTEN: 0.0.0.0:8080
+      BALE_DATA_ROOT: /var/lib/baleforgit-server/data
+      # Signed-URL host. Must be reachable from the host where git-bale runs, so
+      # it uses the published host port (the container always listens on 8080).
+      BALE_PUBLIC_URL: http://localhost:${BALE_HTTP_PORT:-8080}
+      BALE_JWT_SECRET_HEX: ${BALE_JWT_SECRET_HEX}
+      BALE_TRANSFER_SECRET_HEX: ${BALE_TRANSFER_SECRET_HEX}
+      # Delegate repo-access checks back to gitea (docker-internal address).
+      BALE_AUTHZ_HTTP_URL: http://gitea:3000/-/bale
+      # Bundled MinIO. The endpoint host MUST match what the client resolves on
+      # the host (presigned URLs are signature-bound to it), hence the shared
+      # `minio` name backed by the /etc/hosts entry in README.md.
+      BALE_S3_BUCKET: ${BALE_S3_BUCKET}
+      BALE_S3_REGION: us-east-1
+      BALE_S3_ENDPOINT_URL: http://minio:${MINIO_S3_PORT:-9000}
+      BALE_S3_FORCE_PATH_STYLE: "true"
+      # MinIO here runs without SSE-S3; tell the server not to request it.
+      BALE_S3_DISABLE_SSE: "true"
+      BALE_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      BALE_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # Uncomment to demo per-owner quotas (admin token gates PUT /v1/quotas):
+      # BALE_DEFAULT_QUOTA_BYTES: ${BALE_DEFAULT_QUOTA_BYTES}
+      # BALE_ADMIN_TOKEN_HEX: ${BALE_ADMIN_TOKEN_HEX}
+    ports:
+      - "${BALE_HTTP_PORT:-8080}:8080"
+    volumes:
+      - bale-server-data:/var/lib/baleforgit-server/data
+    # No healthcheck: the server image is built from the repo root Dockerfile
+    # (debian-slim), which carries no wget/curl to probe /healthz with.
+
+volumes:
+  gitea-data:
+  bale-server-data:
+  minio-data:

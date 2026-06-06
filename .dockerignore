@@ -1,17 +1,12 @@
-target/
-**/target/
+# The build context is the repo root, but every Dockerfile here (Dockerfile,
+# Dockerfile.musl, Dockerfile.windows) only COPYs Cargo.toml, Cargo.lock and
+# crates/. Allow-list exactly those so the giant siblings — target/ (~59G),
+# xet-data/ (~1G), dist/, gitea/, xet-core/, .git/ — never get tarred into the
+# context. Add a line here if a Dockerfile starts needing another path.
+*
+!Cargo.toml
+!Cargo.lock
+!crates
 
-# Sibling clones — see CLAUDE.md.
-xet-core/
-git-lfs/
-lfs-adapter/
-
-# Local-only.
-.git/
-.github/
-gitea/
-docs/
-*.md
-.pre-commit-config.yaml
-.gitignore
-.editorconfig
+# Defensive: never ship a stray build dir that happens to live inside a crate.
+crates/**/target/
