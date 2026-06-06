@@ -9,7 +9,7 @@ This repo ships two binaries:
 
 ## Install
 
-Proprietary distribution: see your release channel for the `bale-client-<version>-<target>.tar.gz` artifact for your platform, unpack, and put `git-bale` somewhere on your `PATH`. (The server ships separately as `bale-server-<version>-<target>.tar.gz`.)
+Grab the `bale-client-<version>-<target>.tar.gz` artifact for your platform from the release channel, unpack it, and put `git-bale` somewhere on your `PATH`. (The server ships separately as `bale-server-<version>-<target>.tar.gz`.)
 
 ## Usage
 
@@ -117,7 +117,7 @@ If you want to run your own CAS server (rather than point `git-bale` at someone 
 
 ## What this is, in context
 
-Bale for Git is a Git large-file system that does content-defined chunking + chunk-level deduplication, in the lineage of Git-LFS. The on-disk format and the chunk-dedup algorithm are derived from Hugging Face's open-source [Xet](https://huggingface.co/docs/xet/index) project (the `xet-core`/`xet-data` crates this client links against). `baleforgit-server` and `git-bale` are proprietary implementations of the server and client that wrap that format with our own wire protocol, auth, and forge-integration story.
+Bale for Git is a Git large-file system that does content-defined chunking + chunk-level deduplication, in the lineage of Git-LFS. The on-disk format and the chunk-dedup algorithm are derived from Hugging Face's open-source [Xet](https://huggingface.co/docs/xet/index) project (the `xet-core`/`xet-data` crates this client links against). `baleforgit-server` and `git-bale` are independent implementations of the server and client that wrap that format with their own wire protocol, auth, and forge-integration story.
 
 ## More docs
 
@@ -129,4 +129,4 @@ Bale for Git is a Git large-file system that does content-defined chunking + chu
 
 ## License
 
-Proprietary and confidential. See [`LICENSE`](LICENSE).
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).

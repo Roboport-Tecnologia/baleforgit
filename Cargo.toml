@@ -24,7 +24,7 @@ members = [
 [workspace.package]
 version = "0.1.1"
 edition = "2021"
-license = "LicenseRef-Proprietary"
+license = "Apache-2.0"
 rust-version = "1.94"
 
 [workspace.dependencies]
