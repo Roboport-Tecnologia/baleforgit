@@ -105,3 +105,20 @@ gh attestation verify bale-server-<version>-<target>.tar.gz \
 ```
 
 A passing verify means: the artifact was produced by this repo's GitHub Actions workflow at a specific commit, and nothing in transit has tampered with it. The release also ships a `SHA256SUMS` file covering every archive.
+
+Each release additionally publishes an SPDX SBOM (`SBOM.spdx.json`) of the workspace dependency graph, attested the same way:
+
+```bash
+gh attestation verify bale-server-<version>-<target>.tar.gz \
+  --repo davidrios/baleforgit \
+  --predicate-type https://spdx.dev/Document
+```
+
+For verification that doesn't depend on GitHub's attestation API, `SHA256SUMS` is also signed with [cosign](https://docs.sigstore.dev/) keyless (Sigstore). The signature (`SHA256SUMS.sig`) and certificate (`SHA256SUMS.pem`) ship alongside it:
+
+```bash
+cosign verify-blob SHA256SUMS \
+  --signature SHA256SUMS.sig --certificate SHA256SUMS.pem \
+  --certificate-identity-regexp 'https://github.com/davidrios/baleforgit/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```

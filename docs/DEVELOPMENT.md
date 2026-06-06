@@ -82,7 +82,12 @@ a label-gated PR, never a bare tag push:
   `/usr/local/bin`, codesigned (hardened runtime; `git-bale` gets the
   library-validation opt-out for its dlopened FUSE dylib), notarized, and
   stapled when the `MACOS_CERT_*` / `AC_API_*` secrets are set (otherwise an
-  unsigned `.pkg`); **Windows** → `.zip` with a `VERSION.txt`.
+  unsigned `.pkg`); **Windows** → `.zip` with a `VERSION.txt`. The Build step
+  exports `BALE_GIT_SHA` (short commit) and `SOURCE_DATE_EPOCH` (commit time) so
+  each crate's `build.rs` bakes commit + reproducible date + target triple into
+  the binary — surfaced by `git-bale --version` and `baleforgit-server --version`
+  (and logged at server startup). `Cross.toml` forwards both into the `cross`
+  container for the Windows build. Locally, `build.rs` falls back to `git`.
 - **`release-prep.yml`** — manual (`workflow_dispatch`) with a `version` input.
   Validates the version, bumps `[workspace.package].version`, refreshes
   `Cargo.lock`, regenerates `CHANGELOG.md` via [git-cliff](https://git-cliff.org),
@@ -92,10 +97,14 @@ a label-gated PR, never a bare tag push:
   version from `Cargo.toml`, creates and pushes the `v<version>` tag, calls
   `build.yml`, generates `SHA256SUMS`, mints a [SLSA Build Provenance v1](https://slsa.dev/spec/v1.0/provenance)
   attestation (`actions/attest-build-provenance`, verifiable with
-  `gh attestation verify`), and publishes the GitHub release with git-cliff notes.
+  `gh attestation verify`), generates and attests an SPDX SBOM
+  (`anchore/sbom-action` + `actions/attest-sbom`), signs `SHA256SUMS` with
+  cosign keyless (`SHA256SUMS.sig`/`.pem`), and publishes the GitHub release
+  with git-cliff notes.
 - **`edge.yml`** — manual (`workflow_dispatch`). Builds the current `main` via
   `build.yml` with version `edge`, force-moves the `edge` tag, and publishes (or
-  updates) a single rolling **prerelease** with the same checksums + provenance.
+  updates) a single rolling **prerelease** with the same checksums, provenance,
+  SBOM, and cosign signature.
 
 `ci.yml` (fmt / clippy / e2e harness) is checked in as `ci.yml.disabled`; rename
 it to enable. No container image is published — build one locally from

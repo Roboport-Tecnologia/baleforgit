@@ -73,10 +73,40 @@ jobs:
           cd dist
           sha256sum bale-* > SHA256SUMS
 
+      # SPDX SBOM of the workspace dependency graph (syft reads Cargo.lock).
+      # Named SBOM.spdx.json so it doesn't match the bale-* attestation glob.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/SBOM.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
       - name: Attest provenance
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/bale-*"
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@v4
+        with:
+          subject-path: "dist/bale-*"
+          sbom-path: dist/SBOM.spdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4
+
+      # Keyless (Sigstore) signature over the checksum manifest, verifiable
+      # without GitHub's attestation API. Covers every artifact via SHA256SUMS.
+      - name: Sign checksums (cosign keyless)
+        shell: bash
+        run: |
+          cd dist
+          cosign sign-blob --yes SHA256SUMS \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem
 
       - name: Build release notes
         shell: bash
@@ -88,6 +118,18 @@ jobs:
             echo "Verify a download's provenance:"
             echo '```'
             echo "gh attestation verify <file> --repo davidrios/baleforgit"
+            echo '```'
+            echo "Verify the dependency SBOM:"
+            echo '```'
+            echo "gh attestation verify <file> --repo davidrios/baleforgit \\"
+            echo "  --predicate-type https://spdx.dev/Document"
+            echo '```'
+            echo "Verify the checksum signature (cosign keyless):"
+            echo '```'
+            echo "cosign verify-blob SHA256SUMS \\"
+            echo "  --signature SHA256SUMS.sig --certificate SHA256SUMS.pem \\"
+            echo "  --certificate-identity-regexp 'https://github.com/davidrios/baleforgit/.*' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
             echo '```'
           } > RELEASE_NOTES.md
 

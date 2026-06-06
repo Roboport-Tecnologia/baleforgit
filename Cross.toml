@@ -1,0 +1,4 @@
+# `cross` runs cargo inside a container; forward the build-time provenance vars
+# (set in build.yml's Build step) so build.rs embeds them in the Windows binary.
+[build.env]
+passthrough = ["BALE_GIT_SHA", "SOURCE_DATE_EPOCH"]

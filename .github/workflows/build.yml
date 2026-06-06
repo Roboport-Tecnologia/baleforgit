@@ -80,6 +80,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Embedded into the binaries' --version via build.rs. SOURCE_DATE_EPOCH
+          # is the commit time, so the stamped date is reproducible. Cross.toml
+          # passes both through to the Windows `cross` container.
+          export BALE_GIT_SHA="$(git rev-parse --short=12 HEAD)"
+          export SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)"
           PKGS=()
           for comp in ${{ matrix.components }}; do
             case "$comp" in

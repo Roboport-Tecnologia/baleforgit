@@ -9,10 +9,21 @@ use git_bale::install::{self, Scope};
 use git_bale::mount::{self, MountDiffArgs, MountRevArgs};
 use git_bale::{filter_process, gc, push_pending, track};
 
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("BALE_GIT_SHA"),
+    " ",
+    env!("BALE_BUILD_DATE"),
+    " ",
+    env!("BALE_TARGET"),
+    ")"
+);
+
 #[derive(Parser, Debug)]
 #[command(
     name = "git-bale",
-    version,
+    version = LONG_VERSION,
     about = "Git filter for chunk-deduplicated file storage"
 )]
 struct Cli {

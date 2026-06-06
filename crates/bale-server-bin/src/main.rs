@@ -13,10 +13,27 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("BALE_GIT_SHA"),
+    " ",
+    env!("BALE_BUILD_DATE"),
+    " ",
+    env!("BALE_TARGET"),
+    ")"
+);
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("baleforgit-server {VERSION}");
+        return Ok(());
+    }
+
     // Held until end of main so OTLP exporters flush on shutdown.
     let _telemetry = telemetry::init("baleforgit-server")?;
+    tracing::info!(version = VERSION, "baleforgit-server starting");
 
     let listen = env::var("BALE_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let data_root =
