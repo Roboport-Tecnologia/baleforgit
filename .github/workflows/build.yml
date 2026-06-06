@@ -1,0 +1,228 @@
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version string used in archive names (e.g. 0.2.0 or edge)"
+        required: true
+        type: string
+    secrets:
+      MACOS_CERT_P12:
+        required: false
+      MACOS_CERT_PASSWORD:
+        required: false
+      AC_API_KEY_P8:
+        required: false
+      AC_API_KEY_ID:
+        required: false
+      AC_API_ISSUER_ID:
+        required: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    # Lifted to job level so the macOS signing/notarization steps can gate
+    # themselves on `env.MACOS_CERT_P12 != ''` — without the certs configured,
+    # those steps skip and the macOS binaries ship unsigned rather than failing.
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `suffix` is what goes in the artifact names: bale-<component>-<version>-<suffix>.
+          # Per OS: Linux -> .tar.gz, macOS -> signed/notarized/stapled .pkg, Windows -> .zip.
+          # Windows ships the client (git-bale) only; everything else ships both.
+          - { target: x86_64-unknown-linux-musl,  suffix: x86_64-linux-musl,  runner: ubuntu-latest,   os: linux,   components: "server client" }
+          - { target: aarch64-unknown-linux-musl, suffix: aarch64-linux-musl, runner: ubuntu-24.04-arm, os: linux,   components: "server client" }
+          - { target: x86_64-apple-darwin,        suffix: x86_64-macos,       runner: macos-15-intel,   os: macos,   components: "server client" }
+          - { target: aarch64-apple-darwin,       suffix: aarch64-macos,      runner: macos-14,         os: macos,   components: "server client" }
+          - { target: x86_64-pc-windows-gnu,      suffix: x86_64-windows,     runner: ubuntu-latest,    os: windows, components: "client", cross: true }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (Windows via gnu)
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Install musl tools (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Configure musl C toolchain (Linux)
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          TLOW=$(echo "${{ matrix.target }}" | tr '-' '_')
+          TUP=$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')
+          {
+            echo "CC_${TLOW}=musl-gcc"
+            echo "CARGO_TARGET_${TUP}_LINKER=musl-gcc"
+          } >> "$GITHUB_ENV"
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKGS=()
+          for comp in ${{ matrix.components }}; do
+            case "$comp" in
+              server) PKGS+=(-p bale-server-bin) ;;
+              client) PKGS+=(-p git-bale) ;;
+            esac
+          done
+          TOOL=${{ matrix.cross && 'cross' || 'cargo' }}
+          "$TOOL" build --release "${PKGS[@]}" --target ${{ matrix.target }}
+
+      - name: Import signing certificate (macOS)
+        if: matrix.os == 'macos' && env.MACOS_CERT_P12 != ''
+        shell: bash
+        env:
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          CERT="$RUNNER_TEMP/cert.p12"
+
+          echo "$MACOS_CERT_P12" | base64 --decode > "$CERT"
+
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$CERT" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          # Make the temp keychain searchable alongside the existing ones (word-splitting intended).
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/[\"[:space:]]//g')
+
+          # Application identity (hash) signs the Mach-Os; Installer identity
+          # (full name) signs the .pkg. The .p12 is expected to carry both.
+          APP_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk '/Developer ID Application/ {print $2; exit}')"
+          INSTALLER_IDENTITY="$(security find-identity -v "$KEYCHAIN" | sed -n 's/.*"\(Developer ID Installer: [^"]*\)".*/\1/p' | head -1)"
+          if [ -z "$APP_IDENTITY" ]; then
+            echo "::error::No Developer ID Application identity found in the imported certificate"
+            exit 1
+          fi
+          if [ -z "$INSTALLER_IDENTITY" ]; then
+            echo "::error::No Developer ID Installer identity found — required to sign the .pkg"
+            exit 1
+          fi
+          {
+            echo "SIGN_APP_IDENTITY=$APP_IDENTITY"
+            echo "SIGN_INSTALLER_IDENTITY=$INSTALLER_IDENTITY"
+            echo "SIGN_KEYCHAIN=$KEYCHAIN"
+          } >> "$GITHUB_ENV"
+          rm -f "$CERT"
+
+      - name: Codesign binaries (macOS)
+        if: matrix.os == 'macos' && env.MACOS_CERT_P12 != ''
+        shell: bash
+        run: |
+          # shellcheck disable=SC2154  # SIGN_KEYCHAIN/SIGN_APP_IDENTITY arrive via $GITHUB_ENV
+          set -euo pipefail
+          for comp in ${{ matrix.components }}; do
+            case "$comp" in server) bin=baleforgit-server ;; client) bin=git-bale ;; esac
+            BIN="target/${{ matrix.target }}/release/$bin"
+            ENT=()
+            # git-bale dlopens its FUSE dylib, so it needs the library-validation opt-out.
+            [ "$comp" = client ] && ENT=(--entitlements packaging/macos/git-bale.entitlements)
+            # ${arr[@]+...} guard: bash 3.2 (macOS /bin/bash) errors on an empty
+            # array expansion under `set -u`.
+            codesign --force --options runtime --timestamp ${ENT[@]+"${ENT[@]}"} \
+              --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_APP_IDENTITY" "$BIN"
+            codesign --verify --strict --verbose=2 "$BIN"
+          done
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          TARGET="${{ matrix.target }}"
+          SUFFIX="${{ matrix.suffix }}"
+          OS="${{ matrix.os }}"
+          RELDIR="target/$TARGET/release"
+          SHA="$(git rev-parse --short HEAD)"
+          BUILT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p dist staging
+          for comp in ${{ matrix.components }}; do
+            case "$comp" in server) bin=baleforgit-server ;; client) bin=git-bale ;; esac
+            name="bale-$comp-$VERSION-$SUFFIX"
+            if [ "$OS" = macos ]; then
+              # .pkg installs the (already-signed) binary to /usr/local/bin. The
+              # pkg itself is signed with the Installer identity when available
+              # (search-list keychain, so no --keychain flag); without certs it
+              # builds unsigned. Notarize + staple happens in the next step.
+              root="staging/pkgroot-$name"
+              mkdir -p "$root/usr/local/bin"
+              cp "$RELDIR/$bin" "$root/usr/local/bin/$bin"
+              SIGN=()
+              [ -n "${SIGN_INSTALLER_IDENTITY:-}" ] && SIGN=(--sign "$SIGN_INSTALLER_IDENTITY")
+              pkgbuild --root "$root" --identifier "com.davidriosgomes.baleforgit.$comp" \
+                --version "$VERSION" --install-location / ${SIGN[@]+"${SIGN[@]}"} "dist/$name.pkg"
+            else
+              [ "$OS" = windows ] && bin="$bin.exe"
+              sd="staging/$name"
+              mkdir -p "$sd"
+              cp "$RELDIR/$bin" "$sd/$bin"
+              printf 'bale %s\ncomponent: %s\ncommit: %s\ntarget: %s\nbuilt:  %s\n' \
+                "$VERSION" "$comp" "$SHA" "$TARGET" "$BUILT" > "$sd/VERSION.txt"
+              if [ "$OS" = windows ]; then
+                ( cd staging && zip -Xqr "../dist/$name.zip" "$name" )
+              else
+                tar -C staging -czf "dist/$name.tar.gz" "$name"
+              fi
+            fi
+          done
+          ls -la dist
+
+      - name: Notarize and staple pkgs (macOS)
+        if: matrix.os == 'macos' && env.MACOS_CERT_P12 != ''
+        shell: bash
+        env:
+          AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/ac_api.p8"
+          echo "$AC_API_KEY_P8" | base64 --decode > "$KEY"
+          for pkg in dist/*.pkg; do
+            if ! OUT="$(xcrun notarytool submit "$pkg" --key "$KEY" --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID" --wait --timeout 30m 2>&1)"; then
+              printf '%s\n' "$OUT"
+              ID="$(printf '%s\n' "$OUT" | awk '/id:/{print $2; exit}')"
+              if [ -n "$ID" ]; then
+                xcrun notarytool log "$ID" --key "$KEY" --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID" || true
+              fi
+              rm -f "$KEY"
+              exit 1
+            fi
+            printf '%s\n' "$OUT"
+            # Staple the ticket into the .pkg so Gatekeeper verifies offline.
+            xcrun stapler staple "$pkg"
+          done
+          rm -f "$KEY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/bale-*
+          if-no-files-found: error

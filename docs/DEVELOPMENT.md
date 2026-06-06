@@ -66,14 +66,41 @@ The harness exits 77 when the environment can't host it (no podman daemon, no re
 
 ## CI and release artifacts
 
-GitHub Actions workflows live under `.github/workflows/`:
+GitHub Actions workflows live under `.github/workflows/`. Releases are driven by
+a label-gated PR, never a bare tag push:
 
-- **`ci.yml`** — on every push to `main` and every PR, runs `cargo fmt --check`, `cargo clippy -D warnings`, and the `tests/e2e/run.py` harness (after `cargo build --release -p git-bale`). Relies on `git` and `podman` being preinstalled on `ubuntu-latest`, so the harness runs end-to-end rather than skipping.
-- **`release.yml`** — on a `v*` tag push, builds the `baleforgit-server` and `git-bale` binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`, then creates a GitHub release with one `.tar.gz` per binary per target (each paired with its own `.sha256`) attached. Each tarball is also signed via [GitHub artifact attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) — `actions/attest-build-provenance` mints an unforgeable [SLSA Build Provenance v1](https://slsa.dev/spec/v1.0/provenance) statement, signed by Sigstore, recorded in the public transparency log, and reachable from the GitHub Attestations API.
-- **`docker.yml`** — on a push to `main` or a `v*` tag, builds a multi-arch (`linux/amd64`, `linux/arm64`) image from `Dockerfile` and pushes it to `ghcr.io/<owner>/<repo>` with `branch`, `sha-<short>`, semver, and `latest` tags as appropriate. Same SLSA Build Provenance is generated and pushed alongside the image as an OCI referrer, so `gh attestation verify oci://…` and `cosign verify-attestation` both find it.
+- **`build.yml`** — a reusable workflow (`workflow_call`) that does the actual
+  compilation. Takes a `version` string and builds across the release matrix:
+  `x86_64`/`aarch64-unknown-linux-musl` (static, native runners), `x86_64`/
+  `aarch64-apple-darwin` (native), and `x86_64-pc-windows-gnu` (cross-compiled
+  with [`cross`](https://github.com/cross-rs/cross)). Linux/macOS ship both
+  binaries; Windows ships `git-bale` only. Each component is packaged on its own
+  as `bale-server-<version>-<suffix>` / `bale-client-<version>-<suffix>`, where
+  `<suffix>` is a friendly target name like `x86_64-linux-musl`, `aarch64-macos`,
+  or `x86_64-windows`. Packaging differs per OS: **Linux** → `.tar.gz` with a
+  `VERSION.txt`; **macOS** → a `.pkg` that installs the binary to
+  `/usr/local/bin`, codesigned (hardened runtime; `git-bale` gets the
+  library-validation opt-out for its dlopened FUSE dylib), notarized, and
+  stapled when the `MACOS_CERT_*` / `AC_API_*` secrets are set (otherwise an
+  unsigned `.pkg`); **Windows** → `.zip` with a `VERSION.txt`.
+- **`release-prep.yml`** — manual (`workflow_dispatch`) with a `version` input.
+  Validates the version, bumps `[workspace.package].version`, refreshes
+  `Cargo.lock`, regenerates `CHANGELOG.md` via [git-cliff](https://git-cliff.org),
+  and opens a `release`-labelled PR (branch `release/v<version>`). Nothing is
+  tagged or published yet — review the PR, then merge it.
+- **`release.yml`** — on a **merged** PR carrying the `release` label, reads the
+  version from `Cargo.toml`, creates and pushes the `v<version>` tag, calls
+  `build.yml`, generates `SHA256SUMS`, mints a [SLSA Build Provenance v1](https://slsa.dev/spec/v1.0/provenance)
+  attestation (`actions/attest-build-provenance`, verifiable with
+  `gh attestation verify`), and publishes the GitHub release with git-cliff notes.
+- **`edge.yml`** — manual (`workflow_dispatch`). Builds the current `main` via
+  `build.yml` with version `edge`, force-moves the `edge` tag, and publishes (or
+  updates) a single rolling **prerelease** with the same checksums + provenance.
 
-All three workflows are also runnable manually from the Actions tab via **Run workflow** (`workflow_dispatch`):
-
-- `ci.yml` takes no inputs — useful for re-running the test matrix on demand.
-- `release.yml` takes a `tag` input (default `v0.0.0-test`); the release is created as a **draft prerelease**, which means the git tag is *not* materialized in the repo until you click Publish on the resulting draft. Re-dispatching with the same tag overwrites the prior draft so you don't accumulate test releases. Delete the draft when done and nothing is left behind. Attestations are still minted normally.
-- `docker.yml` takes a `tag` input (default `test`); the image is pushed with that tag *and* the usual `sha-<short>` tag, so you can pull `ghcr.io/<owner>/<repo>:test` to try a manual build without touching the `:latest` tag.
+`ci.yml` (fmt / clippy / e2e harness) is checked in as `ci.yml.disabled`; rename
+it to enable. No container image is published — build one locally from
+`Dockerfile` if you want one (see [`docs/SERVER.md`](SERVER.md)). The macOS
+`.pkg` flow needs **both** a Developer ID Application and a Developer ID
+Installer certificate in the `MACOS_CERT_P12` secret (plus the App Store Connect
+API key in `AC_API_*`); the build fails fast if the installer cert is missing
+rather than shipping something that can't be notarized.

@@ -4,7 +4,7 @@ This document covers operating the server side. For the user-facing client (`git
 
 ## Install
 
-Download the `baleforgit-server-<version>-<target>.tar.gz` tarball for your platform from the [releases page](https://github.com/davidrios/baleforgit/releases), or pull the container image from `ghcr.io/davidrios/baleforgit-server`. Verify the artifact before running it — see "Verifying release artifacts" below.
+Download the `bale-server-<version>-<target>` artifact for your platform from the [releases page](https://github.com/davidrios/baleforgit/releases): a `.tar.gz` on Linux, or a signed `.pkg` on macOS (installs `baleforgit-server` to `/usr/local/bin`). Verify the artifact before running it — see "Verifying release artifacts" below. To run it in a container, build your own image as shown under "Container".
 
 ## Quick start
 
@@ -28,13 +28,20 @@ Send `SIGINT` (Ctrl-C) or `SIGTERM` to shut the server down gracefully — it st
 
 ## Container
 
+No image is published; build one from the repo's `Dockerfile` (it compiles the
+server from source into a slim Debian image):
+
 ```bash
+docker build -t baleforgit-server .
 docker run --rm -p 8080:8080 \
   -e BALE_JWT_SECRET_HEX=$(printf '%064x' 1) \
   -e BALE_TRANSFER_SECRET_HEX=$(printf '%064x' 2) \
   -e BALE_GRANTS=token-alice:alice:alice/my-model:write \
-  ghcr.io/davidrios/baleforgit-server:latest
+  baleforgit-server
 ```
+
+For a production setup that bind-mounts a release binary (no in-image build)
+alongside a forge, see [`prod-docker/`](../prod-docker/).
 
 ## Configuration
 
@@ -89,16 +96,12 @@ Standard OTel env vars apply: `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `
 
 ## Verifying release artifacts
 
-Each release tarball and container digest is covered by a [SLSA Build Provenance v1](https://slsa.dev/spec/v1.0/provenance) attestation tying it back to the exact workflow run, commit SHA, and repository that produced it. Verify with the GitHub CLI (no extra signing keys to manage):
+Each release tarball is covered by a [SLSA Build Provenance v1](https://slsa.dev/spec/v1.0/provenance) attestation tying it back to the exact workflow run, commit SHA, and repository that produced it. Verify with the GitHub CLI (no extra signing keys to manage):
 
 ```bash
-# Tarball — works on the file you just downloaded from the release page.
-gh attestation verify baleforgit-server-<version>-<target>.tar.gz \
-  --repo davidrios/baleforgit
-
-# Container image — pin to a digest, not a mutable tag.
-gh attestation verify oci://ghcr.io/davidrios/baleforgit-server@sha256:<digest> \
+# Works on the file you just downloaded from the release page.
+gh attestation verify bale-server-<version>-<target>.tar.gz \
   --repo davidrios/baleforgit
 ```
 
-A passing verify means: the artifact was produced by this repo's GitHub Actions workflow at a specific commit, and nothing in transit has tampered with it. Pin to a digest (not `:latest`) when you care about reproducibility.
+A passing verify means: the artifact was produced by this repo's GitHub Actions workflow at a specific commit, and nothing in transit has tampered with it. The release also ships a `SHA256SUMS` file covering every archive.
