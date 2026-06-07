@@ -87,7 +87,9 @@ pub async fn resolve_for_remote(
 
     let (server_url, forge_bearer) = match remote.scheme {
         RemoteScheme::Ssh => {
-            let auth = ssh_authenticate(&remote, owner, repo_name, scope).await?;
+            let auth =
+                ssh_authenticate(&remote, owner, repo_name, scope, raw.ssh_command.as_deref())
+                    .await?;
             let bearer = strip_bearer(&auth.authorization)
                 .ok_or_else(|| anyhow!("git-bale-authenticate returned non-Bearer Authorization"))?
                 .to_string();
@@ -332,6 +334,7 @@ async fn ssh_authenticate(
     owner: &str,
     repo: &str,
     scope: Scope,
+    ssh_command: Option<&str>,
 ) -> Result<SshAuthOutcome> {
     let op = match scope {
         Scope::Read => "download",
@@ -339,6 +342,9 @@ async fn ssh_authenticate(
     };
     let host = remote.host.as_str();
     let user = remote.user.as_deref().unwrap_or("git");
+    // ssh first-occurrence-wins per keyword, so a user's GIT_SSH_COMMAND /
+    // core.sshCommand can override either of these; they're the safe default
+    // when it doesn't (no interactive prompt, accept an unknown host once).
     let mut args: Vec<String> = vec![
         "-o".into(),
         "BatchMode=yes".into(),
@@ -352,11 +358,11 @@ async fn ssh_authenticate(
     args.push(format!("{user}@{host}"));
     args.push(format!("git-bale-authenticate {owner}/{repo} {op}"));
 
-    // Run blocking, off the async executor.
+    let ssh_command = ssh_command.map(str::to_owned);
     let args_clone = args.clone();
+    // Run blocking, off the async executor.
     let out = tokio::task::spawn_blocking(move || {
-        Command::new("ssh")
-            .args(&args_clone)
+        ssh_subprocess(ssh_command.as_deref(), &args_clone)
             .stderr(Stdio::piped())
             .stdout(Stdio::piped())
             .output()
@@ -389,6 +395,27 @@ async fn ssh_authenticate(
         href: parsed.href.trim_end_matches('/').to_string(),
         authorization: authz,
     })
+}
+
+/// Build the ssh subprocess. With a configured command (`GIT_SSH_COMMAND` /
+/// `core.sshCommand`) we mirror git: run it through `/bin/sh` with our args
+/// appended as `"$@"`, so the shell honors the quoting in the configured string
+/// (e.g. `ssh -F "/path with spaces"`). Falls back to bare `ssh` when unset, or
+/// on non-unix where we can't assume a POSIX shell (Windows forge-auth ssh has
+/// always used ssh's own default identity/host-key lookup).
+fn ssh_subprocess(ssh_command: Option<&str>, args: &[String]) -> Command {
+    #[cfg(unix)]
+    if let Some(cmd) = ssh_command.map(str::trim).filter(|c| !c.is_empty()) {
+        let mut c = Command::new("/bin/sh");
+        // argv[0]-after-`-c` ($0) is cosmetic; "$@" picks up `args`.
+        c.arg("-c").arg(format!("{cmd} \"$@\"")).arg(cmd).args(args);
+        return c;
+    }
+    #[cfg(not(unix))]
+    let _ = ssh_command;
+    let mut c = Command::new("ssh");
+    c.args(args);
+    c
 }
 
 /// `git credential fill` → `(username, password)` for the remote's host. The

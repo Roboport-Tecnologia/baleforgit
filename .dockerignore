@@ -1,12 +1,23 @@
-# The build context is the repo root, but every Dockerfile here (Dockerfile,
-# Dockerfile.musl, Dockerfile.windows) only COPYs Cargo.toml, Cargo.lock and
-# crates/. Allow-list exactly those so the giant siblings — target/ (~59G),
-# xet-data/ (~1G), dist/, gitea/, xet-core/, .git/ — never get tarred into the
-# context. Add a line here if a Dockerfile starts needing another path.
+# The build context is the repo root. The three top-level Dockerfiles
+# (Dockerfile, Dockerfile.musl, Dockerfile.windows) only COPY Cargo.toml,
+# Cargo.lock and crates/; tests/e2e/Dockerfile additionally COPYs
+# tests/e2e/entrypoint.sh. Allow-list exactly those so the giant siblings —
+# target/ (~59G), xet-data/ (~1G), dist/, gitea/, xet-core/, .git/ — never get
+# tarred into the context. Add a line here if a Dockerfile starts needing
+# another path.
 *
 !Cargo.toml
 !Cargo.lock
 !crates
+
+# Re-include only tests/e2e/entrypoint.sh (the e2e image's entrypoint), not the
+# rest of tests/. The nested un-ignore/re-ignore dance is required because a
+# file can't be re-included while a parent dir stays excluded.
+!tests
+tests/*
+!tests/e2e
+tests/e2e/*
+!tests/e2e/entrypoint.sh
 
 # Defensive: never ship a stray build dir that happens to live inside a crate.
 crates/**/target/

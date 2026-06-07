@@ -61,6 +61,7 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
             local_mode: false,
             local_store: None,
             local_shared: false,
+            ssh_command: None,
         }
     });
 

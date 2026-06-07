@@ -36,6 +36,13 @@ pub struct RawConfig {
     /// `bale.localShared` / `BALE_LOCAL_SHARED`: the store is shared across
     /// repos, so gc must not delete objects (see `prune`).
     pub local_shared: bool,
+    /// The ssh command git itself would use (`GIT_SSH_COMMAND` env, else
+    /// `core.sshCommand`). The forge-auth ssh handshake honors it so a user's
+    /// custom key/port/`UserKnownHostsFile`/jump-host applies there too — and so
+    /// the e2e harness's isolated `UserKnownHostsFile` keeps the handshake from
+    /// writing host keys into the developer's real `~/.ssh/known_hosts` (ssh
+    /// expands `~` via getpwuid, ignoring `$HOME`). `None` → bare `ssh`.
+    pub ssh_command: Option<String>,
 }
 
 impl RawConfig {
@@ -76,6 +83,8 @@ impl RawConfig {
         let local_shared = bool_from("BALE_LOCAL_SHARED", snapshot.as_ref(), "bale.localShared");
         let local_store = env_or_cfg("BALE_LOCAL_STORE", snapshot.as_ref(), "bale.localStore")
             .map(|s| expand_tilde(&s));
+        // git's own precedence: GIT_SSH_COMMAND env beats core.sshCommand config.
+        let ssh_command = env_or_cfg("GIT_SSH_COMMAND", snapshot.as_ref(), "core.sshCommand");
 
         Ok(Self {
             server_url,
@@ -86,6 +95,7 @@ impl RawConfig {
             local_mode,
             local_store,
             local_shared,
+            ssh_command,
         })
     }
 }
