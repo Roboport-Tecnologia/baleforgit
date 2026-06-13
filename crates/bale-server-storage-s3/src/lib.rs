@@ -26,6 +26,12 @@ pub struct S3Config {
     pub bucket: String,
     pub region: Option<String>,
     pub endpoint_url: Option<String>,
+    /// Endpoint baked into client-facing presigned URLs, when it must differ
+    /// from `endpoint_url`. Set this when the server reaches the blob store at
+    /// an address clients can't (e.g. a bundled MinIO at the compose-internal
+    /// `minio:9000`, where clients need `localhost:9000`). Unset → presign
+    /// against `endpoint_url`, correct for any endpoint reachable by both.
+    pub public_endpoint_url: Option<String>,
     /// Required for MinIO and similar backends that don't do virtual-host addressing.
     pub force_path_style: bool,
     pub prefix: String,
@@ -39,6 +45,10 @@ pub struct S3Config {
 
 pub struct S3BlobStore {
     client: Client,
+    /// Same client as `client`, except its endpoint is `public_endpoint_url`
+    /// so the URLs it signs carry a client-reachable host. Equal to `client`
+    /// when no public endpoint override is configured.
+    presign_client: Client,
     bucket: String,
     prefix: String,
     sse_enabled: bool,
@@ -54,9 +64,6 @@ impl S3BlobStore {
         if let Some(r) = cfg.region.clone() {
             loader = loader.region(Region::new(r));
         }
-        if let Some(ep) = cfg.endpoint_url.clone() {
-            loader = loader.endpoint_url(ep);
-        }
         if let (Some(ak), Some(sk)) = (cfg.access_key_id.clone(), cfg.secret_access_key.clone()) {
             let creds =
                 Credentials::new(ak, sk, cfg.session_token.clone(), None, "bale-server-cfg");
@@ -64,13 +71,30 @@ impl S3BlobStore {
         }
         let shared = loader.load().await;
 
-        let mut builder = aws_sdk_s3::config::Builder::from(&shared);
-        if cfg.force_path_style {
-            builder = builder.force_path_style(true);
-        }
-        let client = Client::from_conf(builder.build());
+        // Endpoint lives on the per-service builder (not the loader) so the
+        // presign client can override just it while sharing creds/region.
+        let make_client = |endpoint: Option<&str>| {
+            let mut builder = aws_sdk_s3::config::Builder::from(&shared);
+            if cfg.force_path_style {
+                builder = builder.force_path_style(true);
+            }
+            if let Some(ep) = endpoint {
+                builder = builder.endpoint_url(ep);
+            }
+            Client::from_conf(builder.build())
+        };
+
+        let client = make_client(cfg.endpoint_url.as_deref());
+        // Only a public endpoint that actually differs warrants a second client.
+        let presign_client = match cfg.public_endpoint_url.as_deref() {
+            Some(public) if Some(public) != cfg.endpoint_url.as_deref() => {
+                Some(make_client(Some(public)))
+            }
+            _ => None,
+        };
 
         let store = Self {
+            presign_client: presign_client.unwrap_or_else(|| client.clone()),
             client,
             bucket: cfg.bucket,
             prefix: cfg.prefix,
@@ -245,7 +269,7 @@ impl BlobStore for S3BlobStore {
         let cfg = PresigningConfig::expires_in(ttl)
             .map_err(|e| CoreError::Internal(format!("s3 presign config (ttl={ttl:?}): {e}")))?;
         let req = self
-            .client
+            .presign_client
             .get_object()
             .bucket(&self.bucket)
             .key(self.xorb_key(hash))

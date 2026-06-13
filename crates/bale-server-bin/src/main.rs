@@ -169,6 +169,11 @@ where
             bucket: bucket.clone(),
             region: env::var("BALE_S3_REGION").ok(),
             endpoint_url: env::var("BALE_S3_ENDPOINT_URL").ok(),
+            // Empty (a compose `${VAR:-}` passthrough) must mean "unset", not a
+            // bogus empty endpoint that signs unreachable URLs.
+            public_endpoint_url: env::var("BALE_S3_PUBLIC_ENDPOINT_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
             force_path_style: env_truthy("BALE_S3_FORCE_PATH_STYLE"),
             prefix: env::var("BALE_S3_PREFIX").unwrap_or_default(),
             access_key_id: env::var("BALE_S3_ACCESS_KEY_ID").ok(),
@@ -177,11 +182,13 @@ where
             disable_sse: env_truthy("BALE_S3_DISABLE_SSE"),
         };
         let endpoint_for_log = s3_cfg.endpoint_url.clone();
+        let presign_endpoint_for_log = s3_cfg.public_endpoint_url.clone();
         let blobs = Arc::new(S3BlobStore::open(s3_cfg).await.map_err(anyhow_from_core)?);
         tracing::info!(
             backend = "s3",
             bucket = %bucket,
             endpoint = ?endpoint_for_log,
+            presign_endpoint = ?presign_endpoint_for_log,
             %public_url,
             "baleforgit-server up"
         );

@@ -58,7 +58,8 @@ alongside a forge, see [`prod-docker/`](../prod-docker/).
 | `BALE_GRANTS` | none | Used only when `BALE_AUTHZ_HTTP_URL` is unset. Comma-separated `bearer_token:user:repo_id:read\|write` tuples for the in-process static authz (dev/test). |
 | `BALE_S3_BUCKET` | none | If set, switch blob storage from the local filesystem to an S3-compatible bucket. Picks up credentials from the standard AWS provider chain. |
 | `BALE_S3_REGION` | SDK default | Region for the S3 client. |
-| `BALE_S3_ENDPOINT_URL` | none | Override the API endpoint (e.g. `https://minio.example:9000` for MinIO, R2's endpoint for Cloudflare). |
+| `BALE_S3_ENDPOINT_URL` | none | Override the API endpoint (e.g. `https://minio.example:9000` for MinIO, R2's endpoint for Cloudflare). The server uses this both to talk to the store and to sign client-facing download URLs. |
+| `BALE_S3_PUBLIC_ENDPOINT_URL` | = `BALE_S3_ENDPOINT_URL` | Endpoint baked into client-facing presigned download URLs, for when the server reaches the store at an address clients can't (e.g. a bundled MinIO at the compose-internal `minio:9000` while clients need `localhost:9000`). Unset → presign against `BALE_S3_ENDPOINT_URL`, correct whenever that endpoint is reachable by both server and clients (real AWS S3, R2, B2). |
 | `BALE_S3_FORCE_PATH_STYLE` | `false` | Set to `true` for MinIO and other backends that expect `https://host/{bucket}/{key}` rather than virtual-host addressing. |
 | `BALE_S3_PREFIX` | empty | Optional key prefix inside the bucket (include a trailing `/` if you want one). |
 | `BALE_S3_DISABLE_SSE` | `false` | PUTs request SSE-S3 (AES256) by default. Set truthy to disable, for backends that don't support server-side encryption (e.g. MinIO). |

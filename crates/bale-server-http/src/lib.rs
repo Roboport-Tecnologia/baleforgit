@@ -1100,7 +1100,7 @@ where
 
     let is_admin = svc
         .admin_token
-        .and_then(|admin| hex::decode(bearer.trim()).ok().map(|p| (admin, p)))
+        .zip(hex::decode(bearer.trim()).ok())
         .is_some_and(|(admin, presented)| ct_eq(&presented, &admin));
     if is_admin {
         return Ok(());

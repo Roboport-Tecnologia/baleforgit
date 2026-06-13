@@ -3,7 +3,9 @@
 
 use std::io::{stdin, stdout, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use tempfile::NamedTempFile;
@@ -525,6 +527,90 @@ fn handle_clean<W: Write>(
     Ok(())
 }
 
+const STALL_POLL: Duration = Duration::from_secs(2);
+const DEFAULT_DOWNLOAD_STALL_SECS: u64 = 30;
+
+/// Seconds of zero download progress before the cold path gives up. `0` disables
+/// the watchdog (used by the e2e stall phase to verify the hang it replaces).
+/// Shared by the smudge filter and `git-bale mount`.
+pub(crate) fn cold_download_stall_secs() -> u64 {
+    std::env::var("BALE_DOWNLOAD_STALL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_DOWNLOAD_STALL_SECS)
+}
+
+/// Counts bytes actually written so the watchdog can tell a stalled transfer from
+/// a slow-but-progressing one.
+struct StallGuardWriter<W> {
+    inner: W,
+    written: Arc<AtomicU64>,
+}
+
+impl<W: Write> Write for StallGuardWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Cold-path reconstruction guarded by a no-progress watchdog. xet-core classifies
+/// a "host not found" DNS error as *retryable* and backs off with a base-squared
+/// exponential delay (3s, then ~2.5h on the second retry), so an unreachable blob
+/// store would hang `git checkout` silently for hours. Abort instead once no bytes
+/// have arrived for `stall_secs` — dropping the future cancels the in-flight
+/// request and its multi-hour backoff sleep — and surface a user-facing error.
+pub(crate) async fn download_cold<W: Write + Send + 'static>(
+    session: &FileDownloadSession,
+    info: &xet_data::processing::XetFileInfo,
+    file_size: u64,
+    dest: W,
+    label: &str,
+    stall_secs: u64,
+) -> Result<()> {
+    let written = Arc::new(AtomicU64::new(0));
+    let guard_writer = StallGuardWriter {
+        inner: dest,
+        written: written.clone(),
+    };
+    let dl = session.download_to_writer(info, 0..file_size, guard_writer);
+
+    if stall_secs == 0 {
+        dl.await?;
+        return Ok(());
+    }
+
+    tokio::pin!(dl);
+    let stall = Duration::from_secs(stall_secs);
+    let mut last_seen = 0u64;
+    let mut idle = Duration::ZERO;
+    loop {
+        tokio::select! {
+            r = &mut dl => { r?; return Ok(()); }
+            _ = tokio::time::sleep(STALL_POLL) => {
+                let cur = written.load(Ordering::Relaxed);
+                if cur > last_seen {
+                    last_seen = cur;
+                    idle = Duration::ZERO;
+                } else {
+                    idle += STALL_POLL;
+                    if idle >= stall {
+                        return Err(anyhow!(
+                            "download of '{label}' stalled: no data received for {stall_secs}s. \
+                             The bale storage server is unreachable or misconfigured — check your \
+                             network connection, or contact the repository administrator."
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn handle_smudge<R: Read, W: Write>(
     rt: &Arc<XetRuntime>,
     raw: &crate::config::RawConfig,
@@ -679,13 +765,20 @@ fn handle_smudge<R: Read, W: Write>(
         let dest_file = tmp.reopen()?;
         let info_for_dl = info.clone();
         let cache_for_dl = chunk_cache.clone();
+        let pathname_owned = pathname.to_string();
+        let stall_secs = cold_download_stall_secs();
         rt.bridge_sync(async move {
             let session =
                 FileDownloadSession::new(Arc::new(translator), Some(cache_for_dl)).await?;
-            let (_id, _n) = session
-                .download_to_writer(&info_for_dl, 0..file_size, dest_file)
-                .await?;
-            Ok::<(), anyhow::Error>(())
+            download_cold(
+                &session,
+                &info_for_dl,
+                file_size,
+                dest_file,
+                &pathname_owned,
+                stall_secs,
+            )
+            .await
         })
         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 

@@ -382,15 +382,24 @@ impl Reader {
             let info_clone = info.clone();
             let cache_clone = chunk_cache.clone();
             let dest_file = tmp.reopen()?;
+            // Same `0..file_size` range cap as the smudge filter — see
+            // filter_process.rs for why this is load-bearing — and the same
+            // no-progress watchdog, so a misconfigured/unreachable blob store
+            // fails the read instead of hanging the mount for hours.
+            let label = file_id_hex.clone();
+            let stall_secs = crate::filter_process::cold_download_stall_secs();
             rt.bridge_sync(async move {
                 let session =
                     FileDownloadSession::new(Arc::new(translator), Some(cache_clone)).await?;
-                // Same `0..file_size` range cap as the smudge filter — see
-                // filter_process.rs for why this is load-bearing.
-                let (_id, _n) = session
-                    .download_to_writer(&info_clone, 0..file_size, dest_file)
-                    .await?;
-                Ok::<(), anyhow::Error>(())
+                crate::filter_process::download_cold(
+                    &session,
+                    &info_clone,
+                    file_size,
+                    dest_file,
+                    &label,
+                    stall_secs,
+                )
+                .await
             })
             .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 

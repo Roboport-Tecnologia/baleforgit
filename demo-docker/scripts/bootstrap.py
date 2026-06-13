@@ -60,6 +60,11 @@ MINIO_ROOT_PASSWORD={secrets.token_urlsafe(24)}
 # Bucket baleforgit-server reads/writes.
 BALE_S3_BUCKET=bale
 
+# Endpoint signed into the presigned download URLs clients fetch (the server
+# itself reaches MinIO in-network at minio:9000). Defaults to the published
+# localhost port; for a multi-host demo set a LAN IP / domain clients can reach.
+# BALE_S3_PUBLIC_ENDPOINT_URL=http://localhost:9000
+
 # ===== Host ports (change if any clash with something already running) ======
 # Container ports are fixed; these only move the published HOST side. Two are
 # special: MINIO_S3_PORT is published 1:1 because presigned URLs embed it, and

@@ -23,20 +23,7 @@ ports default to 3000 / 2222 / 8080 / 9000 / 9001 (none privileged) and are all
 overridable in the **Host ports** block `bootstrap` writes to `.env`; the URLs
 and examples below assume the defaults.
 
-## 1. One-time host setup
-
-S3 presigned URLs are signature-bound to the hostname they contain.
-baleforgit-server hands the client URLs like `http://minio:9000/...`, so the
-host has to resolve `minio` to localhost:
-
-```bash
-echo '127.0.0.1 minio' | sudo tee -a /etc/hosts
-```
-
-That's the only reason the entry is needed; the gitea and baleforgit-server APIs
-themselves work fine on `localhost` without it.
-
-## 2. Bring it up
+## 1. Bring it up
 
 ```bash
 cd demo-docker
@@ -58,7 +45,7 @@ once the bucket is made; `compose logs -f baleforgit-server` shows it listening.
 Open <http://localhost:3000>, register a user (sign-ups are open in the demo),
 and create a repository.
 
-## 3. Use git-bale against it
+## 2. Use git-bale against it
 
 From a fresh clone of that repository on the host:
 
@@ -76,6 +63,17 @@ git-bale auto-discovers the server URL via gitea's forge endpoints, mints a
 short-lived JWT, and uploads chunks to baleforgit-server, which streams them to
 MinIO. A checkout in a new clone gets back a presigned MinIO URL the client
 fetches directly.
+
+The server reaches MinIO in-network at `minio:9000`, but the client on the host
+can't resolve that name — so the presigned URLs it hands clients are signed
+against `BALE_S3_PUBLIC_ENDPOINT_URL` (default `http://localhost:9000`, the
+published port) instead. If you run the client from another machine, override it
+in `.env` with a LAN IP or domain those clients can reach:
+
+```bash
+echo 'BALE_S3_PUBLIC_ENDPOINT_URL=http://192.168.1.50:9000' >> .env
+podman compose up -d --force-recreate baleforgit-server
+```
 
 The MinIO console at <http://localhost:9001> takes the `MINIO_ROOT_USER` /
 `MINIO_ROOT_PASSWORD` values from `.env` (the password is random per bootstrap);

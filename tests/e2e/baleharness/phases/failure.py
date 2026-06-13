@@ -719,6 +719,125 @@ def phase_failure_s3_conndrop(
         server.stop()
 
 
+def phase_failure_s3_presign_unreachable(
+    *,
+    timings: Timings,
+    rt: Runtime,
+    image_tag: str,
+    work_root: Path,
+    client: ClientEnv,
+    ssh_public_key: str,
+    admin_token_hex: str,
+) -> None:
+    """A blob store the *server* can reach but the *client* can't — presigned
+    download URLs pointing at an unresolvable host — must fail the checkout fast,
+    not hang. Without the cold-path watchdog, xet-core classifies the "host not
+    found" DNS error as retryable and parks in a base-squared exponential backoff
+    (~2.5h on the 2nd retry), hanging `git checkout` silently for hours.
+
+    We point BALE_S3_PUBLIC_ENDPOINT_URL (presign-only) at a bogus host while the
+    server keeps writing to the real MinIO via the auto-injected
+    BALE_S3_ENDPOINT_URL, so push succeeds (server-side write) but a cold clone's
+    checkout fetches an unreachable presigned URL. With a short
+    BALE_DOWNLOAD_STALL_SECS the watchdog must abort promptly with its stall
+    error. S3-only: presigned URLs don't exist under the fs backend."""
+    backend = get_active_s3_backend()
+    if backend is None:
+        info("-- failure-s3-presign-unreachable: presigned URLs are S3-only; skipping")
+        return
+
+    phase_root = work_root / "failure-s3-presign-unreachable"
+    phase_root.mkdir()
+    data_root = phase_root / "data"
+    data_root.mkdir()
+    jwt_secret = secrets.token_bytes(32).hex()
+    transfer_secret = secrets.token_bytes(32).hex()
+
+    stall_secs = 8
+    # `.invalid` is reserved (RFC 6761) → guaranteed NXDOMAIN on the host where
+    # the client runs, so the presigned fetch fails to connect.
+    bogus_endpoint = "http://bale-presign-unreachable.invalid:9000"
+
+    server = start_container(
+        rt,
+        image_tag=image_tag,
+        data_root=data_root,
+        jwt_secret_hex=jwt_secret,
+        transfer_secret_hex=transfer_secret,
+        ssh_public_key=ssh_public_key,
+        test_repos=[f"{E2E_OWNER}/{E2E_REPO}"],
+        admin_token_hex=admin_token_hex,
+        name_suffix="presign-unreachable",
+        extra_env={"BALE_S3_PUBLIC_ENDPOINT_URL": bogus_endpoint},
+    )
+    try:
+        repo, env = init_repo_for_push(
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO,
+            name="presign-unreachable-client",
+        )
+        payload = deterministic_payload(4 * 1024 * 1024, seed=b"presign-unreachable")
+        (repo / "unreachable.bin").write_bytes(payload)
+        with timings.measure(
+            "failure-s3-presign-unreachable: push (server-side write)"
+        ):
+            git(["add", "unreachable.bin"], cwd=repo, env=env)
+            git(["commit", "-m", "presign unreachable"], cwd=repo, env=env)
+            git(["push", "-u", "origin", "main"], cwd=repo, env=env)
+
+        # Cold clone (separate worktree, empty chunk cache): the checkout's smudge
+        # falls to the cold path, gets a presigned URL on the bogus host, stalls.
+        clone_path, clone_env, _ = init_repo_for_clone(
+            work_root=work_root,
+            client=client,
+            server=server,
+            owner=E2E_OWNER,
+            repo=E2E_REPO,
+            name="presign-unreachable-clone",
+        )
+        clone_env = dict(clone_env)
+        clone_env["BALE_DOWNLOAD_STALL_SECS"] = str(stall_secs)
+
+        with timings.measure("failure-s3-presign-unreachable: checkout fails fast"):
+            start = time.monotonic()
+            res = git(
+                ["checkout", "main"],
+                cwd=clone_path,
+                env=clone_env,
+                capture=True,
+                expect_fail=True,
+            )
+            elapsed = time.monotonic() - start
+
+        if res.returncode == 0:
+            raise TestFailure(
+                "failure-s3-presign-unreachable: checkout unexpectedly succeeded "
+                "against an unreachable presign host"
+            )
+        stderr = res.stderr.decode("utf-8", "replace") if res.stderr else ""
+        if "stalled: no data received" not in stderr:
+            raise TestFailure(
+                "failure-s3-presign-unreachable: checkout failed but without the "
+                f"cold-path stall watchdog message; stderr was:\n{stderr}"
+            )
+        # The whole point: fail near the stall window, not on xet-core's
+        # multi-hour backoff. Generous margin for slow CI containers.
+        if elapsed > stall_secs + 30:
+            raise TestFailure(
+                f"failure-s3-presign-unreachable: checkout took {elapsed:.0f}s "
+                f"(stall={stall_secs}s) — the watchdog did not abort promptly"
+            )
+        info(
+            f"  failure-s3-presign-unreachable: checkout aborted in {elapsed:.0f}s "
+            f"with the stall error (stall={stall_secs}s)"
+        )
+    finally:
+        server.stop()
+
+
 def phase_failure_fs_write_fail(
     *,
     timings: Timings,

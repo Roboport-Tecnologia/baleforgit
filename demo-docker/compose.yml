@@ -152,12 +152,15 @@ services:
       BALE_TRANSFER_SECRET_HEX: ${BALE_TRANSFER_SECRET_HEX}
       # Delegate repo-access checks back to gitea (docker-internal address).
       BALE_AUTHZ_HTTP_URL: http://gitea:3000/-/bale
-      # Bundled MinIO. The endpoint host MUST match what the client resolves on
-      # the host (presigned URLs are signature-bound to it), hence the shared
-      # `minio` name backed by the /etc/hosts entry in README.md.
+      # Bundled MinIO. The server reaches it in-network at `minio:9000`, but the
+      # client on the host can't resolve that name — so presigned download URLs
+      # are signed against the public endpoint instead (host-reachable published
+      # port). For a multi-host demo, override BALE_S3_PUBLIC_ENDPOINT_URL with a
+      # LAN IP / domain clients can reach.
       BALE_S3_BUCKET: ${BALE_S3_BUCKET}
       BALE_S3_REGION: us-east-1
       BALE_S3_ENDPOINT_URL: http://minio:${MINIO_S3_PORT:-9000}
+      BALE_S3_PUBLIC_ENDPOINT_URL: ${BALE_S3_PUBLIC_ENDPOINT_URL:-http://localhost:${MINIO_S3_PORT:-9000}}
       BALE_S3_FORCE_PATH_STYLE: "true"
       # MinIO here runs without SSE-S3; tell the server not to request it.
       BALE_S3_DISABLE_SSE: "true"

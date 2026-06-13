@@ -89,6 +89,7 @@ from baleharness.phases.failure import (
     phase_failure_fs_concurrent_put,
     phase_failure_fs_write_fail,
     phase_failure_s3_conndrop,
+    phase_failure_s3_presign_unreachable,
     phase_failure_server_kill_mid_upload,
     phase_failure_transient_db,
 )
@@ -808,6 +809,17 @@ def main() -> int:
                 admin_token_hex=admin_token_hex,
             )
 
+        def _phase_failure_s3_presign_unreachable() -> None:
+            phase_failure_s3_presign_unreachable(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+                admin_token_hex=admin_token_hex,
+            )
+
         def _phase_failure_fs_writefail() -> None:
             phase_failure_fs_write_fail(
                 timings=timings,
@@ -1035,6 +1047,14 @@ def main() -> int:
             # Server↔storage drop — only meaningful with a remote blob store,
             # so it self-skips under the fs backend and runs only on --backend s3.
             "failure-s3-conndrop": ("g3", False, _phase_failure_s3_conndrop),
+            # Presign host the server can reach but the client can't: checkout
+            # must fail fast via the cold-path watchdog, not hang on xet-core's
+            # multi-hour retry backoff. S3-only (presigned URLs).
+            "failure-s3-presign-unreachable": (
+                "g3",
+                False,
+                _phase_failure_s3_presign_unreachable,
+            ),
             # fs BlobStore write_atomic integrity: a forced write failure must
             # leave nothing (no half-write, no tmp leak), then a clean restart
             # recovers; and two concurrent same-content pushes must converge to
