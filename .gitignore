@@ -31,6 +31,7 @@ __pycache__/
 # Local Claude Code config
 .claude/
 lfs-adapter/lfs-adapter
+prod-docker
 
 git-lfs
 gitea

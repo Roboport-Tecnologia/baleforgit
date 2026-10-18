@@ -4,7 +4,7 @@ This document covers operating the server side. For the user-facing client (`git
 
 ## Install
 
-Download the `bale-server-<version>-<target>` artifact for your platform from the [releases page](https://github.com/davidrios/baleforgit/releases): a `.tar.gz` on Linux, or a signed `.pkg` on macOS (installs `baleforgit-server` to `/usr/local/bin`). Verify the artifact before running it — see "Verifying release artifacts" below. To run it in a container, build your own image as shown under "Container".
+Download the `bale-server-<version>-<target>` artifact for your platform from the [releases page](https://github.com/Roboport-Tecnologia/baleforgit/releases): a `.tar.gz` on Linux, or a signed `.pkg` on macOS (installs `baleforgit-server` to `/usr/local/bin`). Verify the artifact before running it — see "Verifying release artifacts" below. To run it in a container, build your own image as shown under "Container".
 
 ## Quick start
 
@@ -103,7 +103,7 @@ Each release tarball is covered by a [SLSA Build Provenance v1](https://slsa.dev
 ```bash
 # Works on the file you just downloaded from the release page.
 gh attestation verify bale-server-<version>-<target>.tar.gz \
-  --repo davidrios/baleforgit
+  --repo Roboport-Tecnologia/baleforgit
 ```
 
 A passing verify means: the artifact was produced by this repo's GitHub Actions workflow at a specific commit, and nothing in transit has tampered with it. The release also ships a `SHA256SUMS` file covering every archive.
@@ -112,7 +112,7 @@ Each release additionally publishes an SPDX SBOM (`SBOM.spdx.json`) of the works
 
 ```bash
 gh attestation verify bale-server-<version>-<target>.tar.gz \
-  --repo davidrios/baleforgit \
+  --repo Roboport-Tecnologia/baleforgit \
   --predicate-type https://spdx.dev/Document
 ```
 
@@ -121,6 +121,6 @@ For verification that doesn't depend on GitHub's attestation API, `SHA256SUMS` i
 ```bash
 cosign verify-blob SHA256SUMS \
   --signature SHA256SUMS.sig --certificate SHA256SUMS.pem \
-  --certificate-identity-regexp 'https://github.com/davidrios/baleforgit/.*' \
+  --certificate-identity-regexp 'https://github.com/Roboport-Tecnologia/baleforgit/.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```

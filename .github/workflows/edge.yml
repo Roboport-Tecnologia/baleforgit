@@ -103,18 +103,18 @@ jobs:
             echo "---"
             echo "Verify a download's provenance:"
             echo '```'
-            echo "gh attestation verify <file> --repo davidrios/baleforgit"
+            echo "gh attestation verify <file> --repo Roboport-Tecnologia/baleforgit"
             echo '```'
             echo "Verify the dependency SBOM:"
             echo '```'
-            echo "gh attestation verify <file> --repo davidrios/baleforgit \\"
+            echo "gh attestation verify <file> --repo Roboport-Tecnologia/baleforgit \\"
             echo "  --predicate-type https://spdx.dev/Document"
             echo '```'
             echo "Verify the checksum signature (cosign keyless):"
             echo '```'
             echo "cosign verify-blob SHA256SUMS \\"
             echo "  --bundle SHA256SUMS.cosign.bundle \\"
-            echo "  --certificate-identity-regexp 'https://github.com/davidrios/baleforgit/.*' \\"
+            echo "  --certificate-identity-regexp 'https://github.com/Roboport-Tecnologia/baleforgit/.*' \\"
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
             echo '```'
           } > EDGE_BODY.md

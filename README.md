@@ -1,7 +1,7 @@
 # Bale for Git
 
-[![CI](https://github.com/davidrios/baleforgit/actions/workflows/ci.yml/badge.svg)](https://github.com/davidrios/baleforgit/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/davidrios/baleforgit?sort=semver)](https://github.com/davidrios/baleforgit/releases/latest)
+[![CI](https://github.com/Roboport-Tecnologia/baleforgit/actions/workflows/ci.yml/badge.svg)](https://github.com/Roboport-Tecnologia/baleforgit/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/Roboport-Tecnologia/baleforgit?sort=semver)](https://github.com/Roboport-Tecnologia/baleforgit/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 A Git filter driver that stores large files as **content-defined chunks** on a Bale CAS server. It's meant to be a replacement for `git-lfs`. It can use a backend server, you can run your own or pester your favourite git forge to implement it, or you can run totally offline.
@@ -13,7 +13,7 @@ This repo ships two binaries:
 
 ## Install
 
-Grab the `bale-client-<version>-<target>` artifact for your platform from the [releases page](https://github.com/davidrios/baleforgit/releases): a `.tar.gz` on Linux (unpack it and put `git-bale` on your `PATH`), a signed `.pkg` on macOS (run it — installs `git-bale` to `/usr/local/bin`), or a `.zip` on Windows. (The server ships separately as `bale-server-<version>-<target>`, Linux/macOS only.)
+Grab the `bale-client-<version>-<target>` artifact for your platform from the [releases page](https://github.com/Roboport-Tecnologia/baleforgit/releases): a `.tar.gz` on Linux (unpack it and put `git-bale` on your `PATH`), a signed `.pkg` on macOS (run it — installs `git-bale` to `/usr/local/bin`), or a `.zip` on Windows. (The server ships separately as `bale-server-<version>-<target>`, Linux/macOS only.)
 
 ## Usage
 
@@ -117,7 +117,7 @@ Defaults: cache directory is `$XDG_CACHE_HOME/bale/chunks` if set, otherwise `~/
 
 ## Self-hosting the server
 
-If you want to run your own CAS server (rather than point `git-bale` at someone else's), grab the `bale-server-<version>-<target>.tar.gz` artifact from the [releases page](https://github.com/davidrios/baleforgit/releases). See [`docs/SERVER.md`](docs/SERVER.md) for the quick start, env vars, and container instructions; [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md) for what your forge needs to expose so clients can auto-resolve.
+If you want to run your own CAS server (rather than point `git-bale` at someone else's), grab the `bale-server-<version>-<target>.tar.gz` artifact from the [releases page](https://github.com/Roboport-Tecnologia/baleforgit/releases). See [`docs/SERVER.md`](docs/SERVER.md) for the quick start, env vars, and container instructions; [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md) for what your forge needs to expose so clients can auto-resolve.
 
 ## Try it locally with Docker
 

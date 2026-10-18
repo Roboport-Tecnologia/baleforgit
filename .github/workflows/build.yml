@@ -200,7 +200,7 @@ jobs:
               cp "$RELDIR/$bin" "$root/usr/local/bin/$bin"
               SIGN=()
               [ -n "${SIGN_INSTALLER_IDENTITY:-}" ] && SIGN=(--sign "$SIGN_INSTALLER_IDENTITY")
-              pkgbuild --root "$root" --identifier "com.davidriosgomes.baleforgit.$comp" \
+              pkgbuild --root "$root" --identifier "com.baleforgit.$comp" \
                 --version "$VERSION" --install-location / ${SIGN[@]+"${SIGN[@]}"} "dist/$name.pkg"
             else
               [ "$OS" = windows ] && bin="$bin.exe"
