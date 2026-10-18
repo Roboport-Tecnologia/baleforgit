@@ -2,7 +2,9 @@
 
 Single-session record of the work done on the `filter.bale.process` clean
 path. Captured here so the next person picking up perf doesn't have to
-re-walk the dead ends.
+re-walk the dead ends. The numbers are a point-in-time snapshot; the
+current clean-cache design is described in
+[`ARCHITECTURE.md`](ARCHITECTURE.md#pointer-cache-clean-short-circuit).
 
 ## Problem statement
 
@@ -205,14 +207,8 @@ realistic file on the fast path.
   serial verify (no thread pool: data is already in RAM so memcpy + xxh3
   dominate and fan-out adds nothing). Bails on first mismatch.
 
-Tests in `clean_cache::tests`:
-
-- `in_memory_round_trips_and_matches_file_path_variant` — cross-checks the
-  two `compute_chunks*` implementations chunk-for-chunk so they can't
-  drift.
-- `in_memory_verify_detects_mid_chunk_edit`
-- `in_memory_verify_rejects_size_mismatch`
-- `in_memory_empty_file_yields_one_zero_chunk`
+The spill path is exercised end-to-end by the `spilled-clean` e2e phase,
+which caps `BALE_MAX_INLINE_CLEAN` at 1 MiB so a small file takes it.
 
 ## Results
 

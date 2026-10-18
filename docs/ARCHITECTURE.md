@@ -310,10 +310,14 @@ While the upload runs, `crates/git-bale/src/progress.rs` draws a single-line, gi
 `git-bale init-local [--store <path>] [--shared]` puts a repo into fully-local (no-server) mode. It:
 
 - Installs the `bale` filter driver + the gc hooks into local git config (same as the filter/gc portions of `install --local`, without the pre-push hook — nothing to drain).
-- Writes `bale.local=true` and `bale.localStore=<store>` into the repo's local git config.
+- Writes `bale.local=true` into the repo's local git config, plus `bale.localStore=<store>` only for a non-default store (the per-repo default is derived from the git dir, so a moved repo follows it — see *Store creation* above).
 - With `--shared`: also sets `bale.localShared=true` and registers the repo in `<store>/repos/` for `git-bale prune --shared`.
 
 Note: the existing `git-bale install --local` is unrelated — its `--local` refers to the git-config scope (as opposed to `--global`/`--system`); `init-local` is the command that enables no-server operation.
+
+**Design choices.** The mode is always explicit — there is no auto-fallback to local when a server is unreachable, so a misconfigured server never silently lands load-bearing data somewhere else — and a repo is either local or server-backed, never both. The store is the same xet-data `LocalClient` layout staging uses (`xet/xorbs/xorbs/default.<hex>`, `xet/xorbs/shards/<hex>.mdb`); local mode invents no format, it makes that directory durable and points clean/smudge/gc at it. Object data never lives in the volatile chunk cache, which stays a pure perf layer.
+
+**Limitations.** A per-repo store is not carried by `git clone` (even a same-machine `git clone /path/to/repo`), so the clone can't reconstruct its large files; use `--shared` for several working copies on one machine. There is no cross-repo refcounting: a shared store is append-only and reclaimed only by a manual `git-bale prune --shared`.
 
 **Config keys** (env overrides git-config in all cases):
 
@@ -551,20 +555,16 @@ Two numbers, both queryable by `GET /v1/usage/{owner}` (which returns JSON `{own
 
 ### Quota enforcement
 
-Quotas are **soft** — under concurrent uploads two writers can both pass the check then both succeed, slightly overshooting. That tradeoff buys us no extra locking on the hot path. Two enforcement points:
+Two enforcement points:
 
 1. **At `POST /v1/xorbs/{prefix}/{hash}`**: if the xorb already exists in CAS, the call is content-addressed-idempotent and skipped — re-pushes never reject. Otherwise we conservatively check `stored_bytes_for_owner + body.len() ≤ quota` and 413 on miss. This blocks the obvious "upload terabytes" failure mode at the door.
 2. **At `POST /shards`**: after xorb metadata is registered but *before* `register_files` (the atomic batch), we compute the projected post-commit stored bytes — current stored plus the on-disk sizes of xorbs the owner doesn't already reference (`unaccounted_xorb_bytes_for_owner`). 413 on miss, and `register_files` never runs, so no file rows are left behind.
 
 The second check is load-bearing because the first one's "skip if exists" shortcut would otherwise let an owner gain attributable bytes by referencing someone else's xorb without paying.
 
-### Configuration
-
 **Quota accounting covers unreferenced uploads, and the shard-time check is atomic.** Each uploaded xorb is charged to its first uploader (`xorb_uploads`) until some file references it, so `stored_bytes` includes an owner's orphan uploads. That closes the "POST xorbs, never send a shard" bypass. `register_files` rechecks usage inside its own transaction (SQLite `BEGIN IMMEDIATE`; Postgres a per-owner advisory lock taken before any per-file lock) and refuses, with `QuotaExceeded` → 413, a batch that grew usage past the limit, so concurrent shards can't each pass a separate pre-check. New xorbs are charged *before* their blob is written: `reserve_xorb_upload` checks the quota and inserts the charge in one per-owner-serialized transaction, sized at the upper bound (body size). The charge is settled to the stored body's on-disk size afterwards, or released if the write fails. So concurrent uploads can't jointly overshoot either. A reservation whose blob never landed (crash) stops counting after an hour. The shard-time delta excludes xorbs the owner already pays for as its own uploads, so a push isn't charged twice, and only a registration that grows usage is ever refused.
 
-**No server-side GC, deliberately.** Nothing is ever deleted. A blob GC can race a client that just learned the blob from a dedup response and is registering a shard against it, which would leave a registered file pointing at a deleted blob, i.e. data loss. Making that safe needs tombstones checked inside `register_files` plus a long grace, and isn't implemented. Disk growth is bounded by quotas (orphans included), so set `BALE_DEFAULT_QUOTA_BYTES`.
-
-Request bodies have a 60 s **idle** (per-frame) timeout, so a slow-but-steady upload is fine but a stalled one is dropped. Connections have a 30 s header-read timeout and are closed gracefully after 10 minutes (in-flight requests get 15 more minutes, then the connection is dropped, so a peer that never reads its responses can't pin it), so an idle HTTP/2 connection kept alive by pings can't hold a slot forever. A connection's global and per-IP slots are released by a drop guard, so a panicking handler can't leak them. The server holds at most 4096 open connections, and at most `BALE_MAX_CONNECTIONS_PER_IP` (default 512) per client IP (an IPv6 client counts per /64, since it usually controls the whole prefix); HTTP/2 connections allow 32 concurrent streams, and per-IP rejections are logged at most every 10 s. `/v1/xorbs` has a 110 s and `/shards` a 300 s per-request deadline. All of this lives in `serve_http` in `bale-server-bin`, which serves over hyper-util because `axum::serve` exposes none of these limits. Shutdown stops accepting, drains connections, then waits for detached xorb commits (a `TaskTracker`). A reverse proxy in front is still recommended for TLS and per-client rate limits.
+### Configuration
 
 `BALE_DEFAULT_QUOTA_BYTES` sets the fallback limit applied when no per-owner override exists. Per-owner overrides (set via `PUT /v1/quotas/{owner}`) take precedence; `null` clears the override and falls back to the default. If neither is set, the owner is unlimited.
 
@@ -573,6 +573,14 @@ Over-quota uploads reject with **413** and a `storage quota exceeded` message. N
 The admin endpoint is gated by `BALE_ADMIN_TOKEN_HEX` (a 64-char hex string decoding to 32 bytes). When unset, the route returns 404 — the wire surface advertises that admin is disabled rather than 401-ing. Comparison is constant-time. The admin bearer is **not** a Bale JWT and the endpoint sits outside the JWT middleware.
 
 `GET /v1/usage/{owner}` accepts either a **write**-scope Bale JWT for a repo of that owner (the token's `repo.owner()` must equal the URL segment, so an `alice/x` token can't enumerate bob's usage, and a read-only collaborator can't read owner-wide totals that span private repos) or the admin bearer (which bypasses the scope check so an operator dashboard can read every owner). `GET /v1/usage/repo/{owner}/{repo}` requires a token for exactly that repo, so it can't be used to probe whether a sibling private repo exists. The admin routes cap request bodies at 4 KiB, and `PUT /v1/quotas` parses its body only after the bearer check. The handler does this auth inline rather than going through the JWT middleware, so the admin bearer doesn't have to be a valid JWT.
+
+### No server-side GC
+
+Nothing is ever deleted. A blob GC can race a client that just learned the blob from a dedup response and is registering a shard against it, which would leave a registered file pointing at a deleted blob, i.e. data loss. Making that safe needs tombstones checked inside `register_files` plus a long grace, and isn't implemented. Disk growth is bounded by quotas (orphans included), so set `BALE_DEFAULT_QUOTA_BYTES`.
+
+## Connection and request limits
+
+Request bodies have a 60 s **idle** (per-frame) timeout, so a slow-but-steady upload is fine but a stalled one is dropped. Connections have a 30 s header-read timeout and are closed gracefully after 10 minutes (in-flight requests get 15 more minutes, then the connection is dropped, so a peer that never reads its responses can't pin it), so an idle HTTP/2 connection kept alive by pings can't hold a slot forever. A connection's global and per-IP slots are released by a drop guard, so a panicking handler can't leak them. The server holds at most 4096 open connections, and at most `BALE_MAX_CONNECTIONS_PER_IP` (default 512) per client IP (an IPv6 client counts per /64, since it usually controls the whole prefix); HTTP/2 connections allow 32 concurrent streams, and per-IP rejections are logged at most every 10 s. `/v1/xorbs` has a 110 s and `/shards` a 300 s per-request deadline. All of this lives in `serve_http` in `bale-server-bin`, which serves over hyper-util because `axum::serve` exposes none of these limits. Shutdown stops accepting, drains connections, then waits for detached xorb commits (a `TaskTracker`). A reverse proxy in front is still recommended for TLS and per-client rate limits.
 
 ## Signed transfer URLs
 

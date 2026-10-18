@@ -37,12 +37,14 @@ crates/
 ├── bale-server-storage-s3/   # BlobStore on any S3-compatible API (real presigned URLs)
 ├── bale-server-meta-sqlite/  # MetadataStore on SQLite
 ├── bale-server-meta-postgres/# MetadataStore on Postgres (BALE_POSTGRES_URL)
+├── bale-server-meta-common/  # Row decoders + conversions shared by the SQLite and Postgres stores
 ├── bale-server-authz-mem/    # In-memory RepoAuthz (AlwaysAllow, ConfigAuthz)
 ├── bale-server-authz-http/   # RepoAuthz that delegates check_repo_access to an HTTP upstream
 ├── bale-server-tokens/       # HS256 Xet JWT mint/verify
 ├── bale-server-http/         # Axum router, handlers, middleware
 ├── bale-server-bin/          # The `baleforgit-server` binary
-└── git-bale/                 # Native Git filter (filter.bale.process driver)
+├── git-bale/                 # Native Git filter (filter.bale.process driver)
+└── bale-e2e-tools/           # Test-only: crafts xorbs/shards with xet's hashing for the e2e harness
 ```
 
 `git-bale` depends on `xet-data`, `xet-client`, `xet-core-structures`, and `xet-runtime` from crates.io, pinned to `=1.5.2`. The sibling `xet-core/` clone is a source reference only — the workspace `Cargo.toml` `exclude`s it from `cargo build --workspace`.
@@ -53,13 +55,15 @@ There are **no Rust unit or integration tests**. `cargo test --workspace` builds
 
 ## Out-of-band full e2e harness
 
-`tests/e2e/run.py` is a Python harness that exercises the release `git-bale` binary against a podman container bundling `baleforgit-server` + `openssh-server`. It runs end-to-end over real SSH (both git push/clone and the Bale forge-auth handshake), covers the user-facing operations (stage / unstage / stash / pop / commit / push / clone) on a 35 MB binary with two slight modifications, verifies the `/v1/usage/...` API numbers agree with on-disk storage, and includes adversarial cases (wrong token, tampered xorb on disk, quota exceeded, and `upload-guards`: direct-HTTP negative tests of the upload-time xorb integrity gate, the signed transfer-URL guards, and write-scope enforcement). Prints a per-phase timing + throughput summary at the end.
+`tests/e2e/run.py` is a Python harness that exercises the release `git-bale` binary against a podman container bundling `baleforgit-server` + `openssh-server`. It runs end-to-end over real SSH (both git push/clone and the Bale forge-auth handshake), covers the user-facing operations (stage / unstage / stash / pop / commit / push / clone) on a 35 MB binary with two slight modifications, verifies the `/v1/usage/...` API numbers agree with on-disk storage, and includes adversarial cases (wrong token, tampered xorb, quota exceeded, upload/shard integrity guards, signed transfer-URL guards, write-scope enforcement, quota races) plus the no-server fully-local phases. Prints a per-phase timing + throughput summary at the end.
 
 It is **not** invoked by `cargo test --workspace` — run it explicitly, and only after producing a release binary:
 
 ```bash
-cargo build --release -p git-bale
-python3 tests/e2e/run.py
+cargo build --release -p git-bale -p bale-e2e-tools
+python3 tests/e2e/run.py                  # fs blob store + SQLite
+python3 tests/e2e/run.py --backend s3     # the whole suite on an S3 (MinIO) blob store
+python3 tests/e2e/run.py --meta postgres  # the whole suite on a Postgres metadata store (composes with --backend s3)
 ```
 
 The harness exits 77 when the environment can't host it (no podman daemon, no release binary, etc.), so CI can distinguish "skipped" from "failed". See [`tests/e2e/README.md`](../tests/e2e/README.md) for full prereqs, flags, and the phase list.

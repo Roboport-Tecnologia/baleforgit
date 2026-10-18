@@ -31,13 +31,14 @@ filter-process subprocess Git invokes on staging (`clean`) and
 checkout (`smudge`). Both directions live in
 `crates/git-bale/src/filter_process.rs`:
 
-- **Clean** (`do_clean` → `handle_clean`): we already spool the input
-  bytes from Git's pkt-line stream into a `NamedTempFile` so we can
-  hand a path to `clean_file`. Insert the transform between spooling
-  and `FileUploadSession::new`: if the spooled bytes look like a
-  supported container, write a SMART_BLOB to a second tempfile and
-  feed *that* path to `clean_file`. The resulting `XetFileInfo`
-  describes the SMART_BLOB.
+- **Clean** (`do_clean` → `handle_clean` / `handle_clean_in_memory`):
+  the input is drained from Git's pkt-line stream into memory, spilling
+  to a `NamedTempFile` past `MAX_INLINE_CLEAN` (see
+  [`ARCHITECTURE.md`](ARCHITECTURE.md#pointer-cache-clean-short-circuit)).
+  Insert the transform between the drain and `FileUploadSession::new`:
+  if the payload looks like a supported container, build a SMART_BLOB
+  and clean *that* instead. The resulting `XetFileInfo` describes the
+  SMART_BLOB.
 - **Smudge** (`handle_smudge` → `finish_smudge`): we already write
   reconstructed bytes to a `NamedTempFile` before pkt-lining them
   back to Git. Insert the inverse transform between writing the
@@ -258,7 +259,7 @@ exactly which deflate params to use.
 
 ## Opt-in / rollout
 
-Per-repo opt-in via a git config key, e.g. `dfs.smartDedup = gzip`
+Per-repo opt-in via a git config key, e.g. `bale.smartDedup = gzip`
 (parallel to the existing `bale.serverUrl` / `bale.token` /
 `bale.cacheDir` set read by `crates/git-bale/src/config.rs`).
 `filter-process` would read it on startup through the same
@@ -267,7 +268,7 @@ This lets a user enable smart dedup for one repo storing `.blend`
 files without affecting any other Bale workflow on the same machine.
 
 `git-bale install` and `git-bale track` need no changes — they
-configure the filter; the filter reads `dfs.smartDedup` per
+configure the filter; the filter reads `bale.smartDedup` per
 invocation.
 
 ## Open questions
@@ -282,15 +283,15 @@ invocation.
    `.blend` files saved by multiple Blender versions, plus a
    round-trip test that asserts bit-exact reconstruction. Pulling real
    Blender into CI is heavy — probably commit a small set of
-   pre-generated fixtures and add an `m13_smart_dedup.rs` integration
-   test that drives `git add` / `git checkout` against a
-   smart-dedup-enabled repo and asserts (a) staged blob is a JSON
+   pre-generated fixtures and add an e2e phase under `tests/e2e/`
+   (there are no Rust tests) that drives `git add` / `git checkout`
+   against a smart-dedup-enabled repo and asserts (a) staged blob is a JSON
    pointer, (b) checkout bytes equal original bytes, (c) two
    near-identical inputs share most chunks at the xorb level.
 3. **Streaming vs buffering.** A 2 GB `.blend` would need to be
    inflated to disk before the parameter sweep can run on it.
    Tempfile in the same filesystem as the input (same approach
-   `do_clean` already takes for spooling) is the obvious answer but
+   `do_clean` already takes for spilled payloads) is the obvious answer but
    adds 2× disk usage during clean. Acceptable for v1; revisit if it
    becomes a complaint.
 4. **What's the actual measured dedup win on a typical Blender
@@ -300,7 +301,7 @@ invocation.
    block order on save), the whole design needs a rethink — possibly
    a format-aware chunker that knows Blender's block structure, which
    is a much bigger lift.
-5. **Should `dfs.smartDedup` ever be auto-set?** E.g. flipped on
+5. **Should `bale.smartDedup` ever be auto-set?** E.g. flipped on
    automatically when `git-bale track '*.blend'` runs. Probably no —
    explicit opt-in is safer, especially while the transform is
    experimental.

@@ -4,6 +4,12 @@ A pass over every crate in the workspace looking for places where user data coul
 
 Treat this as a snapshot in time — line numbers will drift. Re-verify before acting on any specific finding.
 
+## Status (re-checked 2026-10-17)
+
+**Resolved:** #1 (xorb layout is derived from the verified blob; a failed write can't pin it — `xorb-layout-heal`), #2 (quota check and `put_shard` precede `register_files`), #3 (every smudge path verifies size + `sha256` before success, and bad bytes never reach the clean-cache), #5 (term bounds checked), #8 (fs store fsyncs the tmp before `link(2)`; `git-bale` writes go through `fs_util::write_durable`), #9 (`busy_timeout` 30 s; `failure-dbbusy`), #11 (clean fsyncs new xorbs/shards and validates referenced xorbs before writing the marker), #12 (`quota-atomic`), #13 in part (tokens carry and require `iss`/`aud`), shard magic validated and shard verification hashes checked (`shard-guards`), `HttpAuthz` redirects disabled, dedup index built only from server-verified chunk hashes. Test gaps 1–5 are covered by `upload-guards`, `quota-atomic`, `failure-s3-conndrop` and `failure-dbbusy`.
+
+**Still as described:** #4 (clean-cache chunk fingerprints are xxh3-64, by design as change detection), #6 (no checksum header on S3 PUTs), #7 in part (`http://` still accepted for `BALE_AUTHZ_HTTP_URL`), #10 (`BALE_DATA_ROOT` defaults to `./xet-data`), `now_unix()` falls back to 0, `RangeJson` serves both range kinds, the S3 `head_bucket` probe only warns, and an unset `BALE_PUBLIC_URL` only warns (and only beyond loopback).
+
 ---
 
 ## Consolidated findings

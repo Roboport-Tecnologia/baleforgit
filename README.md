@@ -101,7 +101,10 @@ Requires a userspace filesystem driver at runtime (not at build time): `libfuse2
 | env        | `BALE_TOKEN`            | Pre-minted Bale JWT — with `BALE_SERVER_URL`, skips forge auto-resolve |
 | env        | `BALE_TOKEN_EXPIRATION` | Unix timestamp when `BALE_TOKEN` expires                      |
 | env        | `BALE_CACHE_DIR`        | Override the shared chunk cache location                      |
-| env        | `XDG_CACHE_HOME`        | Used to derive the default cache dir                          |
+| env        | `XDG_CACHE_HOME`        | Used to derive the default cache dirs                         |
+| env        | `BALE_XET_CACHE`        | Override xet's own cache dir (default `<cache>/bale/xet`)     |
+| env        | `BALE_DOWNLOAD_STALL_SECS` | Abort a checkout download after this many seconds with no bytes (default 30, `0` disables) |
+| env        | `BALE_GC_GRACE_SECS`    | `git-bale gc` never reclaims content cleaned more recently than this (default 2 weeks) |
 | git config | `bale.serverUrl`        | Same as `BALE_SERVER_URL`                                     |
 | git config | `bale.token`            | Same as `BALE_TOKEN`                                          |
 | git config | `bale.tokenExpiration`  | Same as `BALE_TOKEN_EXPIRATION`                               |
@@ -142,6 +145,8 @@ Bale for Git is a Git large-file system that does content-defined chunking + chu
 - [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md) — what a git forge has to implement to support `git-bale`.
 - [`docs/STATUS.md`](docs/STATUS.md) — feature breakdown with what each piece provides.
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — building from source, the test matrix, CI workflows, and how releases are cut.
+- [`tests/e2e/README.md`](tests/e2e/README.md) — the end-to-end harness and its phase list.
+- Design notes: [`docs/CLEAN_FILTER_PERF.md`](docs/CLEAN_FILTER_PERF.md) (clean-path profiling and why the pointer cache looks the way it does), [`docs/SMART_DEDUP.md`](docs/SMART_DEDUP.md) (unimplemented proposal: decompress gzip containers before chunking), [`docs/DATA_LOSS_AUDIT.md`](docs/DATA_LOSS_AUDIT.md) (2026-05 data-loss audit with current fix status).
 
 ## License
 
