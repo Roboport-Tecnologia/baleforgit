@@ -157,6 +157,12 @@ class TcpProxy:
             ls, self._listen_sock = self._listen_sock, None
             active, self._active = self._active, []
         if ls is not None:
+            # On Linux close() alone doesn't wake the blocked accept(), so the
+            # socket stays LISTENing and the next start() hits EADDRINUSE.
+            try:
+                ls.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 ls.close()
             except OSError:
