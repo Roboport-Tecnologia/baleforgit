@@ -28,8 +28,8 @@ import shutil
 import sys
 import tempfile
 import traceback
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 from baleharness.client import ClientEnv, setup_client
 from baleharness.config import (
@@ -40,13 +40,13 @@ from baleharness.config import (
     E2E_REPO_2,
     E2E_REPO_3,
     E2E_REPO_CHURN,
-    E2E_REPO_GC1,
-    E2E_REPO_GC2,
     E2E_REPO_COLD_A,
     E2E_REPO_COLD_B,
     E2E_REPO_COLD_STAGED_A,
     E2E_REPO_COLD_STAGED_B,
     E2E_REPO_COMPRESS,
+    E2E_REPO_GC1,
+    E2E_REPO_GC2,
     E2E_REPO_GC3,
     E2E_REPO_MERGE_A,
     E2E_REPO_MR_A,
@@ -67,6 +67,11 @@ from baleharness.coverage import (
 from baleharness.covstate import set_coverage
 from baleharness.jwtutil import mint_bale_jwt
 from baleharness.logutil import TestFailure, die, info, skip, warn
+from baleharness.pgbackend import (
+    ActivePostgresBackend,
+    PostgresGuard,
+    set_active_postgres_backend,
+)
 from baleharness.phases.adversarial import (
     phase_adversarial_quota_admin,
     phase_adversarial_quota_exceeded,
@@ -99,14 +104,28 @@ from baleharness.phases.gc import (
     phase_gc_mixed,
 )
 from baleharness.phases.local import (
+    phase_local_autostash,
     phase_local_basic,
     phase_local_cache_hit_gc_race,
     phase_local_clean_gc_race,
     phase_local_concurrent_stress,
     phase_local_gc_abandon,
     phase_local_gc_grace,
+    phase_local_in_gitdir_store_claim,
+    phase_local_moved_repo,
+    phase_local_moved_shared_repo,
+    phase_local_pointer_passthrough,
+    phase_local_prune_cross_repo,
+    phase_local_prune_force_moved,
+    phase_local_prune_missing_repo,
     phase_local_prune_shared,
+    phase_local_reclone_same_path,
     phase_local_shared_dedup,
+    phase_local_stash_reflog,
+    phase_local_store_owner,
+    phase_local_store_switch,
+    phase_local_tampered_store,
+    phase_local_worktree_gc,
 )
 from baleharness.phases.mount import (
     phase_mount_diff,
@@ -118,6 +137,8 @@ from baleharness.phases.progress import phase_progress_demo
 from baleharness.phases.push_pending import (
     phase_push_pending_corrupt_staging,
     phase_push_pending_noop,
+    phase_push_pending_noverify_heal,
+    phase_push_pending_only_pushed,
 )
 from baleharness.phases.resync import phase_resync_after_cas_wipe
 from baleharness.phases.scenario import (
@@ -137,15 +158,22 @@ from baleharness.phases.scenario import (
     phase_term_list_merge,
     phase_usage_api,
 )
+from baleharness.phases.server_guards import (
+    phase_canonical_scope,
+    phase_dedup_repeated_chunk,
+    phase_fetch_overlap,
+    phase_file_hasher_selfcheck,
+    phase_global_dedup_hit,
+    phase_large_file,
+    phase_oversize_xorb,
+    phase_quota_atomic,
+    phase_shard_guards,
+    phase_xorb_layout_heal,
+)
 from baleharness.phases.track import phase_track
 from baleharness.proc import pick_free_port, tool_on_path
 from baleharness.registry import PHASE_GROUPS_ORDER, order_within_group
 from baleharness.runtime import build_image, detect_runtime, image_exists
-from baleharness.pgbackend import (
-    ActivePostgresBackend,
-    PostgresGuard,
-    set_active_postgres_backend,
-)
 from baleharness.s3backend import (
     ActiveS3Backend,
     MinioGuard,
@@ -157,7 +185,7 @@ from baleharness.state import STATE_FILE, load_state, save_state
 from baleharness.timing import Timings
 
 
-def resolve_git_bale(arg_path: Optional[str]) -> Path:
+def resolve_git_bale(arg_path: str | None) -> Path:
     candidates: list[Path] = []
     if arg_path:
         candidates.append(Path(arg_path))
@@ -312,7 +340,7 @@ def main() -> int:
     # the profile dir into every server container. The prod (default) path
     # is unchanged.
     image_tag = args.image_tag
-    cov: Optional[CoverageConfig] = None
+    cov: CoverageConfig | None = None
     if args.coverage:
         if args.image_tag != DEFAULT_IMAGE_TAG:
             die(
@@ -364,7 +392,7 @@ def main() -> int:
     if args.order == "random":
         info(f"random seed: {rng_seed}")
 
-    reused: Optional[dict] = None
+    reused: dict | None = None
     delete_tmpdir_on_exit = True
     if args.reuse_from:
         tmpdir = Path(args.reuse_from).resolve()
@@ -420,12 +448,12 @@ def main() -> int:
     )
 
     timings = Timings()
-    server: Optional[ServerHandle] = None
-    client: Optional[ClientEnv] = None
+    server: ServerHandle | None = None
+    client: ClientEnv | None = None
     # S3 and Postgres sidecars share one per-run podman network.
-    shared_network: Optional[Network] = None
-    s3_minio: Optional[MinioGuard] = None
-    pg_guard: Optional[PostgresGuard] = None
+    shared_network: Network | None = None
+    s3_minio: MinioGuard | None = None
+    pg_guard: PostgresGuard | None = None
     exit_code = 0
     rev_state: dict = {}
     if reused is not None:
@@ -570,6 +598,22 @@ def main() -> int:
 
         def _phase_pp_corrupt() -> None:
             phase_push_pending_corrupt_staging(
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+            )
+
+        def _phase_pp_only_pushed() -> None:
+            phase_push_pending_only_pushed(
+                timings=timings,
+                server=server,
+                client=client,
+                work_root=work_root,
+            )
+
+        def _phase_pp_noverify() -> None:
+            phase_push_pending_noverify_heal(
                 timings=timings,
                 server=server,
                 client=client,
@@ -741,6 +785,106 @@ def main() -> int:
                 client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
+            )
+
+        def _phase_shard_guards() -> None:
+            phase_shard_guards(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+            )
+
+        def _phase_global_dedup_hit() -> None:
+            phase_global_dedup_hit(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+            )
+
+        def _phase_oversize_xorb() -> None:
+            phase_oversize_xorb(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+            )
+
+        def _phase_large_file() -> None:
+            phase_large_file(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+            )
+
+        def _phase_dedup_repeated_chunk() -> None:
+            phase_dedup_repeated_chunk(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+            )
+
+        def _phase_file_hasher_selfcheck() -> None:
+            phase_file_hasher_selfcheck(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+            )
+
+        def _phase_canonical_scope() -> None:
+            phase_canonical_scope(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+            )
+
+        def _phase_quota_atomic() -> None:
+            phase_quota_atomic(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+            )
+
+        def _phase_fetch_overlap() -> None:
+            phase_fetch_overlap(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
+            )
+
+        def _phase_layout_heal() -> None:
+            phase_xorb_layout_heal(
+                timings=timings,
+                rt=rt,
+                image_tag=image_tag,
+                work_root=work_root,
+                client=client,
+                ssh_public_key=ssh_public_key,
             )
 
         def _phase_upload_guards() -> None:
@@ -947,6 +1091,68 @@ def main() -> int:
                 timings=timings, client=client, work_root=work_root
             )
 
+        def _phase_local_stash() -> None:
+            phase_local_stash_reflog(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_worktree() -> None:
+            phase_local_worktree_gc(timings=timings, client=client, work_root=work_root)
+
+        def _phase_local_xrepo() -> None:
+            phase_local_prune_cross_repo(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_autostash() -> None:
+            phase_local_autostash(timings=timings, client=client, work_root=work_root)
+
+        def _phase_local_prune_missing() -> None:
+            phase_local_prune_missing_repo(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_owner() -> None:
+            phase_local_store_owner(timings=timings, client=client, work_root=work_root)
+
+        def _phase_local_moved() -> None:
+            phase_local_moved_shared_repo(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_reclone() -> None:
+            phase_local_reclone_same_path(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_gitdir_claim() -> None:
+            phase_local_in_gitdir_store_claim(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_passthrough() -> None:
+            phase_local_pointer_passthrough(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_moved_repo() -> None:
+            phase_local_moved_repo(timings=timings, client=client, work_root=work_root)
+
+        def _phase_local_store_switch() -> None:
+            phase_local_store_switch(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_force_moved() -> None:
+            phase_local_prune_force_moved(
+                timings=timings, client=client, work_root=work_root
+            )
+
+        def _phase_local_tampered() -> None:
+            phase_local_tampered_store(
+                timings=timings, client=client, work_root=work_root
+            )
+
         def _phase_local_cachehit() -> None:
             phase_local_cache_hit_gc_race(
                 timings=timings, client=client, work_root=work_root
@@ -1024,6 +1230,35 @@ def main() -> int:
             # Direct HTTP negative tests of the upload integrity gate, signed
             # transfer-URL guards, and write-scope enforcement. Own container, g3.
             "upload-guards": ("g3", False, _phase_upload_guards),
+            # Proof-of-possession on shard registration, dedup-index poisoning,
+            # LZ4 bomb, and two-encoding xorb races. Own container, g3.
+            "shard-guards": ("g3", False, _phase_shard_guards),
+            # A failed blob write must not pin its frame layout over a later,
+            # differently-compressed upload of the same xorb. fs-only, g3.
+            "xorb-layout-heal": ("g3", False, _phase_layout_heal),
+            # A fresh-cache second user pushing already-stored content must
+            # global-dedup (zero xorb uploads) and pass shard verification. g3.
+            "global-dedup-hit": ("g3", False, _phase_global_dedup_hit),
+            # A legit xorb whose serialized size exceeds 64 MiB (raw chunks +
+            # headers) must upload. Own container, g3.
+            "oversize-xorb": ("g3", False, _phase_oversize_xorb),
+            # 600 MiB: past xet's 2 × 256 MiB block threshold, so the client
+            # fetches reconstructions by Range. Own container, g3.
+            "large-file": ("g3", False, _phase_large_file),
+            # Overlapping terms within one xorb need disjoint fetch entries
+            # (crafted with bale-e2e-tools). Own container, g3.
+            "fetch-overlap": ("g3", False, _phase_fetch_overlap),
+            # A xorb repeating a chunk: dedup responses must keep every chunk
+            # position (crafted with bale-e2e-tools). Own container, g3.
+            "dedup-repeated-chunk": ("g3", False, _phase_dedup_repeated_chunk),
+            # Concurrent shards can't jointly overshoot a quota; unreferenced
+            # uploads are charged (crafted with bale-e2e-tools). Own container, g3.
+            "quota-atomic": ("g3", False, _phase_quota_atomic),
+            # The forge's canonical scope key + accounting owner win over the
+            # typed name; survives a transfer. Mock /check_access, g3.
+            "canonical-scope": ("g3", False, _phase_canonical_scope),
+            # Incremental merkle hasher == xet's file_hash (no container).
+            "file-hasher-selfcheck": ("g3", False, _phase_file_hasher_selfcheck),
             # Public repo cloneable without credentials: the resolver probes the
             # forge anonymously first for op=download and only falls back to
             # `git credential fill` on 401. Own container + mock forge, so g3.
@@ -1076,6 +1311,8 @@ def main() -> int:
             "gc-abandon-checkout": ("g3", False, _phase_gc_abandon),
             "gc-keeps-unpushed": ("g3", False, _phase_gc_keep),
             "gc-mixed": ("g3", False, _phase_gc_mixed),
+            "push-pending-only-pushed": ("g3", False, _phase_pp_only_pushed),
+            "push-pending-noverify-heal": ("g3", False, _phase_pp_noverify),
             # Sustained churn: many edit→commit→push rounds against ONE reused
             # repo, with cold clones at several rounds that reconstruct the full
             # accumulated history. Integrity + server health checked every push.
@@ -1105,6 +1342,23 @@ def main() -> int:
             # update. Fails without the lock-before-cache-load fix.
             "local-cache-hit-gc-race": ("g3", False, _phase_local_cachehit),
             "local-gc-grace": ("g3", False, _phase_local_grace),
+            # Reflogs are live (stash@{1}), linked worktrees share one inventory,
+            # prune keeps content referenced only by another repo, and smudge
+            # refuses corrupt store content.
+            "local-stash-reflog": ("g3", False, _phase_local_stash),
+            "local-worktree-gc": ("g3", False, _phase_local_worktree),
+            "local-prune-cross-repo": ("g3", False, _phase_local_xrepo),
+            "local-tampered-store": ("g3", False, _phase_local_tampered),
+            "local-autostash": ("g3", False, _phase_local_autostash),
+            "local-prune-missing-repo": ("g3", False, _phase_local_prune_missing),
+            "local-store-owner": ("g3", False, _phase_local_owner),
+            "local-moved-shared-repo": ("g3", False, _phase_local_moved),
+            "local-reclone-same-path": ("g3", False, _phase_local_reclone),
+            "local-in-gitdir-store-claim": ("g3", False, _phase_local_gitdir_claim),
+            "local-pointer-passthrough": ("g3", False, _phase_local_passthrough),
+            "local-moved-repo": ("g3", False, _phase_local_moved_repo),
+            "local-store-switch": ("g3", False, _phase_local_store_switch),
+            "local-prune-force-moved": ("g3", False, _phase_local_force_moved),
         }
 
         # Build the within-group lists in declaration order, then apply
@@ -1146,7 +1400,7 @@ def main() -> int:
         if args.only:
             info(f"--only active: running only {args.only}")
 
-        def filtered_out(name: str) -> Optional[str]:
+        def filtered_out(name: str) -> str | None:
             """Reason `name` is excluded by --skip / --only, or None to run it."""
             if name in args.skip:
                 return "per --skip"

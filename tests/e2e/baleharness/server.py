@@ -10,7 +10,6 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from baleharness.config import (
     BROWSER_DL_JWT,
@@ -24,12 +23,12 @@ from baleharness.config import (
 )
 from baleharness.covstate import get_coverage
 from baleharness.logutil import TestFailure, info
-from baleharness.proc import dir_size_bytes, pick_free_port
-from baleharness.runtime import Runtime, host_mount_path
 from baleharness.pgbackend import (
     db_for_data_root,
     get_active_postgres_backend,
 )
+from baleharness.proc import dir_size_bytes, pick_free_port
+from baleharness.runtime import Runtime, host_mount_path
 from baleharness.s3backend import (
     S3StorageView,
     get_active_s3_backend,
@@ -48,7 +47,7 @@ class ServerHandle:
     public_host_url: str
     # Set in S3 mode: a bucket-prefix view that answers disk_*_bytes from
     # MinIO instead of the (empty) local data_root/xorbs tree.
-    s3_view: Optional[S3StorageView] = None
+    s3_view: S3StorageView | None = None
 
     @property
     def healthz_url(self) -> str:
@@ -111,14 +110,14 @@ def start_container(
     transfer_secret_hex: str,
     ssh_public_key: str,
     test_repos: list[str],
-    cas_port: Optional[int] = None,
-    ssh_port: Optional[int] = None,
-    quota_bytes: Optional[int] = None,
-    admin_token_hex: Optional[str] = None,
-    name_suffix: Optional[str] = None,
-    public_host_url_override: Optional[str] = None,
-    extra_env: Optional[dict[str, str]] = None,
-    extra_run_args: Optional[list[str]] = None,
+    cas_port: int | None = None,
+    ssh_port: int | None = None,
+    quota_bytes: int | None = None,
+    admin_token_hex: str | None = None,
+    name_suffix: str | None = None,
+    public_host_url_override: str | None = None,
+    extra_env: dict[str, str] | None = None,
+    extra_run_args: list[str] | None = None,
 ) -> ServerHandle:
     cas_port = cas_port or pick_free_port()
     ssh_port = ssh_port or pick_free_port()
@@ -160,7 +159,7 @@ def start_container(
     # unchanged. A caller's explicit extra_env (the bespoke s3lib / coverage
     # phases) wins on key conflicts. Both backends share one podman network, so
     # the `--network` arg is added exactly once even when both are active.
-    s3_view: Optional[S3StorageView] = None
+    s3_view: S3StorageView | None = None
     networks: list[str] = []
     s3_backend = get_active_s3_backend()
     if s3_backend is not None:
@@ -287,7 +286,7 @@ def _run_container_start(rt: Runtime, cmd: list[str], name: str):
 
 def wait_for_healthz(handle: ServerHandle) -> None:
     deadline = time.monotonic() + HEALTHZ_TIMEOUT_S
-    last_err: Optional[str] = None
+    last_err: str | None = None
     while time.monotonic() < deadline:
         try:
             with urllib.request.urlopen(handle.healthz_url, timeout=2) as resp:
@@ -307,7 +306,7 @@ def wait_for_healthz(handle: ServerHandle) -> None:
 
 def wait_for_ssh(handle: ServerHandle) -> None:
     deadline = time.monotonic() + SSH_READY_TIMEOUT_S
-    last_err: Optional[str] = None
+    last_err: str | None = None
     while time.monotonic() < deadline:
         try:
             with socket.create_connection(

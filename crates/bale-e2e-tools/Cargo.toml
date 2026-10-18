@@ -1,0 +1,16 @@
+[package]
+name = "bale-e2e-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Test-only helper for tests/e2e: builds xorbs and shards with xet's exact hashing."
+
+[dependencies]
+bale-server-core.workspace = true
+bale-server-shard.workspace = true
+bale-server-wire.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+xet-core-structures = "=1.5.2"

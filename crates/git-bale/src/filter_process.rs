@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use xet_client::cas_client::auth::TokenRefresher;
-use xet_client::chunk_cache::{get_cache, CacheConfig};
+use xet_client::chunk_cache::{get_cache, CacheConfig, ChunkCache};
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
-use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy};
+use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy, XetFileInfo};
 use xet_runtime::core::XetRuntime;
 
 use crate::clean_cache::{self, PathKey};
@@ -21,18 +22,31 @@ use crate::config::BaleConfig;
 use crate::local_reconstruct::{try_reconstruct_from_cache, CacheReconstructOutcome};
 use crate::manifest_cache;
 use crate::pktline::{PktReader, PktWriter, MAX_PKT_PAYLOAD};
-
-// Per-callsite `read_binary_to` caps: defense against a peer forcing unbounded
-// heap growth. Well above any real workload, not a protocol limit.
-const SMUDGE_PAYLOAD_CAP: u64 = (pointer::POINTER_MAX_BYTES as u64) + 4096;
-const CLEAN_PAYLOAD_CAP: u64 = 128 * 1024 * 1024 * 1024;
-const DRAIN_PAYLOAD_CAP: u64 = 64 * 1024 * 1024;
 use crate::pointer;
 use crate::remote_manifest::fetch_manifest;
 use crate::resolver;
 use crate::staging::{file_is_staged, mark_file_staged, staging_root, touch_marker_if_exists};
+use crate::store::{self, StoreLock};
+
+// Per-callsite payload caps: defense against a peer forcing unbounded heap or
+// disk growth. Well above any real workload, not a protocol limit.
+const CLEAN_PAYLOAD_CAP: u64 = 128 * 1024 * 1024 * 1024;
+const DRAIN_PAYLOAD_CAP: u64 = 64 * 1024 * 1024;
+/// Smudge input above this is spilled to disk: it can't be a pointer, and is
+/// passed through unchanged.
+const SMUDGE_INLINE: usize = pointer::POINTER_MAX_BYTES + 4096;
 
 const VERSION: &str = "version=2";
+
+/// A failed write to git's stdin pipe. Once any response byte is out the
+/// stream can't carry a `status=error` anymore, so this tears the filter down.
+#[derive(Debug, thiserror::Error)]
+#[error("writing to git over the filter protocol: {0}")]
+struct ProtocolWrite(#[source] std::io::Error);
+
+fn w<T>(r: std::io::Result<T>) -> Result<T> {
+    r.map_err(|e| ProtocolWrite(e).into())
+}
 
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -51,7 +65,7 @@ pub fn run() -> Result<()> {
     // need it. Defer construction so pointer-cache hits stay fast.
     let mut rt_slot: Option<Arc<XetRuntime>> = None;
 
-    // Clean no longer needs auth — it writes to staging; upload is deferred to
+    // Clean doesn't need auth — it writes to staging; upload is deferred to
     // `git-bale push-pending`. Only smudge resolves auth, cached for the process.
     let mut smudge_cfg: Option<BaleConfig> = None;
 
@@ -76,33 +90,38 @@ pub fn run() -> Result<()> {
             .map(|(_, v)| v.as_str())
             .unwrap_or("<unknown>");
 
-        // Per-request failures go out as `status=error` pktlines; a propagated
-        // error would tear down the filter-process and tank the whole git op.
-        match command {
+        // The payload is always drained to its flush BEFORE any reply, so a
+        // per-request failure can go out as `status=error` without desyncing
+        // the stream. A failed drain leaves the stream unrecoverable: fatal.
+        let outcome = match command {
             "clean" => {
-                if let Err(e) = do_clean(&mut rt_slot, &raw, &mut reader, &mut writer, pathname) {
-                    report_request_error(&mut reader, &mut writer, "clean", pathname, &e)?;
-                }
+                let (payload, size) =
+                    drain_payload_spilling(&mut reader, max_inline_clean(), CLEAN_PAYLOAD_CAP)?;
+                do_clean(&mut rt_slot, &raw, payload, size, &mut writer, pathname)
             }
             "smudge" => {
-                let rt = ensure_runtime(&mut rt_slot)?;
-                if let Err(e) = handle_smudge(
-                    rt,
+                let (payload, _) =
+                    drain_payload_spilling(&mut reader, SMUDGE_INLINE, CLEAN_PAYLOAD_CAP)?;
+                handle_smudge(
+                    &mut rt_slot,
                     &raw,
                     &mut smudge_cfg,
-                    &mut reader,
+                    payload,
                     &mut writer,
                     pathname,
-                ) {
-                    report_request_error(&mut reader, &mut writer, "smudge", pathname, &e)?;
-                }
+                )
             }
             other => {
-                drain_payload(&mut reader)?;
-                let err_line = format!("error=unknown command \"{other}\"");
-                writer.write_text_list(&["status=error", err_line.as_str()])?;
-                writer.flush_packet()?;
+                let mut sink = std::io::sink();
+                reader.read_binary_to(&mut sink, DRAIN_PAYLOAD_CAP)?;
+                Err(anyhow!("unknown command \"{other}\""))
             }
+        };
+        if let Err(e) = outcome {
+            if e.downcast_ref::<ProtocolWrite>().is_some() {
+                return Err(e);
+            }
+            report_request_error(&mut writer, command, pathname, &e)?;
         }
     }
 }
@@ -126,7 +145,8 @@ fn resolve_cached<'a>(
             git_dir: raw.git_dir.clone(),
         });
     }
-    Ok(slot.as_ref().unwrap())
+    slot.as_ref()
+        .ok_or_else(|| anyhow!("auth slot unexpectedly empty"))
 }
 
 fn handshake<R: Read, W: Write>(
@@ -173,35 +193,38 @@ fn parse_headers(list: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn drain_payload<R: Read>(reader: &mut PktReader<R>) -> Result<()> {
-    let mut sink = std::io::sink();
-    reader.read_binary_to(&mut sink, DRAIN_PAYLOAD_CAP)?;
-    Ok(())
-}
-
 /// Error chain is sent verbatim via `{e:#}`; callers must not put secrets
-/// (passwords, JWTs, the bale token) in the `anyhow::Error` chain. `_reader`
-/// is held only to signal the payload was already consumed — re-draining would
-/// block or desync the stream.
-fn report_request_error<R: Read, W: Write>(
-    _reader: &mut PktReader<R>,
+/// (passwords, JWTs, the bale token) in the `anyhow::Error` chain. Only valid
+/// before any byte of this request's response was written.
+fn report_request_error<W: Write>(
     writer: &mut PktWriter<W>,
     op: &str,
     pathname: &str,
     e: &anyhow::Error,
 ) -> Result<()> {
     tracing::warn!("{op} failed for {pathname}: {e:#}");
-    let err_line = format!("error={op} failed: {e:#}");
-    writer.write_text_list(&["status=error", err_line.as_str()])?;
-    writer.flush_packet()?;
-    Ok(())
+    let mut msg: String = format!("{e:#}")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if msg.len() > 1024 {
+        let mut cut = 1024;
+        while !msg.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        msg.truncate(cut);
+    }
+    let err_line = format!("error={op} failed: {msg}");
+    w(writer.write_text_list(&["status=error", err_line.as_str()]))
 }
 
-fn ensure_runtime(slot: &mut Option<Arc<XetRuntime>>) -> Result<&Arc<XetRuntime>> {
-    if slot.is_none() {
-        *slot = Some(XetRuntime::new().context("starting xet runtime")?);
+fn ensure_runtime(slot: &mut Option<Arc<XetRuntime>>) -> Result<Arc<XetRuntime>> {
+    if let Some(rt) = slot {
+        return Ok(rt.clone());
     }
-    Ok(slot.as_ref().unwrap())
+    let rt = XetRuntime::new().context("starting xet runtime")?;
+    *slot = Some(rt.clone());
+    Ok(rt)
 }
 
 /// Above this size, spill the pkt-line clean payload to a tmp file instead of
@@ -220,40 +243,63 @@ fn max_inline_clean() -> usize {
 
 /// TEST-ONLY: widen the window between "objects written" and "marker written"
 /// so the e2e harness can deterministically drive the gc/clean race. A no-op
-/// unless `BALE_TEST_CLEAN_MARKER_DELAY_MS` is set. Mirrors the existing
-/// `BALE_MAX_INLINE_CLEAN` test knob convention.
+/// unless `BALE_TEST_CLEAN_MARKER_DELAY_MS` is set.
 fn maybe_test_marker_delay() {
-    if let Ok(v) = std::env::var("BALE_TEST_CLEAN_MARKER_DELAY_MS") {
-        if let Ok(ms) = v.parse::<u64>() {
-            if ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-            }
-        }
-    }
+    test_delay("BALE_TEST_CLEAN_MARKER_DELAY_MS");
 }
 
 /// TEST-ONLY: widen the cache-HIT emit window so the e2e harness can
 /// deterministically drive the cache-hit-clean vs gc race. No-op unless
 /// `BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS` is set.
 fn maybe_test_cache_hit_delay() {
-    if let Ok(v) = std::env::var("BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS") {
-        if let Ok(ms) = v.parse::<u64>() {
-            if ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-            }
+    test_delay("BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS");
+}
+
+/// TEST-ONLY: widen the window between loading a clean-cache entry and taking
+/// the store lock. No-op unless `BALE_TEST_CLEAN_CACHE_PRELOCK_DELAY_MS` is set.
+fn maybe_test_cache_hit_prelock_delay() {
+    test_delay("BALE_TEST_CLEAN_CACHE_PRELOCK_DELAY_MS");
+}
+
+/// Store lock for a clean, plus the local-mode ownership bookkeeping: a shared
+/// store (re)registers this repo under its current path (a moved or copied repo
+/// must never look unreferenced to `prune`); a non-shared store must be ours.
+fn lock_for_write(
+    raw: &crate::config::RawConfig,
+    store: &Path,
+    git_dir: &Path,
+) -> Result<StoreLock> {
+    let lock = StoreLock::acquire_exclusive(store).context("locking object store")?;
+    if raw.local_mode {
+        if raw.local_shared {
+            store::register_repo_locked(store, git_dir, &lock)?;
+        } else {
+            store::claim_store(store, git_dir, &lock)?;
+        }
+    }
+    Ok(lock)
+}
+
+fn test_delay(var: &str) {
+    if let Some(ms) = std::env::var(var).ok().and_then(|v| v.parse::<u64>().ok()) {
+        if ms > 0 {
+            std::thread::sleep(Duration::from_millis(ms));
         }
     }
 }
 
-enum CleanPayload {
+enum Payload {
     InMemory(Vec<u8>),
     Spilled(NamedTempFile),
 }
 
-fn drain_clean_payload<R: Read>(
+/// Read data packets up to the flush, spilling to a temp file past
+/// `max_inline`. Always consumes through the flush (or errors fatally).
+fn drain_payload_spilling<R: Read>(
     reader: &mut PktReader<R>,
     max_inline: usize,
-) -> Result<(CleanPayload, u64)> {
+    cap: u64,
+) -> Result<(Payload, u64)> {
     use crate::pktline::Packet;
     let mut buf: Vec<u8> = Vec::new();
     let mut spilled: Option<NamedTempFile> = None;
@@ -263,10 +309,8 @@ fn drain_clean_payload<R: Read>(
             Packet::Flush => break,
             Packet::Data(bytes) => {
                 let n = bytes.len() as u64;
-                if total.saturating_add(n) > CLEAN_PAYLOAD_CAP {
-                    return Err(anyhow!(
-                        "pkt-line payload exceeded cap of {CLEAN_PAYLOAD_CAP} bytes"
-                    ));
+                if total.saturating_add(n) > cap {
+                    return Err(anyhow!("pkt-line payload exceeded cap of {cap} bytes"));
                 }
                 if let Some(f) = spilled.as_mut() {
                     f.write_all(&bytes)?;
@@ -283,88 +327,78 @@ fn drain_clean_payload<R: Read>(
             }
             other => {
                 return Err(anyhow!(
-                    "expected pkt-line data or flush in clean payload, got {other:?}"
+                    "expected pkt-line data or flush in payload, got {other:?}"
                 ));
             }
         }
     }
     let payload = if let Some(mut f) = spilled {
         f.flush()?;
-        CleanPayload::Spilled(f)
+        Payload::Spilled(f)
     } else {
-        CleanPayload::InMemory(buf)
+        Payload::InMemory(buf)
     };
     Ok((payload, total))
 }
 
-fn do_clean<R: Read, W: Write>(
+fn do_clean<W: Write>(
     rt_slot: &mut Option<Arc<XetRuntime>>,
     raw: &crate::config::RawConfig,
-    reader: &mut PktReader<R>,
+    payload: Payload,
+    file_size: u64,
     writer: &mut PktWriter<W>,
     pathname: &str,
 ) -> Result<()> {
-    let (payload, file_size) = drain_clean_payload(reader, max_inline_clean())?;
-
     let git_dir = raw.git_dir.as_deref().ok_or_else(|| {
         anyhow!("clean: cannot stage upload — no git directory resolved from cwd")
     })?;
-    let store = crate::store::object_store_root(raw).context("resolving object store root")?;
+    // Already a pointer (a worktree checked out without the filter, a
+    // renormalize): pass it through like git-lfs, or the commit would record
+    // the pointer text itself as the file's content.
+    if file_size <= pointer::POINTER_MAX_BYTES as u64 {
+        let small = match &payload {
+            Payload::InMemory(buf) => buf.clone(),
+            Payload::Spilled(tmp) => std::fs::read(tmp.path()).context("reading clean payload")?,
+        };
+        if pointer::is_canonical_pointer(&small) {
+            tracing::debug!("clean: {pathname} is already a bale pointer; passing through");
+            w(writer.write_text_list(&["status=success"]))?;
+            w(writer.write_all_then_flush(&small))?;
+            w(writer.write_text_list(&["status=success"]))?;
+            return Ok(());
+        }
+    }
+    let store = store::object_store_root(raw).context("resolving object store root")?;
     let cache_key = clean_cache::path_key(pathname);
 
     // `git status`/`git diff` re-invoke clean on every command for a modified
-    // bale file; short-circuit on size, then sample-verify chunks. A cache HIT
-    // writes nothing to the store, so it takes no lock: the only window it could
-    // expose (gc sweeping the existing objects before git records the re-add) is
-    // closed by gc skipping while `index.lock` is held — see `crate::gc`.
+    // bale file; short-circuit on size, then verify every chunk.
     match clean_cache::load(git_dir, &cache_key) {
-        Ok(Some(entry)) => {
-            if entry.size != file_size {
-                tracing::debug!(
-                    "clean-cache size diverged for {pathname} (cached {} vs actual {file_size}); full clean",
-                    entry.size
-                );
-            } else {
-                let verified = match &payload {
-                    CleanPayload::InMemory(buf) => {
-                        Ok(clean_cache::verify_chunks_in_memory(&entry.chunks, buf))
-                    }
-                    CleanPayload::Spilled(tmp) => {
-                        clean_cache::verify_chunks(&entry.chunks, tmp.path(), file_size)
-                    }
-                };
-                match verified {
-                    Ok(true) => {
-                        // Bump the marker mtime (if one exists) under the store
-                        // lock so gc's reclaim grace keys on the most recent add:
-                        // a stash/abandon of cache-hit content whose marker had
-                        // aged past the grace could otherwise be swept in gc's
-                        // brief lock-free window. Touch-if-exists, never create —
-                        // a hit can re-emit a pointer for content already drained
-                        // to the server (post-push), where a marker with no staged
-                        // backing would make push-pending re-translate from empty
-                        // staging. Best-effort: a failed touch only narrows the
-                        // grace for this one file.
-                        let _store_lock = crate::store::StoreLock::acquire_exclusive(&store)
-                            .context("locking object store for clean-cache hit")?;
-                        if let Ok(info) = pointer::parse_pointer(entry.pointer.as_bytes()) {
-                            if let Err(e) = touch_marker_if_exists(git_dir, info.hash()) {
-                                tracing::debug!("clean-cache hit: touching marker: {e}");
-                            }
-                        }
-                        maybe_test_cache_hit_delay();
-                        writer.write_text_list(&["status=success"])?;
-                        writer.write_all_then_flush(entry.pointer.as_bytes())?;
-                        writer.write_text_list(&["status=success"])?;
+        Ok(Some(entry)) if entry.size == file_size => {
+            let verified = match &payload {
+                Payload::InMemory(buf) => {
+                    Ok(clean_cache::verify_chunks_in_memory(&entry.chunks, buf))
+                }
+                Payload::Spilled(tmp) => {
+                    clean_cache::verify_chunks(&entry.chunks, tmp.path(), file_size)
+                }
+            };
+            match verified {
+                Ok(true) => {
+                    if emit_cache_hit(raw, git_dir, &store, &cache_key, &entry, writer)? {
                         return Ok(());
                     }
-                    Ok(false) => {
-                        tracing::debug!("clean-cache chunk mismatch for {pathname}; full clean");
-                    }
-                    Err(e) => tracing::debug!("clean-cache verify IO error: {e}; full clean"),
                 }
+                Ok(false) => {
+                    tracing::debug!("clean-cache chunk mismatch for {pathname}; full clean")
+                }
+                Err(e) => tracing::debug!("clean-cache verify IO error: {e}; full clean"),
             }
         }
+        Ok(Some(entry)) => tracing::debug!(
+            "clean-cache size diverged for {pathname} (cached {} vs actual {file_size}); full clean",
+            entry.size
+        ),
         Ok(None) => {}
         Err(e) => tracing::debug!("clean-cache load failed for {pathname}: {e}; full clean"),
     }
@@ -374,19 +408,75 @@ fn do_clean<R: Read, W: Write>(
     // gc/prune/push-pending sweep can't delete a half-written file's only copy.
     // Scoped to THIS file's write, not the filter-process lifetime: a long hold
     // deadlocks when a git porcelain op (stash/commit) nests another clean while
-    // this filter still holds the lock. The separate marker-vs-index gap (marker
-    // on disk, git's index not yet updated) is closed by gc skipping while
-    // `index.lock` is held — see `crate::gc`, not by widening this lock.
-    let _store_lock = crate::store::StoreLock::acquire_exclusive(&store)
-        .context("locking object store for clean")?;
+    // this filter still holds the lock. The separate marker-vs-index gap is
+    // closed by gc skipping while an index/ref `*.lock` is held.
+    let _store_lock = lock_for_write(raw, &store, git_dir)?;
     match payload {
-        CleanPayload::InMemory(buf) => handle_clean_in_memory(
-            rt, git_dir, &store, buf, writer, pathname, &cache_key, file_size,
+        Payload::InMemory(buf) => handle_clean_in_memory(
+            &rt, git_dir, &store, buf, writer, pathname, &cache_key, file_size,
         ),
-        CleanPayload::Spilled(tmp) => handle_clean(
-            rt, git_dir, &store, tmp, writer, pathname, &cache_key, file_size,
+        Payload::Spilled(tmp) => handle_clean(
+            &rt, git_dir, &store, tmp, writer, pathname, &cache_key, file_size,
         ),
     }
+}
+
+/// Answer a verified clean-cache hit with its stored pointer. Returns false
+/// (nothing written) when the hit can't be trusted and a full clean must run.
+fn emit_cache_hit<W: Write>(
+    raw: &crate::config::RawConfig,
+    git_dir: &Path,
+    store: &Path,
+    cache_key: &PathKey,
+    entry: &clean_cache::CacheEntry,
+    writer: &mut PktWriter<W>,
+) -> Result<bool> {
+    maybe_test_cache_hit_prelock_delay();
+    let lock = lock_for_write(raw, store, git_dir)?;
+    // The entry was loaded without the lock; gc forgets entries (under it)
+    // before sweeping their bytes. Still present ⇒ still backed.
+    let still_cached = matches!(
+        clean_cache::load(git_dir, cache_key),
+        Ok(Some(e)) if e.pointer == entry.pointer && e.size == entry.size
+    );
+    if !still_cached {
+        tracing::debug!("clean-cache entry changed under us; full clean");
+        return Ok(false);
+    }
+    let current_id = store::store_id(store).unwrap_or_else(|e| {
+        tracing::debug!("reading store id: {e:#}");
+        Some(String::new())
+    });
+    if Path::new(&entry.store) != store || entry.store_id != current_id {
+        tracing::debug!("clean-cache entry backed by another store; full clean");
+        return Ok(false);
+    }
+    let pointer_str = entry.pointer.as_str();
+    // Bump the marker mtime (gc's reclaim grace keys on the latest add) but
+    // never create one: in server mode a hit legitimately re-emits pointers
+    // for content already drained to the server.
+    let marker_present = match pointer::parse_pointer(pointer_str.as_bytes()) {
+        Ok(info) => match touch_marker_if_exists(git_dir, info.hash()) {
+            Ok(present) => present,
+            Err(e) => {
+                tracing::debug!("clean-cache hit: touching marker: {e}");
+                false
+            }
+        },
+        Err(_) => return Ok(false),
+    };
+    if raw.local_mode && !marker_present {
+        // The store is the only copy and no marker vouches for it: re-stage.
+        tracing::debug!("clean-cache hit without a marker in local mode; full clean");
+        drop(lock);
+        return Ok(false);
+    }
+    maybe_test_cache_hit_delay();
+    w(writer.write_text_list(&["status=success"]))?;
+    w(writer.write_all_then_flush(pointer_str.as_bytes()))?;
+    w(writer.write_text_list(&["status=success"]))?;
+    drop(lock);
+    Ok(true)
 }
 
 /// In-memory variant of [`handle_clean`]: avoids the tmp-file write plus the
@@ -411,6 +501,7 @@ fn handle_clean_in_memory<W: Write>(
         .with_context(|| format!("creating object store {}", store.display()))?;
     let translator =
         TranslatorConfig::local_config(store).context("building local TranslatorConfig")?;
+    let snapshot = store::ObjectSnapshot::take(store)?;
     // Build the index before clean_bytes consumes the Vec.
     let chunks = clean_cache::compute_chunks_from_slice(&bytes);
     let (pointer_string, file_hex) = rt
@@ -429,20 +520,29 @@ fn handle_clean_in_memory<W: Write>(
         })
         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 
+    // The objects are the only copy until pushed (server) or forever (local),
+    // and xet doesn't fsync them: make them durable before the marker vouches.
+    snapshot
+        .sync_new(store)
+        .context("syncing new objects to disk")?;
     maybe_test_marker_delay();
-    if let Err(e) = mark_file_staged(git_dir, &file_hex, file_size) {
-        tracing::warn!("failed to mark {file_hex} staged: {e}");
-    }
+    // Markers are the inventory gc/prune/push-pending trust: emitting a pointer
+    // with no marker would let gc sweep its only copy (local) or push-pending
+    // skip uploading it (server).
+    mark_file_staged(git_dir, &file_hex, file_size)
+        .with_context(|| format!("recording staged marker for {file_hex}"))?;
 
-    writer.write_text_list(&["status=success"])?;
-    writer.write_all_then_flush(pointer_string.as_bytes())?;
-    writer.write_text_list(&["status=success"])?;
+    w(writer.write_text_list(&["status=success"]))?;
+    w(writer.write_all_then_flush(pointer_string.as_bytes()))?;
+    w(writer.write_text_list(&["status=success"]))?;
 
     let entry = clean_cache::CacheEntry {
         v: clean_cache::CURRENT_VERSION,
         size: file_size,
         chunks,
         pointer: pointer_string,
+        store: store.to_string_lossy().into_owned(),
+        store_id: store::store_id(store).ok().flatten(),
     };
     if let Err(e) = clean_cache::save(git_dir, cache_key, &entry) {
         tracing::warn!("saving clean-cache entry for {pathname}: {e}");
@@ -462,16 +562,13 @@ fn handle_clean<W: Write>(
     cache_key: &PathKey,
     file_size: u64,
 ) -> Result<()> {
-    // Stage chunks/xorbs/shards locally via xet-data's LocalClient instead of
-    // uploading; `git-bale push-pending` drains staging at push time.
-    // Markers stay per-repo under .git/bale/staging/file-index even when the
-    // object store is shared; only xorbs/shards go to `store`.
     crate::fs_util::create_bale_subdir(git_dir, "staging")
         .with_context(|| format!("creating staging dir under {}", git_dir.display()))?;
     std::fs::create_dir_all(store)
         .with_context(|| format!("creating object store {}", store.display()))?;
     let translator =
         TranslatorConfig::local_config(store).context("building local TranslatorConfig")?;
+    let snapshot = store::ObjectSnapshot::take(store)?;
     // Moving `tmp` into the closure would unlink it before compute_chunks below;
     // pass only the path and keep `tmp` owned out here.
     let tmp_path = tmp.path().to_path_buf();
@@ -492,23 +589,21 @@ fn handle_clean<W: Write>(
         })
         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
 
+    // The objects are the only copy until pushed (server) or forever (local),
+    // and xet doesn't fsync them: make them durable before the marker vouches.
+    snapshot
+        .sync_new(store)
+        .context("syncing new objects to disk")?;
     maybe_test_marker_delay();
-    // Marker gates the lukewarm smudge fallback. Without it, a smudge for a
-    // not-staged file_hash (e.g. `git stash`'s HEAD-restore) returns zero terms
-    // and trips a `debug_assert_eq!` in xet-data's progress tracker. Best-effort:
-    // a failed write only costs a cache miss on the next checkout-after-add.
-    if let Err(e) = mark_file_staged(git_dir, &file_hex, file_size) {
-        tracing::warn!("failed to mark {file_hex} staged: {e}");
-    }
+    mark_file_staged(git_dir, &file_hex, file_size)
+        .with_context(|| format!("recording staged marker for {file_hex}"))?;
 
     // Respond before populating the cache so the pointer lands in the index
     // without waiting on best-effort cache work.
-    writer.write_text_list(&["status=success"])?;
-    writer.write_all_then_flush(pointer_string.as_bytes())?;
-    writer.write_text_list(&["status=success"])?;
+    w(writer.write_text_list(&["status=success"]))?;
+    w(writer.write_all_then_flush(pointer_string.as_bytes()))?;
+    w(writer.write_text_list(&["status=success"]))?;
 
-    // Best-effort chunk index for next time; `tmp` is still owned, so the file
-    // is still on disk.
     match clean_cache::compute_chunks(&tmp_path, file_size) {
         Ok(chunks) => {
             let entry = clean_cache::CacheEntry {
@@ -516,6 +611,8 @@ fn handle_clean<W: Write>(
                 size: file_size,
                 chunks,
                 pointer: pointer_string,
+                store: store.to_string_lossy().into_owned(),
+                store_id: store::store_id(store).ok().flatten(),
             };
             if let Err(e) = clean_cache::save(git_dir, cache_key, &entry) {
                 tracing::warn!("saving clean-cache entry for {pathname}: {e}");
@@ -566,7 +663,7 @@ impl<W: Write> Write for StallGuardWriter<W> {
 /// request and its multi-hour backoff sleep — and surface a user-facing error.
 pub(crate) async fn download_cold<W: Write + Send + 'static>(
     session: &FileDownloadSession,
-    info: &xet_data::processing::XetFileInfo,
+    info: &XetFileInfo,
     file_size: u64,
     dest: W,
     label: &str,
@@ -611,18 +708,69 @@ pub(crate) async fn download_cold<W: Write + Send + 'static>(
     }
 }
 
-fn handle_smudge<R: Read, W: Write>(
-    rt: &Arc<XetRuntime>,
+/// True when `path` has exactly the pointer's size and (if the pointer carries
+/// one) sha256. Every smudge path gates on this before git sees a byte: xet
+/// reconstructs from xorb chunks without re-hashing them, so a corrupt cache,
+/// staging dir, local store or server object would otherwise land silently in
+/// the worktree.
+pub(crate) fn content_matches(path: &Path, info: &XetFileInfo, file_size: u64) -> Result<bool> {
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("opening reconstructed file {}", path.display()))?;
+    if f.metadata()?.len() != file_size {
+        return Ok(false);
+    }
+    // git-bale always writes sha256; without it the bytes can't be verified.
+    let Some(expected) = info.sha256() else {
+        tracing::warn!(
+            "pointer {} has no sha256; refusing unverifiable content",
+            info.hash()
+        );
+        return Ok(false);
+    };
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected.trim()))
+}
+
+fn reset_tmp(tmp: &NamedTempFile) -> Result<()> {
+    let mut f = tmp.reopen()?;
+    f.set_len(0)?;
+    std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(0))?;
+    Ok(())
+}
+
+fn handle_smudge<W: Write>(
+    rt_slot: &mut Option<Arc<XetRuntime>>,
     raw: &crate::config::RawConfig,
     auth_slot: &mut Option<BaleConfig>,
-    reader: &mut PktReader<R>,
+    payload: Payload,
     writer: &mut PktWriter<W>,
     pathname: &str,
 ) -> Result<()> {
-    let mut pointer_buf = Vec::with_capacity(256);
-    reader.read_binary_to(&mut pointer_buf, SMUDGE_PAYLOAD_CAP)?;
-    let info =
-        pointer::parse_pointer(&pointer_buf).context("smudge: input is not a bale pointer")?;
+    // Non-pointer content (a file committed before the path was tracked, or
+    // anything too large to be a pointer) passes through unchanged, like
+    // git-lfs, rather than failing the checkout.
+    let pointer_buf = match payload {
+        Payload::Spilled(tmp) => {
+            let len = std::fs::metadata(tmp.path())?.len();
+            return finish_smudge(writer, tmp.path(), len);
+        }
+        Payload::InMemory(bytes) => bytes,
+    };
+    let info = match pointer::parse_pointer(&pointer_buf) {
+        Ok(info) => info,
+        Err(e) => {
+            tracing::debug!("smudge: {pathname} is not a bale pointer ({e}); passing through");
+            return passthrough_bytes(writer, &pointer_buf);
+        }
+    };
 
     let file_size = info
         .file_size()
@@ -631,12 +779,13 @@ fn handle_smudge<R: Read, W: Write>(
     // lowercase hex before interpolating into the manifest cache path, or a
     // crafted `{"hash":"../../etc/passwd"}` escapes the git dir.
     let file_id_hex = info.hash().to_string();
-    if !is_safe_file_id(&file_id_hex) {
+    if !pointer::is_safe_file_id(&file_id_hex) {
         return Err(anyhow!(
             "bale pointer hash is not lowercase hex (got {} chars)",
             file_id_hex.len()
         ));
     }
+    let rt = ensure_runtime(rt_slot)?;
 
     // From raw config so the hot path stays local — no auth resolution.
     let cache_cfg = CacheConfig {
@@ -649,76 +798,69 @@ fn handle_smudge<R: Read, W: Write>(
         tracing::debug!("tightening perms on {}: {e}", raw.cache_dir.display());
     }
 
-    // Hot path: cache-only reconstruction.
     let tmp = NamedTempFile::new()?;
-    let cache_hit = if let Some(git_dir) = raw.git_dir.as_deref() {
-        match manifest_cache::load(git_dir, &file_id_hex) {
-            Ok(Some(manifest)) => {
-                // Reopen so the async block owns its own handle and `tmp` stays
-                // usable for the byte-streaming below.
-                let dest_file = tmp.reopen()?;
-                let rt_for_cache = rt.clone();
-                let cache_for_cache = chunk_cache.clone();
-                let outcome = rt
-                    .bridge_sync(async move {
-                        let mut dest = dest_file;
-                        try_reconstruct_from_cache(
-                            &rt_for_cache,
-                            &cache_for_cache,
-                            &manifest,
-                            file_size,
-                            &mut dest,
-                        )
-                        .await
-                    })
-                    .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
-                matches!(outcome, CacheReconstructOutcome::Wrote(_))
-            }
-            Ok(None) => false,
+    let git_dir = raw.git_dir.as_deref();
+
+    // Hot path: cache-only reconstruction. A miss, error or mismatch falls
+    // through.
+    let mut done = false;
+    let mut server_backed = false;
+    // Bytes came from this repo's own staging/store (not merely a marker).
+    let mut store_backed = false;
+    if let Some(gd) = git_dir {
+        let hit = match try_smudge_from_cache(&rt, &chunk_cache, gd, &file_id_hex, file_size, &tmp)
+        {
+            Ok(hit) => hit,
             Err(e) => {
-                tracing::warn!(
-                    "reading cached manifest for {file_id_hex}: {e}; falling back to network"
-                );
+                tracing::debug!("chunk-cache reconstruction of {file_id_hex} failed: {e:#}");
                 false
             }
+        };
+        if hit {
+            if content_matches(tmp.path(), &info, file_size)? {
+                done = true;
+                // Manifests are only saved from a server fetch.
+                server_backed = !raw.local_mode;
+            } else {
+                tracing::warn!(
+                    "chunk-cache reconstruction of {file_id_hex} failed verification; refetching"
+                );
+                if let Err(e) = manifest_cache::remove(gd, &file_id_hex) {
+                    tracing::debug!("removing manifest for {file_id_hex}: {e}");
+                }
+            }
         }
-    } else {
-        false
-    };
+    }
 
     // Lukewarm path (server mode only): bytes still staged locally, not yet
     // pushed. Gated on the per-file marker (see staging::mark_file_staged).
-    let staging_hit = if !cache_hit
-        && !raw.local_mode
-        && raw
-            .git_dir
-            .as_deref()
-            .is_some_and(|gd| file_is_staged(gd, &file_id_hex))
-    {
-        let gd = raw.git_dir.as_deref().unwrap();
-        match try_smudge_from_store(rt, &staging_root(gd), &info, file_size, &tmp) {
-            Ok(true) => true,
-            Ok(false) => false,
-            Err(e) => {
-                tracing::debug!("staging reconstruction failed for {file_id_hex}: {e:#}");
-                false
+    if !done && !raw.local_mode {
+        if let Some(gd) = git_dir {
+            if file_is_staged(gd, &file_id_hex) {
+                reset_tmp(&tmp)?;
+                match try_smudge_from_store(&rt, &staging_root(gd), &info, file_size, &tmp) {
+                    Ok(true) if content_matches(tmp.path(), &info, file_size)? => {
+                        done = true;
+                        store_backed = true;
+                    }
+                    Ok(true) => tracing::warn!(
+                        "staged reconstruction of {file_id_hex} failed verification; trying server"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::debug!("staging reconstruction failed for {file_id_hex}: {e:#}")
+                    }
+                }
             }
         }
-    } else {
-        false
-    };
+    }
 
     // Local mode: reconstruct only from the durable store. No network, no auth,
-    // no silent fallback — a miss or short read is a hard error.
-    if raw.local_mode && !cache_hit {
-        let store = crate::store::object_store_root(raw).context("resolving object store root")?;
-        // Reset any partial bytes from a failed hot-path attempt.
-        let mut trunc = tmp.reopen()?;
-        trunc.set_len(0)?;
-        std::io::Seek::seek(&mut trunc, std::io::SeekFrom::Start(0))?;
-        drop(trunc);
-
-        let ok = try_smudge_from_store(rt, &store, &info, file_size, &tmp)
+    // no silent fallback — a miss or bad bytes is a hard error.
+    if !done && raw.local_mode {
+        let store = store::object_store_root(raw).context("resolving object store root")?;
+        reset_tmp(&tmp)?;
+        let ok = try_smudge_from_store(&rt, &store, &info, file_size, &tmp)
             .with_context(|| format!("reconstructing {file_id_hex} from local store"))?;
         let written = std::fs::metadata(tmp.path()).map(|m| m.len()).unwrap_or(0);
         if !ok || written != file_size {
@@ -731,132 +873,196 @@ fn handle_smudge<R: Read, W: Write>(
                 file_size
             ));
         }
-        if let Some(git_dir) = raw.git_dir.as_deref() {
-            populate_clean_cache_from_smudge(
-                git_dir,
-                pathname,
-                tmp.path(),
-                &pointer_buf,
-                file_size,
-            );
+        if !content_matches(tmp.path(), &info, file_size)? {
+            return Err(anyhow!(
+                "local store at {} returned corrupt content for {file_id_hex} (sha256 mismatch); \
+                 refusing to write it to the worktree",
+                store.display()
+            ));
         }
-        return finish_smudge(writer, tmp.path());
+        done = true;
+        store_backed = true;
     }
 
-    // Cold path: delegate to xet-data.
-    if !cache_hit && !staging_hit {
-        // Discard any partial bytes from a failed hot-path attempt.
-        let mut trunc = tmp.reopen()?;
-        trunc.set_len(0)?;
-        std::io::Seek::seek(&mut trunc, std::io::SeekFrom::Start(0))?;
-        drop(trunc);
+    // Cold path: delegate to xet-data. A mismatch through the chunk cache is
+    // retried once without it (the cache itself may be what's corrupt).
+    if !done {
+        let cfg = resolve_cached(auth_slot, raw, &rt, resolver::Scope::Read)?.clone();
+        let mut verified = false;
+        for cache in [Some(chunk_cache.clone()), None] {
+            reset_tmp(&tmp)?;
+            download_cold_to(&rt, raw, &cfg, &info, file_size, &tmp, pathname, cache)?;
+            if content_matches(tmp.path(), &info, file_size)? {
+                verified = true;
+                break;
+            }
+            tracing::warn!("downloaded content for {file_id_hex} failed verification");
+        }
+        if !verified {
+            return Err(anyhow!(
+                "downloaded content for {pathname} ({file_id_hex}) does not match the pointer's \
+                 sha256; the server's copy is corrupt. Refusing to write it to the worktree."
+            ));
+        }
+        if let Some(gd) = git_dir {
+            save_remote_manifest(&rt, raw, &cfg, gd, &info, &file_id_hex);
+        }
+        server_backed = true;
+    }
 
-        let cfg = resolve_cached(auth_slot, raw, rt, resolver::Scope::Read)?;
-
-        // The `0..file_size` range cap is load-bearing (do not pass
-        // `FileRange::full()`). With full(), `ReconstructionTermManager`
-        // prefetches up to 256 MiB past EOF, but baleforgit-server has no Range
-        // support on `/v1/reconstructions/*` (see docs/ARCHITECTURE.md), so each
-        // prefetch re-receives full-file terms, shifting `cur_file_byte_offset`
-        // 256 MiB per round and tripping SequentialWriter's contiguity check.
-        // Capping at `file_size` skips the speculative prefetch entirely.
-        let translator =
-            build_translator_config(cfg, resolver::forge_refresher(raw, resolver::Scope::Read))?;
-        let dest_file = tmp.reopen()?;
-        let info_for_dl = info.clone();
-        let cache_for_dl = chunk_cache.clone();
-        let pathname_owned = pathname.to_string();
-        let stall_secs = cold_download_stall_secs();
-        rt.bridge_sync(async move {
-            let session =
-                FileDownloadSession::new(Arc::new(translator), Some(cache_for_dl)).await?;
-            download_cold(
-                &session,
-                &info_for_dl,
-                file_size,
-                dest_file,
-                &pathname_owned,
-                stall_secs,
-            )
-            .await
-        })
-        .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
-
-        // Best-effort manifest fetch so subsequent checkouts hit the hot path;
-        // failure only keeps the cache cold.
-        if let Some(git_dir) = raw.git_dir.as_deref() {
-            let merkle = match info.merkle_hash() {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!("can't parse merkle hash from pointer ({file_id_hex}): {e}");
-                    return finish_smudge(writer, tmp.path());
-                }
-            };
-            let cfg_for_fetch = cfg.clone();
-            let refresher = resolver::forge_refresher(raw, resolver::Scope::Read);
-            let fetched =
-                rt.bridge_sync(
-                    async move { fetch_manifest(&cfg_for_fetch, refresher, &merkle).await },
-                );
-            match fetched {
-                Ok(Ok(manifest)) => {
-                    if let Err(e) = manifest_cache::save(git_dir, &file_id_hex, &manifest) {
-                        tracing::warn!("saving manifest for {file_id_hex}: {e}");
+    // We hold both sides of the content→pointer mapping, so seed the clean
+    // cache to make the next `git status`/`git diff` hit without CDC — but only
+    // while something guarantees the bytes stay retrievable (the server, or a
+    // marker checked under the store lock). Otherwise a seed racing gc's
+    // `forget_hashes` would let a later add emit a pointer with no backing.
+    // The chunk index is computed before locking; only the check + save hold it.
+    // Best-effort: a seed is only an optimization, so it never blocks on the
+    // lock or fails the smudge. A hot-path hit in local mode isn't seeded: a
+    // marker alone doesn't prove the current store holds the bytes.
+    if let (Some(gd), true) = (git_dir, server_backed || store_backed) {
+        if let Ok(store) = store::object_store_root(raw) {
+            if let Some(entry) =
+                smudge_cache_entry(pathname, tmp.path(), &pointer_buf, file_size, &store)
+            {
+                if let Ok(Some(_lock)) = StoreLock::try_exclusive(&store) {
+                    if server_backed || file_is_staged(gd, &file_id_hex) {
+                        let key = clean_cache::path_key(pathname);
+                        if let Err(e) = clean_cache::save(gd, &key, &entry) {
+                            tracing::debug!("smudge: saving clean-cache entry for {pathname}: {e}");
+                        }
                     }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("fetching manifest for {file_id_hex}: {e:?}");
-                }
-                Err(e) => {
-                    tracing::warn!("xet runtime error fetching manifest: {e:?}");
                 }
             }
         }
     }
 
-    // We hold both sides of the content→pointer mapping (the pointer git gave
-    // us, the bytes we reconstructed), so seed the clean cache to make the next
-    // `git status`/`git diff` on this path hit without re-running CDC.
-    if let Some(git_dir) = raw.git_dir.as_deref() {
-        populate_clean_cache_from_smudge(git_dir, pathname, tmp.path(), &pointer_buf, file_size);
-    }
-
-    finish_smudge(writer, tmp.path())
+    finish_smudge(writer, tmp.path(), file_size)
 }
 
-fn populate_clean_cache_from_smudge(
+/// Cache-only reconstruction from a saved manifest. `Ok(false)` on any miss.
+fn try_smudge_from_cache(
+    rt: &Arc<XetRuntime>,
+    chunk_cache: &Arc<dyn ChunkCache>,
     git_dir: &Path,
+    file_id_hex: &str,
+    file_size: u64,
+    tmp: &NamedTempFile,
+) -> Result<bool> {
+    let manifest = match manifest_cache::load(git_dir, file_id_hex) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Ok(false),
+        Err(e) => {
+            tracing::warn!("reading cached manifest for {file_id_hex}: {e}; falling back");
+            return Ok(false);
+        }
+    };
+    // Reopen so the async block owns its own handle.
+    let dest_file = tmp.reopen()?;
+    let rt_for_cache = rt.clone();
+    let cache = chunk_cache.clone();
+    let outcome = rt
+        .bridge_sync(async move {
+            let mut dest = dest_file;
+            try_reconstruct_from_cache(&rt_for_cache, &cache, &manifest, file_size, &mut dest).await
+        })
+        .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+    Ok(matches!(outcome, CacheReconstructOutcome::Wrote(_)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_cold_to(
+    rt: &Arc<XetRuntime>,
+    raw: &crate::config::RawConfig,
+    cfg: &BaleConfig,
+    info: &XetFileInfo,
+    file_size: u64,
+    tmp: &NamedTempFile,
+    pathname: &str,
+    cache: Option<Arc<dyn ChunkCache>>,
+) -> Result<()> {
+    // `0..file_size` (in `download_cold`), not `FileRange::full()`: xet fetches
+    // files past 2 × 256 MiB in Range blocks either way (the server honors
+    // Range on /v1/reconstructions), but the cap spares a past-EOF block request.
+    let translator =
+        build_translator_config(cfg, resolver::forge_refresher(raw, resolver::Scope::Read))?;
+    let dest_file = tmp.reopen()?;
+    let info_for_dl = info.clone();
+    let pathname_owned = pathname.to_string();
+    let stall_secs = cold_download_stall_secs();
+    rt.bridge_sync(async move {
+        let session = FileDownloadSession::new(Arc::new(translator), cache).await?;
+        download_cold(
+            &session,
+            &info_for_dl,
+            file_size,
+            dest_file,
+            &pathname_owned,
+            stall_secs,
+        )
+        .await
+    })
+    .map_err(|e| anyhow!("xet runtime error: {e:?}"))?
+}
+
+/// Best-effort manifest fetch so subsequent checkouts hit the hot path;
+/// failure only keeps the cache cold.
+fn save_remote_manifest(
+    rt: &Arc<XetRuntime>,
+    raw: &crate::config::RawConfig,
+    cfg: &BaleConfig,
+    git_dir: &Path,
+    info: &XetFileInfo,
+    file_id_hex: &str,
+) {
+    let merkle = match info.merkle_hash() {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("can't parse merkle hash from pointer ({file_id_hex}): {e}");
+            return;
+        }
+    };
+    let cfg_for_fetch = cfg.clone();
+    let refresher = resolver::forge_refresher(raw, resolver::Scope::Read);
+    let fetched =
+        rt.bridge_sync(async move { fetch_manifest(&cfg_for_fetch, refresher, &merkle).await });
+    match fetched {
+        Ok(Ok(manifest)) => {
+            if let Err(e) = manifest_cache::save(git_dir, file_id_hex, &manifest) {
+                tracing::warn!("saving manifest for {file_id_hex}: {e}");
+            }
+        }
+        Ok(Err(e)) => tracing::warn!("fetching manifest for {file_id_hex}: {e:?}"),
+        Err(e) => tracing::warn!("xet runtime error fetching manifest: {e:?}"),
+    }
+}
+
+fn smudge_cache_entry(
     pathname: &str,
     content_path: &Path,
     pointer_bytes: &[u8],
     file_size: u64,
-) {
-    let pointer = match std::str::from_utf8(pointer_bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => {
-            tracing::debug!("smudge: refusing to cache non-utf8 pointer for {pathname}");
-            return;
-        }
+    store: &Path,
+) -> Option<clean_cache::CacheEntry> {
+    let Ok(pointer) = std::str::from_utf8(pointer_bytes) else {
+        tracing::debug!("smudge: refusing to cache non-utf8 pointer for {pathname}");
+        return None;
     };
-    let chunks = match clean_cache::compute_chunks(content_path, file_size) {
-        Ok(c) => c,
+    match clean_cache::compute_chunks(content_path, file_size) {
+        Ok(chunks) => Some(clean_cache::CacheEntry {
+            v: clean_cache::CURRENT_VERSION,
+            size: file_size,
+            chunks,
+            pointer: pointer.to_string(),
+            store: store.to_string_lossy().into_owned(),
+            store_id: store::store_id(store).ok().flatten(),
+        }),
         Err(e) => {
             tracing::debug!(
                 "smudge: compute_chunks failed for {pathname} at {}: {e}",
                 content_path.display()
             );
-            return;
+            None
         }
-    };
-    let entry = clean_cache::CacheEntry {
-        v: clean_cache::CURRENT_VERSION,
-        size: file_size,
-        chunks,
-        pointer,
-    };
-    let key = clean_cache::path_key(pathname);
-    if let Err(e) = clean_cache::save(git_dir, &key, &entry) {
-        tracing::debug!("smudge: saving clean-cache entry for {pathname}: {e}");
     }
 }
 
@@ -866,7 +1072,7 @@ fn populate_clean_cache_from_smudge(
 fn try_smudge_from_store(
     rt: &Arc<XetRuntime>,
     store: &Path,
-    info: &xet_data::processing::XetFileInfo,
+    info: &XetFileInfo,
     file_size: u64,
     tmp: &NamedTempFile,
 ) -> Result<bool> {
@@ -888,27 +1094,47 @@ fn try_smudge_from_store(
     Ok(true)
 }
 
-fn finish_smudge<W: Write>(writer: &mut PktWriter<W>, tmp_path: &Path) -> Result<()> {
-    writer.write_text_list(&["status=success"])?;
-    let mut f = std::fs::File::open(tmp_path)?;
+fn passthrough_bytes<W: Write>(writer: &mut PktWriter<W>, bytes: &[u8]) -> Result<()> {
+    w(writer.write_text_list(&["status=success"]))?;
+    w(writer.write_all_then_flush(bytes))?;
+    w(writer.write_text_list(&["status=success"]))
+}
+
+/// Stream `path` to git. Opened and size-checked BEFORE `status=success` so a
+/// failure there is still reportable; a read error mid-stream follows the
+/// protocol's mid-content error form (flush, then `status=error`) so git
+/// discards the partial content instead of taking error text as file bytes.
+fn finish_smudge<W: Write>(
+    writer: &mut PktWriter<W>,
+    path: &Path,
+    expected_size: u64,
+) -> Result<()> {
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("opening smudge output {}", path.display()))?;
+    let len = f.metadata()?.len();
+    if len != expected_size {
+        return Err(anyhow!(
+            "smudge output is {len} bytes, expected {expected_size}"
+        ));
+    }
+    w(writer.write_text_list(&["status=success"]))?;
     let mut buf = vec![0u8; MAX_PKT_PAYLOAD];
     loop {
-        let n = f.read(&mut buf)?;
+        let n = match f.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("reading smudge output {}: {e}", path.display());
+                w(writer.flush_packet())?;
+                return w(writer.write_text_list(&["status=error"]));
+            }
+        };
         if n == 0 {
             break;
         }
-        writer.write_binary(&buf[..n])?;
+        w(writer.write_binary(&buf[..n]))?;
     }
-    writer.flush_packet()?;
-    writer.write_text_list(&["status=success"])?;
-    Ok(())
-}
-
-/// MerkleHash is 32 bytes → 64 hex chars; reject any other length as hostile.
-fn is_safe_file_id(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    w(writer.flush_packet())?;
+    w(writer.write_text_list(&["status=success"]))
 }
 
 fn build_translator_config(

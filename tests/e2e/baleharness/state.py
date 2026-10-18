@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-
 STATE_FILE = ".e2e_state.json"
 
 

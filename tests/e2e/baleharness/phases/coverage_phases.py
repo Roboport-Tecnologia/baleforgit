@@ -7,7 +7,6 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 from baleharness.client import ClientEnv
 from baleharness.config import (
@@ -36,7 +35,6 @@ from baleharness.s3backend import Network
 from baleharness.server import ServerHandle, start_container
 from baleharness.timing import Timings
 from baleharness.usage import fetch_repo_usage
-
 
 AUTHZ_HTTP_REPOS = ["authz-http/allow", "authz-http/denied", "authz-http/error"]
 
@@ -95,8 +93,8 @@ def phase_https_origin_coverage(
     data_root.mkdir()
     jwt_secret = secrets.token_bytes(32).hex()
     transfer_secret = secrets.token_bytes(32).hex()
-    server: Optional[ServerHandle] = None
-    forge: Optional[MockForgeServer] = None
+    server: ServerHandle | None = None
+    forge: MockForgeServer | None = None
     try:
         with timings.measure("https-origin: container start"):
             server = start_container(
@@ -233,7 +231,7 @@ def phase_authz_http_coverage(
     mock = MockAuthzServer(_authz_http_decide)
     mock.start()
     info(f"authz-http: mock listening at {mock.url}")
-    server: Optional[ServerHandle] = None
+    server: ServerHandle | None = None
     try:
         with timings.measure("authz-http: container start"):
             server = start_container(
@@ -351,7 +349,7 @@ def phase_otlp_telemetry(
     collector = OtlpCollector()
     collector.start()
     info(f"otlp: collector listening at {collector.url}")
-    server: Optional[ServerHandle] = None
+    server: ServerHandle | None = None
     try:
         with timings.measure("otlp: container start"):
             server = start_container(
@@ -442,9 +440,9 @@ def phase_postgres_coverage(
     data_root.mkdir()
     jwt_secret = secrets.token_bytes(32).hex()
     transfer_secret = secrets.token_bytes(32).hex()
-    network: Optional[Network] = None
-    pg: Optional[PostgresGuard] = None
-    server: Optional[ServerHandle] = None
+    network: Network | None = None
+    pg: PostgresGuard | None = None
+    server: ServerHandle | None = None
     try:
         with timings.measure("postgres: sidecar"):
             network = Network.create(rt)

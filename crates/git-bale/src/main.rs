@@ -169,6 +169,7 @@ struct PruneArgs {
 
 fn main() -> Result<()> {
     set_default_xet_cache_root();
+    set_default_xet_retry_backoff();
     let cli = Cli::parse();
 
     let log_level = match cli.verbose {
@@ -189,6 +190,14 @@ fn main() -> Result<()> {
             let scope = pick_scope(a.system, a.local);
             install::install(scope, a.path.as_deref())?;
             println!("git-bale installed ({})", describe_scope(scope));
+            if !matches!(scope, Scope::Local) {
+                eprintln!(
+                    "warning: {} installs only the filter, no hooks. Run `git-bale install --local` \
+                     in each repository: without its pre-push hook, `git push` does not upload \
+                     bale content and clones of what you push will fail to check out.",
+                    describe_scope(scope)
+                );
+            }
             Ok(())
         }
         Command::Uninstall(a) => {
@@ -214,7 +223,15 @@ fn main() -> Result<()> {
             remote_name: a.remote_name,
             remote_url: a.remote_url,
         }),
-        Command::Gc => gc::run(),
+        Command::Gc => {
+            // Hooks run `git-bale gc || true`, so a refusal must be visible on
+            // stderr even though the exit status is ignored.
+            if let Err(e) = gc::run() {
+                eprintln!("warning: git-bale gc refused to reclaim anything: {e:#}");
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Command::MountDiff(a) => mount::run(MountDiffArgs {
             rev_a: a.rev_a,
             rev_b: a.rev_b,
@@ -231,11 +248,21 @@ fn main() -> Result<()> {
         Command::InitLocal(a) => {
             let cwd = std::env::current_dir()?;
             let store = git_bale::store::resolve_init_store(&cwd, a.store.as_deref(), a.shared)?;
-            install::init_local(Some(cwd.as_path()), &store, a.shared)?;
+            let git_dir = git_bale::store::repo_git_dir(&cwd)?;
+            // Claim/register before writing any config, so a refusal (store
+            // owned by another repo) leaves the repo untouched.
             if a.shared {
-                let git_dir = git_bale::store::repo_git_dir(&cwd)?;
                 git_bale::store::register_repo(&store, &git_dir)?;
+            } else {
+                let lock = git_bale::store::StoreLock::acquire_exclusive(&store)?;
+                git_bale::store::claim_store(&store, &git_dir, &lock)?;
             }
+            let is_default = store == git_bale::store::default_local_store(&git_dir);
+            install::init_local(
+                Some(cwd.as_path()),
+                (!is_default).then_some(store.as_path()),
+                a.shared,
+            )?;
             println!(
                 "git-bale local mode enabled (store: {}{})",
                 store.display(),
@@ -274,6 +301,17 @@ fn set_default_xet_cache_root() {
     let path = base.join("bale").join("xet");
     // SAFETY: called from main() before any threads or async runtime spawn.
     unsafe { std::env::set_var("HF_XET_CACHE", path) };
+}
+
+/// xet's retry backoff is `base^n` ms (tokio-retry squares each step), so its
+/// 3 s default parks the 2nd retry of any 5xx/408/429 for up to ~2.5 h — a push
+/// against a briefly unhealthy server would hang for hours. A 10 ms base gives
+/// 10 ms, 100 ms, 1 s, 10 s, 100 s. An explicit setting wins.
+fn set_default_xet_retry_backoff() {
+    if std::env::var_os("HF_XET_CLIENT_RETRY_BASE_DELAY").is_none() {
+        // SAFETY: called from main() before any threads or async runtime spawn.
+        unsafe { std::env::set_var("HF_XET_CLIENT_RETRY_BASE_DELAY", "10ms") };
+    }
 }
 
 /// `~/.cache` on Unix; `%LOCALAPPDATA%` (then `%USERPROFILE%\.cache`) on

@@ -12,6 +12,7 @@ use bale_server_storage_s3::{S3BlobStore, S3Config};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -256,13 +257,14 @@ where
             "BALE_ADMIN_TOKEN_HEX unset; PUT /v1/quotas/{{owner}} disabled (returns 404)"
         );
     }
+    let background = tokio_util::task::TaskTracker::new();
     // Service is generic over the authz impl, so each branch builds its own.
     if let Ok(authz_url) = env::var("BALE_AUTHZ_HTTP_URL") {
         if authz_url.is_empty() {
             bail!("BALE_AUTHZ_HTTP_URL is set but empty");
         }
         let authz = HttpAuthz::new(authz_url.clone(), jwt_secret).map_err(anyhow_from_core)?;
-        tracing::info!(%authz_url, "using HttpAuthz upstream");
+        tracing::info!(authz_url = %redact_userinfo(&authz_url), "using HttpAuthz upstream");
         let svc = Service {
             blobs,
             meta,
@@ -271,12 +273,13 @@ where
             public_base_url: public_url,
             default_quota_bytes,
             admin_token,
+            background: background.clone(),
         };
-        axum::serve(listener, router(svc))
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        serve_http(listener, router(svc), background).await?;
     } else {
         let mut authz = ConfigAuthz::new(jwt_secret);
+        let mut users_by_token: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         if let Ok(raw) = env::var("BALE_GRANTS") {
             for (idx, tuple) in raw.split(',').filter(|s| !s.is_empty()).enumerate() {
                 let parts: Vec<&str> = tuple.split(':').collect();
@@ -292,6 +295,12 @@ where
                     "write" => Scope::Write,
                     other => bail!("invalid scope '{other}' in BALE_GRANTS tuple #{idx}"),
                 };
+                let user = users_by_token
+                    .entry(parts[0].to_string())
+                    .or_insert_with(|| parts[1].to_string());
+                if user != parts[1] {
+                    bail!("BALE_GRANTS tuple #{idx} maps an already-granted hub token to a different user");
+                }
                 authz = authz.grant(parts[0], parts[1], parts[2], scope);
             }
         } else {
@@ -307,12 +316,187 @@ where
             public_base_url: public_url,
             default_quota_bytes,
             admin_token,
+            background: background.clone(),
         };
-        axum::serve(listener, router(svc))
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        serve_http(listener, router(svc), background).await?;
     }
     Ok(())
+}
+
+// Serves over hyper-util directly because `axum::serve` exposes no
+// connection-level limits. Without them a client can hold a connection open
+// forever (headers sent byte by byte, or an idle HTTP/2 connection kept alive by
+// pings), and enough such connections lock everyone out.
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    background: tokio_util::task::TaskTracker,
+) -> anyhow::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::service::TowerToHyperService;
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+
+    const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+    const MAX_CONNECTIONS: usize = 4096;
+    // Closed gracefully after this (in-flight requests finish), so no
+    // connection holds a slot forever.
+    const CONN_MAX_AGE: Duration = Duration::from_secs(600);
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(25);
+    // Longer than any handler deadline plus a 64 MiB transfer on a slow link.
+    const AGED_CLOSE_GRACE: Duration = Duration::from_secs(900);
+    const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(120);
+
+    let per_ip_cap: usize = match env::var("BALE_MAX_CONNECTIONS_PER_IP") {
+        Ok(v) => v
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("BALE_MAX_CONNECTIONS_PER_IP must be an integer"))?,
+        Err(_) => 512,
+    };
+    let mut builder = Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(Some(Duration::from_secs(30)))
+        .keep_alive_timeout(Duration::from_secs(20))
+        // Each unauthenticated stream can cost a forge round-trip; hyper's
+        // default (200) times 4096 connections is a large amplification.
+        .max_concurrent_streams(32);
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let per_ip: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>> = Arc::default();
+    let mut last_cap_warn: Option<Instant> = None;
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        let permit = tokio::select! {
+            p = slots.clone().acquire_owned() => p?,
+            _ = &mut shutdown => break,
+        };
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(conn) => conn,
+                // EMFILE/ECONNABORTED etc. are per-connection; keep serving.
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+            _ = &mut shutdown => break,
+        };
+        let ip = client_key(peer.ip());
+        {
+            let mut counts = per_ip.lock().unwrap_or_else(|p| p.into_inner());
+            let n = counts.entry(ip).or_insert(0);
+            if per_ip_cap > 0 && *n >= per_ip_cap {
+                // Rate-limited: a flood of rejected connects mustn't flood the log.
+                let now = Instant::now();
+                if last_cap_warn.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(10)) {
+                    last_cap_warn = Some(now);
+                    tracing::warn!(%ip, per_ip_cap, "per-IP connection limit reached; dropping connections (set BALE_MAX_CONNECTIONS_PER_IP behind a proxy)");
+                }
+                continue;
+            }
+            *n += 1;
+        }
+        let _ = stream.set_nodelay(true);
+        let conn = builder
+            .serve_connection_with_upgrades(
+                TokioIo::new(stream),
+                TowerToHyperService::new(app.clone()),
+            )
+            .into_owned();
+        let mut stop = stop_rx.clone();
+        let guard = ConnSlot {
+            per_ip: per_ip.clone(),
+            ip,
+            _permit: permit,
+        };
+        tokio::spawn(async move {
+            let _guard = guard;
+            tokio::pin!(conn);
+            let age = tokio::time::sleep(CONN_MAX_AGE);
+            tokio::pin!(age);
+            // After graceful_shutdown a peer that never reads its responses
+            // (h2 window 0, h1 pipelining) would hold the slot forever.
+            let result = tokio::select! {
+                r = conn.as_mut() => r,
+                _ = &mut age => {
+                    conn.as_mut().graceful_shutdown();
+                    match tokio::time::timeout(AGED_CLOSE_GRACE, conn).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            tracing::debug!("aged connection did not close in time; dropping it");
+                            Ok(())
+                        }
+                    }
+                }
+                _ = stop.changed() => {
+                    conn.as_mut().graceful_shutdown();
+                    tokio::time::timeout(DRAIN_TIMEOUT, conn).await.unwrap_or(Ok(()))
+                }
+            };
+            if let Err(e) = result {
+                tracing::debug!(error = %e, "connection ended with error");
+            }
+        });
+    }
+    // Refuse new connections at once rather than leaving them in the backlog.
+    drop(listener);
+    let _ = stop_tx.send(true);
+    tokio::select! {
+        _ = slots.acquire_many(MAX_CONNECTIONS as u32) => {}
+        _ = tokio::time::sleep(DRAIN_TIMEOUT) => tracing::warn!("drain timeout; closing remaining connections"),
+    }
+    // Let detached xorb commits (put + layout/accounting writes) finish.
+    background.close();
+    tokio::select! {
+        _ = background.wait() => {}
+        _ = tokio::time::sleep(BACKGROUND_TIMEOUT) => tracing::warn!("background tasks still running at shutdown"),
+    }
+    Ok(())
+}
+
+/// Per-client key for the connection cap: an IPv6 client usually controls a
+/// whole /64, so per-address counting wouldn't bound it.
+fn client_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+        v4 => v4,
+    }
+}
+
+/// A connection's global + per-IP slot, released on drop so a panicking
+/// handler can't leak either.
+struct ConnSlot {
+    per_ip: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    ip: std::net::IpAddr,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        let mut counts = self.per_ip.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = counts.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -356,4 +540,19 @@ fn decode_hex_env(name: &str) -> Result<Vec<u8>> {
 
 fn anyhow_from_core(e: bale_server_core::CoreError) -> anyhow::Error {
     anyhow::anyhow!("core error: {e}")
+}
+
+// The URL may embed credentials (`https://user:pass@host`); never log them.
+fn redact_userinfo(url: &str) -> String {
+    match split_userinfo(url) {
+        Some((scheme, rest)) => format!("{scheme}://{rest}"),
+        None => url.to_string(),
+    }
+}
+
+fn split_userinfo(url: &str) -> Option<(&str, &str)> {
+    let (scheme, after) = url.split_once("://")?;
+    let authority_end = after.find('/').unwrap_or(after.len());
+    let at = after[..authority_end].rfind('@')?;
+    Some((scheme, &after[at + 1..]))
 }

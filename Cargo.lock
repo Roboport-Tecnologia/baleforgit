@@ -642,6 +642,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bale-e2e-tools"
+version = "0.1.1"
+dependencies = [
+ "bale-server-core",
+ "bale-server-shard",
+ "bale-server-wire",
+ "hex",
+ "serde_json",
+ "xet-core-structures",
+]
+
+[[package]]
 name = "bale-server-authz-http"
 version = "0.1.1"
 dependencies = [
@@ -680,10 +692,12 @@ dependencies = [
  "bale-server-storage-s3",
  "bale-server-tokens",
  "hex",
+ "hyper-util",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -714,6 +728,7 @@ dependencies = [
  "base64",
  "blake3",
  "bytes",
+ "futures-util",
  "hex",
  "hmac 0.13.0",
  "opentelemetry",
@@ -722,6 +737,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tokio",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -764,6 +780,7 @@ name = "bale-server-shard"
 version = "0.1.1"
 dependencies = [
  "bale-server-core",
+ "lz4_flex",
  "thiserror",
  "xet-core-structures",
 ]
@@ -1851,6 +1868,7 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "dunce",
  "fs4",
  "gix",
  "hex",
@@ -1859,6 +1877,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror",
  "tokio",
@@ -5451,6 +5470,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -5466,6 +5486,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -5483,6 +5504,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "pin-project-lite",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",

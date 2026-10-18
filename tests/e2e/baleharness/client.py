@@ -6,7 +6,6 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from baleharness.logutil import TestFailure
 from baleharness.proc import run
@@ -22,8 +21,8 @@ class SshAgent:
     that — any process that inherits `SSH_AUTH_SOCK` gets the key."""
 
     def __init__(self) -> None:
-        self.sock: Optional[str] = None
-        self.pid: Optional[int] = None
+        self.sock: str | None = None
+        self.pid: int | None = None
 
     def start(self, identity_file: Path) -> None:
         # `ssh-agent -s` prints sh-style assignments we parse.
@@ -71,7 +70,7 @@ class ClientEnv:
     gitconfig: Path
     ssh_config: Path
     git_bale_bin: Path
-    ssh_agent: Optional[SshAgent] = None
+    ssh_agent: SshAgent | None = None
 
     def make_env(self) -> dict:
         env = os.environ.copy()
@@ -184,7 +183,7 @@ def setup_client(*, work_root: Path, git_bale_bin: Path) -> ClientEnv:
     # key; Windows has no equivalent per-process agent, so it falls back to
     # ssh's default identity lookup at %USERPROFILE%\.ssh\id_ed25519 — exactly
     # where ssh-keygen placed it (USERPROFILE points at our isolated HOME).
-    agent: Optional[SshAgent] = None
+    agent: SshAgent | None = None
     if os.name != "nt":
         agent = SshAgent()
         agent.start(ssh_key)

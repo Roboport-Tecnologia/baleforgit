@@ -157,9 +157,13 @@ jobs:
 
       - name: Package
         shell: bash
+        # Passed via env, not `${{ }}`-interpolated into the script, so a
+        # crafted version string can't inject shell.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ inputs.version }}"
+          VERSION="$INPUT_VERSION"
           TARGET="${{ matrix.target }}"
           SUFFIX="${{ matrix.suffix }}"
           OS="${{ matrix.os }}"

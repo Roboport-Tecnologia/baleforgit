@@ -29,13 +29,11 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from baleharness.logutil import TestFailure, info
 from baleharness.proc import host_primary_ip, pick_free_port
 from baleharness.runtime import Runtime
 from baleharness.s3backend import Network  # shared per-run podman network
-
 
 # =============================================================================
 # Constants
@@ -80,7 +78,7 @@ class PostgresGuard:
         self.host_ip = host_ip
 
     @classmethod
-    def start(cls, rt: Runtime, network: Network) -> "PostgresGuard":
+    def start(cls, rt: Runtime, network: Network) -> PostgresGuard:
         host_port = pick_free_port()
         host_ip = host_primary_ip()
         container = f"bale-e2e-pg-{secrets.token_hex(4)}"
@@ -127,7 +125,7 @@ class PostgresGuard:
 
     def wait_ready(self) -> None:
         deadline = time.monotonic() + PG_READY_TIMEOUT_S
-        last_err: Optional[str] = None
+        last_err: str | None = None
         while time.monotonic() < deadline:
             completed = subprocess.run(
                 self.rt.cmd(
@@ -253,13 +251,13 @@ class ActivePostgresBackend:
     prefix_anchor: Path
 
 
-_ACTIVE_PG: Optional[ActivePostgresBackend] = None
+_ACTIVE_PG: ActivePostgresBackend | None = None
 
 
-def set_active_postgres_backend(backend: Optional[ActivePostgresBackend]) -> None:
+def set_active_postgres_backend(backend: ActivePostgresBackend | None) -> None:
     global _ACTIVE_PG
     _ACTIVE_PG = backend
 
 
-def get_active_postgres_backend() -> Optional[ActivePostgresBackend]:
+def get_active_postgres_backend() -> ActivePostgresBackend | None:
     return _ACTIVE_PG

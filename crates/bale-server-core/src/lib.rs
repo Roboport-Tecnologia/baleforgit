@@ -83,12 +83,20 @@ pub struct RepoRef {
     pub repo_type: RepoType,
     pub repo_id: String,  // "namespace/name"
     pub revision: String, // default "main"
+    /// Accounting owner reported by the authority, when its scope key isn't
+    /// owner-prefixed (a forge keying scope on a transfer-stable repo id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 impl RepoRef {
-    /// Namespace before `/` — the unit of storage accounting and quotas.
-    /// Falls back to the whole `repo_id` defensively; forge tokens always have one.
+    /// The unit of storage accounting and quotas: the authority's explicit
+    /// owner, else the namespace before `/` (falling back to the whole
+    /// `repo_id` defensively).
     pub fn owner(&self) -> &str {
+        if let Some(owner) = &self.owner {
+            return owner;
+        }
         match self.repo_id.split_once('/') {
             Some((owner, _)) => owner,
             None => &self.repo_id,
@@ -147,13 +155,22 @@ pub struct ChunkOffsetRow {
 }
 
 /// `on_disk_start` points at the frame's 8-byte header; `on_disk_len` covers
-/// header + compressed payload.
+/// header + compressed payload. One frame is one chunk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XorbFrameRow {
     pub frame_index: u32,
     pub on_disk_start: u32,
     pub on_disk_len: u32,
     pub uncompressed_len: u32,
+    /// Server-computed from the verified xorb body.
+    pub chunk_hash: ChunkHash,
+}
+
+/// A file whose terms the server has verified against its `file_hash`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRegistration {
+    pub file_hash: FileHash,
+    pub terms: Vec<FileTerm>,
 }
 
 #[derive(Debug, Error)]
@@ -170,6 +187,12 @@ pub enum CoreError {
     Forbidden,
     #[error("internal: {0}")]
     Internal(String),
+    #[error("storage quota exceeded for owner '{owner}': {used} bytes would exceed the {quota}-byte limit")]
+    QuotaExceeded {
+        owner: String,
+        used: u64,
+        quota: u64,
+    },
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
@@ -178,11 +201,19 @@ pub type CoreResult<T> = Result<T, CoreError>;
 /// shards (also content-addressed; kept for archival / re-indexing).
 #[async_trait]
 pub trait BlobStore: Send + Sync {
-    /// `true` if newly inserted, `false` if it already existed.
+    /// `true` if newly inserted, `false` if it already existed. Must never
+    /// replace an existing blob: equal-hash bodies can differ in compression, and
+    /// the recorded frame layout is derived from whichever body was kept.
     async fn put_xorb(&self, hash: &XorbHash, body: Bytes) -> CoreResult<bool>;
+    /// Atomically overwrite a stored blob that failed re-verification with a
+    /// verified body (heals bit rot / tampering).
+    async fn replace_xorb(&self, hash: &XorbHash, body: Bytes) -> CoreResult<()>;
     async fn xorb_exists(&self, hash: &XorbHash) -> CoreResult<bool>;
     /// `byte_range` is half-open `[start, end)`.
     async fn get_xorb_range(&self, hash: &XorbHash, byte_range: Range<u64>) -> CoreResult<Bytes>;
+    async fn get_xorb(&self, hash: &XorbHash) -> CoreResult<Bytes> {
+        self.get_xorb_range(hash, 0..u64::MAX).await
+    }
     async fn put_shard(&self, hash: &ShardHash, body: Bytes) -> CoreResult<()>;
     async fn get_shard(&self, hash: &ShardHash) -> CoreResult<Bytes>;
     /// Return an offloaded download URL (e.g. S3 presign) if the backend
@@ -202,27 +233,42 @@ pub trait BlobStore: Send + Sync {
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
     async fn register_xorb(&self, xorb: &XorbInfo, chunks: &[ChunkRow]) -> CoreResult<()>;
-    async fn register_file(
-        &self,
-        file_hash: &FileHash,
-        repo: &RepoRef,
-        terms: &[FileTerm],
-    ) -> CoreResult<()>;
 
-    /// Register many files atomically so a partial fault can't leak an orphan
-    /// file row the client thinks didn't upload. Default impl is a non-atomic
-    /// loop (fine for in-memory stores); SQL stores must override with one txn.
+    /// Register many files in one transaction so a partial fault can't leak an
+    /// orphan file row the client thinks didn't upload. With `quota`, the
+    /// owner's usage is rechecked inside the transaction (serialized per owner)
+    /// and the whole batch fails with `QuotaExceeded` if it pushed usage over —
+    /// concurrent shards can't each pass a separate pre-check and overshoot.
     async fn register_files(
         &self,
         repo: &RepoRef,
-        files: &[(FileHash, Vec<FileTerm>)],
-    ) -> CoreResult<()> {
-        for (file_hash, terms) in files {
-            self.register_file(file_hash, repo, terms).await?;
-        }
-        Ok(())
-    }
+        files: &[FileRegistration],
+        quota: Option<u64>,
+    ) -> CoreResult<()>;
 
+    /// Charge a new xorb to the uploading owner (until some file references
+    /// it) BEFORE its blob is written, atomically with the quota check and
+    /// serialized per owner, so concurrent uploads can't jointly overshoot.
+    /// `false` if the xorb was already charged to someone.
+    async fn reserve_xorb_upload(
+        &self,
+        xorb: &XorbHash,
+        owner: &str,
+        bytes: u64,
+        quota: Option<u64>,
+    ) -> CoreResult<bool>;
+    /// Replace a reservation's upper-bound size with the stored body's.
+    async fn settle_xorb_upload(
+        &self,
+        xorb: &XorbHash,
+        owner: &str,
+        bytes_on_disk: u64,
+    ) -> CoreResult<()>;
+    /// Drop a reservation whose blob write failed.
+    async fn release_xorb_upload(&self, xorb: &XorbHash, owner: &str) -> CoreResult<()>;
+
+    /// Upsert: rows for the same `(xorb, frame_index)` are overwritten, so the
+    /// layout can be re-derived from whichever encoding the blob store kept.
     async fn register_xorb_layout(
         &self,
         xorb: &XorbHash,
@@ -230,6 +276,14 @@ pub trait MetadataStore: Send + Sync {
     ) -> CoreResult<()>;
     /// Ordered by `frame_index`; empty if no layout was registered.
     async fn xorb_frame_layout(&self, xorb: &XorbHash) -> CoreResult<Vec<XorbFrameRow>>;
+    /// Frames `[start, end)` of each `(xorb, start, end)` span, in span order and
+    /// `frame_index` order — what shard verification needs, without loading
+    /// whole 8192-frame layouts per referenced xorb. A span with missing frames
+    /// comes back short.
+    async fn xorb_frame_spans(
+        &self,
+        spans: &[(XorbHash, u32, u32)],
+    ) -> CoreResult<Vec<Vec<XorbFrameRow>>>;
     /// Default impl loops over `xorb_frame_layout`; SQL stores should batch.
     /// Returned map omits xorbs with no recorded layout.
     async fn xorb_frame_layouts(
@@ -247,6 +301,8 @@ pub trait MetadataStore: Send + Sync {
     }
 
     async fn xorb_exists(&self, xorb: &XorbHash) -> CoreResult<bool>;
+    /// The subset of `xorbs` that have no `xorbs` row (batched).
+    async fn missing_xorb_rows(&self, xorbs: &[XorbHash]) -> CoreResult<Vec<XorbHash>>;
     async fn lookup_file(&self, file_hash: &FileHash) -> CoreResult<Option<Vec<FileTerm>>>;
     /// Reconstruction-scope check: `true` iff `file_hash` is registered in
     /// `repo_id`. The same hash can be registered in many repos (cross-repo
@@ -263,9 +319,9 @@ pub trait MetadataStore: Send + Sync {
     /// dedup-savings display, never for quota enforcement.
     async fn raw_bytes_for_owner(&self, owner: &str) -> CoreResult<u64>;
 
-    /// On-disk bytes of the distinct xorbs the owner's files reference. Accounted
-    /// per owner — a xorb shared by two owners counts once each (no cross-owner
-    /// dedup accounting).
+    /// On-disk bytes of the distinct xorbs the owner's files reference, plus the
+    /// owner's uploaded xorbs no file references. Accounted per owner — a xorb
+    /// shared by two owners counts once each (no cross-owner dedup accounting).
     async fn stored_bytes_for_owner(&self, owner: &str) -> CoreResult<u64>;
 
     async fn get_owner_quota(&self, owner: &str) -> CoreResult<Option<u64>>;
@@ -294,6 +350,25 @@ pub trait MetadataStore: Send + Sync {
     async fn exclusive_stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
 }
 
+/// Why the upstream credential is being checked, so the authority can refuse a
+/// download-scoped credential for token exchange and bind it to one file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessPurpose<'a> {
+    TokenExchange,
+    FileDownload { file_id: &'a str },
+}
+
+#[derive(Clone, Debug)]
+pub struct AccessGrant {
+    pub user: UserId,
+    /// The authority's canonical `owner/name` for the repo, when it reports
+    /// one. Scope and accounting key on this instead of the client-typed name,
+    /// which a case-insensitive forge resolves the same for many spellings.
+    pub canonical_repo_id: Option<String>,
+    /// The authority's accounting owner for the repo, when it reports one.
+    pub canonical_owner: Option<String>,
+}
+
 /// Authorization layer. Pluggable so it can proxy to an external repo
 /// authority (git forge, identity provider) instead of holding its own
 /// user/repo permissions.
@@ -307,7 +382,8 @@ pub trait RepoAuthz: Send + Sync {
         hub_bearer: &str,
         repo: &RepoRef,
         scope: Scope,
-    ) -> CoreResult<UserId>;
+        purpose: AccessPurpose<'_>,
+    ) -> CoreResult<AccessGrant>;
 
     /// Returns `(token, absolute_expiry_unix_seconds)`; tokens minted here must
     /// verify via this impl's [`Self::verify_xet_token`].

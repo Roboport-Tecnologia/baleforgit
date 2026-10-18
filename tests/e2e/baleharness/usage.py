@@ -6,7 +6,6 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Optional
 
 from baleharness.server import ServerHandle
 
@@ -51,7 +50,7 @@ def http_get_file(
     file_id: str,
     token: str,
     repo: str,
-    filename: Optional[str] = None,
+    filename: str | None = None,
 ) -> tuple[int, bytes, dict[str, str]]:
     """GET the browser-facing /v1/files/{id} download. The bearer rides in the
     query (`?token=`) because the forge 302s here without an Authorization

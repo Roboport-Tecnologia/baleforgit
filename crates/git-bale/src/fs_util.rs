@@ -1,7 +1,7 @@
 //! Small helpers shared across the `<git_dir>/bale/` cache modules.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 
 /// Create `<git_dir>/bale/<subdir>` and tighten `bale/` to 0o700 on Unix so
@@ -70,4 +70,98 @@ pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     let mut handle = file.try_clone()?;
     handle.seek(SeekFrom::Start(offset))?;
     handle.read(buf)
+}
+
+/// fsync a file's contents to stable storage.
+pub fn fsync_file(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        // FlushFileBuffers needs GENERIC_WRITE; xet stores objects read-only,
+        // so lift the attribute for the flush and put it back.
+        let open_w = || std::fs::OpenOptions::new().write(true).open(path);
+        match open_w() {
+            Ok(f) => f.sync_all(),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                let mut perms = std::fs::metadata(path)?.permissions();
+                if !perms.readonly() {
+                    return Err(e);
+                }
+                perms.set_readonly(false);
+                std::fs::set_permissions(path, perms.clone())?;
+                let res = open_w().and_then(|f| f.sync_all());
+                perms.set_readonly(true);
+                std::fs::set_permissions(path, perms)?;
+                res
+            }
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)?.sync_all()
+    }
+}
+
+/// fsync a directory so a rename/create inside it survives a crash. Windows
+/// can't open directories for sync (NTFS journals metadata itself): no-op.
+pub fn fsync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// fsync the nearest `levels` ancestors of `dir`. A freshly created store or
+/// staging dir is only durable once its parents' entries are, or a crash can
+/// drop the whole tree while git's index already holds the pointer.
+pub fn fsync_ancestors(dir: &Path, levels: usize) -> io::Result<()> {
+    let mut cur = dir.parent();
+    for _ in 0..levels {
+        match cur {
+            Some(p) if !p.as_os_str().is_empty() && p.is_dir() => {
+                fsync_dir(p)?;
+                cur = p.parent();
+            }
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+/// Crash-safe replace: `<dir>/<tmp_name>` → write → fsync → rename onto
+/// `final_path` → fsync `dir`. Readers see the old file or the complete new one.
+pub fn write_durable(dir: &Path, tmp_name: &str, final_path: &Path, body: &[u8]) -> io::Result<()> {
+    let tmp = dir.join(tmp_name);
+    let res = (|| {
+        let mut f = File::create(&tmp)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, final_path)?;
+        fsync_dir(dir)?;
+        fsync_ancestors(dir, 3)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// fsync every file and directory under `root` (bottom-up), then `root`.
+pub fn fsync_tree(root: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            fsync_tree(&entry.path())?;
+        } else if ft.is_file() {
+            fsync_file(&entry.path())?;
+        }
+    }
+    fsync_dir(root)
 }

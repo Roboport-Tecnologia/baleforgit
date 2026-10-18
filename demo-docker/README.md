@@ -95,11 +95,11 @@ rm .env
 podman compose up -d --force-recreate
 ```
 
-## Why the JWT secrets are paired
+## Why the JWT secrets are independent
 
 `BALE_JWT_SECRET_HEX` (baleforgit-server) and `LFS_JWT_SECRET_BASE64URL` (gitea)
-must decode to the **same 32 bytes**: gitea mints the JWT the client presents to
-baleforgit-server, which verifies it against its own copy of the HS256 key
-before delegating the repo-access check back to gitea over
-`POST /-/bale/check_access`. `bootstrap.py` keeps the two encodings in sync — if
-you edit `.env` by hand, keep them paired.
+are **separate** keys. gitea signs the JWT the client presents to
+baleforgit-server, but baleforgit-server never verifies it locally: it forwards
+it to gitea's `POST /-/bale/check_access`, and signs its own short-lived Bale
+tokens with `BALE_JWT_SECRET_HEX` (bound by `iss`/`aud`). Sharing one key would
+only let a compromise of either service forge the other's tokens.

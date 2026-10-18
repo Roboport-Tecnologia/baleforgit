@@ -65,6 +65,7 @@ alongside a forge, see [`prod-docker/`](../prod-docker/).
 | `BALE_S3_DISABLE_SSE` | `false` | PUTs request SSE-S3 (AES256) by default. Set truthy to disable, for backends that don't support server-side encryption (e.g. MinIO). |
 | `BALE_S3_ACCESS_KEY_ID` / `BALE_S3_SECRET_ACCESS_KEY` / `BALE_S3_SESSION_TOKEN` | none | Explicit credentials. When unset, the SDK uses env vars, `~/.aws/credentials`, and IMDS as usual. |
 | `BALE_DEFAULT_QUOTA_BYTES` | none (unlimited) | Default per-owner storage cap, applied when no per-owner override is set via `PUT /v1/quotas/{owner}`. See [`ARCHITECTURE.md`](ARCHITECTURE.md#owner-accounting-and-quotas). |
+| `BALE_MAX_CONNECTIONS_PER_IP` | `512` | Open connections allowed per client IP, counting an IPv6 client per /64 (`0` = unlimited). Behind a reverse proxy every client shares the proxy's IP, so raise it or set `0` and rate-limit at the proxy. |
 | `BALE_ADMIN_TOKEN_HEX` | none (admin endpoint disabled, returns 404) | 64-char hex (32 bytes) bearer for `PUT /v1/quotas/{owner}`. Constant-time compared. Keep separate from your JWT secret. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | none (exporters disabled) | If set, the server exports traces + metrics over OTLP HTTP/protobuf to `<endpoint>/v1/traces` and `<endpoint>/v1/metrics`. Typical local-collector value: `http://localhost:4318`. See [Observability](#observability). |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | none | Per-signal override; used verbatim (no `/v1/...` suffix appended). Either alone is enough to enable just that signal. |

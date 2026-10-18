@@ -6,7 +6,6 @@ from pathlib import Path
 
 from baleharness.jwtutil import forge_jwt_with_filename
 
-
 # This module lives at tests/e2e/baleharness/config.py, so the e2e dir (which
 # holds the Dockerfile/entrypoint) is one level up and the repo root is three.
 E2E_DIR = Path(__file__).resolve().parents[1]

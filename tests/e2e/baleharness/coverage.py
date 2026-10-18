@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING
 
 from baleharness.config import COVERAGE_IMAGE_TAG, REPO_ROOT
 from baleharness.logutil import TestFailure, die, info, warn
@@ -38,7 +39,7 @@ class CoverageConfig:
         return str(self.profile_dir / "host-%m-%p.profraw")
 
 
-def _find_llvm_tool(name: str) -> Optional[Path]:
+def _find_llvm_tool(name: str) -> Path | None:
     # llvm-tools-preview ships its binaries under
     # `<sysroot>/lib/rustlib/<host-triple>/bin/`, not under any path
     # `rustup which` knows about. Resolve via rustc's --print queries.
@@ -146,7 +147,7 @@ def extract_server_bin(rt: Runtime, image_tag: str, dest: Path) -> Path:
 def setup_coverage(
     rt: Runtime,
     *,
-    coverage_dir_arg: Optional[str],
+    coverage_dir_arg: str | None,
     no_build: bool = False,
 ) -> CoverageConfig:
     """Build instrumented binaries, build instrumented image, extract the
@@ -213,11 +214,11 @@ def setup_coverage(
 
 def run_s3_coverage_phases(
     *,
-    timings: "Timings",
-    rt: "Runtime",
+    timings: Timings,
+    rt: Runtime,
     image_tag: str,
     work_root: Path,
-    client: "ClientEnv",
+    client: ClientEnv,
     ssh_public_key: str,
     admin_token_hex: str,
     skip: set,
@@ -250,8 +251,8 @@ def run_s3_coverage_phases(
     # All container-launching code shares one coverage-state global
     # (baleharness.covstate), so no cross-module mirroring is needed.
 
-    network: Optional["Network"] = None
-    minio: Optional["MinioGuard"] = None
+    network: Network | None = None
+    minio: MinioGuard | None = None
     try:
         with timings.measure("s3-setup: podman network"):
             network = Network.create(rt)

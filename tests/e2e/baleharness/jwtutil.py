@@ -42,6 +42,9 @@ def mint_bale_jwt(
 ) -> str:
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
+        # Must match bale-server-tokens' TOKEN_ISSUER / TOKEN_AUDIENCE.
+        "iss": "baleforgit",
+        "aud": "baleforgit-cas",
         "sub": sub,
         "repo_type": repo_type,
         "repo_id": repo_id,

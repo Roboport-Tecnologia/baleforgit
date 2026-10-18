@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import random
 
-
 PHASE_GROUPS_ORDER = ["g1", "g2-head", "g2-tail", "g3"]
 
 

@@ -10,8 +10,8 @@ import secrets
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 from baleharness.client import ClientEnv
 from baleharness.config import (
@@ -32,8 +32,8 @@ from baleharness.config import (
 from baleharness.gitutil import git, pointer_hash_at, verify_pointer_at, verify_worktree
 from baleharness.jwtutil import mint_bale_jwt
 from baleharness.logutil import TestFailure, fmt_bytes, info
-from baleharness.phases.failure import fail_fast_xet_env
 from baleharness.payloads import deterministic_payload
+from baleharness.phases.failure import fail_fast_xet_env
 from baleharness.proc import sha256_bytes, sha256_file
 from baleharness.repo import init_repo_for_clone, init_repo_for_push
 from baleharness.runtime import Runtime
@@ -147,9 +147,9 @@ def phase_adversarial_tampered_xorb(
     rev_state: dict,
 ) -> None:
     """Corrupt the stored xorbs (we own both the bind-mounted fs data dir and
-    the MinIO bucket), then cold-clone in a fresh worktree. The smudge must
-    NOT silently produce wrong bytes — it must either error or produce content
-    whose sha256 the test detects as wrong."""
+    the MinIO bucket), then cold-clone in a fresh worktree. The smudge verifies
+    reconstructed bytes against the pointer's sha256, so the checkout must
+    FAIL and no wrong bytes may land in the worktree."""
     # Backend-agnostic corrupt/restore. Corrupt EVERY stored xorb — flip a
     # window in the middle of each. Corrupting just one is fragile: HEAD's
     # reconstruction (rev v3 of bigfile) only reads a subset of any single
@@ -206,7 +206,6 @@ def phase_adversarial_tampered_xorb(
             repo=E2E_REPO_2,
             name="tampered",
         )
-        bytes_match = False
         with timings.measure("adversarial: smudge a tampered xorb"):
             completed = git(
                 ["checkout", "main"],
@@ -214,13 +213,16 @@ def phase_adversarial_tampered_xorb(
                 env=env,
                 expect_fail=True,
             )
-            if completed.returncode == 0 and (clone_path / "bigfile.bin").exists():
-                got_sha = sha256_file(clone_path / "bigfile.bin")
-                bytes_match = got_sha == rev_state["shas"][-1]
-        if bytes_match:
+        target = clone_path / "bigfile.bin"
+        if target.exists() and sha256_file(target) != rev_state["shas"][-1]:
             raise TestFailure(
-                "tampered xorb still produced matching bytes — chunk-hash "
-                "verification isn't catching corruption"
+                "tampered xorb wrote WRONG bytes into the worktree — smudge "
+                "content verification isn't catching corruption"
+            )
+        if completed.returncode == 0:
+            raise TestFailure(
+                "checkout of a tampered xorb succeeded; smudge must refuse "
+                "content that fails sha256 verification"
             )
     finally:
         # Restore so downstream phases aren't poisoned.
@@ -295,7 +297,7 @@ def phase_adversarial_quota_exceeded(
             completed = git(
                 ["push", "-u", "origin", "main"],
                 cwd=repo,
-                # 429 is retried by xet; fail-fast keeps the phase from hanging ~tens of seconds.
+                # fail-fast trims xet's retry budget so the phase fails promptly.
                 env=fail_fast_xet_env(env),
                 expect_fail=True,
             )
@@ -306,7 +308,7 @@ def phase_adversarial_quota_exceeded(
         if "over your storage quota" not in push_text.lower():
             raise TestFailure(
                 "over-quota push did not surface the client-friendly quota "
-                "message (429 → rewrite path broken); push output was:\n"
+                "message (413 → rewrite path broken); push output was:\n"
                 f"{push_text[:2000]}"
             )
         # Server should still be healthy after the rejected push.
@@ -666,9 +668,9 @@ def _http(
     method: str,
     url: str,
     *,
-    bearer: Optional[str] = None,
-    body: Optional[bytes] = None,
-    headers: Optional[dict[str, str]] = None,
+    bearer: str | None = None,
+    body: bytes | None = None,
+    headers: dict[str, str] | None = None,
     timeout: int = 30,
 ) -> tuple[int, bytes]:
     """Raw HTTP that returns (status, body) for both 2xx and 4xx so the caller
@@ -712,7 +714,7 @@ def _one_stored_xorb_body(server: ServerHandle) -> bytes:
     raise TestFailure("no xorb on disk to read")
 
 
-def _corrupt_frame_length(body: bytes) -> Optional[bytes]:
+def _corrupt_frame_length(body: bytes) -> bytes | None:
     """Flip the low bit of the first frame's declared *uncompressed_length*
     (header bytes 5-7), leaving the compressed payload and every framing length
     intact. `parse_xorb_frames` still succeeds, but `verify_xorb_body`
@@ -746,9 +748,9 @@ def phase_adversarial_upload_guards(
          a real xorb body under a wrong URL hash (HashMismatch), or a corrupted
          body, must 400 and write nothing. The `tampered-xorb` phase only tests
          the *download* side; this is the *upload* gate that stops CAS poisoning.
-      2. Signed transfer-URL enforcement — forged sig, expired, and Range
-         mismatch must each 401 (fs backend only; S3 presigns bypass the
-         handler).
+      2. Signed transfer-URL enforcement — forged sig and Range mismatch must
+         each 401, an expired URL 403 (the status xet refreshes on) (fs backend
+         only; S3 presigns bypass the handler).
       3. Scope enforcement — a read-scope token doing a POST must 403.
       4. `get_xorb_range` bounds — a validly-signed range whose end runs past
          the xorb clamps to a whole-xorb 206 (never an over-read), and one whose
@@ -922,15 +924,15 @@ def phase_adversarial_upload_guards(
                         "— constant-time signature check not enforcing"
                     )
 
-            with timings.measure("upload-guards: expired signature (401)"):
+            with timings.measure("upload-guards: expired signature (403)"):
                 # Sign over a past exp so the sig check passes and the expiry
                 # branch is what rejects.
                 past_x = now - 3600
                 past_sig = _sign_transfer(tsecret, xorb_hex, s, e, past_x)
                 status, _ = transfer(s, e, past_x, past_sig, range_hdr)
-                if status != 401:
+                if status != 403:
                     raise TestFailure(
-                        f"expired transfer URL returned {status}, want 401"
+                        f"expired transfer URL returned {status}, want 403 (xet refreshes URLs only on 403)"
                     )
 
             with timings.measure("upload-guards: Range mismatch (401)"):

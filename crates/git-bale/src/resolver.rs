@@ -1,16 +1,15 @@
-//! Auto-resolve `(server_url, token)` when local config lacks one or both.
-//! See `docs/BALE_FORGE_PROTOCOL.md` for the wire shape. Three steps, each
-//! skipped once its output is known:
+//! Resolve `(server_url, token)` for a remote. A literal `bale.serverUrl` +
+//! `bale.token` pair short-circuits everything; otherwise (half a pair is
+//! ignored with a warning) the forge is asked. See `docs/BALE_FORGE_PROTOCOL.md`.
 //!
-//! 1. Parse `origin` → HTTPS or SSH URL.
-//! 2. Obtain a forge-minted JWT (+ baleforgit-server URL, unless overridden by
-//!    `bale.serverUrl`):
+//! 1. Parse the remote (`origin` unless overridden) → HTTPS or SSH URL.
+//! 2. Obtain a forge-minted JWT + baleforgit-server URL:
 //!    - HTTPS: `git credential fill`, then POST
 //!      `.../info/bale/authenticate?op=<op>` with Basic auth; the forge verifies
 //!      locally and returns `{href, header.Authorization=Bearer <jwt>}`.
 //!    - SSH: `ssh git@host git-bale-authenticate <repo> <op>` returns the same.
 //! 3. Token exchange: `GET .../bale-{rw}-token/<rev>` with the forge JWT →
-//!    final bale token. Skipped when local config holds a literal token.
+//!    final bale token.
 
 use std::io::Write;
 use std::path::Path;
@@ -62,17 +61,28 @@ pub async fn resolve_for_remote(
     scope: Scope,
     remote_override: Option<RemoteUrl>,
 ) -> Result<ResolvedAuth> {
-    // Fast path: both pieces locally configured. (A literal `bale.serverUrl` +
-    // `bale.token` overrides every remote, so the override is moot here.)
-    if let (Some(url), Some(tok)) = (raw.server_url.as_ref(), raw.token.as_ref()) {
-        return Ok(ResolvedAuth {
-            server_url: url.clone(),
-            token: tok.clone(),
-            token_expiration: raw.token_expiration.unwrap_or_else(far_future_epoch),
-        });
+    // Half a pair is ignored: a lone token would go to whatever server some
+    // remote's forge names; a lone URL would get another setup's token.
+    match (raw.server_url.as_ref(), raw.token.as_ref()) {
+        (Some(url), Some(tok)) => {
+            return Ok(ResolvedAuth {
+                server_url: url.clone(),
+                token: tok.clone(),
+                token_expiration: raw.token_expiration.unwrap_or_else(far_future_epoch),
+            });
+        }
+        (Some(_), None) => tracing::warn!(
+            "bale.serverUrl is set without bale.token; ignoring it and using the forge-advertised server"
+        ),
+        (None, Some(_)) => tracing::warn!(
+            "bale.token is set without bale.serverUrl; ignoring it and minting a token via the forge"
+        ),
+        (None, None) => {}
     }
 
-    let repo_cwd = raw.git_dir.as_deref().and_then(|p| p.parent());
+    // The common git dir itself: discovery and `git credential fill` both work
+    // from inside it, even for a bare repo with linked worktrees.
+    let repo_cwd = raw.git_dir.as_deref();
     let remote = match remote_override {
         Some(r) => r,
         None => parse_origin(repo_cwd)
@@ -93,8 +103,7 @@ pub async fn resolve_for_remote(
             let bearer = strip_bearer(&auth.authorization)
                 .ok_or_else(|| anyhow!("git-bale-authenticate returned non-Bearer Authorization"))?
                 .to_string();
-            let url = raw.server_url.clone().unwrap_or(auth.href);
-            (url, bearer)
+            (auth.href, bearer)
         }
         RemoteScheme::Http | RemoteScheme::Https => {
             let auth =
@@ -102,21 +111,12 @@ pub async fn resolve_for_remote(
             let bearer = strip_bearer(&auth.authorization).ok_or_else(|| {
                 anyhow!("/info/bale/authenticate returned non-Bearer Authorization")
             })?;
-            let url = raw.server_url.clone().unwrap_or(auth.href);
-            (url, bearer.to_string())
+            (auth.href, bearer.to_string())
         }
     };
 
-    // Caller already has a final bale token — skip exchange.
-    if let Some(tok) = raw.token.clone() {
-        return Ok(ResolvedAuth {
-            server_url,
-            token: tok,
-            token_expiration: raw.token_expiration.unwrap_or_else(far_future_epoch),
-        });
-    }
-
-    exchange_token(
+    require_tls(&remote, &server_url, "forge-advertised server URL")?;
+    let resolved = exchange_token(
         &server_url,
         owner,
         repo_name,
@@ -124,7 +124,44 @@ pub async fn resolve_for_remote(
         scope,
         &forge_bearer,
     )
-    .await
+    .await?;
+    require_tls(&remote, &resolved.server_url, "token-exchange casUrl")?;
+    Ok(resolved)
+}
+
+/// Refuse a cleartext `http://` endpoint for a remote reached over https/ssh:
+/// the forge JWT and bale token would cross the network unencrypted. Loopback
+/// is exempt (local dev, test harness).
+fn require_tls(remote: &RemoteUrl, url: &str, what: &str) -> Result<()> {
+    if remote.scheme == RemoteScheme::Http {
+        return Ok(());
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return Ok(());
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if loopback {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "refusing {what} {url}: plain http would send credentials in cleartext for a remote \
+         reached over {}",
+        if remote.scheme == RemoteScheme::Ssh {
+            "ssh"
+        } else {
+            "https"
+        }
+    ))
 }
 
 /// Mirrors xet's private `REFRESH_BUFFER_SEC`: xet treats a token as expired
@@ -342,6 +379,7 @@ async fn ssh_authenticate(
     };
     let host = remote.host.as_str();
     let user = remote.user.as_deref().unwrap_or("git");
+    crate::remote::validate_ssh_target(user, host)?;
     // ssh first-occurrence-wins per keyword, so a user's GIT_SSH_COMMAND /
     // core.sshCommand can override either of these; they're the safe default
     // when it doesn't (no interactive prompt, accept an unknown host once).
@@ -355,6 +393,11 @@ async fn ssh_authenticate(
         args.push("-p".into());
         args.push(port.to_string());
     }
+    // `--` ends option parsing (OpenSSH getopt), so even a destination that
+    // slipped past validation can't be read as `-oProxyCommand=…`. With a
+    // configured GIT_SSH_COMMAND these args are appended after the user's own
+    // options, so `--` still precedes only the destination and command.
+    args.push("--".into());
     args.push(format!("{user}@{host}"));
     args.push(format!("git-bale-authenticate {owner}/{repo} {op}"));
 

@@ -7,9 +7,9 @@ import secrets
 import shutil
 import subprocess
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
 
 from baleharness.client import ClientEnv
 from baleharness.covstate import get_coverage
@@ -204,7 +204,7 @@ def mount_rev_session(
     env: dict,
     mount_root: Path,
     rev: str,
-    paths: Optional[list[str]] = None,
+    paths: list[str] | None = None,
     label: str = "mount-rev",
 ):
     argv = ["mount", rev]
@@ -229,9 +229,9 @@ def mount_diff_session(
     mount_root: Path,
     rev_a: str,
     rev_b: str,
-    label_a: Optional[str] = None,
-    label_b: Optional[str] = None,
-    paths: Optional[list[str]] = None,
+    label_a: str | None = None,
+    label_b: str | None = None,
+    paths: list[str] | None = None,
     label: str = "mount-diff",
 ):
     # Omitting --label-a/--label-b lets the binary derive labels from the revs

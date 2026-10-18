@@ -8,7 +8,6 @@ import subprocess
 import time
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 from baleharness.client import ClientEnv
 from baleharness.config import (
@@ -25,10 +24,10 @@ from baleharness.gitutil import git, verify_pointer_at, verify_worktree
 from baleharness.logutil import TestFailure, fmt_bytes, info
 from baleharness.mocks import TcpProxy, hold_db_writer_lock
 from baleharness.payloads import deterministic_payload
+from baleharness.pgbackend import get_active_postgres_backend
 from baleharness.proc import pick_free_port, sha256_bytes
 from baleharness.repo import init_repo_for_clone, init_repo_for_push
 from baleharness.runtime import Runtime
-from baleharness.pgbackend import get_active_postgres_backend
 from baleharness.s3backend import S3_PROXY_THROTTLE_BPS, get_active_s3_backend
 from baleharness.server import ServerHandle, start_container
 from baleharness.storage import staging_files
@@ -131,7 +130,7 @@ def phase_failure_server_kill_mid_upload(
         name_suffix=f"kill-mid-upload-{secrets.token_hex(3)}",
         public_host_url_override=proxy_url,
     )
-    new_server: Optional[ServerHandle] = None
+    new_server: ServerHandle | None = None
     payload_size = 4 * 1024 * 1024
     try:
         repo, env = init_repo_for_push(
@@ -890,7 +889,7 @@ def phase_failure_fs_write_fail(
         name_suffix=f"fs-writefail-{secrets.token_hex(3)}",
         extra_env={"BALE_TEST_FS_WRITE_FAIL": "1"},
     )
-    new_server: Optional[ServerHandle] = None
+    new_server: ServerHandle | None = None
     try:
         repo, env = init_repo_for_push(
             work_root=work_root,

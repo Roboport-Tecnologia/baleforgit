@@ -19,7 +19,7 @@ use twox_hash::XxHash3_64;
 const CHUNK_SIZE: u64 = 1 << 20;
 /// Bump on any on-disk schema or chunk-hash change — old entries go invisible
 /// and rebuild. v3: chunk hashes are xxh3-64 hex (was blake3 hex in v2).
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 4;
 /// Random middle-chunks checked before the linear sweep.
 const MIDDLE_SAMPLES: usize = 3;
 const VERIFY_PARALLELISM: usize = 3;
@@ -34,6 +34,13 @@ pub struct CacheEntry {
     /// Pointer JSON returned verbatim (incl. trailing newline) on a hit, so we
     /// stream it back to git without re-encoding.
     pub pointer: String,
+    /// Canonical object store the bytes were written to. A hit is honored only
+    /// against the same store: after switching stores the pointer would name
+    /// bytes the current store lacks.
+    pub store: String,
+    /// The store's `.bale-id` (None for server-mode staging): a store wiped
+    /// and re-created at the same path gets a new one.
+    pub store_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -97,7 +104,8 @@ pub fn save(git_dir: &Path, key: &PathKey, entry: &CacheEntry) -> io::Result<()>
         f.write_all(&body)?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, &final_path)
+    fs::rename(&tmp, &final_path)?;
+    crate::fs_util::fsync_dir(&dir)
 }
 
 /// Drop clean-cache entries whose pointer references one of `hashes` (file-level

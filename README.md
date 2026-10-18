@@ -26,9 +26,9 @@ git add some-binary-file.bin && git commit -m 'add binary file'
 git push
 ```
 
-`git add` chunks the file and stages xorbs/shards under `.git/bale/staging/` — no network. The actual upload happens at `git push`, via the pre-push hook installed by `git-bale install --local`. If you want to push the staged content explicitly (e.g. before a clone to verify, or after editing then reverting), run `git-bale push-pending`.
+`git add` chunks the file and stages xorbs/shards under `.git/bale/staging/` — no network. The actual upload happens at `git push`, via the pre-push hook installed by `git-bale install --local`. Only content the pushed commits reference is uploaded — an uncommitted edit that `git status` happened to re-chunk never leaves your machine. To upload explicitly, run `git-bale push-pending`: by hand it uploads the staged content reachable from `HEAD` to `origin`.
 
-If you stage a change and then abandon it (`git reset`, `git checkout`) before pushing, the staged bytes are no longer needed. `git-bale gc` reclaims that orphaned staging by reconciling it against what the index and your unpushed commits still reference; `install --local` runs it automatically via post-checkout/commit/merge hooks, and it's safe to run by hand anytime.
+If you stage a change and then abandon it (`git reset`, `git checkout`) before pushing, the staged bytes are no longer needed. `git-bale gc` reclaims that orphaned staging by reconciling it against everything git itself would keep — every ref (including remote-tracking), every reflog entry (so `stash@{1}` and reset-away commits stay safe), and every worktree's HEAD and index; committed content is only released once `git push` has uploaded it. `install --local` runs gc automatically via post-checkout/commit/merge hooks, and it's safe to run by hand anytime. `git-bale install` without `--local` only registers the filter: run `install --local` in each repo, or pushes won't upload.
 
 **Public repos clone without credentials.** When the forge marks a repo public and grants anonymous read (see [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md)), cloning or checking out its Bale-tracked files over HTTPS needs no login: `git-bale` asks the forge anonymously first and only falls back to `git credential fill` for a private repo, so a public clone never prompts. Uploads (`git push`) always authenticate.
 
@@ -41,11 +41,11 @@ git config --local bale.serverUrl http://127.0.0.1:8080
 git config --local bale.token "<a Bale JWT minted out-of-band>"
 ```
 
-Same env-var equivalents exist for ephemeral overrides: `BALE_SERVER_URL`, `BALE_TOKEN`.
+Same env-var equivalents exist for ephemeral overrides: `BALE_SERVER_URL`, `BALE_TOKEN`. Set both or neither: if only one is set it's ignored (with a warning) and the forge flow runs, so a static token is never sent to a server some remote's forge advertises.
 
 ### Fully local (no server)
 
-If you don't have (or want) a `baleforgit-server`, `git-bale init-local` puts a repo into fully-local mode: large-file objects are stored on disk and never uploaded.
+If you don't have (or want) a `baleforgit-server`, `git-bale init-local` puts a repo into fully-local mode: large-file objects are stored on disk and never uploaded. A non-shared store (`--store <dir>` without `--shared`) belongs to the repo that created it; other repos are refused — use `--shared` for a store several repos use.
 
 ```bash
 git init myrepo && cd myrepo
@@ -93,8 +93,8 @@ Requires a userspace filesystem driver at runtime (not at build time): `libfuse2
 
 | Source     | Key                     | Purpose                                                       |
 |------------|-------------------------|---------------------------------------------------------------|
-| env        | `BALE_SERVER_URL`       | baleforgit-server base URL — skips forge auto-resolve         |
-| env        | `BALE_TOKEN`            | Pre-minted Bale JWT — skips forge auto-resolve                |
+| env        | `BALE_SERVER_URL`       | baleforgit-server base URL — with `BALE_TOKEN`, skips forge auto-resolve |
+| env        | `BALE_TOKEN`            | Pre-minted Bale JWT — with `BALE_SERVER_URL`, skips forge auto-resolve |
 | env        | `BALE_TOKEN_EXPIRATION` | Unix timestamp when `BALE_TOKEN` expires                      |
 | env        | `BALE_CACHE_DIR`        | Override the shared chunk cache location                      |
 | env        | `XDG_CACHE_HOME`        | Used to derive the default cache dir                          |

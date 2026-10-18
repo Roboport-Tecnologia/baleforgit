@@ -10,3 +10,4 @@ thiserror.workspace = true
 bale-server-core.workspace = true
 
 xet-core-structures = "=1.5.2"
+lz4_flex = "0.13"

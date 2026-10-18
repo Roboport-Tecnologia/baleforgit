@@ -27,6 +27,7 @@ async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 clap = { version = "=4.5.50", features = ["derive"] }
+dunce = "=1.0.5"
 fs4 = { version = "=0.12.0", features = ["sync"] }
 gix = "=0.84.0"
 hex.workspace = true
@@ -35,6 +36,7 @@ libloading = "=0.8.6"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

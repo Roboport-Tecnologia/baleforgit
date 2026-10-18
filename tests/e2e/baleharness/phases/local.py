@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
 
 from baleharness.client import ClientEnv
 from baleharness.config import LOCAL_PAYLOAD_BYTES
-from baleharness.gitutil import git, verify_worktree
+from baleharness.gitutil import git, pointer_hash_at, verify_worktree
 from baleharness.logutil import TestFailure, info
 from baleharness.payloads import deterministic_payload
 from baleharness.proc import run, sha256_bytes
@@ -191,8 +192,9 @@ def phase_local_clean_gc_race(
 ) -> None:
     """Demonstrates the clean-vs-gc data race in local mode.
 
-    Setup: add file1 and commit it (marker M1 + xorb X1 in store), then reset
-    the commit so M1 becomes a dead marker.  While gc would sweep ALL objects
+    Setup: add file1 (marker M1 + xorb X1 in store), then unstage it so M1
+    becomes a dead marker (never committed, so no reflog keeps it live).
+    While gc would sweep ALL objects
     (remaining == 0 after dropping M1), concurrently start a second `git add`
     with a test-knob delay so xorb X2 is written to the store but marker M2
     has not yet appeared.  gc fires in that window, drops M1, sees remaining==0,
@@ -206,19 +208,18 @@ def phase_local_clean_gc_race(
         )
         store = per_repo_store(repo)
 
-        # Step 1: add file1 and commit so M1 + X1 land in the store.
+        # Step 1: add file1 so M1 + X1 land in the store.
         p1 = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"local-race-1")
         (repo / "file1.bin").write_bytes(p1)
         git(["add", "file1.bin"], cwd=repo, env=env)
-        git(["commit", "-m", "file1"], cwd=repo, env=env)
         if not local_store_xorbs(store):
-            raise TestFailure("[local-race] step1: no xorbs after committing file1")
+            raise TestFailure("[local-race] step1: no xorbs after adding file1")
         if not staged_markers(repo):
-            raise TestFailure("[local-race] step1: no markers after committing file1")
+            raise TestFailure("[local-race] step1: no markers after adding file1")
 
-        # Step 2: reset the commit so M1 becomes a dead marker (pointer gone
-        # from every reachable commit and from the index).
-        git(["reset", "HEAD~1", "--mixed"], cwd=repo, env=env)
+        # Step 2: unstage so M1 becomes a dead marker (pointer in no index,
+        # commit, or reflog entry).
+        git(["reset"], cwd=repo, env=env)
 
         # Record baseline: how many xorbs are in the store before file2 is added.
         baseline_xorbs = len(local_store_xorbs(store))
@@ -514,10 +515,10 @@ def phase_local_cache_hit_gc_race(
 ) -> None:
     """Demonstrates the cache-hit-clean vs gc data race in local mode.
 
-    Setup: add f.bin and commit it so the clean-cache is populated for
-    f.bin→H, plus marker H and objects H are in the store.  Then dereference
-    H (reset the commit) so H is no longer reachable from the index or any
-    commit, but the clean-cache entry, marker, and objects are still on disk.
+    Setup: add f.bin so the clean-cache is populated for f.bin→H, plus marker
+    H and objects H are in the store.  Then unstage it so H is reachable from
+    no index, commit or reflog entry, but the clean-cache entry, marker, and
+    objects are still on disk.
 
     Re-add f.bin with BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS=3000 so the cache-
     hit path sleeps for 3 s before emitting the pointer.  Sleep 0.5 s after
@@ -533,24 +534,21 @@ def phase_local_cache_hit_gc_race(
         )
         store = per_repo_store(repo)
 
-        # Step 1: add f.bin and commit — populates clean-cache[f.bin→H], marker
-        # H, objects H.  We need the clean-cache entry to exist so the re-add
+        # Step 1: add f.bin — populates clean-cache[f.bin→H], marker H,
+        # objects H.  We need the clean-cache entry to exist so the re-add
         # takes the HIT path (not the miss path, which re-writes objects itself).
         payload = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"cachehit")
-        base = git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()
         (repo / "f.bin").write_bytes(payload)
         git(["add", "f.bin"], cwd=repo, env=env)
-        git(["commit", "-m", "addf"], cwd=repo, env=env)
 
         if not local_store_xorbs(store):
-            raise TestFailure("[cachehit] no xorbs after initial commit")
+            raise TestFailure("[cachehit] no xorbs after initial add")
         if not staged_markers(repo):
-            raise TestFailure("[cachehit] no markers after initial commit")
+            raise TestFailure("[cachehit] no markers after initial add")
 
-        # Step 2: dereference H while leaving the worktree intact.  git reset
-        # --mixed rolls HEAD back to base and removes f.bin from the index but
+        # Step 2: dereference H while leaving the worktree intact: unstaging
         # keeps the worktree file, the marker, the xorbs, and the cache entry.
-        git(["reset", "--mixed", base], cwd=repo, env=env)
+        git(["reset", "--mixed"], cwd=repo, env=env)
 
         # Precondition check: cache entry must exist so the re-add is a HIT.
         cache_dir = repo / ".git" / "bale" / "clean-cache"
@@ -721,3 +719,866 @@ def phase_local_gc_grace(
             label="grace",
         )
         info("[grace] young orphan survived gc under grace; reclaimed once aged")
+
+
+def phase_local_stash_reflog(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """Reflog entries are live, like in git's own gc: content reachable only
+    from `stash@{1}` keeps its marker. Without that, dropping `stash@{0}` later
+    leaves no marker at all, gc sweeps the whole store, and `stash pop` of the
+    older entry can't be reconstructed."""
+    with timings.measure("local-stash-reflog"):
+        repo, env = init_repo_local(
+            work_root=work_root, client=client, name="local-stash"
+        )
+        rel = "s.bin"
+        v1 = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"stash-v1")
+        v2 = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"stash-v2")
+
+        (repo / rel).write_bytes(v1)
+        git(["add", rel], cwd=repo, env=env)
+        h1 = pointer_hash_at(repo, env, f":{rel}", label="stash")
+        git(["stash"], cwd=repo, env=env)
+        (repo / rel).write_bytes(v2)
+        git(["add", rel], cwd=repo, env=env)
+        h2 = pointer_hash_at(repo, env, f":{rel}", label="stash")
+        git(["stash"], cwd=repo, env=env)
+
+        run([str(client.git_bale_bin), "gc"], cwd=repo, env=env)
+        markers = staged_markers(repo)
+        if not {h1, h2} <= markers:
+            raise TestFailure(
+                "[stash] gc dropped the marker of content reachable only from "
+                f"stash@{{1}}: want {{{h1[:8]}.., {h2[:8]}..}} have {markers}"
+            )
+
+        # Drop v2; v2's marker is now dead, v1's must still be there.
+        git(["stash", "drop", "stash@{0}"], cwd=repo, env=env)
+        run([str(client.git_bale_bin), "gc"], cwd=repo, env=env)
+        markers = staged_markers(repo)
+        if h1 not in markers:
+            raise TestFailure(f"[stash] v1 marker lost after dropping v2: {markers}")
+        if h2 in markers:
+            raise TestFailure(f"[stash] dropped v2's marker survived gc: {markers}")
+
+        git(["stash", "pop"], cwd=repo, env=env)
+        verify_worktree(
+            repo,
+            rel,
+            expected_sha=sha256_bytes(v1),
+            expected_size=len(v1),
+            label="stash",
+        )
+        info("[stash] stash@{1} content survived gc and pops intact")
+
+
+def phase_local_worktree_gc(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """gc in the main worktree must see a linked worktree's staged content: all
+    bookkeeping lives in the common git dir and liveness covers every
+    worktree's index. Previously the linked worktree kept private markers, so
+    main's gc (seeing only its own dead marker) swept the shared store."""
+    with timings.measure("local-worktree-gc"):
+        repo, env = init_repo_local(
+            work_root=work_root, client=client, name="local-worktree"
+        )
+        wt = work_root / "local-worktree-linked"
+        git(["worktree", "add", "-b", "linked", str(wt)], cwd=repo, env=env)
+
+        pm = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"wt-main")
+        pw = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"wt-linked")
+
+        # Main: an abandoned add (dead marker).
+        (repo / "m.bin").write_bytes(pm)
+        git(["add", "m.bin"], cwd=repo, env=env)
+        hm = pointer_hash_at(repo, env, ":m.bin", label="worktree")
+        git(["reset"], cwd=repo, env=env)
+
+        # Linked worktree: staged, not committed.
+        (wt / "w.bin").write_bytes(pw)
+        git(["add", "w.bin"], cwd=wt, env=env)
+        hw = pointer_hash_at(wt, env, ":w.bin", label="worktree")
+        if not (wt / ".git").is_file():
+            raise TestFailure("[worktree] linked worktree has no .git file")
+        markers = staged_markers(repo)
+        if not {hm, hw} <= markers:
+            raise TestFailure(
+                "[worktree] markers should all live in the common git dir: "
+                f"want {{{hm[:8]}.., {hw[:8]}..}} have {markers}"
+            )
+
+        run([str(client.git_bale_bin), "gc"], cwd=repo, env=env)
+        markers = staged_markers(repo)
+        if hw not in markers:
+            raise TestFailure(
+                f"[worktree] main gc dropped the linked worktree's staged marker: {markers}"
+            )
+        if hm in markers:
+            raise TestFailure(f"[worktree] main's abandoned marker survived: {markers}")
+
+        def restore_and_verify(label: str) -> None:
+            (wt / "w.bin").unlink()
+            run(
+                ["rm", "-rf", str(repo / ".git" / "bale" / "manifests")],
+                cwd=repo,
+                env=env,
+            )
+            git(["checkout", "--", "w.bin"], cwd=wt, env=env)
+            verify_worktree(
+                wt,
+                "w.bin",
+                expected_sha=sha256_bytes(pw),
+                expected_size=len(pw),
+                label=label,
+            )
+
+        restore_and_verify("worktree-staged")
+
+        # Committed in the linked worktree only; gc from either side keeps it.
+        git(["commit", "-m", "w"], cwd=wt, env=env)
+        run([str(client.git_bale_bin), "gc"], cwd=repo, env=env)
+        run([str(client.git_bale_bin), "gc"], cwd=wt, env=env)
+        restore_and_verify("worktree-committed")
+        info("[worktree] linked worktree's content survived gc from both worktrees")
+
+
+def phase_local_prune_cross_repo(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """prune --shared must keep content cleaned in repo B but referenced only
+    by repo A (A fetched B's commit, so A holds no marker for it). Liveness is
+    the union of every repo's markers tested against EVERY repo."""
+    with timings.measure("local-prune-cross-repo"):
+        shared = work_root / "xrepo-store"
+        a, ea = init_repo_local(
+            work_root=work_root, client=client, name="xrepo-a", shared_store=shared
+        )
+        b, eb = init_repo_local(
+            work_root=work_root, client=client, name="xrepo-b", shared_store=shared
+        )
+        px = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"xrepo-x")
+        py = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"xrepo-y")
+
+        (b / "x.bin").write_bytes(px)
+        git(["add", "x.bin"], cwd=b, env=eb)
+        git(["commit", "-m", "x"], cwd=b, env=eb)
+
+        git(["fetch", str(b), "main"], cwd=a, env=ea)
+        git(["checkout", "-b", "from-b", "FETCH_HEAD"], cwd=a, env=ea)
+        verify_worktree(
+            a,
+            "x.bin",
+            expected_sha=sha256_bytes(px),
+            expected_size=len(px),
+            label="xrepo-fetch",
+        )
+
+        # B forgets x entirely (commit, reflog, ORIG_HEAD) and abandons y.
+        git(["reset", "--hard", "HEAD~1"], cwd=b, env=eb)
+        git(["reflog", "expire", "--expire=now", "--all"], cwd=b, env=eb)
+        (b / ".git" / "ORIG_HEAD").unlink(missing_ok=True)
+        (b / "y.bin").write_bytes(py)
+        git(["add", "y.bin"], cwd=b, env=eb)
+        git(["reset", "--hard"], cwd=b, env=eb)
+
+        before = len(local_store_xorbs(shared))
+        run([str(client.git_bale_bin), "prune", "--shared"], cwd=b, env=eb)
+        after = len(local_store_xorbs(shared))
+        if after >= before:
+            raise TestFailure(
+                f"[xrepo] expected the orphan to be reclaimed: {before} -> {after} xorbs"
+            )
+
+        (a / "x.bin").unlink()
+        run(["rm", "-rf", str(a / ".git" / "bale" / "manifests")], cwd=a, env=ea)
+        git(["checkout", "--", "x.bin"], cwd=a, env=ea)
+        verify_worktree(
+            a,
+            "x.bin",
+            expected_sha=sha256_bytes(px),
+            expected_size=len(px),
+            label="xrepo-after-prune",
+        )
+        info(
+            f"[xrepo] content referenced only by another repo survived prune ({before} -> {after} xorbs)"
+        )
+
+
+def phase_local_tampered_store(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """Corrupt the local store's xorbs: smudge must fail the checkout instead
+    of writing wrong bytes into the worktree (content is verified against the
+    pointer's sha256 before git sees it)."""
+    with timings.measure("local-tampered-store"):
+        repo, env = init_repo_local(
+            work_root=work_root, client=client, name="local-tampered"
+        )
+        rel = "t.bin"
+        payload = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"tampered")
+        (repo / rel).write_bytes(payload)
+        git(["add", rel], cwd=repo, env=env)
+        git(["commit", "-m", "t"], cwd=repo, env=env)
+
+        xorbs = local_store_xorbs(per_repo_store(repo))
+        if not xorbs:
+            raise TestFailure("[tampered] no xorbs to corrupt")
+        for x in xorbs:
+            data = bytearray(x.read_bytes())
+            window = min(4096, len(data))
+            start = (len(data) - window) // 2
+            for i in range(start, start + window):
+                data[i] ^= 0xFF
+            x.chmod(0o644)  # xet stores objects read-only
+            x.write_bytes(bytes(data))
+
+        (repo / rel).unlink()
+        run(["rm", "-rf", str(repo / ".git" / "bale" / "manifests")], cwd=repo, env=env)
+        checkout = git(["checkout", "--", rel], cwd=repo, env=env, expect_fail=True)
+        if checkout.returncode == 0:
+            raise TestFailure(
+                "[tampered] checkout of corrupted local-store content succeeded"
+            )
+        target = repo / rel
+        if target.exists() and sha256_bytes(target.read_bytes()) != sha256_bytes(
+            payload
+        ):
+            raise TestFailure("[tampered] wrong bytes were written to the worktree")
+        info("[tampered] corrupted store content refused; worktree untouched")
+
+
+def phase_local_autostash(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """A `rebase --autostash` that stops on a conflict holds the user's
+    uncommitted changes only in `rebase-merge/autostash` (no ref, no reflog,
+    no `*.lock`). gc must keep that content and `rebase --continue` must
+    restore it."""
+    with timings.measure("local-autostash"):
+        repo, env = init_repo_local(
+            work_root=work_root, client=client, name="local-autostash"
+        )
+        (repo / "other.txt").write_text("base\n")
+        git(["add", "other.txt"], cwd=repo, env=env)
+        git(["commit", "-m", "base"], cwd=repo, env=env)
+        git(["checkout", "-b", "topic"], cwd=repo, env=env)
+        (repo / "other.txt").write_text("topic\n")
+        git(["commit", "-am", "topic"], cwd=repo, env=env)
+        git(["checkout", "main"], cwd=repo, env=env)
+        (repo / "other.txt").write_text("main\n")
+        git(["commit", "-am", "main"], cwd=repo, env=env)
+        git(["checkout", "topic"], cwd=repo, env=env)
+
+        # The only bale content anywhere: staged, never committed.
+        payload = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"autostash")
+        (repo / "a.bin").write_bytes(payload)
+        git(["add", "a.bin"], cwd=repo, env=env)
+        h = pointer_hash_at(repo, env, ":a.bin", label="autostash")
+
+        rebase = git(
+            ["rebase", "--autostash", "main"], cwd=repo, env=env, expect_fail=True
+        )
+        if rebase.returncode == 0:
+            raise TestFailure(
+                "[autostash] rebase unexpectedly applied without conflict"
+            )
+        if not (repo / ".git" / "rebase-merge" / "autostash").exists():
+            raise TestFailure("[autostash] rebase stopped without an autostash entry")
+
+        run([str(client.git_bale_bin), "gc"], cwd=repo, env=env, expect_fail=True)
+        if h not in staged_markers(repo):
+            raise TestFailure(
+                f"[autostash] gc dropped the autostashed content's marker: {staged_markers(repo)}"
+            )
+
+        (repo / "other.txt").write_text("resolved\n")
+        git(["add", "other.txt"], cwd=repo, env=env)
+        git(
+            ["-c", "core.editor=true", "rebase", "--continue"],
+            cwd=repo,
+            env={**env, "GIT_EDITOR": "true"},
+        )
+        verify_worktree(
+            repo,
+            "a.bin",
+            expected_sha=sha256_bytes(payload),
+            expected_size=len(payload),
+            label="autostash",
+        )
+        info("[autostash] autostashed content survived gc and was restored")
+
+
+def phase_local_prune_missing_repo(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """Content a present repo reaches survives `prune --shared --force` even
+    when the only marker for it lived in a registered repo that is now gone."""
+    with timings.measure("local-prune-missing-repo"):
+        shared = work_root / "missing-store"
+        a, ea = init_repo_local(
+            work_root=work_root, client=client, name="missing-a", shared_store=shared
+        )
+        b, eb = init_repo_local(
+            work_root=work_root, client=client, name="missing-b", shared_store=shared
+        )
+        px = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"missing-x")
+        py = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"missing-y")
+
+        (a / "x.bin").write_bytes(px)
+        git(["add", "x.bin"], cwd=a, env=ea)
+        git(["commit", "-m", "x"], cwd=a, env=ea)
+        git(["fetch", str(a), "main"], cwd=b, env=eb)
+        git(["checkout", "-b", "from-a", "FETCH_HEAD"], cwd=b, env=eb)
+
+        # An orphan in B so prune has something to reclaim.
+        (b / "y.bin").write_bytes(py)
+        git(["add", "y.bin"], cwd=b, env=eb)
+        git(["reset", "--hard"], cwd=b, env=eb)
+
+        run(["rm", "-rf", str(a)], cwd=work_root, env=eb)
+        before = len(local_store_xorbs(shared))
+        run([str(client.git_bale_bin), "prune", "--shared", "--force"], cwd=b, env=eb)
+        after = len(local_store_xorbs(shared))
+        if after >= before:
+            raise TestFailure(
+                f"[missing] expected the orphan to be reclaimed: {before} -> {after} xorbs"
+            )
+
+        (b / "x.bin").unlink()
+        run(["rm", "-rf", str(b / ".git" / "bale" / "manifests")], cwd=b, env=eb)
+        git(["checkout", "--", "x.bin"], cwd=b, env=eb)
+        verify_worktree(
+            b,
+            "x.bin",
+            expected_sha=sha256_bytes(px),
+            expected_size=len(px),
+            label="missing-after-prune",
+        )
+        info("[missing] content reached by a present repo survived prune --force")
+
+
+def phase_local_store_owner(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """A non-shared store belongs to one repo (gc sweeps it whole). A second
+    repo pointed at it is refused by init-local, by clean and by gc — and its
+    gc never sweeps the owner's objects."""
+    with timings.measure("local-store-owner"):
+        store = work_root / "owned-store"
+        a = work_root / "owner-a"
+        a.mkdir()
+        ea = client.make_env()
+        git(["init", "-b", "main", "."], cwd=a, env=ea)
+        run(
+            [str(client.git_bale_bin), "init-local", "--store", str(store)],
+            cwd=a,
+            env=ea,
+        )
+        run([str(client.git_bale_bin), "track", "*.bin"], cwd=a, env=ea)
+        payload = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"owner-a")
+        (a / "a.bin").write_bytes(payload)
+        git(["add", ".gitattributes", "a.bin"], cwd=a, env=ea)
+        git(["commit", "-m", "a"], cwd=a, env=ea)
+        xorbs = local_store_xorbs(store)
+        if not xorbs:
+            raise TestFailure("[owner] repo A wrote no objects to its store")
+
+        b = work_root / "owner-b"
+        b.mkdir()
+        eb = client.make_env()
+        git(["init", "-b", "main", "."], cwd=b, env=eb)
+        init = run(
+            [str(client.git_bale_bin), "init-local", "--store", str(store)],
+            cwd=b,
+            env=eb,
+            expect_fail=True,
+        )
+        if init.returncode == 0:
+            raise TestFailure(
+                "[owner] init-local accepted another repo's non-shared store"
+            )
+
+        # Point B at the store by hand anyway: gc must refuse, not sweep.
+        for k, v in (
+            ("filter.bale.process", "git-bale filter-process"),
+            ("filter.bale.required", "true"),
+            ("bale.local", "true"),
+            ("bale.localStore", str(store)),
+        ):
+            git(["config", "--local", k, v], cwd=b, env=eb)
+        gc = run([str(client.git_bale_bin), "gc"], cwd=b, env=eb, expect_fail=True)
+        if gc.returncode == 0:
+            raise TestFailure("[owner] gc in a non-owner repo did not refuse")
+        if local_store_xorbs(store) != xorbs:
+            raise TestFailure(
+                "[owner] gc in a non-owner repo swept the owner's objects"
+            )
+        (b / ".gitattributes").write_text("*.bin filter=bale -text\n")
+        (b / "b.bin").write_bytes(
+            deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"owner-b")
+        )
+        add = git(["add", "b.bin"], cwd=b, env=eb, expect_fail=True)
+        if add.returncode == 0:
+            raise TestFailure(
+                "[owner] clean wrote into another repo's non-shared store"
+            )
+
+        (a / "a.bin").unlink()
+        git(["checkout", "--", "a.bin"], cwd=a, env=ea)
+        verify_worktree(
+            a,
+            "a.bin",
+            expected_sha=sha256_bytes(payload),
+            expected_size=len(payload),
+            label="owner",
+        )
+        info(
+            "[owner] non-shared store refused to a second repo; owner's content intact"
+        )
+
+
+def phase_local_moved_shared_repo(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """A repo moved after `init-local --shared` re-registers from its next gc,
+    so `prune --shared --force` (which skips the stale old path) keeps its
+    content."""
+    with timings.measure("local-moved-shared-repo"):
+        shared = work_root / "moved-store"
+        a, ea = init_repo_local(
+            work_root=work_root, client=client, name="moved-a", shared_store=shared
+        )
+        px = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"moved-x")
+        py = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"moved-y")
+        (a / "x.bin").write_bytes(px)
+        git(["add", "x.bin"], cwd=a, env=ea)
+        git(["commit", "-m", "x"], cwd=a, env=ea)
+        (a / "y.bin").write_bytes(py)
+        git(["add", "y.bin"], cwd=a, env=ea)
+        git(["reset", "--hard"], cwd=a, env=ea)
+
+        moved = work_root / "moved-a-renamed"
+        a.rename(moved)
+        run([str(client.git_bale_bin), "gc"], cwd=moved, env=ea)
+        before = len(local_store_xorbs(shared))
+        run(
+            [str(client.git_bale_bin), "prune", "--shared", "--force"],
+            cwd=moved,
+            env=ea,
+        )
+        after = len(local_store_xorbs(shared))
+        if after >= before:
+            raise TestFailure(
+                f"[moved] expected the orphan reclaimed: {before} -> {after}"
+            )
+
+        (moved / "x.bin").unlink()
+        run(
+            ["rm", "-rf", str(moved / ".git" / "bale" / "manifests")], cwd=moved, env=ea
+        )
+        git(["checkout", "--", "x.bin"], cwd=moved, env=ea)
+        verify_worktree(
+            moved,
+            "x.bin",
+            expected_sha=sha256_bytes(px),
+            expected_size=len(px),
+            label="moved",
+        )
+        info("[moved] moved shared repo re-registered; its content survived prune")
+
+
+def phase_local_reclone_same_path(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """A repo deleted and re-cloned at the same path re-claims its external
+    store with NO markers. That store is the only copy of every committed
+    file, so neither gc's zero-marker sweep nor the sweep after dropping the
+    last dead marker may reclaim it while its content is still reachable."""
+    with timings.measure("local-reclone-same-path"):
+        store = work_root / "reclone-store"
+        bare = work_root / "reclone-bare.git"
+        a = work_root / "reclone-a"
+        a.mkdir()
+        env = client.make_env()
+        env.pop("BALE_SERVER_URL", None)
+        env.pop("BALE_TOKEN", None)
+        git(["init", "--bare", "-b", "main", str(bare)], cwd=work_root, env=env)
+        git(["init", "-b", "main", "."], cwd=a, env=env)
+        run(
+            [str(client.git_bale_bin), "init-local", "--store", str(store)],
+            cwd=a,
+            env=env,
+        )
+        run([str(client.git_bale_bin), "track", "*.bin"], cwd=a, env=env)
+        payload = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"reclone")
+        (a / "a.bin").write_bytes(payload)
+        git(["add", ".gitattributes", "a.bin"], cwd=a, env=env)
+        git(["commit", "-m", "a"], cwd=a, env=env)
+        git(["push", str(bare), "main"], cwd=a, env=env)
+
+        subprocess.run(["rm", "-rf", str(a)], check=True)
+        git(["clone", "--no-checkout", str(bare), str(a)], cwd=work_root, env=env)
+        run(
+            [str(client.git_bale_bin), "init-local", "--store", str(store)],
+            cwd=a,
+            env=env,
+        )
+        if staged_markers(a):
+            raise TestFailure("[reclone] precondition: a fresh clone has no markers")
+        # post-checkout fires gc with zero markers.
+        git(["checkout", "main"], cwd=a, env=env)
+        run([str(client.git_bale_bin), "gc"], cwd=a, env=env)
+        if not local_store_xorbs(store):
+            raise TestFailure("[reclone] zero-marker gc swept the only copy")
+
+        # Drop the last (dead) marker: the sweep that follows must also refuse.
+        (a / "tmp.bin").write_bytes(
+            deterministic_payload(LOCAL_PAYLOAD_BYTES // 4, seed=b"reclone-tmp")
+        )
+        git(["add", "tmp.bin"], cwd=a, env=env)
+        h_tmp = pointer_hash_at(a, env, ":tmp.bin", label="reclone")
+        git(["reset", "-q", "tmp.bin"], cwd=a, env=env)
+        (a / "tmp.bin").unlink()
+        # A racy-git re-clean of the freshly smudged a.bin may have left a live
+        # marker, which would keep gc off the whole-store sweep path under test.
+        for h in staged_markers(a) - {h_tmp}:
+            (a / ".git" / "bale" / "staging" / "file-index" / h).unlink()
+        run([str(client.git_bale_bin), "gc"], cwd=a, env=env)
+        if staged_markers(a):
+            raise TestFailure("[reclone] gc kept the abandoned tmp.bin marker")
+
+        (a / "a.bin").unlink()
+        git(["checkout", "--", "a.bin"], cwd=a, env=env)
+        verify_worktree(
+            a,
+            "a.bin",
+            expected_sha=sha256_bytes(payload),
+            expected_size=len(payload),
+            label="reclone",
+        )
+        info("[reclone] re-cloned repo's store survived zero-marker and last-marker gc")
+
+
+def phase_local_in_gitdir_store_claim(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """A store inside a repo's git dir is claimed like any other: another repo
+    pointed at it with `--store` is refused when the containing repo got there
+    first, and — if the other repo claimed it first — the containing repo's gc
+    must not sweep the other's content."""
+    with timings.measure("local-in-gitdir-store-claim"):
+        a, ea = init_repo_local(work_root=work_root, client=client, name="gitdir-a")
+        pa = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"gitdir-a")
+        (a / "a.bin").write_bytes(pa)
+        git(["add", "a.bin"], cwd=a, env=ea)
+        git(["commit", "-m", "a"], cwd=a, env=ea)
+        a_store = per_repo_store(a)
+
+        b = work_root / "gitdir-b"
+        b.mkdir()
+        eb = client.make_env()
+        git(["init", "-b", "main", "."], cwd=b, env=eb)
+        for extra in ([], ["--shared"]):
+            init = run(
+                [
+                    str(client.git_bale_bin),
+                    "init-local",
+                    *extra,
+                    "--store",
+                    str(a_store),
+                ],
+                cwd=b,
+                env=eb,
+                expect_fail=True,
+            )
+            if init.returncode == 0:
+                raise TestFailure(
+                    f"[gitdir] init-local {extra} claimed another repo's in-gitdir store"
+                )
+
+        # Other order: C claims D's (not yet used) in-gitdir store first.
+        d = work_root / "gitdir-d"
+        d.mkdir()
+        ed = client.make_env()
+        git(["init", "-b", "main", "."], cwd=d, env=ed)
+        d_store = per_repo_store(d)
+        c, ec = work_root / "gitdir-c", client.make_env()
+        c.mkdir()
+        git(["init", "-b", "main", "."], cwd=c, env=ec)
+        run(
+            [str(client.git_bale_bin), "init-local", "--store", str(d_store)],
+            cwd=c,
+            env=ec,
+        )
+        run([str(client.git_bale_bin), "track", "*.bin"], cwd=c, env=ec)
+        pc = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"gitdir-c")
+        (c / "c.bin").write_bytes(pc)
+        git(["add", ".gitattributes", "c.bin"], cwd=c, env=ec)
+        git(["commit", "-m", "c"], cwd=c, env=ec)
+        xorbs = local_store_xorbs(d_store)
+
+        init = run(
+            [str(client.git_bale_bin), "init-local"], cwd=d, env=ed, expect_fail=True
+        )
+        if init.returncode == 0:
+            raise TestFailure("[gitdir] D claimed its git-dir store already owned by C")
+        for k, v in (
+            ("filter.bale.process", "git-bale filter-process"),
+            ("filter.bale.required", "true"),
+            ("bale.local", "true"),
+        ):
+            git(["config", "--local", k, v], cwd=d, env=ed)
+        gc = run([str(client.git_bale_bin), "gc"], cwd=d, env=ed, expect_fail=True)
+        if gc.returncode == 0:
+            raise TestFailure("[gitdir] gc in D did not refuse C's store")
+        if local_store_xorbs(d_store) != xorbs:
+            raise TestFailure("[gitdir] D's gc swept C's content from D's git dir")
+
+        (c / "c.bin").unlink()
+        git(["checkout", "--", "c.bin"], cwd=c, env=ec)
+        verify_worktree(
+            c,
+            "c.bin",
+            expected_sha=sha256_bytes(pc),
+            expected_size=len(pc),
+            label="gitdir-c",
+        )
+        (a / "a.bin").unlink()
+        git(["checkout", "--", "a.bin"], cwd=a, env=ea)
+        verify_worktree(
+            a,
+            "a.bin",
+            expected_sha=sha256_bytes(pa),
+            expected_size=len(pa),
+            label="gitdir-a",
+        )
+        info("[gitdir] in-gitdir stores are claimed via .bale-owner in both orders")
+
+
+def phase_local_pointer_passthrough(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """A worktree holding raw pointer text (cloned before the filter was set
+    up) must not be re-cleaned into a pointer-to-a-pointer by
+    `git add --renormalize`; the pointer passes through and still smudges."""
+    with timings.measure("local-pointer-passthrough"):
+        shared = work_root / "passthrough-store"
+        bare = work_root / "passthrough-bare.git"
+        a, ea = init_repo_local(
+            work_root=work_root,
+            client=client,
+            name="passthrough-a",
+            shared_store=shared,
+        )
+        payload = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"passthrough")
+        (a / "a.bin").write_bytes(payload)
+        git(["add", "a.bin"], cwd=a, env=ea)
+        git(["commit", "-m", "a"], cwd=a, env=ea)
+        git(["init", "--bare", "-b", "main", str(bare)], cwd=work_root, env=ea)
+        git(["push", str(bare), "main"], cwd=a, env=ea)
+        committed = git(["rev-parse", "HEAD:a.bin"], cwd=a, env=ea).stdout.strip()
+
+        b = work_root / "passthrough-b"
+        eb = client.make_env()
+        git(["clone", str(bare), str(b)], cwd=work_root, env=eb)
+        if (b / "a.bin").stat().st_size >= len(payload):
+            raise TestFailure(
+                "[passthrough] precondition: clone should hold pointer text"
+            )
+        run(
+            [
+                str(client.git_bale_bin),
+                "init-local",
+                "--shared",
+                "--store",
+                str(shared),
+            ],
+            cwd=b,
+            env=eb,
+        )
+        git(["add", "--renormalize", "."], cwd=b, env=eb)
+        staged = git(["rev-parse", ":a.bin"], cwd=b, env=eb).stdout.strip()
+        if staged != committed:
+            raise TestFailure(
+                "[passthrough] renormalize re-cleaned the pointer text into a new pointer"
+            )
+        (b / "a.bin").unlink()
+        git(["checkout", "--", "a.bin"], cwd=b, env=eb)
+        verify_worktree(
+            b,
+            "a.bin",
+            expected_sha=sha256_bytes(payload),
+            expected_size=len(payload),
+            label="passthrough",
+        )
+        # A user file that merely looks pointer-ish (has a 64-hex "hash") is
+        # real content: it must be cleaned, not passed through.
+        run([str(client.git_bale_bin), "track", "*.json"], cwd=b, env=eb)
+        meta = (
+            '{"hash": "' + sha256_bytes(b"release") + '", "algorithm": "sha256", '
+            '"name": "release-1.2"}\n'
+        ).encode()
+        (b / "meta.json").write_bytes(meta)
+        git(["add", ".gitattributes", "meta.json"], cwd=b, env=eb)
+        git(["commit", "-m", "meta"], cwd=b, env=eb)
+        (b / "meta.json").unlink()
+        git(["checkout", "--", "meta.json"], cwd=b, env=eb)
+        if (b / "meta.json").read_bytes() != meta:
+            raise TestFailure(
+                "[passthrough] pointer-shaped user JSON did not round-trip"
+            )
+        info("[passthrough] existing pointer passed through clean unchanged")
+
+
+def phase_local_moved_repo(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """A moved repo keeps using its own (default, in-git-dir) store, and a
+    missing external store is an error — never silently recreated empty at
+    the old path."""
+    with timings.measure("local-moved-repo"):
+        a, env = init_repo_local(work_root=work_root, client=client, name="moved-old")
+        payload = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"moved-a")
+        (a / "a.bin").write_bytes(payload)
+        git(["add", "a.bin"], cwd=a, env=env)
+        git(["commit", "-m", "a"], cwd=a, env=env)
+        moved = work_root / "moved-new"
+        a.rename(moved)
+
+        pb = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"moved-b")
+        (moved / "b.bin").write_bytes(pb)
+        git(["add", "b.bin"], cwd=moved, env=env)
+        git(["commit", "-m", "b"], cwd=moved, env=env)
+        if a.exists():
+            raise TestFailure(f"[moved] a store was recreated at the old path {a}")
+        for name, data in (("a.bin", payload), ("b.bin", pb)):
+            (moved / name).unlink()
+            git(["checkout", "--", name], cwd=moved, env=env)
+            verify_worktree(
+                moved,
+                name,
+                expected_sha=sha256_bytes(data),
+                expected_size=len(data),
+                label=f"moved-{name}",
+            )
+
+        store = work_root / "moved-ext-store"
+        c = work_root / "moved-ext"
+        c.mkdir()
+        git(["init", "-b", "main", "."], cwd=c, env=env)
+        run(
+            [str(client.git_bale_bin), "init-local", "--store", str(store)],
+            cwd=c,
+            env=env,
+        )
+        run([str(client.git_bale_bin), "track", "*.bin"], cwd=c, env=env)
+        git(["add", ".gitattributes"], cwd=c, env=env)
+        git(["commit", "-m", "track"], cwd=c, env=env)
+        store.rename(work_root / "moved-ext-store.away")
+        (c / "c.bin").write_bytes(
+            deterministic_payload(LOCAL_PAYLOAD_BYTES // 4, seed=b"moved-c")
+        )
+        add = git(["add", "c.bin"], cwd=c, env=env, expect_fail=True)
+        if add.returncode == 0:
+            raise TestFailure("[moved] clean accepted a missing external store")
+        if store.exists():
+            raise TestFailure("[moved] clean recreated the missing store empty")
+        info("[moved] moved repo kept its store; a missing store is refused")
+
+
+def phase_local_store_switch(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """After `init-local --store X` switches a repo's store, a re-add that
+    hits the clean-cache must not emit a pointer whose bytes live only in the
+    old store: the new commit has to be reconstructable from X."""
+    with timings.measure("local-store-switch"):
+        repo, env = init_repo_local(work_root=work_root, client=client, name="switch")
+        payload = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"switch")
+        (repo / "a.bin").write_bytes(payload)
+        git(["add", "a.bin"], cwd=repo, env=env)
+        git(["commit", "-m", "a"], cwd=repo, env=env)
+
+        store = work_root / "switch-store"
+        run(
+            [str(client.git_bale_bin), "init-local", "--store", str(store)],
+            cwd=repo,
+            env=env,
+        )
+        git(["rm", "-q", "--cached", "a.bin"], cwd=repo, env=env)
+        git(["commit", "-m", "drop"], cwd=repo, env=env)
+        git(["add", "a.bin"], cwd=repo, env=env)
+        git(["commit", "-m", "re-add"], cwd=repo, env=env)
+        if not local_store_xorbs(store):
+            raise TestFailure("[switch] re-add wrote nothing to the new store")
+        (repo / "a.bin").unlink()
+        git(["checkout", "--", "a.bin"], cwd=repo, env=env)
+        verify_worktree(
+            repo,
+            "a.bin",
+            expected_sha=sha256_bytes(payload),
+            expected_size=len(payload),
+            label="switch",
+        )
+
+        # Same path, new store (wiped, then re-created by init-local): the
+        # path matches but the store id doesn't, so the cache must not hit.
+        subprocess.run(["rm", "-rf", str(store)], check=True)
+        run(
+            [str(client.git_bale_bin), "init-local", "--store", str(store)],
+            cwd=repo,
+            env=env,
+        )
+        git(["rm", "-q", "--cached", "a.bin"], cwd=repo, env=env)
+        git(["commit", "-m", "drop again"], cwd=repo, env=env)
+        git(["add", "a.bin"], cwd=repo, env=env)
+        git(["commit", "-m", "re-add again"], cwd=repo, env=env)
+        (repo / "a.bin").unlink()
+        git(["checkout", "--", "a.bin"], cwd=repo, env=env)
+        verify_worktree(
+            repo,
+            "a.bin",
+            expected_sha=sha256_bytes(payload),
+            expected_size=len(payload),
+            label="switch-recreated",
+        )
+        info("[switch] re-add after a store switch is backed by the new store")
+
+
+def phase_local_prune_force_moved(
+    *, timings: Timings, client: ClientEnv, work_root: Path
+) -> None:
+    """`prune --shared --force` that skipped a (moved) repo drops content only
+    that repo referenced — but its worktree still has the bytes, so a re-add
+    there must re-stage them rather than hit a stale clean-cache entry."""
+    with timings.measure("local-prune-force-moved"):
+        shared = work_root / "force-moved-store"
+        a, ea = init_repo_local(
+            work_root=work_root, client=client, name="force-a", shared_store=shared
+        )
+        b, eb = init_repo_local(
+            work_root=work_root, client=client, name="force-b", shared_store=shared
+        )
+        pb = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"force-moved")
+        (b / "b.bin").write_bytes(pb)
+        git(["add", "b.bin"], cwd=b, env=eb)
+        git(["commit", "-m", "b"], cwd=b, env=eb)
+
+        moved = work_root / "force-b-moved"
+        b.rename(moved)
+        run([str(client.git_bale_bin), "prune", "--shared", "--force"], cwd=a, env=ea)
+
+        os.utime(moved / "b.bin")
+        git(["add", "b.bin"], cwd=moved, env=eb)
+        (moved / "b.bin").unlink()
+        git(["checkout", "--", "b.bin"], cwd=moved, env=eb)
+        verify_worktree(
+            moved,
+            "b.bin",
+            expected_sha=sha256_bytes(pb),
+            expected_size=len(pb),
+            label="force-moved",
+        )
+        info("[force-moved] re-add after a forced prune re-staged the worktree bytes")

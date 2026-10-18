@@ -72,5 +72,15 @@ pub fn save(git_dir: &Path, file_id_hex: &str, manifest: &CachedManifest) -> io:
         f.write_all(b"\n")?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, &final_path)
+    fs::rename(&tmp, &final_path)?;
+    crate::fs_util::fsync_dir(&dir)
+}
+
+/// Drop a manifest whose reconstruction failed verification so the next
+/// smudge goes back to the server for fresh terms.
+pub fn remove(git_dir: &Path, file_id_hex: &str) -> io::Result<()> {
+    match fs::remove_file(manifest_path(git_dir, file_id_hex)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }

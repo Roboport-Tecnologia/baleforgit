@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import secrets
 from pathlib import Path
-from typing import Optional
 
 from baleharness.client import ClientEnv
 from baleharness.config import E2E_HUB_TOKEN, E2E_OWNER, SMALL_FILE_BYTES
@@ -16,7 +15,6 @@ from baleharness.proc import run, sha256_bytes
 from baleharness.runtime import Runtime
 from baleharness.server import ServerHandle, start_container
 from baleharness.timing import Timings
-
 
 ANON_REPO = f"{E2E_OWNER}/anon-public"
 
@@ -58,8 +56,8 @@ def phase_anonymous_public_clone(
     data_root.mkdir()
     jwt_secret = secrets.token_bytes(32).hex()
     transfer_secret = secrets.token_bytes(32).hex()
-    server: Optional[ServerHandle] = None
-    forge: Optional[MockForgeServer] = None
+    server: ServerHandle | None = None
+    forge: MockForgeServer | None = None
     try:
         with timings.measure("anon-public: container start"):
             server = start_container(

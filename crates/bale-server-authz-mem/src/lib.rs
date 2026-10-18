@@ -1,7 +1,10 @@
 //! In-memory `RepoAuthz` implementations.
 
 use async_trait::async_trait;
-use bale_server_core::{CoreError, CoreResult, RepoAuthz, RepoRef, Scope, TokenClaims, UserId};
+use bale_server_core::{
+    AccessGrant, AccessPurpose, CoreError, CoreResult, RepoAuthz, RepoRef, Scope, TokenClaims,
+    UserId,
+};
 use bale_server_tokens as tokens;
 use std::collections::HashMap;
 
@@ -21,6 +24,7 @@ impl RepoAuthz for AlwaysAllow {
                 repo_type: bale_server_core::RepoType::Model,
                 repo_id: "anonymous/repo".into(),
                 revision: "main".into(),
+                owner: None,
             },
             scope: Scope::Write,
             expires_at: u64::MAX,
@@ -32,8 +36,13 @@ impl RepoAuthz for AlwaysAllow {
         _hub_bearer: &str,
         _repo: &RepoRef,
         _scope: Scope,
-    ) -> CoreResult<UserId> {
-        Ok(UserId("anonymous".into()))
+        _purpose: AccessPurpose<'_>,
+    ) -> CoreResult<AccessGrant> {
+        Ok(AccessGrant {
+            user: UserId("anonymous".into()),
+            canonical_repo_id: None,
+            canonical_owner: None,
+        })
     }
 
     async fn mint_xet_token(
@@ -113,7 +122,8 @@ impl RepoAuthz for ConfigAuthz {
         hub_bearer: &str,
         repo: &RepoRef,
         requested: Scope,
-    ) -> CoreResult<UserId> {
+        _purpose: AccessPurpose<'_>,
+    ) -> CoreResult<AccessGrant> {
         // Iterate + ct_eq instead of a HashMap lookup so the hub bearer match doesn't leak via timing.
         let mut found: Option<&ConfigUser> = None;
         for (k, v) in &self.users {
@@ -130,7 +140,11 @@ impl RepoAuthz for ConfigAuthz {
         if matches!(requested, Scope::Write) && matches!(granted, Scope::Read) {
             return Err(CoreError::Forbidden);
         }
-        Ok(UserId(u.user_id.clone()))
+        Ok(AccessGrant {
+            user: UserId(u.user_id.clone()),
+            canonical_repo_id: None,
+            canonical_owner: None,
+        })
     }
 
     async fn mint_xet_token(

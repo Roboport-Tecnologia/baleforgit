@@ -10,7 +10,7 @@
 # README.md for the one /etc/hosts line MinIO's presigned URLs need.
 
 services:
-  # First-run guard. Generates .env (with paired JWT secrets) when missing,
+  # First-run guard. Generates .env (with independent JWT secrets) when missing,
   # then exits non-zero so dependent services don't start with the empty env
   # vars compose already substituted. Operator reruns `compose up`; second
   # time around .env exists, this exits 0, and the stack starts normally.
@@ -94,9 +94,8 @@ services:
       # gitea's built-in SSH listens on (and advertises in clone URLs) this
       # port, so it's published 1:1 below.
       GITEA__server__SSH_PORT: "${GITEA_SSH_PORT:-2222}"
-      # Bale replaces git-lfs, but the JWT signing key is shared: gitea mints the
-      # JWT under server.LFS_JWT_SECRET and baleforgit-server verifies it with
-      # the same 32 bytes (as BALE_JWT_SECRET_HEX).
+      # gitea signs its LFS/forge JWTs with its own key; baleforgit-server never
+      # verifies them (it calls gitea /check_access) and uses a separate key.
       GITEA__server__LFS_START_SERVER: "false"
       GITEA__server__LFS_JWT_SECRET: ${LFS_JWT_SECRET_BASE64URL}
       GITEA__security__INSTALL_LOCK: "true"

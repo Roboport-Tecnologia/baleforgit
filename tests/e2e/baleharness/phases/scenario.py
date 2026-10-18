@@ -23,16 +23,6 @@ from baleharness.config import (
     COLD_BIG_BYTES,
     COLD_SMALL_BYTES,
     E2E_HUB_TOKEN,
-    HUGE_CHURN_ADD_PROB,
-    HUGE_CHURN_BASE_FILES,
-    HUGE_CHURN_CLONE_EVERY,
-    HUGE_CHURN_DEL_PROB,
-    HUGE_CHURN_EDIT_BYTES,
-    HUGE_CHURN_EDIT_FILES,
-    HUGE_CHURN_NEW_BYTES,
-    HUGE_CHURN_PLAIN_ADD_PROB,
-    HUGE_CHURN_ROUNDS_PER_MIN,
-    HUGE_CHURN_WALK_STRIDE,
     E2E_OWNER,
     E2E_REPO,
     E2E_REPO_2,
@@ -50,11 +40,21 @@ from baleharness.config import (
     E2E_REPO_MR_B,
     E2E_REPO_MR_C,
     E2E_REPO_OFFLINE,
-    MERGE_FILE_BYTES,
     E2E_REPO_SPILL,
     E2E_USER,
     GC_PAYLOAD_BYTES,
+    HUGE_CHURN_ADD_PROB,
+    HUGE_CHURN_BASE_FILES,
+    HUGE_CHURN_CLONE_EVERY,
+    HUGE_CHURN_DEL_PROB,
+    HUGE_CHURN_EDIT_BYTES,
+    HUGE_CHURN_EDIT_FILES,
+    HUGE_CHURN_NEW_BYTES,
+    HUGE_CHURN_PLAIN_ADD_PROB,
+    HUGE_CHURN_ROUNDS_PER_MIN,
+    HUGE_CHURN_WALK_STRIDE,
     JWT_TTL_YEARS,
+    MERGE_FILE_BYTES,
     SIZE_TOLERANCE_BYTES,
     SMALL_FILE_BYTES,
     SPILL_FILE_BYTES,
@@ -2054,7 +2054,7 @@ class _ChurnParams:
     walk_stride: int  # verify every Nth revision within a clone's walk
     # None = walk the whole history; int = walk only the most recent N revisions
     # (a sliding window that tiles the history → linear total time).
-    walk_window: "int | None"
+    walk_window: int | None
     base_files: tuple  # ((name, size), ...) created in round 0
     # Huge-mode-only knobs (ignored when huge is False).
     edit_files: tuple = (1, 1)  # (min, max) base files edited per round
@@ -2243,7 +2243,7 @@ def _churn_clone_and_verify(
     all_names: set,
     round_idx: int,
     walk_stride: int = 1,
-    walk_window: "int | None" = None,
+    walk_window: int | None = None,
 ) -> None:
     """Cold-clone the churn repo as it stands after `round_idx`, then walk a
     span of the revision history verifying each one reconstructs byte-for-byte.

@@ -66,6 +66,15 @@ impl BlobStore for MemBlobStore {
         Ok(true)
     }
 
+    async fn replace_xorb(&self, hash: &XorbHash, body: Bytes) -> CoreResult<()> {
+        let mut g = self.xorbs.write().await;
+        if !g.contains_key(hash.as_bytes()) {
+            self.reserve(body.len() as u64)?;
+        }
+        g.insert(*hash.as_bytes(), body);
+        Ok(())
+    }
+
     async fn xorb_exists(&self, hash: &XorbHash) -> CoreResult<bool> {
         Ok(self.xorbs.read().await.contains_key(hash.as_bytes()))
     }

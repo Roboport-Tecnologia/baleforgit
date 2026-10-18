@@ -52,6 +52,7 @@ pub struct S3BlobStore {
     bucket: String,
     prefix: String,
     sse_enabled: bool,
+    cput_verified: tokio::sync::OnceCell<()>,
 }
 
 impl S3BlobStore {
@@ -99,6 +100,7 @@ impl S3BlobStore {
             bucket: cfg.bucket,
             prefix: cfg.prefix,
             sse_enabled: !cfg.disable_sse,
+            cput_verified: tokio::sync::OnceCell::new(),
         };
 
         // Non-fatal: lets dev loops boot against a bucket not yet created.
@@ -114,9 +116,65 @@ impl S3BlobStore {
                 error = %display_sdk_error(&e),
                 "S3 head_bucket failed at startup — uploads may fail"
             );
+            return Ok(store);
         }
-
+        match store.probe_conditional_put().await {
+            Ok(true) => {
+                let _ = store.cput_verified.set(());
+            }
+            Ok(false) => return Err(cput_unsupported()),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "S3 conditional-write probe failed; retrying before the first upload"
+            ),
+        }
         Ok(store)
+    }
+
+    // Proven once per process; until then every xorb put re-probes and fails if
+    // support can't be established, so a store that ignores `If-None-Match`
+    // never accepts a write.
+    async fn ensure_conditional_put(&self) -> CoreResult<()> {
+        self.cput_verified
+            .get_or_try_init(|| async {
+                match self.probe_conditional_put().await? {
+                    true => Ok(()),
+                    false => Err(cput_unsupported()),
+                }
+            })
+            .await
+            .map(|_| ())
+    }
+
+    // First-writer-wins xorb puts (and so layout/blob agreement) rely on
+    // `If-None-Match: *`. Some S3-compatible stores silently ignore it; refuse
+    // to run on one rather than risk an equal-hash body overwriting another.
+    /// `Ok(false)`: the endpoint accepted a second conditional write of the
+    /// same key, i.e. it ignores `If-None-Match`.
+    async fn probe_conditional_put(&self) -> CoreResult<bool> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let key = format!("{}.bale-probe/{}-{nanos}", self.prefix, std::process::id());
+        let first = self.put_object(&key, Bytes::from_static(b"1"), true).await;
+        let second = match first {
+            Ok(true) => self.put_object(&key, Bytes::from_static(b"2"), true).await,
+            Ok(false) => {
+                return Err(CoreError::Internal(
+                    "S3 conditional-write probe key unexpectedly exists".into(),
+                ))
+            }
+            Err(e) => return Err(e),
+        };
+        let _ = self
+            .client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await;
+        second.map(|overwrote| !overwrote)
     }
 
     fn fanout(prefix: &str, kind: &str, hash: &Hash32) -> String {
@@ -155,34 +213,115 @@ impl S3BlobStore {
         }
     }
 
-    async fn put_object(&self, key: &str, body: Bytes) -> CoreResult<()> {
+    /// `Ok(false)` when `if_absent` and the key already exists.
+    async fn put_object(&self, key: &str, body: Bytes, if_absent: bool) -> CoreResult<bool> {
+        // 409: a concurrent conditional PUT of this key is in flight — its
+        // outcome is unknown, so wait and re-check rather than assume it won.
+        for attempt in 1..=5u64 {
+            match self.put_object_once(key, body.clone(), if_absent).await? {
+                PutOutcome::Written => return Ok(true),
+                PutOutcome::Exists => return Ok(false),
+                PutOutcome::Conflict => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
+                    if self.object_exists(key).await? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Err(CoreError::Internal(format!(
+            "s3 put_object {key}: persistent conditional-write conflict"
+        )))
+    }
+
+    async fn put_object_once(
+        &self,
+        key: &str,
+        body: Bytes,
+        if_absent: bool,
+    ) -> CoreResult<PutOutcome> {
         let mut req = self
             .client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
             .body(ByteStream::from(body));
+        if if_absent {
+            req = req.if_none_match("*");
+        }
         if self.sse_enabled {
             req = req.server_side_encryption(ServerSideEncryption::Aes256);
         }
-        req.send().await.map_err(|e| {
-            CoreError::Internal(format!("s3 put_object {key}: {}", display_sdk_error(&e)))
-        })?;
-        Ok(())
+        match req.send().await {
+            Ok(_) => Ok(PutOutcome::Written),
+            Err(SdkError::ServiceError(svc)) if if_absent && svc.raw().status().as_u16() == 412 => {
+                Ok(PutOutcome::Exists)
+            }
+            Err(SdkError::ServiceError(svc)) if if_absent && svc.raw().status().as_u16() == 409 => {
+                Ok(PutOutcome::Conflict)
+            }
+            Err(e) => Err(CoreError::Internal(format!(
+                "s3 put_object {key}: {}",
+                display_sdk_error(&e)
+            ))),
+        }
     }
+}
+
+fn cput_unsupported() -> CoreError {
+    CoreError::Internal(
+        "S3 endpoint ignores `If-None-Match: *` on PutObject; baleforgit-server requires \
+         conditional writes (AWS S3, MinIO >= 2024)"
+            .into(),
+    )
+}
+
+enum PutOutcome {
+    Written,
+    Exists,
+    Conflict,
 }
 
 #[async_trait]
 impl BlobStore for S3BlobStore {
     async fn put_xorb(&self, hash: &XorbHash, body: Bytes) -> CoreResult<bool> {
         let key = self.xorb_key(hash);
-        // Two racers can both see "not exists" and both PUT — benign because
-        // the body is content-addressed and the handler verified it upstream.
         if self.object_exists(&key).await? {
             return Ok(false);
         }
-        self.put_object(&key, body).await?;
-        Ok(true)
+        self.ensure_conditional_put().await?;
+        // Conditional so a racing writer with a different (equally valid)
+        // compression can't overwrite the body whose layout was recorded.
+        self.put_object(&key, body, true).await
+    }
+
+    async fn replace_xorb(&self, hash: &XorbHash, body: Bytes) -> CoreResult<()> {
+        self.put_object(&self.xorb_key(hash), body, false).await?;
+        Ok(())
+    }
+
+    async fn get_xorb(&self, hash: &XorbHash) -> CoreResult<Bytes> {
+        let key = self.xorb_key(hash);
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| {
+                if is_not_found_get(&e) {
+                    CoreError::NotFound
+                } else {
+                    CoreError::Internal(format!("s3 get_object {key}: {}", display_sdk_error(&e)))
+                }
+            })?;
+        let agg = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| CoreError::Internal(format!("s3 body collect: {e}")))?;
+        Ok(agg.into_bytes())
     }
 
     async fn xorb_exists(&self, hash: &XorbHash) -> CoreResult<bool> {
@@ -227,7 +366,8 @@ impl BlobStore for S3BlobStore {
         if self.object_exists(&key).await? {
             return Ok(());
         }
-        self.put_object(&key, body).await
+        self.put_object(&key, body, true).await?;
+        Ok(())
     }
 
     async fn get_shard(&self, hash: &ShardHash) -> CoreResult<Bytes> {

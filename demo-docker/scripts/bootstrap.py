@@ -24,11 +24,11 @@ def main() -> int:
         print(f"[bootstrap] {ENV_PATH} already exists, nothing to do.")
         return 0
 
-    # baleforgit-server verifies the gitea-minted JWT with its own copy of the
-    # HS256 key, so the two encodings must decode to the same 32 raw bytes.
-    jwt_bytes = secrets.token_bytes(32)
-    jwt_hex = jwt_bytes.hex()
-    jwt_b64url = base64.urlsafe_b64encode(jwt_bytes).decode().rstrip("=")
+    # Independent keys: baleforgit-server never verifies gitea's JWTs (it asks
+    # gitea's /check_access), so sharing one key would only let a compromise of
+    # either service forge the other's tokens.
+    bale_jwt_hex = secrets.token_bytes(32).hex()
+    lfs_jwt_b64url = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
 
     # The published MinIO host port. It appears in two coupled places below — the
     # client-facing presign endpoint and MINIO_S3_PORT — so derive both from one
@@ -41,10 +41,10 @@ def main() -> int:
 
 # ===== Secrets (auto-generated — keep private) ==============================
 
-# Paired HS256 secret: the SAME 32 bytes, hex for baleforgit-server and
-# base64url for gitea. gitea mints the JWT that baleforgit-server verifies.
-BALE_JWT_SECRET_HEX={jwt_hex}
-LFS_JWT_SECRET_BASE64URL={jwt_b64url}
+# Independent HS256 keys: baleforgit-server signs its own Bale tokens; gitea
+# signs its LFS/forge JWTs (verified by gitea itself via /check_access).
+BALE_JWT_SECRET_HEX={bale_jwt_hex}
+LFS_JWT_SECRET_BASE64URL={lfs_jwt_b64url}
 
 # HMAC key for baleforgit-server signed download URLs (exactly 32 bytes hex).
 BALE_TRANSFER_SECRET_HEX={secrets.token_bytes(32).hex()}

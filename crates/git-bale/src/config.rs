@@ -13,7 +13,7 @@ pub struct BaleConfig {
     pub token: String,
     pub token_expiration: u64,
     pub cache_dir: PathBuf,
-    /// `None` outside a git context; per-repo caches are disabled then.
+    /// Common git dir; `None` outside a git context (per-repo caches off).
     pub git_dir: Option<PathBuf>,
 }
 
@@ -25,6 +25,8 @@ pub struct RawConfig {
     pub token: Option<String>,
     pub token_expiration: Option<u64>,
     pub cache_dir: PathBuf,
+    /// The repo's COMMON git dir (canonical), shared by every linked worktree;
+    /// all bale bookkeeping keys on it. See `store::common_git_dir`.
     pub git_dir: Option<PathBuf>,
     /// Fully-local (no-server) mode: `bale.local` / `BALE_LOCAL`.
     pub local_mode: bool,
@@ -62,7 +64,7 @@ impl RawConfig {
                 None
             }
         };
-        let git_dir = gix_repo.as_ref().map(|r| r.git_dir().to_path_buf());
+        let git_dir = gix_repo.as_ref().map(crate::store::common_git_dir);
         let snapshot = gix_repo.as_ref().map(|r| r.config_snapshot());
 
         let server_url = env_or_cfg("BALE_SERVER_URL", snapshot.as_ref(), "bale.serverUrl");

@@ -76,3 +76,22 @@ pub fn looks_like_pointer(bytes: &[u8]) -> bool {
         .windows(POINTER_SENTINEL.len())
         .any(|w| w == POINTER_SENTINEL.as_bytes())
 }
+
+/// MerkleHash is 32 bytes → 64 lowercase hex chars. A pointer's `hash` is
+/// free-form in xet-data, so gate it before it reaches a path or URL.
+pub fn is_safe_file_id(s: &str) -> bool {
+    crate::staging::is_64_lower_hex(s)
+}
+
+/// `bytes` is exactly a pointer git-bale itself would write (safe hash, size
+/// and sha256 present, byte-identical canonical encoding). Clean passes only
+/// these through: a user's JSON that merely has a `"hash"` key must be cleaned.
+pub fn is_canonical_pointer(bytes: &[u8]) -> bool {
+    let Ok(info) = parse_pointer(bytes) else {
+        return false;
+    };
+    is_safe_file_id(info.hash())
+        && info.file_size().is_some()
+        && info.sha256().is_some()
+        && encode_pointer(&info).is_ok_and(|enc| enc == bytes)
+}

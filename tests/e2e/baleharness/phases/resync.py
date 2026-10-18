@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import secrets
 from pathlib import Path
-from typing import Optional
 
 from baleharness.client import ClientEnv, remote_url_ssh
 from baleharness.config import E2E_OWNER, E2E_REPO_RESYNC
@@ -81,7 +80,7 @@ def phase_resync_after_cas_wipe(
         )
 
     server = _boot(data_root, f"resync-{secrets.token_hex(3)}")
-    wiped: Optional[ServerHandle] = None
+    wiped: ServerHandle | None = None
     payload = deterministic_payload(RESYNC_PAYLOAD_BYTES, seed=b"resync-wipe")
     payload_sha = sha256_bytes(payload)
     try:

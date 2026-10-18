@@ -33,12 +33,10 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from baleharness.logutil import TestFailure, info
 from baleharness.proc import host_primary_ip, pick_free_port
 from baleharness.runtime import Runtime
-
 
 # =============================================================================
 # Constants
@@ -69,7 +67,7 @@ class Network:
     name: str
 
     @classmethod
-    def create(cls, rt: Runtime) -> "Network":
+    def create(cls, rt: Runtime) -> Network:
         name = f"bale-e2e-net-{secrets.token_hex(4)}"
         completed = subprocess.run(
             rt.cmd("network", "create", name), capture_output=True, check=False
@@ -137,7 +135,7 @@ class MinioGuard:
         self.host_ip = host_ip
 
     @classmethod
-    def start(cls, rt: Runtime, network: Network) -> "MinioGuard":
+    def start(cls, rt: Runtime, network: Network) -> MinioGuard:
         host_port = pick_free_port()
         host_ip = host_primary_ip()
         container = f"bale-e2e-minio-{secrets.token_hex(4)}"
@@ -204,7 +202,7 @@ class MinioGuard:
     def wait_ready(self) -> None:
         url = f"{self.host_url}/minio/health/ready"
         deadline = time.monotonic() + MINIO_READY_TIMEOUT_S
-        last_err: Optional[str] = None
+        last_err: str | None = None
         while time.monotonic() < deadline:
             try:
                 with urllib.request.urlopen(url, timeout=2) as resp:
@@ -392,7 +390,7 @@ def s3_server_env(
     minio: MinioGuard,
     *,
     prefix: str,
-    endpoint_override: Optional[str] = None,
+    endpoint_override: str | None = None,
 ) -> dict[str, str]:
     """BALE_S3_* env dict the server reads (see
     crates/bale-server-bin/src/main.rs:97-160). `endpoint_override` lets
@@ -465,13 +463,13 @@ class ActiveS3Backend:
     prefix_anchor: Path
 
 
-_ACTIVE_S3: Optional[ActiveS3Backend] = None
+_ACTIVE_S3: ActiveS3Backend | None = None
 
 
-def set_active_s3_backend(backend: Optional[ActiveS3Backend]) -> None:
+def set_active_s3_backend(backend: ActiveS3Backend | None) -> None:
     global _ACTIVE_S3
     _ACTIVE_S3 = backend
 
 
-def get_active_s3_backend() -> Optional[ActiveS3Backend]:
+def get_active_s3_backend() -> ActiveS3Backend | None:
     return _ACTIVE_S3

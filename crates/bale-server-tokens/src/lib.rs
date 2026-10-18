@@ -3,14 +3,23 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Binds tokens to this service, so a JWT from any other HS256 issuer that
+// happens to share the secret (e.g. a forge's LFS key) never verifies here.
+pub const TOKEN_ISSUER: &str = "baleforgit";
+pub const TOKEN_AUDIENCE: &str = "baleforgit-cas";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct XetClaims {
+    pub iss: String,
+    pub aud: String,
     pub sub: String,
     pub repo_type: String,
     pub repo_id: String,
     pub revision: String,
     pub scope: String,
     pub exp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 fn now_unix() -> CoreResult<u64> {
@@ -29,12 +38,15 @@ pub fn mint(
 ) -> CoreResult<(String, u64)> {
     let exp = now_unix()?.saturating_add(ttl_secs);
     let claims = XetClaims {
+        iss: TOKEN_ISSUER.into(),
+        aud: TOKEN_AUDIENCE.into(),
         sub: user.0.clone(),
         repo_type: repo_type_str(repo.repo_type).into(),
         repo_id: repo.repo_id.clone(),
         revision: repo.revision.clone(),
         scope: scope_str(scope).into(),
         exp,
+        owner: repo.owner.clone(),
     };
     let token = encode(
         &Header::new(Algorithm::HS256),
@@ -47,7 +59,9 @@ pub fn mint(
 
 pub fn verify(secret: &[u8], token: &str) -> CoreResult<TokenClaims> {
     let mut v = Validation::new(Algorithm::HS256);
-    v.set_required_spec_claims(&["exp"]);
+    v.set_required_spec_claims(&["exp", "iss", "aud"]);
+    v.set_issuer(&[TOKEN_ISSUER]);
+    v.set_audience(&[TOKEN_AUDIENCE]);
     v.leeway = 0;
     let data = decode::<XetClaims>(token, &DecodingKey::from_secret(secret), &v)
         .map_err(|_| CoreError::Unauthorized)?;
@@ -58,6 +72,7 @@ pub fn verify(secret: &[u8], token: &str) -> CoreResult<TokenClaims> {
             repo_type: parse_repo_type(&c.repo_type)?,
             repo_id: c.repo_id,
             revision: c.revision,
+            owner: c.owner,
         },
         scope: parse_scope(&c.scope)?,
         expires_at: c.exp,

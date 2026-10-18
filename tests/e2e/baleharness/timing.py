@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
 
 from baleharness.logutil import fmt_bytes, info
 
@@ -16,7 +16,7 @@ class TimingEntry:
     elapsed_s: float
     bytes_moved: int = 0  # populated only for throughput-relevant phases
 
-    def throughput_mb_s(self) -> Optional[float]:
+    def throughput_mb_s(self) -> float | None:
         if self.bytes_moved <= 0 or self.elapsed_s <= 0:
             return None
         return (self.bytes_moved / (1024 * 1024)) / self.elapsed_s

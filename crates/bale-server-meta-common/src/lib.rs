@@ -121,6 +121,7 @@ pub fn row_to_frame<R: DecodeRow>(r: &R) -> CoreResult<XorbFrameRow> {
         on_disk_start: r.get_u32("on_disk_start")?,
         on_disk_len: r.get_u32("on_disk_len")?,
         uncompressed_len: r.get_u32("uncompressed_len")?,
+        chunk_hash: ChunkHash(r.get_hash("chunk_hash")?),
     })
 }
 

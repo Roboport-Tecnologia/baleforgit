@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 from baleharness.client import ClientEnv, remote_url_ssh
 from baleharness.gitutil import git
@@ -55,7 +54,7 @@ def init_repo_local(
     work_root: Path,
     client: ClientEnv,
     name: str,
-    shared_store: Optional[Path] = None,
+    shared_store: Path | None = None,
     track_glob: str = "*.bin",
 ) -> tuple[Path, dict]:
     """Init a working repo in fully-local mode. No server remote is configured.

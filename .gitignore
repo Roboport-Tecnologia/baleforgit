@@ -37,3 +37,6 @@ gitea
 xet-core
 *.profraw
 dist
+
+# e2e harness --state-dir runs kept inside the repo
+/.e2e-state/

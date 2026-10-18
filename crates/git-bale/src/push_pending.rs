@@ -2,7 +2,9 @@
 //! present on (and scoped to) the remote being pushed to.
 //!
 //! Invoked by the pre-push hook as `git-bale push-pending <remote> <url>` with
-//! git's ref-update lines on stdin. Two classes of file must reach the target:
+//! git's ref-update lines on stdin. Only files reachable from the pushed refs are considered; other staged
+//! markers (e.g. from `git status` re-cleaning an uncommitted edit) stay put
+//! for gc. Two classes of pushed file must reach the target:
 //!
 //!   1. **Freshly staged** files (`git add` cleaned them offline into
 //!      `.git/bale/staging/`, no server has them yet) — reconstructed from
@@ -24,7 +26,7 @@
 //! online session must equal the file hash we sourced for — we assert that and
 //! bail on mismatch (version skew or corruption).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -45,12 +47,12 @@ use crate::progress::{UploadProgress, UploadSnapshot};
 use crate::remote::{self, RemoteUrl};
 use crate::resolver;
 use crate::staging::{
-    list_staged_files, remove_all_staged_objects, remove_empty_dirs, remove_marker, staging_root,
+    list_staged_files, remove_empty_dirs, remove_marker, staging_root, sweep_objects,
 };
 
 /// Positional args from the pre-push hook (`$1` remote name, `$2` remote URL).
-/// Both `None` when invoked by hand: auth falls back to `origin` and only
-/// staging is drained (no ref set to reconcile against).
+/// Both `None` when invoked by hand: auth falls back to `origin` and only the
+/// staged content HEAD reaches is uploaded.
 #[derive(Default, Debug)]
 pub struct Args {
     pub remote_name: Option<String>,
@@ -81,29 +83,68 @@ pub fn run(args: Args) -> Result<()> {
         None => None,
     };
 
-    // Freshly staged files (hex -> size). A size-less marker can't drive
-    // download_to_writer, so erroring here beats advertising a backless pointer.
-    let mut staged: BTreeMap<String, u64> = BTreeMap::new();
-    for (hex, size) in list_staged_files(&git_dir)
-        .with_context(|| format!("listing staged files in {}", staging.display()))?
-    {
-        let size = size.ok_or_else(|| {
-            anyhow!(
-                "staged marker for {hex} has no size — was it written by an older client? \
-                 Run `git add` again to re-stage with a size."
-            )
-        })?;
-        staged.insert(hex, size);
-    }
+    // Only content the push actually advertises is uploaded: markers also
+    // exist for bytes a `git status`/`git diff` re-clean staged that the user
+    // never committed, and those must not leave the machine. In hook mode git
+    // tells us the ref delta on stdin; run by hand (no args) we treat it as
+    // pushing HEAD (whole history, nothing hidden) and only drain staged
+    // content HEAD reaches, without re-sourcing anything from other remotes.
+    let hook_mode = args.remote_name.is_some();
+    let updates = if hook_mode {
+        read_ref_updates_from_stdin()?
+    } else {
+        head_as_update(&cwd)?
+    };
+    let pushed = reachable_pointers(&cwd, &updates)
+        .map_err(|e| explain_partial_clone(e, &cwd))
+        .context("enumerating bale files in the pushed commits (push aborted)")?;
 
-    // Files the push advertises that aren't in staging: they were pushed to some
-    // other remote and drained. Only computed in hook mode (stdin tells us what's
-    // being pushed). Re-sourced from another remote that still holds them.
-    let from_refs: BTreeMap<String, u64> = if args.remote_name.is_some() {
-        let updates = read_ref_updates_from_stdin()?;
-        reachable_pointers(&cwd, &updates)
+    let markers: BTreeMap<String, Option<u64>> = list_staged_files(&git_dir)
+        .with_context(|| format!("listing staged files in {}", staging.display()))?
+        .into_iter()
+        .collect();
+    // Freshly staged files the push references (hex -> size). A size-less
+    // marker can't drive download_to_writer, so erroring here beats
+    // advertising a backless pointer.
+    let mut staged: BTreeMap<String, u64> = BTreeMap::new();
+    for hex in pushed.keys().filter(|h| markers.contains_key(*h)) {
+        let size = markers.get(hex).copied().flatten().ok_or_else(|| {
+            anyhow!("staged marker for {hex} has no size; run `git add` again to re-stage it")
+        })?;
+        staged.insert(hex.clone(), size);
+    }
+    // Staged content the target ALREADY references (commits pushed earlier with
+    // `--no-verify`, or where the hook couldn't run): the remote advertises
+    // those pointers with the bytes only here. Not a privacy leak — the user
+    // already pushed the commits. Only hashes the delta didn't cover are
+    // tested, with early exit.
+    if hook_mode {
+        let leftover: BTreeSet<String> = markers
+            .keys()
+            .filter(|h| !pushed.contains_key(*h))
+            .cloned()
+            .collect();
+        if !leftover.is_empty() {
+            let remote_name = args.remote_name.as_deref().unwrap_or("origin");
+            for hex in on_target(&cwd, remote_name, &updates, &leftover)
+                .map_err(|e| explain_partial_clone(e, &cwd))
+                .context("checking staged content the push target already references")?
+            {
+                let size = markers.get(&hex).copied().flatten().ok_or_else(|| {
+                    anyhow!(
+                        "staged marker for {hex} has no size; run `git add` again to re-stage it"
+                    )
+                })?;
+                staged.insert(hex, size);
+            }
+        }
+    }
+    // Files the push advertises that aren't staged: drained by an earlier push
+    // to some other remote. Re-sourced from a remote that still holds them.
+    let from_refs: BTreeMap<String, u64> = if hook_mode {
+        pushed
             .into_iter()
-            .filter(|(h, _)| !staged.contains_key(h))
+            .filter(|(h, _)| !markers.contains_key(h))
             .collect()
     } else {
         BTreeMap::new()
@@ -111,7 +152,7 @@ pub fn run(args: Args) -> Result<()> {
 
     if staged.is_empty() && from_refs.is_empty() {
         // Nothing cleaned and nothing new to this remote, or a prior run drained.
-        let _ = remove_empty_dirs(&staging);
+        // (No dir cleanup: unlocked, it could race a concurrent clean.)
         return Ok(());
     }
 
@@ -285,11 +326,27 @@ pub fn run(args: Args) -> Result<()> {
                         tracing::warn!("removing marker {file_hex} in {}: {e}", staging.display());
                     }
                 }
-                let remaining = list_staged_files(&git_dir).map(|v| v.len()).unwrap_or(0);
-                if remaining == 0 {
-                    if let Err(e) = remove_all_staged_objects(&staging) {
-                        tracing::warn!("removing staged objects under {}: {e}", staging.display());
+                // Unreadable inventory → keep the objects (sweeping on a
+                // guess could delete a concurrently staged file's only copy).
+                // A git op in flight (e.g. a `git add` in another process
+                // between files) may be about to dedup against these objects;
+                // leave them for the next gc/drain.
+                let busy = crate::gc::git_op_in_flight(&git_dir).unwrap_or(true);
+                match list_staged_files(&git_dir) {
+                    Ok(_) if busy => {}
+                    Ok(remaining) if remaining.is_empty() => {
+                        if let Err(e) = sweep_objects(&staging) {
+                            tracing::warn!(
+                                "removing staged objects under {}: {e}",
+                                staging.display()
+                            );
+                        }
                     }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        "re-listing markers in {}: {e}; leaving staged objects",
+                        staging.display()
+                    ),
                 }
                 let _ = remove_empty_dirs(&staging);
             }
@@ -404,8 +461,9 @@ impl SourceSessions {
                 continue;
             };
             // A failed download (file not in that remote's repo → 404) falls
-            // through to the next source; download verifies content against the
-            // merkle hash, so a *successful* download then cleanly round-trips.
+            // through to the next source. Downloads are NOT content-verified;
+            // the re-clean's hash check in `re_translate_one` is what rejects
+            // corrupt bytes before they're registered on the target.
             let label = format!("remote '{}'", self.remotes[i].0);
             match re_translate_one(&dl, upload_session.clone(), file_hex, file_size, &label).await {
                 Ok(metrics) => return Ok(metrics),
@@ -459,12 +517,28 @@ async fn file_registered_on_target(
     match client
         .get(&url)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        // Scope check is the same; one byte keeps the response to the first
+        // term instead of a huge file's whole term list.
+        .header(reqwest::header::RANGE, "bytes=0-0")
         .send()
         .await
     {
-        Ok(resp) => resp.status().is_success(),
+        // 416 comes after the scope check: a registered empty file.
+        Ok(resp) => {
+            resp.status().is_success()
+                || resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+        }
         Err(_) => false,
     }
+}
+
+/// `HEAD` as a single ref update with nothing on the remote side (manual run).
+fn head_as_update(cwd: &Path) -> Result<Vec<(ObjectId, Option<ObjectId>)>> {
+    let repo = gix::discover(cwd).with_context(|| format!("opening repo at {}", cwd.display()))?;
+    Ok(match repo.head_id() {
+        Ok(id) => vec![(id.detach(), None)],
+        Err(_) => Vec::new(), // unborn HEAD: nothing committed to push
+    })
 }
 
 /// Parse pre-push stdin lines (`<local ref> <local sha> <remote ref> <remote
@@ -501,77 +575,211 @@ fn parse_oid(s: &str) -> Option<ObjectId> {
 }
 
 /// All bale pointers (`file_hex -> file_size`) introduced by the commits being
-/// pushed: walk `tips` (local shas) hiding only the *remote shas git reports on
-/// stdin* (what the pushed ref currently points to on the remote), and for each
-/// commit collect Added/Modified blobs that parse as pointers. A new ref (remote
-/// sha = zero) hides nothing → the full history is enumerated.
+/// pushed: walk `tips` (local shas, tags peeled) hiding only the *remote shas
+/// git reports on stdin* (what the pushed ref currently points to on the
+/// remote), and for each commit collect Added/Modified blobs that parse as
+/// pointers. A new ref (remote sha = zero) hides nothing → the full history is
+/// enumerated. Any read error fails the push: under-counting here advertises a
+/// pointer the target can't reconstruct.
 ///
 /// Deliberately does NOT hide the remote's `refs/remotes/<name>/*`: git refs
 /// being present on a remote says nothing about whether the *bale objects* were
 /// ever registered under that remote's repo (the server scopes registration
-/// per-repo, and an old client — or this very bug — could have pushed the
-/// commits without the objects). Hiding them would skip exactly the files this
-/// drain must register. The per-file server probe in `run` keeps the resulting
-/// over-walk cheap by not re-uploading files already registered on the target.
+/// per-repo, and an old client could have pushed the commits without the
+/// objects). The per-file server probe in `run` keeps the resulting over-walk
+/// cheap by not re-uploading files already registered on the target.
 fn reachable_pointers(
     start_dir: &Path,
     updates: &[(ObjectId, Option<ObjectId>)],
-) -> BTreeMap<String, u64> {
-    let mut out = BTreeMap::new();
-    let repo = match gix::discover(start_dir) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("push-pending: not in a git repo ({e}); no refs to reconcile");
-            return out;
-        }
+) -> Result<BTreeMap<String, u64>> {
+    if updates.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let repo = gix::discover(start_dir)
+        .with_context(|| format!("opening repo at {}", start_dir.display()))?;
+    let common = crate::store::common_git_dir(&repo);
+    let partial = crate::gc::is_partial_clone(&repo, &common);
+    let mut out = Found {
+        pointers: BTreeMap::new(),
+        missing: partial.then(Vec::new),
     };
 
-    let tips: Vec<ObjectId> = updates
+    let mut tips: Vec<ObjectId> = Vec::new();
+    for (local, _) in updates {
+        let peeled = repo
+            .find_object(*local)
+            .and_then(|o| o.peel_tags_to_end())
+            .with_context(|| format!("reading pushed object {local}"))?;
+        match peeled.kind {
+            gix::object::Kind::Commit => tips.push(peeled.id),
+            gix::object::Kind::Tree => {
+                let tree = repo.find_tree(peeled.id)?;
+                collect_changed_pointers(&repo, &repo.empty_tree(), &tree, &mut out)?;
+            }
+            gix::object::Kind::Blob => consider_blob(&repo, peeled.id, &mut out)?,
+            gix::object::Kind::Tag => {}
+        }
+    }
+
+    // Hiding fewer commits only enumerates more, so drop any remote sha we
+    // can't resolve to a local commit (someone else's push we never fetched).
+    let hidden: Vec<ObjectId> = updates
         .iter()
-        .map(|(l, _)| *l)
-        .filter(|id| is_commit(&repo, *id))
+        .filter_map(|(_, r)| *r)
+        .filter_map(|id| {
+            let peeled = repo.find_object(id).ok()?.peel_tags_to_end().ok()?;
+            (peeled.kind == gix::object::Kind::Commit).then_some(peeled.id)
+        })
+        .collect();
+
+    if !tips.is_empty() {
+        collect_delta(&repo, &tips, &hidden, &mut out, None)?;
+    }
+
+    let missing = out.missing.take().unwrap_or_default();
+    if !missing.is_empty() {
+        lazy_fetch(start_dir, &missing)?;
+        // Fresh handle: the ODB may have cached the pack list before the fetch.
+        let repo = gix::discover(start_dir)
+            .with_context(|| format!("reopening repo at {}", start_dir.display()))?;
+        for oid in missing {
+            consider_blob(&repo, oid, &mut out)?;
+        }
+    }
+    Ok(out.pointers)
+}
+
+/// Subset of `want` reachable from what the target remote already has: the
+/// remote shas git reported on stdin plus `refs/remotes/<remote>/*` (when
+/// `remote_name` is a configured remote).
+fn on_target(
+    start_dir: &Path,
+    remote_name: &str,
+    updates: &[(ObjectId, Option<ObjectId>)],
+    want: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let repo = gix::discover(start_dir)
+        .with_context(|| format!("opening repo at {}", start_dir.display()))?;
+    let mut tips: Vec<ObjectId> = updates.iter().filter_map(|(_, r)| *r).collect();
+    // `git push <url>` passes the URL as the remote name: no tracking refs.
+    let names: Vec<String> = repo.remote_names().iter().map(|n| n.to_string()).collect();
+    if names.iter().any(|n| n == remote_name) {
+        let prefix = format!("refs/remotes/{remote_name}/");
+        // A remote named `<name>/x` has its tracking refs under our prefix too.
+        let nested: Vec<String> = names
+            .iter()
+            .filter(|n| n.starts_with(&prefix["refs/remotes/".len()..]))
+            .map(|n| format!("refs/remotes/{n}/"))
+            .collect();
+        let platform = repo.references().context("opening refs")?;
+        for r in platform
+            .prefixed(prefix.as_str())
+            .context("listing remote-tracking refs")?
+        {
+            let r = r.map_err(|e| anyhow!("reading a remote-tracking ref: {e}"))?;
+            let name = r.name().as_bstr().to_string();
+            if nested.iter().any(|p| name.starts_with(p.as_str())) {
+                continue;
+            }
+            if let gix::refs::TargetRef::Object(id) = r.target() {
+                tips.push(id.to_owned());
+            }
+        }
+    }
+    // A remote sha we never fetched names nothing we could have staged.
+    let tips: Vec<ObjectId> = tips
+        .into_iter()
+        .filter_map(|id| {
+            let peeled = repo.find_object(id).ok()?.peel_tags_to_end().ok()?;
+            (peeled.kind == gix::object::Kind::Commit).then_some(peeled.id)
+        })
         .collect();
     if tips.is_empty() {
-        return out;
+        return Ok(BTreeSet::new());
     }
-
-    let hidden: Vec<ObjectId> = updates.iter().filter_map(|(_, r)| *r).collect();
-
-    // A bad hidden tip (remote sha not present locally) would abort the walk; if
-    // hidden-walk fails, retry with none hidden so we over-upload rather than
-    // strand a pointer the target can't reconstruct.
-    if !collect_delta(&repo, &tips, &hidden, &mut out) && !hidden.is_empty() {
-        out.clear();
-        collect_delta(&repo, &tips, &[], &mut out);
+    let common = crate::store::common_git_dir(&repo);
+    let mut out = Found {
+        pointers: BTreeMap::new(),
+        missing: crate::gc::is_partial_clone(&repo, &common).then(Vec::new),
+    };
+    collect_delta(&repo, &tips, &[], &mut out, Some(want))?;
+    let missing = out.missing.take().unwrap_or_default();
+    if !missing.is_empty() {
+        lazy_fetch(start_dir, &missing)?;
+        let repo = gix::discover(start_dir)
+            .with_context(|| format!("reopening repo at {}", start_dir.display()))?;
+        for oid in missing {
+            consider_blob(&repo, oid, &mut out)?;
+        }
     }
-    out
+    Ok(out
+        .pointers
+        .into_keys()
+        .filter(|h| want.contains(h))
+        .collect())
+}
+
+struct Found {
+    pointers: BTreeMap<String, u64>,
+    /// `Some` in a partial clone: blobs the walk needed but don't exist locally.
+    missing: Option<Vec<ObjectId>>,
+}
+
+/// Have git fetch exactly `oids` from the promisor remote: in a partial clone
+/// `cat-file` lazily fetches any object it's asked about.
+fn lazy_fetch(cwd: &Path, oids: &[ObjectId]) -> Result<()> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["cat-file", "--batch-check"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning git cat-file to fetch missing blobs")?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("git cat-file stdin unavailable"))?;
+        for oid in oids {
+            writeln!(stdin, "{oid}")?;
+        }
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "fetching {} missing blob(s) from the promisor remote failed: {}",
+            oids.len(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Walk `tips` hiding `hidden`, recording pointers each commit introduces (diff
-/// vs first parent). Returns false if the rev walk couldn't be set up.
+/// vs first parent; an unreadable parent diffs against the empty tree, which
+/// only over-collects).
 fn collect_delta(
     repo: &gix::Repository,
     tips: &[ObjectId],
     hidden: &[ObjectId],
-    out: &mut BTreeMap<String, u64>,
-) -> bool {
-    let walk = match repo
+    out: &mut Found,
+    want: Option<&BTreeSet<String>>,
+) -> Result<()> {
+    let walk = repo
         .rev_walk(tips.iter().copied())
         .with_hidden(hidden.iter().copied())
         .all()
-    {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::debug!("push-pending: rev walk failed ({e})");
-            return false;
-        }
-    };
+        .context("setting up history walk")?;
     for info in walk {
-        let Ok(info) = info else { continue };
-        let Ok(commit) = info.object() else { continue };
-        let Ok(commit_tree) = commit.tree() else {
-            continue;
-        };
+        let info = info.context("walking pushed history")?;
+        let commit = info
+            .object()
+            .with_context(|| format!("reading commit {}", info.id))?;
+        let commit_tree = commit
+            .tree()
+            .with_context(|| format!("reading tree of {}", info.id))?;
         let parent_tree = info
             .parent_ids()
             .next()
@@ -579,27 +787,28 @@ fn collect_delta(
             .and_then(|o| o.peel_to_commit().ok())
             .and_then(|c| c.tree().ok())
             .unwrap_or_else(|| repo.empty_tree());
-        collect_changed_pointers(repo, &parent_tree, &commit_tree, out);
+        collect_changed_pointers(repo, &parent_tree, &commit_tree, out)?;
+        if want.is_some_and(|w| w.iter().all(|h| out.pointers.contains_key(h))) {
+            break;
+        }
     }
-    true
+    Ok(())
 }
 
 fn collect_changed_pointers(
     repo: &gix::Repository,
     parent_tree: &gix::Tree<'_>,
     commit_tree: &gix::Tree<'_>,
-    out: &mut BTreeMap<String, u64>,
-) {
-    let mut platform = match parent_tree.changes() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+    out: &mut Found,
+) -> Result<()> {
+    let mut platform = parent_tree.changes().context("preparing tree diff")?;
     // Skip rename tracking (O(N²) similarity): a moved pointer still surfaces as
-    // a Deletion + Addition carrying the same blob id.
+    // an Addition carrying the same blob id.
     platform.options(|opts| {
         opts.track_rewrites(None);
     });
-    let _ = platform.for_each_to_obtain_tree(
+    let mut failure: Option<anyhow::Error> = None;
+    let result = platform.for_each_to_obtain_tree(
         commit_tree,
         |change| -> Result<gix::object::tree::diff::Action, std::convert::Infallible> {
             use gix::object::tree::diff::Change;
@@ -607,40 +816,75 @@ fn collect_changed_pointers(
             | Change::Modification { entry_mode, id, .. } = change
             {
                 if entry_mode.is_blob() {
-                    consider_blob(repo, id.detach(), out);
+                    if let Err(e) = consider_blob(repo, id.detach(), out) {
+                        failure = Some(e);
+                        return Ok(std::ops::ControlFlow::Break(()));
+                    }
                 }
             }
             Ok(std::ops::ControlFlow::Continue(()))
         },
     );
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    result.context("diffing trees")?;
+    Ok(())
 }
 
 /// Record `oid` as a pointer (`hash -> file_size`) if it's a small blob that
 /// parses as one. Header pre-filters keep non-pointer blobs from being read.
-fn consider_blob(repo: &gix::Repository, oid: ObjectId, out: &mut BTreeMap<String, u64>) {
+fn consider_blob(repo: &gix::Repository, oid: ObjectId, out: &mut Found) -> Result<()> {
     let header = match repo.find_header(oid) {
         Ok(h) => h,
-        Err(_) => return,
+        Err(e) => match out.missing.as_mut() {
+            // Partial clone: fetched lazily in one batch after the walk.
+            Some(missing) => {
+                missing.push(oid);
+                return Ok(());
+            }
+            None => {
+                return Err(e)
+                    .with_context(|| format!("blob {oid} is missing from the object database"))
+            }
+        },
     };
     if header.kind() != gix::object::Kind::Blob
         || header.size() == 0
         || header.size() > pointer::POINTER_MAX_BYTES as u64
     {
-        return;
+        return Ok(());
     }
-    let Ok(obj) = repo.find_object(oid) else {
-        return;
-    };
+    let obj = repo
+        .find_object(oid)
+        .with_context(|| format!("reading blob {oid}"))?;
     if let Ok(info) = pointer::parse_pointer(&obj.data) {
+        if !pointer::is_safe_file_id(info.hash()) {
+            // Small JSON that happens to have a `hash` key: never ours.
+            tracing::debug!("push-pending: blob {oid} has a non-hex `hash`; not a bale pointer");
+            return Ok(());
+        }
         if let Some(size) = info.file_size() {
-            out.insert(info.hash().to_string(), size);
+            out.pointers.insert(info.hash().to_string(), size);
         }
     }
+    Ok(())
 }
 
-fn is_commit(repo: &gix::Repository, oid: ObjectId) -> bool {
-    repo.find_header(oid)
-        .is_ok_and(|h| h.kind() == gix::object::Kind::Commit)
+fn explain_partial_clone(err: anyhow::Error, cwd: &Path) -> anyhow::Error {
+    let partial = gix::discover(cwd).is_ok_and(|repo| {
+        let common = crate::store::common_git_dir(&repo);
+        crate::gc::is_partial_clone(&repo, &common)
+    });
+    if !partial {
+        return err;
+    }
+    err.context(
+        "this is a partial clone (promisor remote) and a blob the pushed history needs is \
+         not available locally; git-bale can't tell which bale files the push references. \
+         Fetch the missing blobs (e.g. `git fetch --refetch` or `git rev-list --objects --all \
+         --missing=print`) or push from a full clone",
+    )
 }
 
 // Over-quota uploads surface from xet as a noisy HTTP error: the bale server
@@ -654,8 +898,8 @@ fn is_commit(repo: &gix::Repository, oid: ObjectId) -> bool {
 // from a bale server only ever means over-quota; no other endpoint returns it.
 fn explain_quota_exceeded(err: anyhow::Error, server_url: &str) -> anyhow::Error {
     let chain = format!("{err:#}");
-    let is_quota = chain.contains("(429")
-        || chain.contains("Too Many Requests")
+    let is_quota = chain.contains("(413")
+        || chain.contains("Payload Too Large")
         || chain.contains("quota exceeded");
     if !is_quota {
         return err;

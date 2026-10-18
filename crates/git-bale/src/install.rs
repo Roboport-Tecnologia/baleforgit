@@ -67,13 +67,21 @@ pub fn install(scope: Scope, repo: Option<&Path>) -> Result<()> {
 /// install only the gc hooks (no pre-push drain — nothing to drain), and write
 /// `bale.local*` config. `store` is the resolved, tilde-expanded store path;
 /// `shared` marks it as a cross-repo store.
-pub fn init_local(repo: Option<&Path>, store: &Path, shared: bool) -> Result<()> {
+/// `store: None` is the per-repo default store, deliberately NOT recorded:
+/// it's derived from the current git dir, so a moved repo keeps finding it
+/// (a recorded absolute path would point at the old location).
+pub fn init_local(repo: Option<&Path>, store: Option<&Path>, shared: bool) -> Result<()> {
     set_config(Scope::Local, repo, "process", PROCESS_VALUE)?;
     set_config(Scope::Local, repo, "required", "true")?;
     set_bale_config(Scope::Local, repo, "local", "true")?;
-    set_bale_config(Scope::Local, repo, "localStore", &store.to_string_lossy())?;
+    match store {
+        Some(store) => set_bale_config(Scope::Local, repo, "localStore", &store.to_string_lossy())?,
+        None => unset_bale_config(Scope::Local, repo, "localStore")?,
+    }
     if shared {
         set_bale_config(Scope::Local, repo, "localShared", "true")?;
+    } else {
+        unset_bale_config(Scope::Local, repo, "localShared")?;
     }
     for hook in GC_HOOKS {
         install_managed_hook(
@@ -175,9 +183,10 @@ fn uninstall_managed_hook(repo: Option<&Path>, hook_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve where git will look for `hook_name`, like git does: `core.hooksPath`
+/// with `~` expanded, relative to the worktree root (the git dir when bare);
+/// else the COMMON git dir's `hooks/` (linked worktrees share it).
 fn resolve_hook_path(repo: Option<&Path>, hook_name: &str) -> Result<PathBuf> {
-    // gix resolves the git dir (incl. worktrees) and honours `core.hooksPath`
-    // from the merged config snapshot.
     let start_dir = repo
         .map(|p| p.to_path_buf())
         .or_else(|| std::env::current_dir().ok())
@@ -185,16 +194,20 @@ fn resolve_hook_path(repo: Option<&Path>, hook_name: &str) -> Result<PathBuf> {
     let gix_repo =
         gix::discover(&start_dir).with_context(|| format!("opening repo at {start_dir:?}"))?;
     let snapshot = gix_repo.config_snapshot();
-    let hooks_root = if let Some(p) = snapshot.string("core.hooksPath") {
-        let s = p.to_string();
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            PathBuf::from(trimmed)
-        } else {
-            gix_repo.git_dir().join("hooks")
+    let configured = match snapshot.trusted_path("core.hooksPath") {
+        Some(p) => {
+            let p = p.context("interpolating core.hooksPath")?;
+            (!p.as_os_str().is_empty()).then(|| p.into_owned())
         }
-    } else {
-        gix_repo.git_dir().join("hooks")
+        None => None,
+    };
+    let hooks_root = match configured {
+        Some(p) if p.is_absolute() => p,
+        Some(p) => gix_repo
+            .workdir()
+            .unwrap_or_else(|| gix_repo.git_dir())
+            .join(p),
+        None => gix_repo.common_dir().join("hooks"),
     };
     Ok(hooks_root.join(hook_name))
 }
@@ -265,9 +278,16 @@ fn set_config(scope: Scope, repo: Option<&Path>, key: &str, value: &str) -> Resu
     Ok(())
 }
 
+fn unset_bale_config(scope: Scope, repo: Option<&Path>, key: &str) -> Result<()> {
+    unset_full_key(scope, repo, &format!("bale.{key}"))
+}
+
 fn unset_config(scope: Scope, repo: Option<&Path>, key: &str) -> Result<()> {
-    let full_key = format!("{SECTION}.{key}");
-    let out = run_git_config(scope, repo, &["--unset-all", &full_key])?;
+    unset_full_key(scope, repo, &format!("{SECTION}.{key}"))
+}
+
+fn unset_full_key(scope: Scope, repo: Option<&Path>, full_key: &str) -> Result<()> {
+    let out = run_git_config(scope, repo, &["--unset-all", full_key])?;
     // Exit status 5 from `git config --unset-all` means "key not set" — fine.
     if !out.status.success() && out.status.code() != Some(5) {
         return Err(anyhow!(

@@ -1,45 +1,42 @@
-//! `git-bale gc` — reconcile the per-repo staging area against git
-//! reachability, dropping xorbs/shards/markers that nothing references.
+//! `git-bale gc` — reconcile the per-repo object store against git
+//! reachability, dropping markers (and, once none remain, objects) that
+//! nothing references.
 //!
 //! `git add` stages a bale file's xorbs/shards offline (see [`crate::staging`])
-//! plus a `<file_hex>` marker; only `git push` (via [`crate::push_pending`])
-//! drains them. Without gc, content `git add`ed then abandoned (`git reset`,
-//! `git checkout`) lingers forever. Wired into post-checkout/-commit/-merge
-//! hooks; safe to run by hand.
+//! plus a `<file_hex>` marker. Without gc, content `git add`ed then abandoned
+//! (`git reset`, `git checkout`) lingers forever. Wired into
+//! post-checkout/-commit/-merge hooks; safe to run by hand.
 //!
-//! Safety: everything in staging is unpushed (push-pending wipes the whole dir
-//! on success). A staged file is needed iff some pointer git could push
-//! references it — in the index, or introduced by a local-but-not-remote commit.
-//! Never *under*-count: dropping a marker for committed-but-unpushed content
-//! strands it (push-pending drains by marker; lukewarm smudge is marker-gated),
-//! so a later push advertises a pointer the server can't reconstruct. Hence we
-//! diff each unpushed commit against its first parent and over-retain freely
-//! (pruning by remotes only shrinks the live set toward already-pushed content).
+//! Liveness mirrors git's own gc: a staged file is live if any pointer to it is
+//! reachable from any ref (local OR remote-tracking), any reflog entry (incl.
+//! `stash@{n}`), any worktree's HEAD or index. Remote-tracking reachability is
+//! NOT proof of upload (`push --no-verify`, plain-git remotes); in server mode
+//! the only thing that releases committed staged content is push-pending's
+//! drain after a successful upload. Every error while computing liveness
+//! aborts gc and keeps everything — an unreadable ref must never read as
+//! "unreferenced".
 //!
 //! Xorbs are shared across files by xet-data's local dedup, so per-xorb deletion
-//! is unsafe: the object sweep runs only once no marker remains.
+//! is unsafe: the object sweep runs only once no marker remains (and, in local
+//! mode, nothing the store holds is reachable).
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Context, Result};
 use gix::ObjectId;
 
 use crate::clean_cache;
 use crate::pointer;
-use crate::staging::{
-    clear_file_markers, list_staged_files, remove_all_staged_objects, remove_empty_dirs,
-    remove_marker, staging_root,
-};
+use crate::staging::{list_staged_files, remove_empty_dirs, remove_marker, staging_root};
+use crate::store::{self, StoreLock};
 
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
     reconcile(&cwd)
 }
 
-/// Reconcile staging for the repo at `start_dir`. Best-effort: any open/read
-/// error degrades to "keep more" rather than risk deleting live content.
 pub fn reconcile(start_dir: &Path) -> Result<()> {
     let repo = match gix::discover(start_dir) {
         Ok(r) => r,
@@ -48,398 +45,639 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
             return Ok(());
         }
     };
-    let git_dir = repo.git_dir().to_path_buf();
+    let common = store::common_git_dir(&repo);
+    let raw = crate::config::RawConfig::load(Some(start_dir))
+        .context("git-bale gc: loading config (nothing reclaimed)")?;
+    let store = store::object_store_root(&raw)?;
+    let staging = staging_root(&common);
 
-    let raw = crate::config::RawConfig::load(Some(start_dir)).unwrap_or_else(|e| {
-        tracing::debug!("git-bale gc: config load failed ({e}); assuming server mode");
-        crate::config::RawConfig {
-            server_url: None,
-            token: None,
-            token_expiration: None,
-            cache_dir: PathBuf::from("."),
-            git_dir: Some(git_dir.clone()),
-            local_mode: false,
-            local_store: None,
-            local_shared: false,
-            ssh_command: None,
-        }
-    });
-
-    // Shared local store: append-only. gc must not delete objects another repo
-    // may reference, and markers are the only record of what's in the store, so
-    // keep them too. `git-bale prune --shared` reclaims. Just tidy empty dirs.
-    if raw.local_mode && raw.local_shared {
-        let _ = remove_empty_dirs(&staging_root(&git_dir));
+    // Held across {read markers → remove dead → sweep objects} so a concurrent
+    // `clean` (which holds the same lock across its object+marker write) can't
+    // have a just-written object swept before its marker lands. Non-blocking:
+    // a held lock means a `git add` is mid-write, so skip (hooks run `|| true`).
+    let Some(lock) = StoreLock::try_exclusive(&store)? else {
+        tracing::debug!(
+            "git-bale gc: store {} locked by a concurrent add; skipping",
+            store.display()
+        );
         return Ok(());
-    }
-
-    let store = crate::store::object_store_root(&raw).unwrap_or_else(|_| staging_root(&git_dir));
-
-    // Hold the store lock across {read markers → remove dead → sweep objects} so
-    // a concurrent `clean` (which holds the same lock across its per-file
-    // object+marker write) can't have a just-written object swept before its
-    // marker lands. Try-lock (non-blocking): if it's held, a `git add` is mid
-    // write — skip. gc hooks fire via `|| true`, so skipping never fails the op.
-    let _store_lock = match crate::store::StoreLock::try_exclusive(&store) {
-        Ok(Some(l)) => l,
-        Ok(None) => {
-            tracing::debug!(
-                "git-bale gc: store {} locked by a concurrent add; skipping",
-                store.display()
-            );
-            return Ok(());
-        }
-        Err(e) => {
-            tracing::warn!(
-                "git-bale gc: could not lock store {}: {e}; skipping",
-                store.display()
-            );
-            return Ok(());
-        }
     };
 
-    // Checked AFTER taking the store lock — order is load-bearing. A git op that
-    // is cleaning content and recording it (add/commit/stash) holds a `*.lock`
-    // for its index/ref write; gc reads liveness from that index+refs, so a stale
-    // read makes a file whose objects+marker are already on disk — but whose
-    // index/ref entry hasn't landed — look abandoned, and gc would sweep its only
-    // copy. With the store lock already held, any clean that wrote its marker has
-    // either released the store lock (so its op's lock is still present here → we
-    // skip) or is blocked acquiring it (so it hasn't written a marker we'd see).
-    // Checking before the store lock would leave a gap: a clean could slip in,
-    // write+release between the check and the marker read, and be swept.
-    if git_op_in_flight(&git_dir) {
+    // Checked AFTER taking the store lock — order is load-bearing. A clean that
+    // already wrote its marker has released the store lock while its git op
+    // still holds an index/ref `*.lock` (we skip); one that hasn't is blocked
+    // on the store lock (no marker for us to misjudge).
+    if git_op_in_flight(&common)? {
         tracing::debug!("git-bale gc: a git index/ref update is in flight; skipping");
         return Ok(());
     }
 
-    let staging = staging_root(&git_dir);
-
-    let staged = list_staged_files(&git_dir).unwrap_or_default();
-    if staged.is_empty() {
-        // Common case: nothing pending. Tidy stray empty dirs and exit.
+    // Shared local store: append-only. Other repos may reference these
+    // objects and markers are the only record of what's in the store;
+    // `git-bale prune --shared` reclaims.
+    if raw.local_mode && raw.local_shared {
+        store::register_repo_locked(&store, &common, &lock)?;
         let _ = remove_empty_dirs(&staging);
         return Ok(());
     }
-    let want: BTreeSet<String> = staged.into_iter().map(|(h, _)| h).collect();
+    // A non-shared store is swept whole; never one another repo owns (or one
+    // no clean of ours has claimed yet).
+    if raw.local_mode && !store::owns_store(&store, &common)? {
+        if let Some(owner) = store::store_owner(&store)? {
+            bail!(
+                "local store {} belongs to {}; refusing to reclaim it from {}",
+                store.display(),
+                store::describe_owner(&owner, &store),
+                common.display()
+            );
+        }
+        return Ok(());
+    }
 
-    let (local_tips, remote_tips) = ref_tips(&repo);
-    // Local mode: the store is the only copy, so liveness = reachable from ANY
-    // ref (no remote-tracking hiding) + index. Server mode: hide remotes (the
-    // server is the source of truth for already-pushed content).
-    let live = if raw.local_mode {
-        let mut all = local_tips.clone();
-        all.extend(remote_tips.iter().copied());
-        reachable_hashes(&repo, &want, &all, &[])
-    } else {
-        reachable_hashes(&repo, &want, &local_tips, &remote_tips)
-    };
-    // Reclaim grace: never drop/sweep a marker whose content was cleaned within
-    // the grace window. This is the backstop for the one window `git_op_in_flight`
-    // can't see — a `git stash`'s lock-free commit-object write — and for any
-    // other brief gap between a clean writing/refreshing a marker and git
-    // recording the content. clean refreshes the marker mtime on every add (hit
-    // or miss), so "marker age" == "time since last cleaned". An unreferenced but
-    // recent marker is treated as live this run; a later gc reclaims it once it
-    // ages past the grace and is still unreferenced.
+    let staged = list_staged_files(&common).context("listing staged markers")?;
+    if staged.is_empty() {
+        // No marker vouches for anything left here (e.g. push-pending skipped
+        // its sweep because a git op was in flight); we hold the lock and no op
+        // is in flight now, so reclaim it.
+        sweep_store(&repo, &common, &raw, &store, &staging)?;
+        return Ok(());
+    }
+
+    // Reclaim grace: a marker cleaned within the window is kept regardless —
+    // the backstop for the one gap `git_op_in_flight` can't see (a `git
+    // stash`'s lock-free commit-object write). Filtering BEFORE the scan keeps
+    // hooks cheap: young markers (every `git status` re-clean makes one) would
+    // otherwise force a full-history walk on every checkout/commit.
     let grace = reclaim_grace();
     let now = SystemTime::now();
-    let dead: Vec<String> = want
+    let candidates: BTreeSet<String> = staged
+        .into_iter()
+        .map(|(h, _)| h)
+        .filter(|h| marker_age_exceeds(&common, h, grace, now))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    if is_partial_clone(&repo, &common) {
+        // Missing blobs are indistinguishable from corruption: never reclaim,
+        // and say so only at debug level since every hook would repeat it.
+        tracing::debug!("git-bale gc: partial clone; not reclaiming anything");
+        return Ok(());
+    }
+    let live = live_hashes(&repo, &common, &candidates)?;
+    let dead: BTreeSet<String> = candidates
         .iter()
         .filter(|h| !live.contains(*h))
-        .filter(|h| marker_age_exceeds(&git_dir, h, grace, now))
         .cloned()
         .collect();
     if dead.is_empty() {
         return Ok(());
     }
 
+    // Clean-cache first: a surviving entry would let a later `git add` of the
+    // same bytes short-circuit to a pointer whose bytes we're about to sweep.
+    clean_cache::forget_hashes(&common, &dead).context("invalidating clean-cache")?;
     for h in &dead {
-        if let Err(e) = remove_marker(&git_dir, h) {
-            tracing::warn!("git-bale gc: removing stale marker {h}: {e}");
-        }
+        remove_marker(&common, h).with_context(|| format!("removing stale marker {h}"))?;
     }
-    tracing::debug!(
-        "git-bale gc: dropped {} orphaned staging marker(s)",
-        dead.len()
-    );
+    tracing::debug!("git-bale gc: dropped {} orphaned marker(s)", dead.len());
 
-    // A dropped marker is either pushed (commit on a remote) or orphaned
-    // (abandoned before any push). For orphaned hashes the staged bytes are
-    // about to be swept and exist nowhere else, yet the clean-cache still maps
-    // those worktree bytes to the pointer — so a later `git add` short-circuits
-    // to a pointer with no backing (the stage→unstage→stash data-loss bug).
-    // Invalidate them; pushed hashes keep their cache (smudge falls to server).
-    let orphaned: BTreeSet<String> = if raw.local_mode || remote_tips.is_empty() {
-        dead.iter().cloned().collect()
-    } else {
-        let mut all_tips = local_tips;
-        all_tips.extend(remote_tips);
-        let reachable_anywhere = reachable_hashes(&repo, &want, &all_tips, &[]);
-        dead.iter()
-            .filter(|h| !reachable_anywhere.contains(*h))
-            .cloned()
-            .collect()
-    };
-    match clean_cache::forget_hashes(&git_dir, &orphaned) {
-        Ok(n) if n > 0 => {
-            tracing::debug!("git-bale gc: invalidated {n} stale clean-cache entr(ies)")
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("git-bale gc: invalidating clean-cache: {e}"),
+    if list_staged_files(&common)
+        .context("re-listing staged markers")?
+        .is_empty()
+    {
+        sweep_store(&repo, &common, &raw, &store, &staging)?;
     }
+    drop(lock);
+    Ok(())
+}
 
-    // No marker left → nothing references the staged xorbs/shards; sweep them.
-    let remaining = list_staged_files(&git_dir).map(|v| v.len()).unwrap_or(0);
-    if remaining == 0 {
-        let _ = clear_file_markers(&git_dir);
-        if let Err(e) = remove_all_staged_objects(&store) {
-            tracing::warn!("git-bale gc: sweeping store objects: {e}");
+/// Sweep the whole object store once no marker remains. In local mode the
+/// store is the ONLY copy of committed content, and "no markers" doesn't mean
+/// "nothing live" (a repo re-cloned at the same path re-claims its old store
+/// with no markers), so it's swept only if nothing it holds is reachable.
+/// Caller holds the store lock and has checked no git op is in flight.
+fn sweep_store(
+    repo: &gix::Repository,
+    common: &Path,
+    raw: &crate::config::RawConfig,
+    store: &Path,
+    staging: &Path,
+) -> Result<()> {
+    if store.join("xet").exists() {
+        if raw.local_mode {
+            if is_partial_clone(repo, common) {
+                tracing::debug!("git-bale gc: partial clone; not sweeping the local store");
+                return Ok(());
+            }
+            let held: BTreeSet<String> = crate::prune::stored_files(store)?.into_keys().collect();
+            if !held.is_empty() {
+                let live = live_hashes(repo, common, &held)?;
+                if !live.is_empty() {
+                    tracing::debug!(
+                        "git-bale gc: local store holds {} reachable file(s); not sweeping",
+                        live.len()
+                    );
+                    return Ok(());
+                }
+            }
         }
-        let _ = remove_empty_dirs(&store);
-        if store != staging {
-            let _ = remove_empty_dirs(&staging);
-        }
+        crate::staging::sweep_objects(store)
+            .with_context(|| format!("sweeping objects under {}", store.display()))?;
+    }
+    let _ = remove_empty_dirs(store);
+    if store != staging {
+        let _ = remove_empty_dirs(staging);
     }
     Ok(())
 }
 
-/// Subset of `want` reachable from the index or commits in `tips`, with
-/// `hidden`'s ancestors pruned. Live set: `tips=local, hidden=remotes` ("index
-/// or unpushed commit"); orphan check: all refs as tips, nothing hidden
-/// ("reachable anywhere"). Stops once every wanted hash is found.
-fn reachable_hashes(
+/// Subset of `want` referenced by any index, ref, reflog entry, worktree HEAD
+/// or in-progress rebase/merge state of the repo whose common git dir is
+/// `common`. Errors on anything it can't read. Stops once every wanted hash is
+/// found.
+pub fn live_hashes(
     repo: &gix::Repository,
+    common: &Path,
     want: &BTreeSet<String>,
-    tips: &[ObjectId],
-    hidden: &[ObjectId],
-) -> HashSet<String> {
-    let mut live = HashSet::new();
-    let mut seen_blobs: HashSet<ObjectId> = HashSet::new();
+) -> Result<HashSet<String>> {
+    Ok(scan(repo, common, Some(want))?.into_iter().collect())
+}
 
-    // Index covers staged-but-uncommitted pointers.
-    if let Ok(index) = repo.index_or_empty() {
-        use gix::index::entry::Mode;
+/// Every bale file hash reachable the same way as [`live_hashes`], without a
+/// candidate set. `prune` uses this: liveness can't depend on which repo's
+/// markers happen to survive.
+pub fn reachable_hashes(repo: &gix::Repository, common: &Path) -> Result<BTreeSet<String>> {
+    scan(repo, common, None)
+}
+
+fn scan(
+    repo: &gix::Repository,
+    common: &Path,
+    want: Option<&BTreeSet<String>>,
+) -> Result<BTreeSet<String>> {
+    if common.join("reftable").exists() {
+        bail!("reftable ref storage is not supported by git-bale's liveness scan");
+    }
+    if is_partial_clone(repo, common) {
+        bail!(
+            "this is a partial clone (promisor remote): blobs may be missing locally, so \
+             git-bale can't prove which bale files are unreferenced"
+        );
+    }
+    let mut scan = Scan {
+        repo,
+        want,
+        seen: HashSet::new(),
+        found: BTreeSet::new(),
+    };
+
+    for index in index_files(repo, common)? {
+        scan.index(&index)?;
+        if scan.done() {
+            return Ok(scan.found);
+        }
+    }
+
+    let mut commits: Vec<ObjectId> = Vec::new();
+    for id in tip_ids(repo, common)? {
+        let header = repo
+            .find_header(id)
+            .with_context(|| format!("object {id} named by a ref/reflog is missing"))?;
+        let (kind, id) = if header.kind() == gix::object::Kind::Tag {
+            let peeled = repo
+                .find_object(id)
+                .and_then(|o| o.peel_tags_to_end())
+                .with_context(|| format!("peeling tag {id}"))?;
+            (peeled.kind, peeled.id)
+        } else {
+            (header.kind(), id)
+        };
+        match kind {
+            gix::object::Kind::Commit => commits.push(id),
+            gix::object::Kind::Tree => scan.whole_tree(id)?,
+            gix::object::Kind::Blob => scan.blob(id)?,
+            gix::object::Kind::Tag => {}
+        }
+        if scan.done() {
+            return Ok(scan.found);
+        }
+    }
+    commits.sort();
+    commits.dedup();
+    if !commits.is_empty() {
+        scan.history(&commits)?;
+    }
+    Ok(scan.found)
+}
+
+/// Partial clones (`extensions.partialClone`, a `remote.*.promisor`, or
+/// `*.promisor` packs) may lack blobs locally, which the scan can't tell apart
+/// from corruption.
+pub fn is_partial_clone(repo: &gix::Repository, common: &Path) -> bool {
+    let snapshot = repo.config_snapshot();
+    if snapshot.string("extensions.partialClone").is_some() {
+        return true;
+    }
+    for name in repo.remote_names() {
+        if snapshot
+            .boolean(format!("remote.{name}.promisor").as_str())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    std::fs::read_dir(common.join("objects").join("pack")).is_ok_and(|rd| {
+        rd.flatten()
+            .any(|e| e.path().extension().is_some_and(|x| x == "promisor"))
+    })
+}
+
+struct Scan<'r, 'w> {
+    repo: &'r gix::Repository,
+    want: Option<&'w BTreeSet<String>>,
+    seen: HashSet<ObjectId>,
+    found: BTreeSet<String>,
+}
+
+impl Scan<'_, '_> {
+    fn done(&self) -> bool {
+        self.want.is_some_and(|w| self.found.len() == w.len())
+    }
+
+    fn index(&mut self, path: &Path) -> Result<()> {
+        let min_len = 12 + self.repo.object_hash().len_in_bytes() as u64;
+        match std::fs::metadata(path) {
+            Ok(m) if m.len() < min_len => bail!("index {} is truncated", path.display()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+        }
+        let index = gix::index::File::at(path, self.repo.object_hash(), false, Default::default())
+            .with_context(|| format!("reading index {}", path.display()))?;
+        use gix::index::entry::{Flags, Mode};
         for entry in index.entries() {
-            if entry.mode != Mode::FILE && entry.mode != Mode::FILE_EXECUTABLE {
+            // `git add -N` records the empty blob, which may not exist in the ODB.
+            if entry.flags.contains(Flags::INTENT_TO_ADD) {
                 continue;
             }
-            consider_blob(repo, entry.id, want, &mut seen_blobs, &mut live);
-            if live.len() == want.len() {
-                return live;
+            if entry.mode == Mode::FILE || entry.mode == Mode::FILE_EXECUTABLE {
+                self.blob(entry.id)?;
+            } else if entry.mode == Mode::DIR {
+                // Sparse-index directory entry: its whole subtree is in the index.
+                self.whole_tree(entry.id)?;
+            }
+            if self.done() {
+                return Ok(());
             }
         }
+        Ok(())
     }
 
-    // Pointers each walked commit introduces: diff against first parent so we
-    // only read the blobs it changed.
-    if tips.is_empty() {
-        return live;
-    }
-    let walk = match repo
-        .rev_walk(tips.iter().copied())
-        .with_hidden(hidden.iter().copied())
-        .all()
-    {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::debug!("git-bale gc: rev walk failed ({e}); keeping index-reachable only");
-            return live;
+    /// Pointers each commit introduces, diffing against its first parent (a
+    /// missing/unreadable parent diffs against the empty tree: a superset).
+    fn history(&mut self, tips: &[ObjectId]) -> Result<()> {
+        let walk = self
+            .repo
+            .rev_walk(tips.iter().copied())
+            .all()
+            .context("setting up history walk")?;
+        for info in walk {
+            let info = info.context("walking history")?;
+            let commit = info
+                .object()
+                .with_context(|| format!("reading commit {}", info.id))?;
+            let tree = commit
+                .tree()
+                .with_context(|| format!("reading tree of {}", info.id))?;
+            let parent_tree = info
+                .parent_ids()
+                .next()
+                .and_then(|pid| pid.object().ok())
+                .and_then(|o| o.peel_to_commit().ok())
+                .and_then(|c| c.tree().ok())
+                .unwrap_or_else(|| self.repo.empty_tree());
+            self.diff(&parent_tree, &tree)?;
+            if self.done() {
+                return Ok(());
+            }
         }
-    };
-    for info in walk {
-        let Ok(info) = info else { continue };
-        let Ok(commit) = info.object() else { continue };
-        let Ok(commit_tree) = commit.tree() else {
-            continue;
-        };
-        let parent_tree = info
-            .parent_ids()
-            .next()
-            .and_then(|pid| pid.object().ok())
-            .and_then(|o| o.peel_to_commit().ok())
-            .and_then(|c| c.tree().ok())
-            .unwrap_or_else(|| repo.empty_tree());
-        collect_changed_pointers(
-            repo,
-            &parent_tree,
-            &commit_tree,
-            want,
-            &mut seen_blobs,
-            &mut live,
-        );
-        if live.len() == want.len() {
-            return live;
-        }
-    }
-    live
-}
-
-/// Split commit ref tips into `(local, remote)`: non-remote refs (plus HEAD for
-/// detached) are local, `refs/remotes/*` are remote.
-fn ref_tips(repo: &gix::Repository) -> (Vec<ObjectId>, Vec<ObjectId>) {
-    let mut tips = Vec::new();
-    let mut hidden = Vec::new();
-
-    if let Ok(id) = repo.head_id() {
-        let id = id.detach();
-        if is_commit(repo, id) {
-            tips.push(id);
-        }
+        Ok(())
     }
 
-    let platform = match repo.references() {
-        Ok(p) => p,
-        Err(_) => return (tips, hidden),
-    };
-    let iter = match platform.all() {
-        Ok(i) => i,
-        Err(_) => return (tips, hidden),
-    };
-    for r in iter {
-        let mut r = match r {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let is_remote = r.name().as_bstr().starts_with(b"refs/remotes/");
-        let id = match r.peel_to_id() {
-            Ok(id) => id.detach(),
-            Err(_) => continue,
-        };
-        if !is_commit(repo, id) {
-            continue;
-        }
-        if is_remote {
-            hidden.push(id);
-        } else {
-            tips.push(id);
-        }
+    fn whole_tree(&mut self, id: ObjectId) -> Result<()> {
+        let tree = self
+            .repo
+            .find_tree(id)
+            .with_context(|| format!("reading tree {id}"))?;
+        let empty = self.repo.empty_tree();
+        self.diff(&empty, &tree)
     }
-    (tips, hidden)
-}
 
-/// Record Added/Modified blobs between the trees that parse as a wanted pointer.
-fn collect_changed_pointers(
-    repo: &gix::Repository,
-    parent_tree: &gix::Tree<'_>,
-    commit_tree: &gix::Tree<'_>,
-    want: &BTreeSet<String>,
-    seen: &mut HashSet<ObjectId>,
-    live: &mut HashSet<String>,
-) {
-    let mut platform = match parent_tree.changes() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    // Skip rename tracking (O(N²) similarity): a moved pointer still surfaces
-    // as a Deletion + Addition carrying the same blob id.
-    platform.options(|opts| {
-        opts.track_rewrites(None);
-    });
-    let _ = platform.for_each_to_obtain_tree(
-        commit_tree,
-        |change| -> Result<gix::object::tree::diff::Action, std::convert::Infallible> {
-            use gix::object::tree::diff::Change;
-            if let Change::Addition { entry_mode, id, .. }
-            | Change::Modification { entry_mode, id, .. } = change
-            {
-                if entry_mode.is_blob() {
-                    consider_blob(repo, id.detach(), want, seen, live);
-                    if live.len() == want.len() {
-                        return Ok(std::ops::ControlFlow::Break(()));
+    /// Record Added/Modified blobs between the trees that parse as a wanted
+    /// pointer.
+    fn diff(&mut self, from: &gix::Tree<'_>, to: &gix::Tree<'_>) -> Result<()> {
+        let mut platform = from.changes().context("preparing tree diff")?;
+        // No rename tracking (O(N²)): a moved pointer still surfaces as an
+        // Addition carrying the same blob id.
+        platform.options(|opts| {
+            opts.track_rewrites(None);
+        });
+        let mut failure: Option<anyhow::Error> = None;
+        let mut stopped = false;
+        let result = platform.for_each_to_obtain_tree(
+            to,
+            |change| -> Result<gix::object::tree::diff::Action, std::convert::Infallible> {
+                use gix::object::tree::diff::Change;
+                if let Change::Addition { entry_mode, id, .. }
+                | Change::Modification { entry_mode, id, .. } = change
+                {
+                    if entry_mode.is_blob() {
+                        if let Err(e) = self.blob(id.detach()) {
+                            failure = Some(e);
+                        }
+                        if failure.is_some() || self.done() {
+                            stopped = true;
+                            return Ok(std::ops::ControlFlow::Break(()));
+                        }
                     }
                 }
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        );
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        // A deliberate Break surfaces as a "cancelled" error; anything else is real.
+        if !stopped {
+            result.context("diffing trees")?;
+        }
+        Ok(())
+    }
+
+    /// Record `oid`'s file hash if it's a small blob parsing as a (wanted)
+    /// pointer.
+    fn blob(&mut self, oid: ObjectId) -> Result<()> {
+        if !self.seen.insert(oid) {
+            return Ok(());
+        }
+        let header = self
+            .repo
+            .find_header(oid)
+            .with_context(|| format!("blob {oid} is missing from the object database"))?;
+        if header.kind() != gix::object::Kind::Blob
+            || header.size() == 0
+            || header.size() > pointer::POINTER_MAX_BYTES as u64
+        {
+            return Ok(());
+        }
+        let obj = self
+            .repo
+            .find_object(oid)
+            .with_context(|| format!("reading blob {oid}"))?;
+        if let Ok(info) = pointer::parse_pointer(&obj.data) {
+            let h = info.hash();
+            if pointer::is_safe_file_id(h) && self.want.is_none_or(|w| w.contains(h)) {
+                self.found.insert(h.to_string());
             }
-            Ok(std::ops::ControlFlow::Continue(()))
-        },
-    );
+        }
+        Ok(())
+    }
 }
 
-/// Record `oid`'s file hash as live if it's a small blob parsing as a wanted
-/// pointer. Pre-filters (seen dedup, header size/kind) avoid inflating non-pointers.
-fn consider_blob(
-    repo: &gix::Repository,
-    oid: ObjectId,
-    want: &BTreeSet<String>,
-    seen: &mut HashSet<ObjectId>,
-    live: &mut HashSet<String>,
-) {
-    if !seen.insert(oid) {
-        return;
-    }
-    let header = match repo.find_header(oid) {
-        Ok(h) => h,
-        Err(_) => return,
+/// Linked worktrees' private git dirs (`<common>/worktrees/<id>`).
+fn worktree_dirs(common: &Path) -> Result<Vec<PathBuf>> {
+    let rd = match std::fs::read_dir(common.join("worktrees")) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).context("listing linked worktrees"),
     };
-    if header.kind() != gix::object::Kind::Blob
-        || header.size() == 0
-        || header.size() > pointer::POINTER_MAX_BYTES as u64
-    {
-        return;
-    }
-    let obj = match repo.find_object(oid) {
-        Ok(o) => o,
-        Err(_) => return,
-    };
-    if let Ok(info) = pointer::parse_pointer(&obj.data) {
-        let h = info.hash().to_string();
-        if want.contains(&h) {
-            live.insert(h);
+    let mut out = Vec::new();
+    for entry in rd {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            out.push(entry.path());
         }
     }
+    out.sort();
+    Ok(out)
 }
 
-/// File-hashes in `want` reachable from `repo`'s index or ANY ref (no hiding).
-/// Shared by `git-bale prune`.
-pub fn reachable_all(repo: &gix::Repository, want: &BTreeSet<String>) -> HashSet<String> {
-    let (local_tips, remote_tips) = ref_tips(repo);
-    let mut all = local_tips;
-    all.extend(remote_tips);
-    reachable_hashes(repo, want, &all, &[])
+/// Every worktree's index (main + linked), plus an explicit GIT_INDEX_FILE.
+fn index_files(repo: &gix::Repository, common: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = vec![common.join("index"), repo.index_path()];
+    for wt in worktree_dirs(common)? {
+        out.push(wt.join("index"));
+    }
+    if let Some(p) = std::env::var_os("GIT_INDEX_FILE") {
+        out.push(PathBuf::from(p));
+    }
+    let mut canon: Vec<PathBuf> = out.iter().map(|p| store::canonical_path(p)).collect();
+    canon.sort();
+    canon.dedup();
+    Ok(canon)
+}
+
+const PSEUDO_REFS: [&str; 8] = [
+    "HEAD",
+    "ORIG_HEAD",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "REBASE_HEAD",
+    "BISECT_HEAD",
+    "AUTO_MERGE",
+];
+
+const OP_STATE_REFS: [&str; 11] = [
+    "MERGE_AUTOSTASH",
+    "rebase-merge/autostash",
+    "rebase-merge/orig-head",
+    "rebase-merge/onto",
+    "rebase-merge/stopped-sha",
+    "rebase-merge/amend",
+    "rebase-apply/autostash",
+    "rebase-apply/orig-head",
+    "rebase-apply/onto",
+    "sequencer/head",
+    "sequencer/abort-safety",
+];
+
+/// A multi-step op (rebase, am, cherry-pick/revert sequence, autostash merge)
+/// is stopped mid-way: its state may name commits nothing else does.
+const OP_STATE_PATHS: [&str; 4] = [
+    "rebase-merge",
+    "rebase-apply",
+    "sequencer",
+    "MERGE_AUTOSTASH",
+];
+
+/// Object ids named by every ref, every reflog entry, and every worktree's
+/// HEAD / pseudo-refs / per-worktree refs / rebase-merge-sequencer state.
+fn tip_ids(repo: &gix::Repository, common: &Path) -> Result<Vec<ObjectId>> {
+    let mut ids: Vec<ObjectId> = Vec::new();
+
+    let platform = repo.references().context("opening refs")?;
+    for r in platform.all().context("listing refs")? {
+        let r = r.map_err(|e| anyhow!("reading a ref: {e}"))?;
+        // Symbolic refs point at refs listed on their own (or dangle, like a
+        // stale refs/remotes/origin/HEAD) — skip rather than fail.
+        if let gix::refs::TargetRef::Object(id) = r.target() {
+            ids.push(id.to_owned());
+        }
+    }
+
+    let mut git_dirs = vec![common.to_path_buf()];
+    git_dirs.extend(worktree_dirs(common)?);
+    for dir in &git_dirs {
+        for name in PSEUDO_REFS {
+            ids.extend(read_ref_file(&dir.join(name))?);
+        }
+        // A stopped `rebase --autostash` / `merge --autostash` holds the
+        // user's uncommitted changes ONLY here, in no ref or reflog.
+        for name in OP_STATE_REFS {
+            ids.extend(read_ref_file(&dir.join(name))?);
+        }
+        ids.extend(loose_refs(&dir.join("refs"))?);
+        ids.extend(reflog_ids(&dir.join("logs"))?);
+    }
+    ids.retain(|id| !id.is_null());
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Object ids in a ref-like file (one `<hex>[ ...]` per line; `ref:` lines are
+/// symbolic and skipped). Missing file → none.
+fn read_ref_file(path: &Path) -> Result<Vec<ObjectId>> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if path.is_dir() => {
+            tracing::debug!("{} is a directory: {e}", path.display());
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("ref:") {
+            continue;
+        }
+        let tok = line.split_whitespace().next().unwrap_or("");
+        out.push(
+            ObjectId::from_hex(tok.as_bytes())
+                .with_context(|| format!("malformed object id in {}", path.display()))?,
+        );
+    }
+    Ok(out)
+}
+
+fn loose_refs(dir: &Path) -> Result<Vec<ObjectId>> {
+    let mut out = Vec::new();
+    for f in walk_files(dir)? {
+        if f.extension().is_some_and(|e| e == "lock") {
+            continue;
+        }
+        out.extend(read_ref_file(&f)?);
+    }
+    Ok(out)
+}
+
+/// Both sides of every reflog entry (`<old> <new> <ident> <ts> <tz>\t<msg>`).
+fn reflog_ids(dir: &Path) -> Result<Vec<ObjectId>> {
+    let mut out = Vec::new();
+    for f in walk_files(dir)? {
+        if f.extension().is_some_and(|e| e == "lock") {
+            continue;
+        }
+        let body = std::fs::read(&f).with_context(|| format!("reading reflog {}", f.display()))?;
+        for line in body.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let mut toks = line.split(|b| *b == b' ');
+            for _ in 0..2 {
+                let tok = toks.next().unwrap_or(b"");
+                out.push(
+                    ObjectId::from_hex(tok)
+                        .with_context(|| format!("malformed reflog entry in {}", f.display()))?,
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn walk_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut out = Vec::new();
+    for entry in rd {
+        let entry = entry?;
+        // Stray dotfiles (e.g. `.DS_Store`) are never refs or reflogs.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            out.extend(walk_files(&entry.path())?);
+        } else if ft.is_file() {
+            out.push(entry.path());
+        }
+    }
+    Ok(out)
 }
 
 /// True if any git operation that could be cleaning bale content and recording
-/// it (in the index or a ref) is in flight, detected by its `*.lock` file. gc
-/// reads liveness from the index + refs, both of which lag the clean filter, so
-/// it must defer while any such write is in progress or it may classify an
-/// in-flight file as dead and sweep its only copy.
+/// it (in an index or a ref) is in flight in ANY worktree, detected by its
+/// `*.lock` file. gc reads liveness from indexes + refs, both of which lag the
+/// clean filter, so it must defer or it may sweep an in-flight file's only copy.
 ///
-/// Covers `git add`/`commit` (`index.lock`), `git stash`/`stash push` (a
-/// temporary index `index.<temp>.lock` during the clean, then `refs/stash.lock`
-/// during the ref write — `git stash` does NOT use the main `index.lock`, and gc
-/// is a separate process so it can't see the stash's `GIT_INDEX_FILE`), and ref
-/// updates generally. A tiny lock-free residual remains — the commit-object
-/// write between a stash's temp-index unlock and its `refs/stash.lock` — see the
-/// note in `docs/ARCHITECTURE.md`.
-fn git_op_in_flight(git_dir: &Path) -> bool {
-    // An explicit GIT_INDEX_FILE (rare for gc itself, but be precise).
+/// Covers `git add`/`commit` (`index.lock`), `git stash` (a temporary
+/// `index.<temp>.lock` during the clean, then `refs/stash.lock` — stash does NOT
+/// use the main `index.lock`), and ref updates generally. The lock-free
+/// residual (a stash's commit-object write) is covered by the reclaim grace.
+/// A stopped rebase/am/sequencer/autostash merge also counts. An unreadable
+/// dir counts as "in flight" (skip, never guess).
+pub fn git_op_in_flight(common: &Path) -> Result<bool> {
     if let Some(idx) = std::env::var_os("GIT_INDEX_FILE") {
         let mut lock = idx;
         lock.push(".lock");
         if Path::new(&lock).exists() {
-            return true;
+            return Ok(true);
         }
     }
-    // Top-level locks: index.lock, index.<temp>.lock (stash et al.), HEAD.lock,
-    // packed-refs.lock, ORIG_HEAD.lock, config.lock …
-    if dir_has_lock(git_dir, false) {
-        return true;
+    let mut dirs = vec![common.to_path_buf()];
+    dirs.extend(worktree_dirs(common)?);
+    for dir in &dirs {
+        if dir_has_lock(dir, false) || dir_has_lock(&dir.join("refs"), true) {
+            return Ok(true);
+        }
+        if OP_STATE_PATHS.iter().any(|p| dir.join(p).exists()) {
+            return Ok(true);
+        }
     }
-    // Loose-ref update locks (refs/stash.lock, refs/heads/*.lock) and the
-    // reftable backend's lock.
-    dir_has_lock(&git_dir.join("refs"), true) || dir_has_lock(&git_dir.join("reftable"), true)
+    Ok(dir_has_lock(&common.join("reftable"), true))
 }
 
-/// Whether `dir` contains a `*.lock` file (recursively if `recurse`). Best-effort:
-/// an unreadable dir is treated as "no lock" (gc degrades to its other guards).
 fn dir_has_lock(dir: &Path, recurse: bool) -> bool {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return false;
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
     };
-    for entry in rd.flatten() {
+    for entry in rd {
+        let Ok(entry) = entry else { return true };
         let path = entry.path();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if is_dir {
+        let Ok(ft) = entry.file_type() else {
+            return true;
+        };
+        if ft.is_dir() {
             if recurse && dir_has_lock(&path, true) {
                 return true;
             }
@@ -451,9 +689,12 @@ fn dir_has_lock(dir: &Path, recurse: bool) -> bool {
 }
 
 /// Grace before an unreferenced marker may be reclaimed. `BALE_GC_GRACE_SECS`
-/// overrides; default 10 minutes — generous margin over any clean→git-records
-/// gap, traded against abandoned content lingering that long before reclaim.
-fn reclaim_grace() -> Duration {
+/// overrides. Default matches git's `gc.pruneExpire` (2 weeks), with the same
+/// clock: git prunes an unreachable loose object once its mtime (written or
+/// last freshened) is older than that, not counting from when it became
+/// unreachable; ours counts from the marker's mtime (last clean). So content
+/// is reclaimable no earlier than git would drop a dangling commit naming it.
+pub fn reclaim_grace() -> Duration {
     let secs = std::env::var("BALE_GC_GRACE_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -461,12 +702,11 @@ fn reclaim_grace() -> Duration {
     Duration::from_secs(secs)
 }
 
-const DEFAULT_GRACE_SECS: u64 = 600;
+const DEFAULT_GRACE_SECS: u64 = 14 * 24 * 60 * 60;
 
-/// Whether `h`'s marker is older than `grace`. Fail-safe: if the mtime can't be
-/// read or is in the future (clock skew), treat the marker as too young to
-/// reclaim (returns false) — never sweep on an uncertain age.
-fn marker_age_exceeds(git_dir: &Path, h: &str, grace: Duration, now: SystemTime) -> bool {
+/// Whether `h`'s marker is older than `grace`. An unreadable or future
+/// (clock-skewed) mtime counts as too young — never sweep on an uncertain age.
+pub fn marker_age_exceeds(git_dir: &Path, h: &str, grace: Duration, now: SystemTime) -> bool {
     match crate::staging::marker_mtime(git_dir, h) {
         Some(mtime) => now
             .duration_since(mtime)
@@ -474,9 +714,4 @@ fn marker_age_exceeds(git_dir: &Path, h: &str, grace: Duration, now: SystemTime)
             .unwrap_or(false),
         None => false,
     }
-}
-
-fn is_commit(repo: &gix::Repository, oid: ObjectId) -> bool {
-    repo.find_header(oid)
-        .is_ok_and(|h| h.kind() == gix::object::Kind::Commit)
 }

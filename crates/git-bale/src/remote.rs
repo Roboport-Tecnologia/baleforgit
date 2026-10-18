@@ -49,8 +49,7 @@ impl RemoteUrl {
     }
 
     /// Base URL for the forge's Bale endpoints. SSH remotes assume https on the
-    /// same host/default port; override via `bale.serverUrl` if HTTP and SSH
-    /// live on different hosts.
+    /// same host/default port.
     pub fn https_base(&self) -> String {
         match self.scheme {
             RemoteScheme::Http => format!("http://{}", self.host_with_port(80)),
@@ -82,9 +81,11 @@ pub fn parse_remote(s: &str) -> Result<RemoteUrl> {
             if host.is_empty() {
                 return Err(anyhow!("scp-style remote missing host: {s}"));
             }
+            let user = user.unwrap_or_else(|| "git".into());
+            validate_ssh_target(&user, &host)?;
             return Ok(RemoteUrl {
                 scheme: RemoteScheme::Ssh,
-                user: Some(user.unwrap_or_else(|| "git".into())),
+                user: Some(user),
                 host,
                 port: None,
                 repo_path: strip_dot_git(path).to_string(),
@@ -125,6 +126,7 @@ pub fn parse_remote(s: &str) -> Result<RemoteUrl> {
         RemoteScheme::Ssh => Some(user.unwrap_or_else(|| "git".into())),
         _ => user,
     };
+    validate_ssh_target(user.as_deref().unwrap_or("git"), &host)?;
 
     Ok(RemoteUrl {
         scheme,
@@ -133,6 +135,26 @@ pub fn parse_remote(s: &str) -> Result<RemoteUrl> {
         port,
         repo_path: strip_dot_git(path).to_string(),
     })
+}
+
+/// Reject a user/host that ssh could parse as an option (`-oProxyCommand=…`)
+/// or that smuggles extra argv/shell tokens. Remote URLs come from repo config
+/// and can be attacker-influenced (a cloned repo's submodule, a pasted URL).
+pub fn validate_ssh_target(user: &str, host: &str) -> Result<()> {
+    for (label, v) in [("user", user), ("host", host)] {
+        if v.is_empty() || v.starts_with('-') {
+            return Err(anyhow!("remote {label} {v:?} is empty or starts with '-'"));
+        }
+        if v.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(anyhow!(
+                "remote {label} {v:?} contains whitespace or control characters"
+            ));
+        }
+    }
+    if host.contains('@') {
+        return Err(anyhow!("remote host {host:?} contains '@'"));
+    }
+    Ok(())
 }
 
 fn strip_dot_git(p: &str) -> &str {

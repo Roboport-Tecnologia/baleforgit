@@ -360,6 +360,7 @@ impl Reader {
                         })
                         .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
                     matches!(outcome, CacheReconstructOutcome::Wrote(_))
+                        && crate::filter_process::content_matches(tmp.path(), info, file_size)?
                 }
                 None => false,
             }
@@ -375,33 +376,45 @@ impl Reader {
             drop(trunc);
 
             let cfg = self.resolved_cfg()?;
-            let translator = build_translator_config(
-                &cfg,
-                resolver::forge_refresher(raw, resolver::Scope::Read),
-            )?;
-            let info_clone = info.clone();
-            let cache_clone = chunk_cache.clone();
-            let dest_file = tmp.reopen()?;
-            // Same `0..file_size` range cap as the smudge filter — see
-            // filter_process.rs for why this is load-bearing — and the same
-            // no-progress watchdog, so a misconfigured/unreachable blob store
-            // fails the read instead of hanging the mount for hours.
-            let label = file_id_hex.clone();
-            let stall_secs = crate::filter_process::cold_download_stall_secs();
-            rt.bridge_sync(async move {
-                let session =
-                    FileDownloadSession::new(Arc::new(translator), Some(cache_clone)).await?;
-                crate::filter_process::download_cold(
-                    &session,
-                    &info_clone,
-                    file_size,
-                    dest_file,
-                    &label,
-                    stall_secs,
-                )
-                .await
-            })
-            .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+            // A mismatch through the chunk cache is retried once without it
+            // (the cache itself may be what's corrupt), like the smudge filter.
+            let mut verified = false;
+            for cache in [Some(chunk_cache.clone()), None] {
+                tmp.reopen()?.set_len(0)?;
+                let translator = build_translator_config(
+                    &cfg,
+                    resolver::forge_refresher(raw, resolver::Scope::Read),
+                )?;
+                let info_clone = info.clone();
+                let dest_file = tmp.reopen()?;
+                // Same `0..file_size` range cap as the smudge filter and the same
+                // no-progress watchdog, so a misconfigured/unreachable blob store
+                // fails the read instead of hanging the mount for hours.
+                let label = file_id_hex.clone();
+                let stall_secs = crate::filter_process::cold_download_stall_secs();
+                rt.bridge_sync(async move {
+                    let session = FileDownloadSession::new(Arc::new(translator), cache).await?;
+                    crate::filter_process::download_cold(
+                        &session,
+                        &info_clone,
+                        file_size,
+                        dest_file,
+                        &label,
+                        stall_secs,
+                    )
+                    .await
+                })
+                .map_err(|e| anyhow!("xet runtime error: {e:?}"))??;
+                if crate::filter_process::content_matches(tmp.path(), info, file_size)? {
+                    verified = true;
+                    break;
+                }
+            }
+            if !verified {
+                return Err(anyhow!(
+                    "downloaded content for {file_id_hex} does not match the pointer's size/sha256"
+                ));
+            }
 
             // Backfill the per-repo manifest cache for the next mount.
             if let Some(git_dir) = raw.git_dir.as_deref() {

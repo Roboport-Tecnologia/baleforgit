@@ -18,10 +18,13 @@
 //! footer start (xet-core footer magics like `XETBLOB` are ASCII, outside the
 //! version-0 range). Scheme `99` (Auto) is sentinel-only and rejected.
 
-use bale_server_core::XorbHash;
+use bale_server_core::{ChunkHash, FileHash, Hash32, XorbHash};
+use std::io::Read;
 use thiserror::Error;
-use xet_core_structures::merklehash::{compute_data_hash, xorb_hash as compute_xorb_merkle_hash};
-use xet_core_structures::xorb_object::CompressionScheme;
+use xet_core_structures::merklehash::{
+    compute_data_hash, xorb_hash as compute_xorb_merkle_hash, MerkleHash,
+};
+use xet_core_structures::xorb_object::byte_grouping::bg4::bg4_regroup;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XorbChunkFrame {
@@ -46,6 +49,8 @@ pub enum XorbParseError {
     BadCompressionScheme { frame_index: usize, scheme: u8 },
     #[error("xorb body exceeds {max} bytes ({actual} given)")]
     TooLarge { actual: usize, max: usize },
+    #[error("{0} trailing bytes after the last chunk frame")]
+    TrailingBytes(usize),
 }
 
 #[derive(Debug, Error)]
@@ -67,6 +72,9 @@ pub enum XorbVerifyError {
 }
 
 const HEADER_LEN: usize = 8;
+// xet-core-structures' MAX_XORB_CHUNKS / MAX_XORB_BYTES.
+const MAX_XORB_CHUNKS: usize = 8 * 1024;
+const MAX_XORB_UNPACKED_BYTES: u64 = 64 * 1024 * 1024;
 
 fn u24_le(b: &[u8]) -> u32 {
     (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16)
@@ -133,55 +141,48 @@ pub fn parse_xorb_frames(body: &[u8]) -> Result<Vec<XorbChunkFrame>, XorbParseEr
 /// Recompute the xorb content hash and compare to `expected` so a bad upload is
 /// rejected before persisting. `expected` is natural-byte order (from
 /// `bale_server_wire::decode_hash`), which is what `DataHash::from([u8; 32])`
-/// consumes.
-pub fn verify_xorb_body(body: &[u8], expected: &XorbHash) -> Result<(), XorbVerifyError> {
+/// consumes. Returns the per-frame chunk hashes: they are the only trusted
+/// source for the dedup index and for verifying shard file terms.
+pub fn verify_xorb_body(
+    body: &[u8],
+    expected: &XorbHash,
+) -> Result<Vec<ChunkHash>, XorbVerifyError> {
     let frames = parse_xorb_frames(body)?;
-    let mut entries: Vec<(xet_core_structures::merklehash::MerkleHash, u64)> =
-        Vec::with_capacity(frames.len());
+    // xet uploads xorbs without a footer; unverified trailing bytes would be
+    // stored (and unaccounted) forever.
+    let consumed = frames
+        .last()
+        .map(|f| f.on_disk_start as usize + f.on_disk_len as usize)
+        .unwrap_or(0);
+    if consumed != body.len() {
+        return Err(XorbVerifyError::Parse(XorbParseError::TrailingBytes(
+            body.len() - consumed,
+        )));
+    }
+    // xet never builds past these; checked before decompressing so a body of
+    // ~1000 max-size frames can't cost ~16 GiB of decode + hashing per request.
+    let unpacked: u64 = frames.iter().map(|f| f.uncompressed_len as u64).sum();
+    if frames.len() > MAX_XORB_CHUNKS || unpacked > MAX_XORB_UNPACKED_BYTES {
+        return Err(XorbVerifyError::Parse(XorbParseError::TooLarge {
+            actual: unpacked as usize,
+            max: MAX_XORB_UNPACKED_BYTES as usize,
+        }));
+    }
+    let mut entries: Vec<(MerkleHash, u64)> = Vec::with_capacity(frames.len());
+    let mut buf = Vec::new();
     for (i, f) in frames.iter().enumerate() {
-        let payload_start = f.on_disk_start as usize + HEADER_LEN;
-        let payload_end = f.on_disk_start as usize + f.on_disk_len as usize;
-        let payload = &body[payload_start..payload_end];
-
-        let scheme = match f.compression_scheme {
-            0 => CompressionScheme::None,
-            1 => CompressionScheme::LZ4,
-            2 => CompressionScheme::ByteGrouping4LZ4,
-            // Unreachable: parse_xorb_frames already rejects schemes outside 0..=2.
-            other => {
-                return Err(XorbVerifyError::Parse(
-                    XorbParseError::BadCompressionScheme {
-                        frame_index: i,
-                        scheme: other,
-                    },
-                ));
-            }
-        };
-
-        let decompressed = scheme.decompress_from_slice(payload).map_err(|e| {
-            XorbVerifyError::DecompressFailed {
-                frame_index: i,
-                message: e.to_string(),
-            }
-        })?;
-        if decompressed.len() != f.uncompressed_len as usize {
-            return Err(XorbVerifyError::LengthMismatch {
-                frame_index: i,
-                declared: f.uncompressed_len as usize,
-                actual: decompressed.len(),
-            });
-        }
-
-        let chunk_hash = compute_data_hash(&decompressed);
-        entries.push((chunk_hash, decompressed.len() as u64));
+        buf.clear();
+        decompress_frame(body, f, i, &mut buf)?;
+        entries.push((compute_data_hash(&buf), buf.len() as u64));
     }
 
-    let computed = compute_xorb_merkle_hash(&entries);
-    let expected_mh: xet_core_structures::merklehash::MerkleHash = (*expected.as_bytes()).into();
-    if computed != expected_mh {
+    if compute_xorb_merkle_hash(&entries) != MerkleHash::from(expected.as_bytes()) {
         return Err(XorbVerifyError::HashMismatch);
     }
-    Ok(())
+    Ok(entries
+        .iter()
+        .map(|(h, _)| ChunkHash::from_bytes((*h).into()))
+        .collect())
 }
 
 /// Decompress `body` (the on-disk range for one reconstruction term) into `out`,
@@ -190,37 +191,200 @@ pub fn verify_xorb_body(body: &[u8], expected: &XorbHash) -> Result<(), XorbVeri
 pub fn decompress_xorb_chunks_into(body: &[u8], out: &mut Vec<u8>) -> Result<(), XorbVerifyError> {
     let frames = parse_xorb_frames(body)?;
     for (i, f) in frames.iter().enumerate() {
-        let payload_start = f.on_disk_start as usize + HEADER_LEN;
-        let payload_end = f.on_disk_start as usize + f.on_disk_len as usize;
-        let payload = &body[payload_start..payload_end];
-
-        let scheme = match f.compression_scheme {
-            0 => CompressionScheme::None,
-            1 => CompressionScheme::LZ4,
-            2 => CompressionScheme::ByteGrouping4LZ4,
-            other => {
-                return Err(XorbVerifyError::Parse(
-                    XorbParseError::BadCompressionScheme {
-                        frame_index: i,
-                        scheme: other,
-                    },
-                ));
-            }
-        };
-        let decompressed = scheme.decompress_from_slice(payload).map_err(|e| {
-            XorbVerifyError::DecompressFailed {
-                frame_index: i,
-                message: e.to_string(),
-            }
-        })?;
-        if decompressed.len() != f.uncompressed_len as usize {
-            return Err(XorbVerifyError::LengthMismatch {
-                frame_index: i,
-                declared: f.uncompressed_len as usize,
-                actual: decompressed.len(),
-            });
-        }
-        out.extend_from_slice(&decompressed);
+        decompress_frame(body, f, i, out)?;
     }
     Ok(())
+}
+
+/// [`decompress_xorb_chunks_into`] that also checks each chunk against the
+/// expected hash (one per frame, in order), so bit rot or tampering in the blob
+/// store is never served.
+pub fn decompress_xorb_chunks_verified(
+    body: &[u8],
+    expected: &[ChunkHash],
+    out: &mut Vec<u8>,
+) -> Result<(), XorbVerifyError> {
+    let frames = parse_xorb_frames(body)?;
+    if frames.len() != expected.len() {
+        return Err(XorbVerifyError::HashMismatch);
+    }
+    for (i, (f, want)) in frames.iter().zip(expected).enumerate() {
+        let start = out.len();
+        decompress_frame(body, f, i, out)?;
+        if compute_data_hash(&out[start..]) != MerkleHash::from(want.as_bytes()) {
+            return Err(XorbVerifyError::HashMismatch);
+        }
+    }
+    Ok(())
+}
+
+// Appends exactly `f.uncompressed_len` bytes to `out`. Output is capped at the
+// declared length (+1 to detect overrun) while decoding: LZ4 expands ~255x, so
+// an unbounded decode of a 16 MiB frame is a multi-GiB allocation (OOM kill).
+fn decompress_frame(
+    body: &[u8],
+    f: &XorbChunkFrame,
+    frame_index: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), XorbVerifyError> {
+    let payload_start = f.on_disk_start as usize + HEADER_LEN;
+    let payload_end = f.on_disk_start as usize + f.on_disk_len as usize;
+    let payload = &body[payload_start..payload_end];
+    let declared = f.uncompressed_len as usize;
+    let fail = |message: String| XorbVerifyError::DecompressFailed {
+        frame_index,
+        message,
+    };
+
+    let base = out.len();
+    match f.compression_scheme {
+        0 => out.extend_from_slice(payload),
+        1 | 2 => {
+            let mut dec = lz4_flex::frame::FrameDecoder::new(payload).take(declared as u64 + 1);
+            if f.compression_scheme == 1 {
+                dec.read_to_end(out).map_err(|e| fail(e.to_string()))?;
+            } else {
+                let mut grouped = Vec::with_capacity(declared);
+                dec.read_to_end(&mut grouped)
+                    .map_err(|e| fail(e.to_string()))?;
+                out.extend_from_slice(&bg4_regroup(&grouped));
+            }
+        }
+        // parse_xorb_frames already rejects schemes outside 0..=2.
+        other => {
+            return Err(XorbVerifyError::Parse(
+                XorbParseError::BadCompressionScheme {
+                    frame_index,
+                    scheme: other,
+                },
+            ))
+        }
+    }
+    let actual = out.len() - base;
+    if actual != declared {
+        return Err(XorbVerifyError::LengthMismatch {
+            frame_index,
+            declared,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn merkle_entries(chunks: &[(ChunkHash, u64)]) -> Vec<(MerkleHash, u64)> {
+    chunks
+        .iter()
+        .map(|(h, len)| (MerkleHash::from(h.as_bytes()), *len))
+        .collect()
+}
+
+pub fn xorb_hash_of(chunks: &[(ChunkHash, u64)]) -> XorbHash {
+    XorbHash::from_bytes(compute_xorb_merkle_hash(&merkle_entries(chunks)).into())
+}
+
+/// xet's file hash over the file's full chunk sequence.
+pub fn file_hash_of(chunks: &[(ChunkHash, u64)]) -> FileHash {
+    FileHash::from_bytes(xet_core_structures::merklehash::file_hash(&merkle_entries(chunks)).into())
+}
+
+/// xet's `FileVerificationEntry.range_hash` for one term's chunks.
+pub fn term_verification_hash(chunks: &[ChunkHash]) -> Hash32 {
+    let hashes: Vec<MerkleHash> = chunks
+        .iter()
+        .map(|h| MerkleHash::from(h.as_bytes()))
+        .collect();
+    Hash32(
+        xet_core_structures::metadata_shard::chunk_verification::range_hash_from_chunks(&hashes)
+            .into(),
+    )
+}
+
+/// xet's file hash computed incrementally in O(levels) memory, so verifying a
+/// huge file doesn't hold every chunk hash. Equivalent to `file_hash_of` over
+/// the pushed sequence: xet's tree groups each level greedily left to right,
+/// and with ≥ `MAX_GROUP` entries buffered a group's cut depends only on those
+/// entries, so groups can be emitted as soon as they are decidable.
+#[derive(Default)]
+pub struct FileHasher {
+    levels: Vec<Vec<(MerkleHash, u64)>>,
+    pushed: Vec<u64>,
+}
+
+// xet aggregated_hashes: groups of 2..=2·4+1 entries, cut after an entry whose
+// hash % 4 == 0 (from the 3rd entry on).
+const MERGE_BRANCHING: u64 = 4;
+const MAX_GROUP: usize = 2 * MERGE_BRANCHING as usize + 1;
+
+impl FileHasher {
+    pub fn push(&mut self, chunk: ChunkHash, len: u64) {
+        self.push_at(0, (MerkleHash::from(chunk.as_bytes()), len));
+    }
+
+    pub fn finish(mut self) -> FileHash {
+        if self.pushed.first().copied().unwrap_or(0) == 0 {
+            return FileHash::from_bytes(MerkleHash::default().into());
+        }
+        let mut lvl = 0;
+        loop {
+            let higher_empty = self.pushed.get(lvl + 1).copied().unwrap_or(0) == 0;
+            if self.pushed[lvl] == 1 && higher_empty {
+                let root = self.levels[lvl][0].0;
+                return FileHash::from_bytes(root.hmac([0u8; 32].into()).into());
+            }
+            let rest = std::mem::take(&mut self.levels[lvl]);
+            let mut i = 0;
+            while i < rest.len() {
+                let cut = tail_cut(&rest[i..]);
+                let merged = merged_hash(&rest[i..i + cut]);
+                self.push_at(lvl + 1, merged);
+                i += cut;
+            }
+            lvl += 1;
+        }
+    }
+
+    fn push_at(&mut self, lvl: usize, entry: (MerkleHash, u64)) {
+        if self.levels.len() <= lvl {
+            self.levels.resize_with(lvl + 1, Vec::new);
+            self.pushed.resize(lvl + 1, 0);
+        }
+        self.levels[lvl].push(entry);
+        self.pushed[lvl] += 1;
+        while self.levels[lvl].len() >= MAX_GROUP {
+            let cut = tail_cut(&self.levels[lvl][..MAX_GROUP]);
+            let group: Vec<(MerkleHash, u64)> = self.levels[lvl].drain(..cut).collect();
+            let merged = merged_hash(&group);
+            self.push_at(lvl + 1, merged);
+        }
+    }
+}
+
+// xet's next_merge_cut over the remaining entries.
+fn tail_cut(entries: &[(MerkleHash, u64)]) -> usize {
+    if entries.len() <= 2 {
+        return entries.len();
+    }
+    let end = MAX_GROUP.min(entries.len());
+    (2..end)
+        .find(|&i| entries[i].0 % MERGE_BRANCHING == 0)
+        .map_or(end, |i| i + 1)
+}
+
+// xet's merged_hash_of_sequence: "{hash words as 16-hex each} : {size}\n" per
+// entry, hashed as an internal node.
+fn merged_hash(entries: &[(MerkleHash, u64)]) -> (MerkleHash, u64) {
+    use std::fmt::Write;
+    let mut buf = String::with_capacity(entries.len() * 88);
+    let mut total = 0u64;
+    for (h, size) in entries {
+        for word in h.iter() {
+            let _ = write!(buf, "{:016x}", word.to_le());
+        }
+        let _ = writeln!(buf, " : {size}");
+        total += size;
+    }
+    (
+        xet_core_structures::merklehash::compute_internal_node_hash(buf.as_bytes()),
+        total,
+    )
 }

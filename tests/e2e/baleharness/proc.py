@@ -9,12 +9,11 @@ import socket
 import stat
 import subprocess
 from pathlib import Path
-from typing import Optional, Union
 
 from baleharness.logutil import TestFailure
 
 
-def rmtree(path: Union[str, Path]) -> None:
+def rmtree(path: str | Path) -> None:
     """`shutil.rmtree` that also works on Windows git trees. Git writes loose
     objects read-only, and Windows refuses `os.unlink` on a read-only file
     (WinError 5), so clear the read-only bit across the tree first. No-op on
@@ -41,9 +40,9 @@ def rmtree(path: Union[str, Path]) -> None:
 def run(
     cmd: list[str],
     *,
-    cwd: Optional[Path] = None,
-    env: Optional[dict] = None,
-    input_bytes: Optional[bytes] = None,
+    cwd: Path | None = None,
+    env: dict | None = None,
+    input_bytes: bytes | None = None,
     check: bool = True,
     capture: bool = True,
     expect_fail: bool = False,

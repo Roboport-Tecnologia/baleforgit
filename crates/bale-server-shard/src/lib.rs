@@ -10,7 +10,8 @@ use thiserror::Error;
 
 pub mod xorb;
 pub use xorb::{
-    decompress_xorb_chunks_into, parse_xorb_frames, verify_xorb_body, XorbChunkFrame,
+    decompress_xorb_chunks_into, decompress_xorb_chunks_verified, file_hash_of, parse_xorb_frames,
+    term_verification_hash, verify_xorb_body, xorb_hash_of, FileHasher, XorbChunkFrame,
     XorbParseError, XorbVerifyError,
 };
 

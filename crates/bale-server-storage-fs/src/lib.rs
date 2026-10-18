@@ -43,6 +43,23 @@ impl FsBlobStore {
                 .await
                 .map_err(|e| CoreError::Internal(format!("mkdir {sub}: {e}")))?;
         }
+        // A crash mid-write leaves its tmp file behind; nothing else would ever
+        // reclaim it. Age-gated so a concurrently starting instance's in-flight
+        // writes are spared.
+        if let Ok(mut entries) = fs::read_dir(root.join("tmp")).await {
+            while let Ok(Some(e)) = entries.next_entry().await {
+                let stale = e
+                    .metadata()
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(3600));
+                if stale {
+                    let _ = fs::remove_file(e.path()).await;
+                }
+            }
+        }
         Ok(Self { root })
     }
 
@@ -65,18 +82,21 @@ impl FsBlobStore {
         self.root.join("tmp").join(Uuid::new_v4().to_string())
     }
 
-    async fn write_atomic(&self, dst: &Path, body: &Bytes) -> CoreResult<bool> {
-        if fs::metadata(dst).await.is_ok() {
+    async fn write_atomic(&self, dst: &Path, body: &Bytes, mode: WriteMode) -> CoreResult<bool> {
+        let parent = dst
+            .parent()
+            .ok_or_else(|| CoreError::Internal(format!("no parent for {}", dst.display())))?;
+        if mode == WriteMode::NoReplace && fs::metadata(dst).await.is_ok() {
+            // The entry (and its fanout dirs) may be a racing writer's, not yet
+            // durable; make it so before the caller registers metadata on it.
+            self.sync_chain(parent).await?;
             return Ok(false);
         }
-        let parent = dst.parent();
-        if let Some(parent) = parent {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| CoreError::Internal(format!("mkdir {}: {e}", parent.display())))?;
-        }
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| CoreError::Internal(format!("mkdir {}: {e}", parent.display())))?;
         let tmp = self.tmp_path();
-        // fsync tmp before rename so a crash can't leave a short blob at the content-addressed path.
+        // fsync tmp before linking so a crash can't leave a short blob at the content-addressed path.
         let mut f = open_private(&tmp)
             .await
             .map_err(|e| CoreError::Internal(format!("create tmp: {e}")))?;
@@ -96,37 +116,89 @@ impl FsBlobStore {
             return Err(CoreError::Internal(format!("write tmp: {e}")));
         }
         drop(f);
-        let rename_result = fs::rename(&tmp, dst).await;
-        match rename_result {
-            Ok(()) => {
-                // fsync the parent dir so the rename is durable — else a crash can lose the entry.
-                if let Some(parent) = parent {
-                    if let Ok(dir) = fs::File::open(parent).await {
-                        let _ = dir.sync_all().await;
-                    }
+        let inserted = match mode {
+            // link(2) fails with EEXIST instead of replacing, so exactly one
+            // concurrent writer's bytes are ever visible at `dst`.
+            WriteMode::NoReplace => match fs::hard_link(&tmp, dst).await {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp).await;
+                    return Err(CoreError::Internal(format!(
+                        "link to {}: {e}",
+                        dst.display()
+                    )));
                 }
-                Ok(true)
+            },
+            WriteMode::Replace => {
+                if let Err(e) = fs::rename(&tmp, dst).await {
+                    let _ = fs::remove_file(&tmp).await;
+                    return Err(CoreError::Internal(format!(
+                        "rename to {}: {e}",
+                        dst.display()
+                    )));
+                }
+                true
             }
-            Err(_) if fs::metadata(dst).await.is_ok() => {
-                // A racing writer beat us to it; content-addressed, so drop our tmp.
-                let _ = fs::remove_file(&tmp).await;
-                Ok(false)
+        };
+        if mode == WriteMode::NoReplace {
+            let _ = fs::remove_file(&tmp).await;
+        }
+        self.sync_chain(parent).await?;
+        Ok(inserted)
+    }
+
+    // fsync `dir` and every ancestor up to the root. Unconditional: whichever
+    // writer created a fanout dir may not have synced it yet, and a crash could
+    // then drop the whole subtree while metadata already points into it.
+    async fn sync_chain(&self, dir: &Path) -> CoreResult<()> {
+        let mut cur = dir;
+        loop {
+            sync_dir(cur).await?;
+            if cur == self.root {
+                return Ok(());
             }
-            Err(e) => {
-                let _ = fs::remove_file(&tmp).await;
-                Err(CoreError::Internal(format!(
-                    "rename to {}: {e}",
-                    dst.display()
-                )))
+            match cur.parent() {
+                Some(up) => cur = up,
+                None => return Ok(()),
             }
         }
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    NoReplace,
+    Replace,
+}
+
+#[cfg(unix)]
+async fn sync_dir(dir: &Path) -> CoreResult<()> {
+    let d = fs::File::open(dir)
+        .await
+        .map_err(|e| CoreError::Internal(format!("open dir {}: {e}", dir.display())))?;
+    d.sync_all()
+        .await
+        .map_err(|e| CoreError::Internal(format!("fsync dir {}: {e}", dir.display())))
+}
+
+// Windows can't open a directory handle via std; NTFS journals metadata.
+#[cfg(not(unix))]
+async fn sync_dir(_dir: &Path) -> CoreResult<()> {
+    Ok(())
+}
+
 #[async_trait]
 impl BlobStore for FsBlobStore {
     async fn put_xorb(&self, hash: &XorbHash, body: Bytes) -> CoreResult<bool> {
-        self.write_atomic(&self.xorb_path(hash), &body).await
+        self.write_atomic(&self.xorb_path(hash), &body, WriteMode::NoReplace)
+            .await
+    }
+
+    async fn replace_xorb(&self, hash: &XorbHash, body: Bytes) -> CoreResult<()> {
+        self.write_atomic(&self.xorb_path(hash), &body, WriteMode::Replace)
+            .await?;
+        Ok(())
     }
 
     async fn xorb_exists(&self, hash: &XorbHash) -> CoreResult<bool> {
@@ -163,7 +235,8 @@ impl BlobStore for FsBlobStore {
     }
 
     async fn put_shard(&self, hash: &ShardHash, body: Bytes) -> CoreResult<()> {
-        self.write_atomic(&self.shard_path(hash), &body).await?;
+        self.write_atomic(&self.shard_path(hash), &body, WriteMode::NoReplace)
+            .await?;
         Ok(())
     }
 

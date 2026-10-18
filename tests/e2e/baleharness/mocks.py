@@ -9,8 +9,8 @@ import subprocess
 import threading
 import time
 import urllib.parse
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Callable, Iterator, Optional
 
 from baleharness.logutil import TestFailure
 from baleharness.pgbackend import (
@@ -45,7 +45,7 @@ class TcpProxy:
         upstream_host: str,
         upstream_port: int,
         *,
-        throttle_bytes_per_sec: Optional[int] = None,
+        throttle_bytes_per_sec: int | None = None,
         bind_host: str = "127.0.0.1",
     ) -> None:
         self.listen_port = listen_port
@@ -56,9 +56,9 @@ class TcpProxy:
         # reach the proxy via host.containers.internal.
         self.bind_host = bind_host
         self._lock = threading.Lock()
-        self._listen_sock: Optional[socket.socket] = None
+        self._listen_sock: socket.socket | None = None
         self._active: list[socket.socket] = []
-        self._accept_thread: Optional[threading.Thread] = None
+        self._accept_thread: threading.Thread | None = None
         self._stopped = True
         self._bytes_forwarded = 0
         self._connections = 0
@@ -135,7 +135,7 @@ class TcpProxy:
         a: socket.socket,
         b: socket.socket,
         *,
-        throttle: Optional[int] = None,
+        throttle: int | None = None,
     ) -> None:
         chunk_size = 16 * 1024 if throttle is not None else 64 * 1024
         try:
@@ -211,15 +211,15 @@ class MockAuthzServer:
         self,
         decide: Callable[[str, str, str], tuple[int, dict]],
         *,
-        port: Optional[int] = None,
+        port: int | None = None,
     ) -> None:
         self.decide = decide
         self.port = port or pick_free_port()
         self.calls: list[
             tuple[str, str, str, int]
         ] = []  # (bearer, repo_id, scope, status)
-        self._server: Optional["http.server.ThreadingHTTPServer"] = None
-        self._thread: Optional[threading.Thread] = None
+        self._server: http.server.ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
 
     @property
@@ -233,12 +233,12 @@ class MockAuthzServer:
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, fmt, *args):  # noqa: N802
+            def log_message(self, fmt, *args):
                 # http.server's default writes one stderr line per request,
                 # which would drown our own info() output. Drop them.
                 pass
 
-            def do_POST(self):  # noqa: N802
+            def do_POST(self):
                 if self.path != "/check_access":
                     self.send_response(404)
                     self.end_headers()
@@ -305,7 +305,7 @@ class MockForgeServer:
         *,
         bale_href: str,
         hub_token: str,
-        port: Optional[int] = None,
+        port: int | None = None,
         enforce_auth: bool = False,
         public: bool = False,
     ) -> None:
@@ -322,8 +322,8 @@ class MockForgeServer:
         self.enforce_auth = enforce_auth
         self.public = public
         self.calls: list[tuple[str, bool]] = []  # (op, had_basic_auth)
-        self._server: Optional["http.server.ThreadingHTTPServer"] = None
-        self._thread: Optional[threading.Thread] = None
+        self._server: http.server.ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
 
     @property
@@ -334,10 +334,10 @@ class MockForgeServer:
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, fmt, *args):  # noqa: N802
+            def log_message(self, fmt, *args):
                 pass
 
-            def do_POST(self):  # noqa: N802
+            def do_POST(self):
                 parsed = urllib.parse.urlparse(self.path)
                 if not parsed.path.endswith("/info/bale/authenticate"):
                     self.send_response(404)
@@ -399,12 +399,12 @@ class OtlpCollector:
     per-path hit count so the phase can assert the server's exporter pipeline
     actually fired."""
 
-    def __init__(self, *, port: Optional[int] = None) -> None:
+    def __init__(self, *, port: int | None = None) -> None:
         self.port = port or pick_free_port()
         self._lock = threading.Lock()
         self.hits: dict[str, int] = {}
-        self._server: Optional["http.server.ThreadingHTTPServer"] = None
-        self._thread: Optional[threading.Thread] = None
+        self._server: http.server.ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
 
     @property
     def url(self) -> str:
@@ -421,10 +421,10 @@ class OtlpCollector:
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, fmt, *args):  # noqa: N802
+            def log_message(self, fmt, *args):
                 pass
 
-            def do_POST(self):  # noqa: N802
+            def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 if length:
                     self.rfile.read(length)
