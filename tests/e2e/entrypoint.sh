@@ -86,15 +86,10 @@ chmod 755 /usr/local/bin/git-bale-authenticate
 # ("bad ownership or modes"), denying every publickey auth.
 log "starting sshd on :2222"
 /usr/sbin/sshd -D -e -o StrictModes=no &
-SSHD_PID=$!
 
-cleanup() {
-    log "shutting down (sshd pid=$SSHD_PID)"
-    kill "$SSHD_PID" 2>/dev/null || true
-}
-trap cleanup INT TERM EXIT
-
-# exec so the server takes over this PID and receives the container's signals.
+# exec makes the server PID 1 so it gets the container's SIGTERM; when it exits
+# the kernel kills the rest of the PID namespace, sshd included (a trap here
+# would never run).
 log "starting baleforgit-server as bale user"
 exec setpriv --reuid=bale --regid=bale --init-groups --inh-caps=-all \
     /usr/local/bin/baleforgit-server
