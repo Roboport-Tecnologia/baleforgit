@@ -46,8 +46,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # The harness drives the release binary directly; it never invokes cargo.
-      - run: cargo build --release -p git-bale
+      # The harness drives the release binaries directly; it never invokes cargo.
+      - run: cargo build --release -p git-bale -p bale-e2e-tools
 
       - name: Show tool versions
         run: |

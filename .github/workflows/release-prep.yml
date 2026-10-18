@@ -10,7 +10,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   prep:
@@ -59,15 +58,23 @@ jobs:
       - name: Extract notes for PR body
         run: git cliff --tag "v$VERSION" --current --strip header > RELEASE_NOTES.md
 
-      - name: Open release PR
-        uses: peter-evans/create-pull-request@v8
-        with:
-          branch: release/v${{ inputs.version }}
-          title: "release: v${{ inputs.version }}"
-          labels: release
-          commit-message: "chore(release): v${{ inputs.version }}"
-          body-path: RELEASE_NOTES.md
-          add-paths: |
-            Cargo.toml
-            Cargo.lock
-            CHANGELOG.md
+      - name: Push release branch
+        shell: bash
+        run: |
+          BRANCH="release/v$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "chore(release): v$VERSION"
+          git push -f -u origin "$BRANCH"
+
+          {
+            echo "## Release v$VERSION branch pushed"
+            echo
+            echo "Open the PR: https://github.com/$GITHUB_REPOSITORY/compare/$BRANCH?expand=1"
+            echo
+            echo "Suggested PR body:"
+            echo
+            cat RELEASE_NOTES.md
+          } >> "$GITHUB_STEP_SUMMARY"

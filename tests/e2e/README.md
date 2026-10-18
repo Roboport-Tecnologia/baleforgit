@@ -518,10 +518,26 @@ bogus token to exercise the unauthorized-rejection path.
 The container's `bale` user is UID 10001, but the bind-mounted `/data`
 on the host is owned by whichever UID created it (the test user). The
 entrypoint chowns `/data` to `bale:bale` at startup so the server can
-write. Files written by `bale` land mode 0644 by default, which the
-host user can still read for the disk-size measurements that the test
-performs from outside the container. Rootless podman's user namespace
-remapping handles the cross-UID story transparently.
+write. The server then writes xorbs/shards mode **0600** (tempfile →
+rename), under directories mode 0755.
+
+The split that matters: the harness can **stat** those files from the
+host — `stat(2)` only needs traverse (`+x`) on the 0755 parent dirs, not
+read on the file — so `disk_xorb_bytes()` / `disk_shard_bytes()` size
+the store directly. But it can **not open their contents**, for read or
+write: under rootless podman a `bale`-owned 0600 file maps to a host
+subuid the harness isn't (and under rootful podman to host UID 10001),
+and 0600 grants nothing to "other". A host-side `read_bytes()` /
+`open(..., 'w')` fails with `PermissionError [Errno 13]`.
+
+So any phase touching xorb/shard **contents** goes through the
+container, whose default `exec` user is root: `ServerHandle.read_data_file`
+(`cat`) and `write_data_file` (`cat > $path`) in `server.py`. Used by
+`compression` (read), `tampered-xorb` (read + corrupt/restore write), and
+`upload-guards` (read). The same lesson already applies to `meta.db`
+(read via a sidecar `sqlite3`, see `mocks.py`). This is
+location-independent — moving the work dir off `/tmp` does not change file
+ownership, so the fix is the container, not the path.
 
 ### Phase orchestration
 

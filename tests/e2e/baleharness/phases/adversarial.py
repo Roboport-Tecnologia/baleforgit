@@ -130,10 +130,6 @@ def phase_adversarial_wrong_token(
     )
 
 
-def _fs_writer(path: Path) -> Callable[[bytes], None]:
-    return lambda data: path.write_bytes(data)
-
-
 def _s3_writer(minio, key: str) -> Callable[[bytes], None]:
     return lambda data: minio.put_object(key, data)
 
@@ -146,10 +142,11 @@ def phase_adversarial_tampered_xorb(
     work_root: Path,
     rev_state: dict,
 ) -> None:
-    """Corrupt the stored xorbs (we own both the bind-mounted fs data dir and
-    the MinIO bucket), then cold-clone in a fresh worktree. The smudge verifies
-    reconstructed bytes against the pointer's sha256, so the checkout must
-    FAIL and no wrong bytes may land in the worktree."""
+    """Corrupt the stored xorbs (fs files via the container — they're owned by
+    the in-container `bale` user, not the harness user — or the MinIO bucket),
+    then cold-clone in a fresh worktree. The smudge verifies reconstructed bytes
+    against the pointer's sha256, so the checkout must FAIL and no wrong bytes
+    may land in the worktree."""
     # Backend-agnostic corrupt/restore. Corrupt EVERY stored xorb — flip a
     # window in the middle of each. Corrupting just one is fragile: HEAD's
     # reconstruction (rev v3 of bigfile) only reads a subset of any single
@@ -175,13 +172,9 @@ def phase_adversarial_tampered_xorb(
             for name in names:
                 p = Path(cur) / name
                 if p.stat().st_size > 0:
-                    victims.append(
-                        (
-                            str(p.relative_to(server.data_root)),
-                            p.read_bytes(),
-                            _fs_writer(p),
-                        )
-                    )
+                    rel = str(p.relative_to(server.data_root))
+                    writer = lambda data, p=p: server.write_data_file(p, data)
+                    victims.append((rel, server.read_data_file(p), writer))
         if not victims:
             raise TestFailure("no xorb on disk to tamper with")
 
@@ -710,7 +703,7 @@ def _one_stored_xorb_body(server: ServerHandle) -> bytes:
         for name in names:
             p = Path(cur) / name
             if p.stat().st_size > 0:
-                return p.read_bytes()
+                return server.read_data_file(p)
     raise TestFailure("no xorb on disk to read")
 
 
@@ -963,7 +956,7 @@ def phase_adversarial_upload_guards(
                     f"upload-guards: expected exactly 1 xorb on disk, found "
                     f"{len(xorb_files)} — range-clamp assertion is ambiguous"
                 )
-            full_xorb = xorb_files[0].read_bytes()
+            full_xorb = server.read_data_file(xorb_files[0])
             past = len(full_xorb) + 1_000_000
             clamp_x = now + 3600
 

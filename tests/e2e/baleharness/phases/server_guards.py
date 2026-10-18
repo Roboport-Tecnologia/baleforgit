@@ -568,7 +568,9 @@ def phase_xorb_layout_heal(
                 )
             )
             raw = _wire_to_raw(xorb_hex).hex()
-            stored = (data_root / "xorbs" / raw[:2] / raw[2:4] / raw).read_bytes()
+            stored = server.read_data_file(
+                data_root / "xorbs" / raw[:2] / raw[2:4] / raw
+            )
             starts, pos = [], 0
             for _scheme, _ulen, frame_payload in _xorb_frames(stored):
                 starts.append(pos)

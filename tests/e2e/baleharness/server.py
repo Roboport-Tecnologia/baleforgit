@@ -100,6 +100,40 @@ class ServerHandle:
     def disk_total_bytes(self) -> int:
         return self.disk_xorb_bytes() + self.disk_shard_bytes()
 
+    def read_data_file(self, path: Path) -> bytes:
+        # The server writes xorbs/shards as the in-container `bale` user mode
+        # 0600, so the harness (a different host UID — a subuid under rootless
+        # podman) can stat them for sizing but can't open their contents. Read
+        # through the container, whose default exec user is root.
+        rel = path.relative_to(self.data_root).as_posix()
+        completed = subprocess.run(
+            self.rt.cmd("exec", self.name, "cat", f"/data/{rel}"),
+            capture_output=True,
+        )
+        if completed.returncode != 0:
+            raise TestFailure(
+                f"failed to read /data/{rel} in container: "
+                + completed.stderr.decode("utf-8", "replace")
+            )
+        return completed.stdout
+
+    def write_data_file(self, path: Path, data: bytes) -> None:
+        # Counterpart to read_data_file: overwrite a `bale`-owned 0600 file the
+        # harness can't write directly (the tampered-xorb corrupt/restore).
+        rel = path.relative_to(self.data_root).as_posix()
+        completed = subprocess.run(
+            self.rt.cmd(
+                "exec", "-i", self.name, "sh", "-c", 'cat > "$0"', f"/data/{rel}"
+            ),
+            input=data,
+            capture_output=True,
+        )
+        if completed.returncode != 0:
+            raise TestFailure(
+                f"failed to write /data/{rel} in container: "
+                + completed.stderr.decode("utf-8", "replace")
+            )
+
 
 def start_container(
     rt: Runtime,

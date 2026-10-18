@@ -65,7 +65,7 @@ def _stored_xorb_schemes(server: ServerHandle) -> set[int]:
         xorbs_dir = server.data_root / "xorbs"
         for cur, _dirs, names in os.walk(xorbs_dir):
             for fn in names:
-                seen.update(_frame_schemes((Path(cur) / fn).read_bytes()))
+                seen.update(_frame_schemes(server.read_data_file(Path(cur) / fn)))
     return seen
 
 

@@ -1,6 +1,10 @@
 # Bale for Git
 
-A Git filter driver that stores large files as **content-defined chunks** on a Bale CAS server. It's meant to be a replacement for `git-lfs`. It needs a backend server to work, you can run your own or pester your favourite git forge to implement it.
+[![CI](https://github.com/davidrios/baleforgit/actions/workflows/ci.yml/badge.svg)](https://github.com/davidrios/baleforgit/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/davidrios/baleforgit?sort=semver)](https://github.com/davidrios/baleforgit/releases/latest)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
+A Git filter driver that stores large files as **content-defined chunks** on a Bale CAS server. It's meant to be a replacement for `git-lfs`. It can use a backend server, you can run your own or pester your favourite git forge to implement it, or you can run totally offline.
 
 This repo ships two binaries:
 
@@ -114,6 +118,18 @@ Defaults: cache directory is `$XDG_CACHE_HOME/bale/chunks` if set, otherwise `~/
 ## Self-hosting the server
 
 If you want to run your own CAS server (rather than point `git-bale` at someone else's), grab the `bale-server-<version>-<target>.tar.gz` artifact from the [releases page](https://github.com/davidrios/baleforgit/releases). See [`docs/SERVER.md`](docs/SERVER.md) for the quick start, env vars, and container instructions; [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md) for what your forge needs to expose so clients can auto-resolve.
+
+## Try it locally with Docker
+
+Want to see the whole thing working end-to-end without wiring up a forge yourself? [`demo-docker/`](demo-docker/) is a self-contained compose stack — [gitea](https://gitea.io/) (patched with the Bale forge-auth endpoints) + `baleforgit-server` + [MinIO](https://min.io/) — that lets a `git-bale` client on your host push and pull large files against a real forge. The server is built from this repo's root `Dockerfile`, so it always runs the code in your working tree.
+
+```bash
+cd demo-docker
+podman compose up -d    # or: docker compose up -d
+# first run writes .env with fresh secrets and exits; run it once more to start the stack
+```
+
+Then open <http://localhost:3000>, register a user, create a repo, and use `git-bale` against it exactly as in [Usage](#against-a-bale-enabled-forge). See [`demo-docker/README.md`](demo-docker/README.md) for the full walkthrough, host-port and public-endpoint overrides, and teardown. Meant for trying Bale out locally, not for production.
 
 ## What this is, in context
 

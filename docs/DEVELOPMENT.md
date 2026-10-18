@@ -106,8 +106,8 @@ a label-gated PR, never a bare tag push:
   updates) a single rolling **prerelease** with the same checksums, provenance,
   SBOM, and cosign signature.
 
-`ci.yml` (fmt / clippy / e2e harness) is checked in as `ci.yml.disabled`; rename
-it to enable. No container image is published — build one locally from
+`ci.yml` (fmt / clippy / e2e harness) runs on pushes and PRs to `main`, and via
+`workflow_dispatch`. No container image is published — build one locally from
 `Dockerfile` if you want one (see [`docs/SERVER.md`](SERVER.md)). The macOS
 `.pkg` flow needs **both** a Developer ID Application and a Developer ID
 Installer certificate in the `MACOS_CERT_P12` secret (plus the App Store Connect
