@@ -81,8 +81,8 @@ fn u24_le(b: &[u8]) -> u32 {
 }
 
 /// Stops at the first non-zero version byte (footer marker) or EOF. Bodies over
-/// u32::MAX are rejected since `XorbChunkFrame` offsets are u32 (defense in
-/// depth — the upload handler already caps xorbs at 64 MiB).
+/// u32::MAX are rejected since frame offsets are u32 (defense in depth: the
+/// upload handler already caps bodies at ~64 MiB).
 pub fn parse_xorb_frames(body: &[u8]) -> Result<Vec<XorbChunkFrame>, XorbParseError> {
     if body.len() > u32::MAX as usize {
         return Err(XorbParseError::TooLarge {
@@ -138,11 +138,9 @@ pub fn parse_xorb_frames(body: &[u8]) -> Result<Vec<XorbChunkFrame>, XorbParseEr
     Ok(frames)
 }
 
-/// Recompute the xorb content hash and compare to `expected` so a bad upload is
-/// rejected before persisting. `expected` is natural-byte order (from
-/// `bale_server_wire::decode_hash`), which is what `DataHash::from([u8; 32])`
-/// consumes. Returns the per-frame chunk hashes: they are the only trusted
-/// source for the dedup index and for verifying shard file terms.
+/// Rejects a bad upload before it is persisted. `expected` is natural-byte order
+/// (from `bale_server_wire::decode_hash`). The returned per-frame chunk hashes
+/// are the only trusted source for the dedup index and shard term verification.
 pub fn verify_xorb_body(
     body: &[u8],
     expected: &XorbHash,
@@ -185,9 +183,8 @@ pub fn verify_xorb_body(
         .collect())
 }
 
-/// Decompress `body` (the on-disk range for one reconstruction term) into `out`,
-/// in order. Like [`verify_xorb_body`] without the hash check — callers (e.g. the
-/// download streamer) already know the xorb is intact.
+/// Decompresses one reconstruction term's on-disk range into `out` without any
+/// hash check; only for callers that already know the bytes are intact.
 pub fn decompress_xorb_chunks_into(body: &[u8], out: &mut Vec<u8>) -> Result<(), XorbVerifyError> {
     let frames = parse_xorb_frames(body)?;
     for (i, f) in frames.iter().enumerate() {

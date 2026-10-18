@@ -100,7 +100,6 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
 
-    // Metadata store: Postgres when BALE_POSTGRES_URL is set, else local SQLite.
     if let Ok(pg_url) = env::var("BALE_POSTGRES_URL") {
         let pg_url = pg_url.trim();
         if pg_url.is_empty() {
@@ -145,9 +144,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Select the blob store (S3 when BALE_S3_BUCKET is set, else filesystem) and
-// serve. Generic over the metadata store so either backend pairs with either
-// blob store.
 #[allow(clippy::too_many_arguments)]
 async fn run<M>(
     listener: tokio::net::TcpListener,
@@ -323,10 +319,9 @@ where
     Ok(())
 }
 
-// Serves over hyper-util directly because `axum::serve` exposes no
-// connection-level limits. Without them a client can hold a connection open
-// forever (headers sent byte by byte, or an idle HTTP/2 connection kept alive by
-// pings), and enough such connections lock everyone out.
+// hyper-util directly because `axum::serve` has no connection-level limits:
+// without them slow-header or ping-kept-alive idle h2 connections can hold every
+// slot and lock everyone out.
 async fn serve_http(
     listener: tokio::net::TcpListener,
     app: axum::Router,
@@ -340,8 +335,7 @@ async fn serve_http(
 
     const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
     const MAX_CONNECTIONS: usize = 4096;
-    // Closed gracefully after this (in-flight requests finish), so no
-    // connection holds a slot forever.
+    // Graceful close after this so no connection holds a slot forever.
     const CONN_MAX_AGE: Duration = Duration::from_secs(600);
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(25);
     // Longer than any handler deadline plus a 64 MiB transfer on a slow link.
@@ -501,8 +495,7 @@ impl Drop for ConnSlot {
 
 async fn shutdown_signal() {
     use tokio::signal;
-    // Both expects fire only if the kernel refuses a signal handler at startup —
-    // not a network input.
+    // These expects fire only if the OS refuses a signal handler at startup.
     let ctrl_c = async {
         signal::ctrl_c().await.expect("install Ctrl+C handler");
     };

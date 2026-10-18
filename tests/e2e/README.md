@@ -81,7 +81,7 @@ host. On a Windows host:
 | `track`         | `git-bale track` appends `filter=bale` lines to `.gitattributes`: creates the file when absent, dedups already-tracked patterns, normalizes a missing trailing newline (LF or CRLF) so a new pattern isn't fused onto the last line, skips empty patterns, and errors on an unreadable (directory) `.gitattributes`. |
 | `compression`   | Pushes an LZ4-friendly and a BG4-LZ4-friendly file, asserts both frame schemes are stored, then downloads each via `GET /v1/files/{id}` and cold-clones them, covering the server's decompress arms that incompressible payloads never reach. |
 | `bigfile`       | 35 MB binary pushed at three revisions; storage growth per push matches the *actual* edit size.     |
-| `usage`         | `GET /v1/usage/{owner}` and `GET /v1/usage/repo/{owner}/{repo}` numbers agree with on-disk bytes. Also checks `require_admin_or_owner`: the hex admin bearer reads any owner (200), a JWT scoped to a different owner is forbidden (403). |
+| `usage`         | `GET /v1/usage/{owner}` and `GET /v1/usage/repo/{owner}/{repo}` numbers agree with on-disk bytes. Also checks `require_usage_access`: the hex admin bearer reads any owner (200), a JWT scoped to a different owner is forbidden (403). |
 | `browser-download` | `GET /v1/files/{id}` streaming download of the 35 MB file: hub token without filename → 200 with no `Content-Disposition`; forge JWT + matching filename → 200 with `attachment; filename=…`; tampered filename → 400. |
 | `dedup`         | A *second file* with bit-identical content adds zero new xorb bytes.                                |
 | `idempotency`   | Re-pushing with no new commits doesn't grow server storage.                                         |

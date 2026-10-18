@@ -91,8 +91,7 @@ pub struct RepoRef {
 
 impl RepoRef {
     /// The unit of storage accounting and quotas: the authority's explicit
-    /// owner, else the namespace before `/` (falling back to the whole
-    /// `repo_id` defensively).
+    /// owner, else the namespace before `/` (whole `repo_id` if there's none).
     pub fn owner(&self) -> &str {
         if let Some(owner) = &self.owner {
             return owner;
@@ -339,8 +338,8 @@ pub trait MetadataStore: Send + Sync {
 
     /// [`Self::raw_bytes_for_owner`] keyed by full `repo_id` (e.g. `"alice/big-model"`).
     async fn raw_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
-    /// [`Self::stored_bytes_for_owner`] per-repo. Cross-repo dedup within an
-    /// owner can make this smaller than `raw_bytes_for_repo`.
+    /// On-disk bytes of the distinct xorbs this repo's files reference; unlike
+    /// [`Self::stored_bytes_for_owner`], unreferenced uploads aren't counted.
     async fn stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64>;
     /// On-disk bytes of the xorbs this repo references that no *sibling* repo
     /// (same owner) references — how much the owner's stored bytes would drop if

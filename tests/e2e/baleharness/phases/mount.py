@@ -40,14 +40,8 @@ def phase_mount_rev(
     work_root: Path,
     rev_state: dict,
 ) -> None:
-    """Cold-clone the bigfile repo, mount HEAD as a read-only FUSE FS, and
-    verify both the non-bale `.gitattributes` (served from gix's ODB) and
-    the bale-tracked `bigfile.bin` (reconstructed via the same Reader the
-    smudge filter uses) come through correctly.
-
-    The mount path exercises Reader's cold-then-warm transition end-to-end
-    over real SSH-forge auth + network reconstruction — coverage no Rust
-    unit test reaches because libfuse is mocked out there."""
+    """Cold-clone the bigfile repo, mount HEAD, and check a plain blob (from
+    the ODB) and a bale file (Reader reconstruction) cold, then warm."""
     if not rev_state.get("shas"):
         raise TestFailure("mount-rev: rev_state missing — bigfile phase didn't run")
     expected_sha = rev_state["shas"][-1]
@@ -76,9 +70,6 @@ def phase_mount_rev(
                 label="mount-rev",
             ) as mp,
         ):
-            # Plain (non-bale) blob: byte-for-byte against what git itself
-            # would hand back — the only correct answer for a small text
-            # file served from gix's ODB through the FUSE plain_cache path.
             mounted_attrs = (mp / ".gitattributes").read_bytes()
             source_attrs = git(
                 ["show", "HEAD:.gitattributes"],
@@ -91,8 +82,8 @@ def phase_mount_rev(
                     f"  mounted: {mounted_attrs!r}\n"
                     f"  source:  {source_attrs!r}"
                 )
-            # stat must report the *decompressed* size, not the pointer
-            # JSON length — Reader.size_of reads only the pointer.
+            # stat must report the file size, not the pointer JSON length
+            # (`Reader::size_of` reads only the pointer).
             size = (mp / "bigfile.bin").stat().st_size
             if size != BIG_FILE_BYTES:
                 raise TestFailure(
@@ -106,16 +97,14 @@ def phase_mount_rev(
                     f"mount-rev: bigfile.bin sha {got_sha} != HEAD sha "
                     f"{expected_sha} — Reader reconstructed wrong bytes"
                 )
-            # If lazy dir population is broken, individual lookups still
-            # work but readdir returns an empty list.
+            # Broken lazy dir population still serves lookups but empties readdir.
             names = sorted(p.name for p in mp.iterdir())
             for required in (".gitattributes", "bigfile.bin"):
                 if required not in names:
                     raise TestFailure(
                         f"mount-rev: readdir missing {required!r}; got {names}"
                     )
-        # Hot path: re-mount on the same clone hits the manifest + chunk
-        # caches the first mount populated.
+        # Re-mount hits the manifest + chunk caches the first mount populated.
         with (
             timings.measure(
                 "mount-rev: re-mount HEAD (hot caches)",
@@ -150,10 +139,8 @@ def phase_mount_diff(
     work_root: Path,
     rev_state: dict,
 ) -> None:
-    """Cold-clone the bigfile repo, mount `git diff v1 v3`, and verify both
-    sides reconstruct correctly with their respective shas. Both sides are
-    bale-tracked pointers, so each one drives a full Reader cold-path
-    reconstruction through libfuse."""
+    """Cold-clone the bigfile repo, mount v1 vs v3, and verify each side's
+    cold reconstruction; a pathspec matching nothing must error."""
     if len(rev_state.get("commits", [])) < 3:
         raise TestFailure(
             "mount-diff: rev_state needs v1+v3 commits — bigfile phase did "
@@ -216,8 +203,7 @@ def phase_mount_diff(
                     raise TestFailure(
                         f"mount-diff: {name} stat size {sz} != {BIG_FILE_BYTES}"
                     )
-        # Pathspec must yield an empty diff and exit with "no files differ"
-        # rather than silently mounting an empty FS.
+        # An empty filtered diff must error, not mount an empty FS.
         empty_mp = mount_root / f"empty-{secrets.token_hex(3)}"
         empty_mp.mkdir()
         try:
@@ -274,21 +260,10 @@ def phase_mount_diff_mixed(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """Sets up a fresh repo with TWO files that both change across two
-    commits — a plain text file (`notes.txt`, served from gix's ODB) and a
-    bale-tracked binary (`data.bin`, reconstructed through the Reader cold
-    path). Mounts the diff and asserts:
-
-      - both labelled sides of *each* file match `git show <rev>:<path>`
-        byte-for-byte (catches any silent path-routing or chunking bug
-        that would surface as off-by-one bytes or wrong-side wiring),
-      - `diff -q` on each pair reports a difference and exits 1, proving
-        the labelled sides aren't accidentally serving the same content.
-
-    The mount-diff happy-path test (`mount-diff`) only exercises a single
-    bale-tracked binary; this one is what catches regressions where plain
-    git blobs and bale pointers go through divergent code paths in the
-    Reader and one of them silently breaks."""
+    """A plain file and a bale file both change across two commits; every
+    labelled side must match the committed bytes and each pair must differ
+    (`diff -q` exits 1). Catches one of the Reader's two divergent paths
+    (ODB blob vs pointer) breaking — `mount-diff` covers only bale files."""
     repo, env = init_repo_for_push(
         work_root=work_root,
         client=client,
@@ -299,8 +274,7 @@ def phase_mount_diff_mixed(
     )
     plain_v1 = b"alpha\nbravo\ncharlie\ndelta\n"
     plain_v2 = b"alpha\nbravo CHANGED\ncharlie\ndelta\necho added\n"
-    # 256 KiB so CDC produces a handful of chunks; small enough to keep
-    # the test fast.
+    # 256 KiB: a handful of CDC chunks, still fast.
     bale_v1 = deterministic_payload(256 * 1024, seed=b"mixed-bale-v1")
     bale_v2 = modify_bytes(bale_v1, offset=10_000, replacement=b"\xff" * 32)
 
@@ -334,8 +308,6 @@ def phase_mount_diff_mixed(
 
     git(["push", "-u", "origin", "main"], cwd=repo, env=env)
 
-    # Cold-clone so mount goes through the same network reconstruction path
-    # a fresh user would hit (no chunk cache, no manifests).
     clone_path, clone_env, _cache = init_repo_for_clone(
         work_root=work_root,
         client=client,
@@ -347,11 +319,7 @@ def phase_mount_diff_mixed(
     mount_root = work_root / "mount-diff-mixed-points"
     mount_root.mkdir(exist_ok=True)
 
-    # `kind` distinguishes the comparison path: plain files round-trip
-    # through gix's ODB so `git show` returns the literal bytes; bale files
-    # store a pointer JSON in the ODB and the mount serves the reconstructed
-    # content, so the right cross-check is the bytes we committed + a
-    # pointer-shape assertion on what `git show` returns.
+    # For bale files `git show` returns the pointer, so cross-check its sha256.
     files = [
         ("notes", ".txt", "plain", plain_v1, plain_v2),
         ("data", ".bin", "bale", bale_v1, bale_v2),
@@ -406,8 +374,6 @@ def phase_mount_diff_mixed(
                         env=clone_env,
                     ).stdout
                     if kind == "plain":
-                        # Plain blobs: the ODB stores the literal bytes,
-                        # so `git show` and the mount must agree.
                         if odb_blob != mounted:
                             raise TestFailure(
                                 f"mount-diff-mixed: plain {stem}__{label}{ext} "
@@ -416,10 +382,6 @@ def phase_mount_diff_mixed(
                                 f"vs {len(odb_blob)} B)"
                             )
                     else:
-                        # Bale: ODB holds a pointer JSON, mount serves the
-                        # reconstructed bytes. Verify the pointer's sha256
-                        # matches the content the mount reconstructed —
-                        # that's the link between the two views.
                         if not is_bale_pointer(odb_blob):
                             raise TestFailure(
                                 f"mount-diff-mixed: bale {stem}{ext}@{src_rev[:8]} "
@@ -433,10 +395,7 @@ def phase_mount_diff_mixed(
                                 f"sha256(mounted bytes) {sha256_bytes(mounted)}"
                             )
 
-            # `diff -q` exits 1 when files differ. Confirms the two
-            # labelled sides really are distinct content (a wiring bug
-            # that served the same blob on both sides would slip past
-            # the read checks above for v1 only).
+            # Catches both sides wired to the same blob.
             for stem, ext, _kind, _, _ in files:
                 a = mp / f"{stem}__v1{ext}"
                 b = mp / f"{stem}__v2{ext}"
@@ -463,27 +422,14 @@ def phase_mount_edge_cases(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """`mount` / `mount-diff` argument + diff validation in `mount/mod.rs`,
-    the paths the happy-path mount phases never reach. All git-level (no
-    bale/server), so it builds its own throwaway repo with plain text files:
-
-      - mount-diff with identical labels is rejected (`both resolve`);
-      - mount-diff of two identical-tree commits errors `no files differ`
-        with no pathspec (the paths-empty arm of the empty-diff guard);
-      - mount of a revision filtered to nothing errors `no files in`;
-      - mount of an empty-tree commit errors `no files in` (paths-empty arm);
-      - mount-diff with NO --label-a/--label-b derives labels via
-        sanitize_label — `HEAD~2`/`HEAD~1` sanitize to `HEAD_2`/`HEAD_1`
-        (the `~` exercises the non-alnum replacement), and those labels must
-        show up in the mounted filenames.
-
-    Skips cleanly (like the other mount phases) when libfuse/fuse-t is absent."""
+    """`mount`/`mount-diff` validation in `mount/mod.rs`, on a plain-git repo
+    (no server): identical labels, empty diff, pathspec filtering to nothing,
+    empty-tree commit, and auto-derived `sanitize_label` labels (`HEAD~2` →
+    `HEAD_2`). Skips when libfuse/fuse-t is absent."""
     env = client.make_env()
     bale = str(client.git_bale_bin)
 
-    # Three commits: c1, c2 (differs from c1), c3 (--allow-empty, same tree as
-    # c2). So HEAD=c3, HEAD~1=c2, HEAD~2=c1: HEAD~2..HEAD~1 has a real diff,
-    # HEAD~1..HEAD is empty.
+    # HEAD~2..HEAD~1 has a real diff; HEAD~1..HEAD (c3 is --allow-empty) is empty.
     repo = work_root / "mount-edge"
     repo.mkdir()
     git(["init", "-b", "main", "."], cwd=repo, env=env)
@@ -495,7 +441,6 @@ def phase_mount_edge_cases(
     git(["commit", "-m", "c2"], cwd=repo, env=env)
     git(["commit", "--allow-empty", "-m", "c3 (same tree as c2)"], cwd=repo, env=env)
 
-    # Separate repo whose only commit has an empty tree (no files at all).
     empty_repo = work_root / "mount-edge-empty"
     empty_repo.mkdir()
     git(["init", "-b", "main", "."], cwd=empty_repo, env=env)
@@ -507,9 +452,7 @@ def phase_mount_edge_cases(
     throwaway.mkdir()
 
     def expect_fail(cwd: Path, argv_tail: list[str], needle: str, what: str) -> None:
-        """Run a mount/mount-diff expected to exit before mounting; assert it
-        failed with `needle` in stderr. A libfuse-missing exit short-circuits
-        the whole phase to a skip (the binary can't reach the validation)."""
+        """A missing FS driver skips the whole phase: validation is never reached."""
         # --mount must precede any `--` pathspec separator, else clap folds it
         # into the (last = true) `paths` and reports it as missing.
         if "--" in argv_tail:
@@ -543,7 +486,7 @@ def phase_mount_edge_cases(
         # so provision WinFsp up front; on POSIX this is a no-op.
         ensure_fs_driver()
         with timings.measure("mount-edge: arg/diff validation + sanitize labels"):
-            # Identical labels collide (reached only after a non-empty diff).
+            # Reached only after a non-empty diff.
             expect_fail(
                 repo,
                 [
@@ -558,21 +501,18 @@ def phase_mount_edge_cases(
                 "both resolve",
                 "identical labels",
             )
-            # Two identical-tree commits, no pathspec: paths-empty empty-diff arm.
             expect_fail(
                 repo,
                 ["mount-diff", "HEAD~1", "HEAD"],
                 "no files differ",
                 "empty diff (no pathspec)",
             )
-            # Single-rev mount filtered to nothing: paths-nonempty empty arm.
             expect_fail(
                 repo,
                 ["mount", "HEAD", "--", "no-such-path"],
                 "no files in",
                 "mount with empty pathspec result",
             )
-            # Single-rev mount of an empty tree, no pathspec: paths-empty arm.
             expect_fail(
                 empty_repo,
                 ["mount", "HEAD"],
@@ -580,7 +520,6 @@ def phase_mount_edge_cases(
                 "mount of an empty-tree commit",
             )
 
-            # Auto-derived labels: HEAD~2 -> "HEAD_2", HEAD~1 -> "HEAD_1".
             with mount_diff_session(
                 client=client,
                 repo=repo,
@@ -621,10 +560,9 @@ def phase_mount_local(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """`mount` in fully-local mode reconstructs Bale files from the local
-    store with no server configured (a miss used to fall through to the
-    network path and fail auth), and a corrupted store fails the read rather
-    than serving wrong bytes. Skips cleanly when libfuse/fuse-t is absent."""
+    """Fully-local `mount` reconstructs from the local store with no server (a
+    miss used to fall through to the network and fail auth), and a corrupted
+    store fails the read rather than serving wrong bytes."""
     repo, env = init_repo_local(work_root=work_root, client=client, name="mount-local")
     rel = "local.bin"
     payload = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"mount-local")

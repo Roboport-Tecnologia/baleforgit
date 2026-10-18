@@ -2,29 +2,24 @@
 //! present on (and scoped to) the remote being pushed to.
 //!
 //! Invoked by the pre-push hook as `git-bale push-pending <remote> <url>` with
-//! git's ref-update lines on stdin. Only files reachable from the pushed refs are considered; other staged
-//! markers (e.g. from `git status` re-cleaning an uncommitted edit) stay put
-//! for gc. Two classes of pushed file must reach the target:
+//! git's ref-update lines on stdin. Only files reachable from the pushed refs
+//! are considered; other staged markers (e.g. a `git status` re-clean of an
+//! uncommitted edit) stay put for gc. Two classes of pushed file must reach the
+//! target:
 //!
-//!   1. **Freshly staged** files (`git add` cleaned them offline into
-//!      `.git/bale/staging/`, no server has them yet) — reconstructed from
-//!      staging and re-translated through an online session to the target.
-//!   2. **Already-pushed-elsewhere** files reachable from the refs being pushed
-//!      but no longer in staging (a prior push to a *different* remote drained
-//!      them). The server scopes uploads per-repo, so the target repo doesn't
-//!      know about them yet and a clone of the target would 404 on checkout.
-//!      We re-source their bytes from whichever remote still holds them and
-//!      re-translate through the target session, which registers the file under
-//!      the target repo (the per-session reconstruction shard is always
-//!      uploaded; xorbs dedup against the server, so this is cheap when the
-//!      remotes share a server).
+//!   1. **Freshly staged** files (cleaned offline into `.git/bale/staging/`) —
+//!      reconstructed from staging and re-cleaned through an online session.
+//!   2. **Already-pushed-elsewhere** files no longer in staging (a prior push to
+//!      a *different* remote drained them). Uploads are scoped per-repo, so a
+//!      clone of the target would 404 on checkout. Their bytes are re-sourced
+//!      from whichever remote still holds them and re-cleaned through the target
+//!      session, whose reconstruction shard registers them under the target repo
+//!      (xorbs dedup, so this is cheap when the remotes share a server).
 //!
-//! Re-translating (rather than POSTing staged xorbs/shards verbatim) keeps the
-//! server's global dedup intact: the online `FileUploadSession` queries
-//! server-known chunks and only POSTs genuinely new xorbs. Clean stays offline;
-//! the contract holds. xet's CDC is deterministic, so the merkle hash out of the
-//! online session must equal the file hash we sourced for — we assert that and
-//! bail on mismatch (version skew or corruption).
+//! Re-cleaning (rather than POSTing staged xorbs/shards verbatim) keeps server
+//! global dedup: the online session only POSTs genuinely new xorbs. CDC is
+//! deterministic, so the online merkle hash must equal the sourced file hash;
+//! a mismatch (version skew or corruption) aborts the push.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -114,10 +109,9 @@ pub fn run(args: Args) -> Result<()> {
         staged.insert(hex.clone(), size);
     }
     // Staged content the target ALREADY references (commits pushed earlier with
-    // `--no-verify`, or where the hook couldn't run): the remote advertises
-    // those pointers with the bytes only here. Not a privacy leak — the user
-    // already pushed the commits. Only hashes the delta didn't cover are
-    // tested, with early exit.
+    // `--no-verify`, or where the hook couldn't run): the remote advertises those
+    // pointers with the bytes only here. Not a privacy leak — the commits are
+    // already pushed.
     if hook_mode {
         let leftover: BTreeSet<String> = markers
             .keys()
@@ -178,8 +172,6 @@ pub fn run(args: Args) -> Result<()> {
     )
     .context("building online TranslatorConfig for push-pending")?;
 
-    // Remotes to source already-pushed files from. Empty when there are none to
-    // source (nothing but staged files), to skip the discovery walk.
     let source_remotes = if from_refs.is_empty() {
         Vec::new()
     } else {
@@ -187,23 +179,17 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     let server_url = auth.server_url.clone();
-    // For the per-file "already registered on the target?" probe (below): the
-    // target's server + write token. A write token is accepted on GET
-    // reconstruction, and reconstruction 404s unless the file is registered
-    // under *this* token's repo — exactly the signal we want.
+    // See `file_registered_on_target`.
     let probe_server = auth.server_url.trim_end_matches('/').to_string();
     let probe_token = auth.token.clone();
     let total = staged.len() + from_refs.len();
 
-    // Reports upload progress once work runs past ~200ms. The session is created
-    // inside the async block below, so the poller reads it through a shared slot
-    // (empty = "preparing", before the session exists).
+    // The session is created inside the async block, so the progress poller
+    // reads it through a shared slot (empty = "preparing").
     let session_slot: Arc<Mutex<Option<Arc<FileUploadSession>>>> = Arc::new(Mutex::new(None));
     let slot_for_poll = session_slot.clone();
-    // Dedup breakdown, filled in once all files are re-cleaned (before finalize).
-    // The live bar ignores it; the completion summary reads it to split the bytes
-    // into uploaded-vs-deduped, so a push whose content the server already had
-    // doesn't read as a full re-upload of the whole file.
+    // Filled before finalize so the completion summary splits uploaded vs
+    // deduped bytes; otherwise a fully deduped push reads as a full re-upload.
     let metrics_slot: Arc<Mutex<DeduplicationMetrics>> = Arc::new(Mutex::new(Default::default()));
     let metrics_for_poll = metrics_slot.clone();
     let progress = UploadProgress::start(total, move || {
@@ -250,11 +236,10 @@ pub fn run(args: Args) -> Result<()> {
         }
 
         // (2) already-pushed-elsewhere files → re-source from another remote,
-        // skipping any the target already has registered (so a push to a remote
-        // that's already fully populated doesn't re-download its whole history).
+        // skipping any the target already has (or a push to a fully populated
+        // remote would re-download its whole history).
         if !from_refs.is_empty() {
-            // One client for all probes; if it can't be built, skip probing and
-            // attempt every file (re-translate is idempotent — just less cheap).
+            // No probe client → attempt every file (re-translate is idempotent).
             let probe = reqwest::Client::builder()
                 .user_agent(concat!("git-bale/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(15))
@@ -326,11 +311,10 @@ pub fn run(args: Args) -> Result<()> {
                         tracing::warn!("removing marker {file_hex} in {}: {e}", staging.display());
                     }
                 }
-                // Unreadable inventory → keep the objects (sweeping on a
-                // guess could delete a concurrently staged file's only copy).
-                // A git op in flight (e.g. a `git add` in another process
-                // between files) may be about to dedup against these objects;
-                // leave them for the next gc/drain.
+                // Unreadable inventory → keep the objects (sweeping on a guess
+                // could delete a concurrently staged file's only copy). A git op
+                // in flight (a `git add` between files) may be about to dedup
+                // against them; leave them for the next gc/drain.
                 let busy = crate::gc::git_op_in_flight(&git_dir).unwrap_or(true);
                 match list_staged_files(&git_dir) {
                     Ok(_) if busy => {}
@@ -362,12 +346,9 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Download `file_hex` (size `file_size`) through `download_session`, re-clean it
-/// through `upload_session`, and assert the round-tripped hash matches. The
-/// online upload session POSTs only genuinely-new xorbs and always its
-/// per-session reconstruction shard, so this both uploads new content and
-/// registers the file under the upload token's repo scope. Returns the dedup
-/// metrics so the caller can report uploaded-vs-deduped bytes.
+/// Download, re-clean through `upload_session`, and assert the round-tripped
+/// hash matches. The session POSTs only new xorbs but always its reconstruction
+/// shard, which registers the file under the upload token's repo.
 async fn re_translate_one(
     download_session: &Arc<FileDownloadSession>,
     upload_session: Arc<FileUploadSession>,
@@ -378,9 +359,8 @@ async fn re_translate_one(
     // on "local reconstruct" to confirm a missing staged xorb fails *here*.
     source: &str,
 ) -> Result<DeduplicationMetrics> {
-    // Via a temp file because `clean_file` takes a path (it reads twice —
-    // hashing then chunking — and needs random access), so we can't stream
-    // download straight into upload.
+    // `clean_file` needs a path (it reads twice: hashing, then chunking), so the
+    // download can't stream straight into the upload.
     let tmp = NamedTempFile::new().context("creating temp file for re-translation")?;
     let info_for_dl = XetFileInfo::new(file_hex.to_string(), file_size);
     let writer = tmp
@@ -501,12 +481,10 @@ async fn build_read_session(
     Ok(FileDownloadSession::new(Arc::new(cfg), None).await?)
 }
 
-/// True iff `file_hex` is already registered under the target repo, via
-/// `GET /v1/reconstructions/{hash}` with the target write token. The server 404s
-/// unless the file is in *this token's* repo (the per-repo scope check), so a 200
-/// means "already here, no need to re-source." Any non-200 — 404, an auth hiccup,
-/// a network error — returns false so we attempt the (idempotent) re-translate
-/// rather than wrongly skip a file the target lacks.
+/// Whether `file_hex` is registered under the target repo: `GET
+/// /v1/reconstructions/{hash}` with the target write token 404s unless the file
+/// is in *this token's* repo. Any other failure returns false, so we re-translate
+/// (idempotent) rather than wrongly skip a file the target lacks.
 async fn file_registered_on_target(
     client: &reqwest::Client,
     server_url: &str,
@@ -574,20 +552,16 @@ fn parse_oid(s: &str) -> Option<ObjectId> {
     }
 }
 
-/// All bale pointers (`file_hex -> file_size`) introduced by the commits being
-/// pushed: walk `tips` (local shas, tags peeled) hiding only the *remote shas
-/// git reports on stdin* (what the pushed ref currently points to on the
-/// remote), and for each commit collect Added/Modified blobs that parse as
-/// pointers. A new ref (remote sha = zero) hides nothing → the full history is
-/// enumerated. Any read error fails the push: under-counting here advertises a
-/// pointer the target can't reconstruct.
+/// All bale pointers (`file_hex -> file_size`) the pushed commits introduce:
+/// walk the local shas (tags peeled) hiding only the remote shas git reports on
+/// stdin; a new ref hides nothing, so the full history is enumerated. Any read
+/// error fails the push: under-counting advertises a pointer the target can't
+/// reconstruct.
 ///
-/// Deliberately does NOT hide the remote's `refs/remotes/<name>/*`: git refs
-/// being present on a remote says nothing about whether the *bale objects* were
-/// ever registered under that remote's repo (the server scopes registration
-/// per-repo, and an old client could have pushed the commits without the
-/// objects). The per-file server probe in `run` keeps the resulting over-walk
-/// cheap by not re-uploading files already registered on the target.
+/// Deliberately does NOT hide `refs/remotes/<name>/*`: commits on a remote don't
+/// prove their bale objects were registered under its repo (e.g. pushed by an
+/// old client or with `--no-verify`). The per-file probe in `run` keeps the
+/// over-walk cheap.
 fn reachable_pointers(
     start_dir: &Path,
     updates: &[(ObjectId, Option<ObjectId>)],
@@ -887,15 +861,10 @@ fn explain_partial_clone(err: anyhow::Error, cwd: &Path) -> anyhow::Error {
     )
 }
 
-// Over-quota uploads surface from xet as a noisy HTTP error: the bale server
-// returns 429, xet treats 429 as transient and retries it to exhaustion, so the
-// chain we finally see is long. Collapse it to one actionable line. xet drops
-// the response body before we ever see it, so the only reliable signal is the
-// status code in reqwest's Display ("HTTP status client error (429) for url ..").
-// Match the parenthesised status, not a bare "429" — a hex hash in the request
-// URL can contain those digits. ("quota exceeded"/"Too Many Requests" are kept
-// as harmless future-proofing if a later xet ever surfaces body/reason.) A 429
-// from a bale server only ever means over-quota; no other endpoint returns it.
+// The bale server answers over-quota with 413 (see `quota_exceeded` in
+// bale-server-http). xet drops the response body, so key on the parenthesised
+// status in reqwest's Display ("HTTP status client error (413) for url ..") —
+// never a bare "413", which a hex hash in the URL can contain.
 fn explain_quota_exceeded(err: anyhow::Error, server_url: &str) -> anyhow::Error {
     let chain = format!("{err:#}");
     let is_quota = chain.contains("(413")
@@ -911,14 +880,10 @@ fn explain_quota_exceeded(err: anyhow::Error, server_url: &str) -> anyhow::Error
     ))
 }
 
-// Turn the opaque "400 Bad Request on /shards" that xet surfaces into an
-// actionable diagnosis. The server rejects a shard whose CAS blocks name a xorb
-// it doesn't hold; in push-pending that happens when our local xet dedup cache
-// recorded a xorb as already uploaded and so skipped re-sending it, but the
-// server no longer has it (its storage was reset or gc'd). xet erases the
-// response body and hands us only status + URL, so we key on those — a /shards
-// 400 here is overwhelmingly this case (a freshly round-tripped shard can't be
-// malformed or oversized).
+// The server 400s a shard naming a xorb it doesn't hold; here that means the
+// local xet dedup cache skipped re-sending a xorb the server has since lost
+// (storage reset or gc'd). xet erases the body, so key on status + URL — a
+// freshly round-tripped shard can't be malformed.
 fn explain_dedup_cache_mismatch(err: anyhow::Error, server_url: &str) -> anyhow::Error {
     let chain = format!("{err:#}");
     let is_shards_400 =

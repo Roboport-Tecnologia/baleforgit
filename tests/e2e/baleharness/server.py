@@ -45,8 +45,7 @@ class ServerHandle:
     ssh_port: int
     data_root: Path
     public_host_url: str
-    # Set in S3 mode: a bucket-prefix view that answers disk_*_bytes from
-    # MinIO instead of the (empty) local data_root/xorbs tree.
+    # S3 mode: answers disk_*_bytes from MinIO, since data_root/xorbs is empty.
     s3_view: S3StorageView | None = None
 
     @property
@@ -54,11 +53,8 @@ class ServerHandle:
         return f"{self.public_host_url}/healthz"
 
     def stop(self) -> None:
-        # In coverage mode SIGKILL (`rm -f`) prevents the server's atexit
-        # hook from flushing .profraw files. Send SIGTERM first so the
-        # axum graceful-shutdown path runs, LLVM atexit writes profiles,
-        # then `--rm` on `podman run` auto-removes the container. Prod
-        # mode skips this for speed.
+        # `rm -f` SIGKILLs, so LLVM's atexit never flushes .profraw; in
+        # coverage mode SIGTERM first for a graceful exit.
         if get_coverage() is not None:
             subprocess.run(
                 self.rt.cmd("stop", "-t", "10", self.name),
@@ -78,9 +74,8 @@ class ServerHandle:
         )
 
     def is_healthy(self) -> bool:
-        """Quiet one-shot `/healthz` probe (no retry, no logging). A crashed
-        server's container exits under `--rm`, so this goes false the moment
-        the process dies — the per-push crash detector the churn phase needs."""
+        """One-shot `/healthz` probe, no retry or logging. Under `--rm` a crashed
+        server's container is gone, so this is false as soon as it dies."""
         try:
             with urllib.request.urlopen(self.healthz_url, timeout=2) as resp:
                 return resp.status == 200
@@ -101,10 +96,8 @@ class ServerHandle:
         return self.disk_xorb_bytes() + self.disk_shard_bytes()
 
     def read_data_file(self, path: Path) -> bytes:
-        # The server writes xorbs/shards as the in-container `bale` user mode
-        # 0600, so the harness (a different host UID — a subuid under rootless
-        # podman) can stat them for sizing but can't open their contents. Read
-        # through the container, whose default exec user is root.
+        # Files are `bale`-owned 0600 and the harness is a different host UID
+        # (a subuid under rootless podman), so read via a root `exec`.
         rel = path.relative_to(self.data_root).as_posix()
         completed = subprocess.run(
             self.rt.cmd("exec", self.name, "cat", f"/data/{rel}"),
@@ -118,8 +111,7 @@ class ServerHandle:
         return completed.stdout
 
     def write_data_file(self, path: Path, data: bytes) -> None:
-        # Counterpart to read_data_file: overwrite a `bale`-owned 0600 file the
-        # harness can't write directly (the tampered-xorb corrupt/restore).
+        # Same permission workaround as read_data_file.
         rel = path.relative_to(self.data_root).as_posix()
         completed = subprocess.run(
             self.rt.cmd(
@@ -155,16 +147,13 @@ def start_container(
 ) -> ServerHandle:
     cas_port = cas_port or pick_free_port()
     ssh_port = ssh_port or pick_free_port()
-    # public_host_url is the URL the SSH forge-auth script hands back to the
-    # client. The connection-drop phase points it at an in-process TCP proxy
-    # instead of the container's port so it can sever connections mid-upload
-    # while the server itself stays running.
+    # The URL the SSH forge-auth script hands the client. Failure phases point
+    # it at an in-process TCP proxy to sever connections with the server up.
     public_host_url = public_host_url_override or f"http://127.0.0.1:{cas_port}"
     name = f"{CONTAINER_NAME_PREFIX}-{name_suffix or secrets.token_hex(4)}"
     bale_grants = ",".join(f"{E2E_HUB_TOKEN}:{E2E_USER}:{r}:write" for r in test_repos)
-    # The browser-download phase presents a forge-style JWT instead of the
-    # opaque hub token, so register it as a read grant on repo2 wherever repo2
-    # is hosted (static authz matches the bearer verbatim).
+    # The browser-download phase presents a forge-style JWT; static authz
+    # matches bearers verbatim, so grant it read on repo2.
     repo2_id = f"{E2E_OWNER}/{E2E_REPO_2}"
     if repo2_id in test_repos:
         bale_grants += f",{BROWSER_DL_JWT}:{E2E_USER}:{repo2_id}:read"
@@ -187,12 +176,10 @@ def start_container(
     if admin_token_hex is not None:
         env_kvs.append(f"BALE_ADMIN_TOKEN_HEX={admin_token_hex}")
 
-    # `run.py --backend s3` and/or `--meta postgres` set process-global backends;
-    # when active, auto-inject their env + the shared-network arg for every
-    # container so the full fs phase registry runs against MinIO / Postgres
-    # unchanged. A caller's explicit extra_env (the bespoke s3lib / coverage
-    # phases) wins on key conflicts. Both backends share one podman network, so
-    # the `--network` arg is added exactly once even when both are active.
+    # `--backend s3` / `--meta postgres` set process-global backends; inject
+    # their env + network into every container so all phases run on them
+    # unchanged. An explicit extra_env (s3lib phases) wins on conflicts. Both
+    # backends share one podman network, so `--network` is added once.
     s3_view: S3StorageView | None = None
     networks: list[str] = []
     s3_backend = get_active_s3_backend()
@@ -205,10 +192,7 @@ def start_container(
         s3_view = S3StorageView(s3_backend.minio, extra_env["BALE_S3_PREFIX"])
         networks.append(s3_backend.network.name)
 
-    # Postgres metadata store: derive a per-data_root database (the metadata
-    # analogue of the S3 per-data_root bucket prefix), create it, and point the
-    # server at it. The fs/s3 blob store is unaffected — only the MetadataStore
-    # changes.
+    # One database per data_root, like the S3 per-data_root prefix.
     pg_backend = get_active_postgres_backend()
     if pg_backend is not None:
         dbname = db_for_data_root(data_root, pg_backend.prefix_anchor)
@@ -226,17 +210,12 @@ def start_container(
             with_net += ["--network", net]
         extra_run_args = with_net
 
-    # extra_env carries the BALE_S3_* wiring (from the active backend above, or
-    # explicitly from the coverage s3 phases). Existing fs call sites pass None
-    # and behave exactly as before.
     if extra_env:
         for k, v in extra_env.items():
             env_kvs.append(f"{k}={v}")
 
-    # Bind-mount `<data_root>/git-home` too so the bare git repos under
-    # /home/git survive a container restart. Without this, the restart
-    # persistence phase brings up a fresh container with empty repos and the
-    # post-restart clone has no refs to check out.
+    # Bare repos under /home/git must survive a restart, or the restart
+    # phases' post-restart clone finds no refs.
     git_home_root = data_root.parent / "git-home"
     git_home_root.mkdir(exist_ok=True)
     cmd: list[str] = [
@@ -255,17 +234,13 @@ def start_container(
         "-v",
         f"{host_mount_path(git_home_root)}:/home/git",
     ]
-    # In --coverage mode every container shares the same host profile dir,
-    # bind-mounted as /coverage. The in-container `bale` user writes
-    # .profraw files there; entrypoint.sh propagates LLVM_PROFILE_FILE.
+    # All containers share one host profile dir; entrypoint.sh re-exports
+    # LLVM_PROFILE_FILE for the server.
     if get_coverage() is not None:
         cmd.extend(["-v", f"{host_mount_path(get_coverage().profile_dir)}:/coverage"])
         env_kvs.append(f"LLVM_PROFILE_FILE={get_coverage().container_profile_template}")
     for kv in env_kvs:
         cmd.extend(["-e", kv])
-    # extra_run_args attaches the container to the shared podman network in S3 /
-    # Postgres mode (set above from the active backend, or by the coverage s3
-    # phases) so server→MinIO / server→Postgres traffic resolves.
     if extra_run_args:
         cmd.extend(extra_run_args)
     cmd.append(image_tag)
@@ -299,12 +274,10 @@ def _is_port_bind_conflict(stderr: str) -> bool:
 
 
 def _run_container_start(rt: Runtime, cmd: list[str], name: str):
-    # podman-on-Windows occasionally can't bind a host port that
-    # pick_free_port just saw as free: pasta's teardown of a prior --rm'd
-    # container lags, so its host-side forward still holds the port. The
-    # port is load-bearing (restart phases bake the ssh port into the git
-    # remote URL), so we can't re-pick — wait for the stale forward to clear
-    # and retry the same command, clearing any half-created container first.
+    # podman-on-Windows: pasta's teardown of a prior --rm'd container lags, so
+    # its host-side forward still holds a port pick_free_port saw as free.
+    # Restart phases bake the ssh port into the remote URL, so retry the same
+    # port rather than re-pick, removing any half-created container first.
     attempts = 6
     completed = subprocess.run(cmd, capture_output=True, check=False)
     for i in range(1, attempts):

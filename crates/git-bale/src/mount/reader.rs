@@ -39,7 +39,6 @@ struct CachedBlob {
 }
 
 pub struct Reader {
-    /// `None` only in `for_test_only` builds, where any git path errors.
     repo: Option<Arc<gix::ThreadSafeRepository>>,
     raw: Option<RawConfig>,
     rt: Option<Arc<XetRuntime>>,
@@ -88,7 +87,6 @@ impl BaleLru {
 
     fn get(&mut self, key: &str) -> Option<Arc<CachedBlob>> {
         let v = self.map.get(key).cloned()?;
-        // Touch: move to back.
         if let Some(idx) = self.order.iter().position(|k| k == key) {
             let s = self.order.remove(idx);
             self.order.push(s);
@@ -190,8 +188,8 @@ impl Reader {
         Ok(size)
     }
 
-    /// Per-open handle backing the next `pread`s. Over-budget Bale files go to a
-    /// tempfile held for the open so a readahead loop doesn't re-run the pipeline.
+    /// Over-budget Bale files keep their tempfile for the open's lifetime so a
+    /// readahead loop doesn't re-run the reconstruction per `pread`.
     pub fn open(&self, source: &BlobSource) -> Result<u64> {
         let data = self.materialize(source)?;
         // 0 is reserved as "uninitialized fh" by the FUSE callbacks.
@@ -200,8 +198,7 @@ impl Reader {
         Ok(id)
     }
 
-    /// Read from a handle from `open`. Short read only at EOF or unknown handle
-    /// (caller maps that to EBADF).
+    /// Short only at EOF; an unknown handle is an error.
     pub fn pread(&self, fh: u64, offset: u64, len: usize) -> Result<Bytes> {
         let handle = self
             .handles
@@ -235,7 +232,6 @@ impl Reader {
         }
     }
 
-    /// Drop the handle's resources. False if it was already absent.
     pub fn close(&self, fh: u64) -> bool {
         self.handles.lock().unwrap().remove(&fh).is_some()
     }
@@ -271,7 +267,6 @@ impl Reader {
                     .ok_or_else(|| anyhow!("bale pointer missing file_size"))?;
                 let tmp = self.reconstruct_bale_to_tempfile(&info)?;
                 if file_size <= BALE_LRU_BUDGET_BYTES {
-                    // Fits the LRU: slurp, cache, serve from RAM.
                     let buf = std::fs::read(tmp.path())?;
                     let bytes = Bytes::from(buf);
                     let blob = Arc::new(CachedBlob {
@@ -280,7 +275,6 @@ impl Reader {
                     self.bale_cache.lock().unwrap().put(file_id_hex, blob);
                     return Ok(HandleData::Bytes(bytes));
                 }
-                // Too large for the LRU: keep the tempfile, pread on demand.
                 let file = tmp
                     .reopen()
                     .context("opening reconstruction tempfile for read")?;
@@ -337,8 +331,7 @@ impl Reader {
             ));
         }
 
-        // xet-data's download writer is by-value `'static`, so we go through a
-        // tempfile; the caller slurps it or keeps the on-disk handle.
+        // xet-data's download writer is by-value `'static`, hence a tempfile.
         let tmp = tempfile::NamedTempFile::new()?;
 
         let cache_hit = if let Some(git_dir) = raw.git_dir.as_deref() {
@@ -396,9 +389,8 @@ impl Reader {
                 )?;
                 let info_clone = info.clone();
                 let dest_file = tmp.reopen()?;
-                // Same `0..file_size` range cap as the smudge filter and the same
-                // no-progress watchdog, so a misconfigured/unreachable blob store
-                // fails the read instead of hanging the mount for hours.
+                // Same range cap and no-progress watchdog as smudge, so an
+                // unreachable blob store fails the read instead of hanging the mount.
                 let label = file_id_hex.clone();
                 let stall_secs = crate::filter_process::cold_download_stall_secs();
                 rt.bridge_sync(async move {

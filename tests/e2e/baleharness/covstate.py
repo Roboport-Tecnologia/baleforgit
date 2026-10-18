@@ -1,8 +1,5 @@
-"""Mutable coverage-mode state, shared by every container launcher.
-
-Kept in its own module so server.py can read it without importing the
-heavier coverage.py (which pulls in the runtime + lazy s3lib).
-"""
+"""Coverage-mode state, split out so container launchers (server.py, mount.py)
+can read it without importing coverage.py and its runtime/s3lib deps."""
 
 from __future__ import annotations
 

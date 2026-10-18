@@ -117,7 +117,8 @@ pub struct SqliteMetadataStore {
 }
 
 impl SqliteMetadataStore {
-    // `":memory:"` forces pool size to 1 so the schema survives between calls.
+    // `":memory:"` gets a 1-connection pool (open_url): each connection would
+    // otherwise see its own empty database.
     pub async fn open_path(path: impl AsRef<Path>) -> CoreResult<Self> {
         let p = path.as_ref().to_string_lossy().to_string();
         let url = if p == ":memory:" {
@@ -314,16 +315,12 @@ async fn write_file_in_tx(
     .await
     .map_err(|e| CoreError::Internal(format!("insert file: {e}")))?;
 
-    // The term list for a file_hash is NOT canonical: global dedup segments the
-    // same content into a different *number* of xorb-referencing terms depending
-    // on which pre-existing xorbs it matches. file_terms is global (keyed by
-    // file_hash, not repo), so a per-term INSERT OR IGNORE would *merge* two
-    // differently-segmented registrations — keeping the old terms where indices
-    // collide and appending the longer list's tail — yielding Σunpacked > file_size
-    // and corrupting every reconstruction of this hash (xet's last-term trim then
-    // underflows). Register write-once: the first complete list fully describes the
-    // content, so if any terms already exist we leave them untouched. The
-    // enclosing write transaction serializes this against concurrent registers.
+    // Write-once: a file_hash's term list is NOT canonical (global dedup can
+    // segment the same content into a different number of terms), and
+    // file_terms is global, so a per-term INSERT OR IGNORE would merge two
+    // segmentations into Σunpacked > file_size and corrupt every reconstruction
+    // of this hash (xet's last-term trim underflows). The first complete list
+    // wins; the enclosing write transaction serializes concurrent registers.
     let terms_exist = sqlx::query("SELECT 1 FROM file_terms WHERE file_hash = ? LIMIT 1")
         .bind(hash_to_blob(&file_hash.0))
         .fetch_optional(&mut **tx)
@@ -481,12 +478,10 @@ impl MetadataStore for SqliteMetadataStore {
         let Some(terms) = self.stored_file_terms(file_hash).await? else {
             return Ok(None);
         };
-        // Defense in depth: the terms must sum to the file's recorded size. A
-        // mismatch means the term list is internally inconsistent (e.g. legacy data
-        // from before terms were registered write-once, where two differently-
-        // segmented registrations got merged into an over-describing list). Serving
-        // it would underflow xet's last-term trim and panic the client, so error.
-        // Any matching row suffices: one repo's bad row must not 500 every repo.
+        // Defense in depth: terms must sum to the recorded size. A mismatch (e.g.
+        // legacy pre-write-once data with merged segmentations) would underflow
+        // xet's last-term trim and panic the client, so error. Any matching row
+        // suffices: one repo's bad row must not 500 every repo.
         let term_sum: u64 = terms.iter().map(|t| t.unpacked_segment_bytes as u64).sum();
         let row = sqlx::query(
             "SELECT COUNT(*) AS n, SUM(CASE WHEN total_bytes = ? THEN 1 ELSE 0 END) AS matching
@@ -684,7 +679,7 @@ impl MetadataStore for SqliteMetadataStore {
         chunk_hash: &ChunkHash,
         limit: usize,
     ) -> CoreResult<Vec<XorbInfo>> {
-        // Prototype: only the containing xorb; neighborhood expansion is future work.
+        // Only the containing xorb; no neighborhood expansion yet.
         let row = sqlx::query("SELECT xorb_hash FROM chunks WHERE chunk_hash = ? LIMIT 1")
             .bind(hash_to_blob(&chunk_hash.0))
             .fetch_optional(&self.pool)
@@ -887,11 +882,11 @@ impl MetadataStore for SqliteMetadataStore {
     }
 
     async fn exclusive_stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64> {
-        // Xorbs this repo references, minus any also referenced by a *sibling*
-        // repo of the same owner (from the files' recorded owner: a canonical
-        // key like `id/42` names none) — the amount the owner's stored_bytes would drop if
-        // this repo were deleted. Cross-owner sharing is ignored, matching the
-        // owner-independent accounting in stored_bytes_for_owner.
+        // What the owner's stored_bytes would drop if this repo were deleted:
+        // its xorbs minus those a *sibling* repo of the same owner also
+        // references (owner taken from the files' rows, since a canonical key
+        // like `id/42` names none). Cross-owner sharing is ignored, matching
+        // stored_bytes_for_owner.
         let row = sqlx::query(
             "SELECT COALESCE(SUM(num_bytes_on_disk), 0) AS n
              FROM xorbs

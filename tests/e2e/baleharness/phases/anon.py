@@ -33,21 +33,16 @@ def phase_anonymous_public_clone(
 ) -> None:
     """A public repo's Bale content downloads WITHOUT credentials.
 
-    The resolver probes the forge's `/info/bale/authenticate?op=download`
-    anonymously first (no Basic auth) and only falls back to `git credential
-    fill` on 401/403, so a clone/checkout of a public repo never prompts. Driven
-    via a MockForgeServer that models repo visibility:
+    The resolver probes `/info/bale/authenticate?op=download` anonymously and
+    only falls back to `git credential fill` on 401/403:
 
-      1. public  → an anonymous cold smudge reconstructs over the wire with NO
-         credential helper configured, and the forge sees a credential-less
-         `download` call and no credentialed fallback.
-      2. private → the same anonymous probe is refused (401); the resolver falls
-         back to Basic auth and the smudge then succeeds — proving anon-first
-         didn't break private repos.
+      1. public  → a cold smudge with no credential helper succeeds and the forge
+         sees only credential-less `download` calls.
+      2. private → the anonymous probe gets 401, the resolver retries with Basic
+         auth and the smudge succeeds.
 
-    Upload always authenticates: the seeding `push-pending` sends Basic auth.
-    Covers resolver.rs `authenticate_http_with_fallback` and the anonymous
-    `op=download` arm of `authenticate_http`.
+    Upload always authenticates. Covers resolver.rs
+    `authenticate_http_with_fallback` and the anonymous arm of `authenticate_http`.
     """
     owner, name = ANON_REPO.split("/", 1)
     phase_root = work_root / "anon-public"
@@ -102,15 +97,14 @@ def phase_anonymous_public_clone(
         git(["add", "f.bin"], cwd=work, env=env)
         git(["commit", "-m", "add f.bin"], cwd=work, env=env)
 
-        # Seed the server: push-pending (op=upload) ALWAYS authenticates, so set
-        # a credential helper for it, then remove it so the download leg below is
-        # genuinely credential-less.
+        # op=upload always authenticates; drop the helper afterwards so the
+        # download leg is genuinely credential-less.
         git(["config", "--local", "credential.helper", _CRED_HELPER], cwd=work, env=env)
         with timings.measure("anon-public: seed (authenticated upload)"):
             run([str(client.git_bale_bin), "push-pending"], cwd=work, env=env)
         git(["config", "--local", "--unset", "credential.helper"], cwd=work, env=env)
 
-        # ---- public: anonymous download succeeds, no credential fallback -----
+        # Public: anonymous download succeeds with no credential fallback.
         forge.public = True
         forge.calls.clear()
         with timings.measure("anon-public: anonymous cold smudge (public)"):
@@ -135,14 +129,12 @@ def phase_anonymous_public_clone(
             )
         info(f"anon-public: public download was anonymous (calls={forge.calls})")
 
-        # ---- private: anonymous refused (401) → falls back to credentials ----
+        # Private: anonymous refused (401) → falls back to credentials.
         forge.public = False
         forge.calls.clear()
         git(["config", "--local", "credential.helper", _CRED_HELPER], cwd=work, env=env)
-        # Fresh chunk cache for this second cold smudge: re-wiping the cache the
-        # public smudge populated trips the harness rmtree (it chmods nested
-        # cache dirs write-only, then can't traverse them on POSIX), so always
-        # wipe an empty tree instead.
+        # Fresh cache dir: re-wiping the one the public smudge populated trips the
+        # harness rmtree on its write-only nested dirs.
         cache_dir_2 = work_root / "cache-anon-private"
         cache_dir_2.mkdir(exist_ok=True)
         git(["config", "--local", "bale.cacheDir", str(cache_dir_2)], cwd=work, env=env)

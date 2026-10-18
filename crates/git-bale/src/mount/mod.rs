@@ -1,7 +1,8 @@
 //! `git-bale mount-diff` / `git-bale mount` — read-only virtual filesystems.
 //! mount-diff exposes both sides of a `git diff` as `foo__<label>.ext`; mount
-//! exposes one revision under original names. No bytes hit disk: each `read`
-//! goes to git's ODB (plain blobs) or chunk cache + reconstruction (pointers).
+//! exposes one revision under original names. Nothing is written to the
+//! worktree; `read`s are served by `reader` (ODB for plain blobs, smudge's
+//! reconstruction path for pointers).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -108,7 +109,7 @@ fn resolve_commit_and_tree(
 }
 
 pub fn run(args: MountDiffArgs) -> Result<()> {
-    // Fail fast with an install hint before doing the diff, not at mount time.
+    // Fail fast with an install hint before running the diff.
     if let Err(e) = ensure_available() {
         eprintln!("{e}");
         std::process::exit(2);

@@ -1,5 +1,3 @@
-"""Storage / cache footprint helpers (staging, clean-cache, manifests)."""
-
 from __future__ import annotations
 
 import os
@@ -41,10 +39,8 @@ def manifest_cache_entries(repo: Path) -> list[Path]:
 
 
 def local_store_objects(store_dir: Path) -> list[Path]:
-    """Content xorbs/shards under an arbitrary local store dir (per-repo or
-    shared). Excludes `shard-cache/` — that subdirectory holds client-side
-    lookup-optimization files written by xet on every clean, not deduplicated
-    content objects, so it grows even when a second repo adds identical bytes."""
+    """Excludes `shard-cache/`: xet rewrites its lookup files on every clean, so
+    it grows even when a second repo adds identical bytes."""
     if not store_dir.exists():
         return []
     out: list[Path] = []
@@ -62,9 +58,8 @@ def local_store_objects(store_dir: Path) -> list[Path]:
 
 
 def local_store_xorbs(store_dir: Path) -> list[Path]:
-    """Only the xorb objects under a store dir. Used to assert content-level
-    dedup: a second repo adding identical bytes must produce no new xorbs,
-    even though the shard layer may add compact/index shards."""
+    """Content-level dedup is asserted on xorbs alone: identical bytes from a
+    second repo add no xorbs, though the shard layer may add shards."""
     return [p for p in local_store_objects(store_dir) if p.name.startswith("default.")]
 
 
@@ -73,11 +68,7 @@ def per_repo_store(repo: Path) -> Path:
 
 
 def staged_markers(repo: Path) -> set[str]:
-    """The set of `<file_hex>` markers under `.git/bale/staging/file-index/`.
-    Each marker name is the merkle file hash the clean filter recorded — the
-    same value as a committed pointer's `hash` field, so we can correlate a
-    marker with the file version that produced it. This is the precise signal
-    `git-bale gc` operates on."""
+    """Marker names equal the pointer's `hash` field — the exact set gc reclaims by."""
     d = repo / ".git" / "bale" / "staging" / "file-index"
     if not d.exists():
         return set()

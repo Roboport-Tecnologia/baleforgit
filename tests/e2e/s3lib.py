@@ -1,27 +1,23 @@
-"""Two focused S3 phases used by coverage mode.
-
-The whole suite runs on S3 via `run.py --backend s3` (see
-`baleharness/s3backend.py`); this module is what's left of the old standalone
-S3 harness — `phase_s3_basic` + `phase_s3_dedup`, which `run.py --coverage`
-runs with the instrumented image so `bale-server-storage-s3` shows up in the
-coverage report. Each scopes its writes under a unique `BALE_S3_PREFIX` so
-they share one bucket without cross-contamination.
-
-The S3 infrastructure (MinioGuard, Network, S3StorageView, the env/run-arg
-helpers) lives in `baleharness.s3backend` and is re-exported here for the
-imports `coverage.py` still does (`from s3lib import MinioGuard, ...`).
+"""The two S3 phases `run.py --coverage` runs on the instrumented image so
+`bale-server-storage-s3` shows up in the coverage report (the full suite runs
+on S3 via `run.py --backend s3`). Each scopes its writes under its own
+`BALE_S3_PREFIX` so they share one bucket.
 """
 
 from __future__ import annotations
 
 import secrets
 from pathlib import Path
-from typing import Optional
 
+from baleharness.s3backend import (
+    MinioGuard,
+    Network,
+    S3StorageView,
+    s3_run_args,
+    s3_server_env,
+)
 
-# We deliberately import from run.py rather than re-implementing — keeps the
-# fs and S3 suites in lock-step on container plumbing, JWT minting, git
-# driving, payload generation, and the worktree/pointer verifiers.
+# Reuse run.py's plumbing so the fs and S3 phases can't drift apart.
 from run import (
     BIG_FILE_BYTES,
     E2E_OWNER,
@@ -50,24 +46,6 @@ from run import (
 )
 
 
-# The S3 infrastructure (MinIO sidecar, bucket views, env/run-arg helpers)
-# now lives in baleharness.s3backend so server.py can import it without a
-# circular dependency on `run`. Re-exported here for the imports coverage.py
-# still does (`from s3lib import MinioGuard, Network, ...`).
-from baleharness.s3backend import (
-    MinioGuard,  # noqa: F401 — re-exported for coverage.py
-    Network,  # noqa: F401 — re-exported for coverage.py
-    S3StorageView,
-    s3_run_args,
-    s3_server_env,
-)
-
-
-# =============================================================================
-# Local helpers
-# =============================================================================
-
-
 def _mint_admin_jwt(jwt_secret_hex: str, repo: str) -> str:
     return mint_bale_jwt(
         secret=bytes.fromhex(jwt_secret_hex),
@@ -94,16 +72,11 @@ def _start_s3_server(
     minio: MinioGuard,
     network: Network,
     prefix: str,
-    endpoint_override: Optional[str] = None,
-    public_host_url_override: Optional[str] = None,
-    cas_port: Optional[int] = None,
-    ssh_port: Optional[int] = None,
+    endpoint_override: str | None = None,
+    public_host_url_override: str | None = None,
+    cas_port: int | None = None,
+    ssh_port: int | None = None,
 ) -> ServerHandle:
-    """Wrap start_container with the S3 env + network plumbing. Every S3
-    phase boots its server through this — keeps the BALE_S3_* +
-    --network wiring in one place. `cas_port`/`ssh_port` are forwarded
-    so phases that put a TcpProxy in front of the server can target the
-    exact port the container publishes."""
     run_args = s3_run_args(network)
     return start_container(
         rt,
@@ -125,11 +98,6 @@ def _start_s3_server(
     )
 
 
-# =============================================================================
-# Phase: basic push + clone roundtrip against S3
-# =============================================================================
-
-
 def phase_s3_basic(
     *,
     timings: Timings,
@@ -142,11 +110,9 @@ def phase_s3_basic(
     minio: MinioGuard,
     network: Network,
 ) -> None:
-    """Stage → commit → push → clone → checkout, all against an S3-backed
-    server. Asserts the bucket actually receives xorbs (server isn't
-    silently falling back to fs) and the cold smudge on the clone side
-    reconstructs the right bytes via /v1/reconstructions/ (which presigns
-    against MinIO under the hood)."""
+    """Push + cold clone against an S3-backed server: the bucket must receive
+    the xorbs (no silent fs fallback) and the smudge must reconstruct through
+    MinIO-presigned URLs."""
     phase_root = work_root / "s3-basic"
     phase_root.mkdir()
     data_root = phase_root / "data"
@@ -213,9 +179,6 @@ def phase_s3_basic(
             )
         info(f"  s3-basic: bucket grew to {fmt_bytes(storage.total_bytes())}")
 
-        # Cold clone in a fresh worktree — the smudge has to traverse
-        # /v1/reconstructions/ AND the resulting presigned URL has to fetch
-        # the right bytes back from MinIO. Both ends matter.
         with timings.measure(
             "s3-basic: cold clone + checkout", bytes_moved=len(payload)
         ):
@@ -239,11 +202,6 @@ def phase_s3_basic(
         server.stop()
 
 
-# =============================================================================
-# Phase: chunk-level dedup against S3
-# =============================================================================
-
-
 def phase_s3_dedup(
     *,
     timings: Timings,
@@ -256,21 +214,13 @@ def phase_s3_dedup(
     minio: MinioGuard,
     network: Network,
 ) -> None:
-    """Push a 35 MiB binary at THREE revisions with small edits (v1 →
-    8-byte poke → 1 MiB region swap), mirroring the fs `bigfile` phase.
+    """Push a 35 MiB file at three revisions (v1, 8-byte poke, 1 MiB region
+    swap): the bucket grows only by each edit's delta, `raw_bytes` ≈ 3× the
+    file, `stored_bytes` ≈ 1×.
 
-    Each revision has a distinct sha256 — so the server registers three
-    file_hash entries and `raw_bytes` ≈ 3 × BIG_FILE_BYTES. The CDC
-    chunks overlap heavily across revisions, so the bucket grows only
-    by the edit delta on v2/v3 and `stored_bytes` stays close to one
-    payload's worth. `dedup_savings_bytes = raw - stored` shows the
-    savings story.
-
-    Note: a duplicate file (same content, different path) at the same
-    commit does NOT exercise this — the server collapses identical
-    file_hashes at the metadata layer (`register_files` is content-
-    addressed), so raw_bytes wouldn't grow. The 3-revision shape is the
-    only one that exercises chunk-level dedup at the accounting layer.
+    Distinct revisions are required: identical content at another path has
+    the same file_hash, which the server registers once, so raw_bytes
+    wouldn't grow and chunk-level dedup would go unexercised.
     """
     phase_root = work_root / "s3-dedup"
     phase_root.mkdir()
@@ -306,7 +256,6 @@ def phase_s3_dedup(
             name="s3-dedup-client",
         )
 
-        # ---- v1: baseline 35 MiB ----------------------------------------
         payload_v1 = deterministic_payload(BIG_FILE_BYTES, seed=b"s3-dedup-v1")
         sha_v1 = sha256_bytes(payload_v1)
         (repo / "bigfile.bin").write_bytes(payload_v1)
@@ -319,7 +268,7 @@ def phase_s3_dedup(
             git(["push", "-u", "origin", "main"], cwd=repo, env=env)
         after_v1 = storage.total_bytes()
         grew_v1 = after_v1 - before_v1
-        # Full payload upload; compression keeps it below raw size.
+        # Compression keeps a full upload below raw size.
         if grew_v1 < BIG_FILE_BYTES // 2:
             raise TestFailure(
                 f"s3-dedup v1: bucket grew only {fmt_bytes(grew_v1)} — "
@@ -327,10 +276,6 @@ def phase_s3_dedup(
             )
         info(f"  s3-dedup v1: bucket +{fmt_bytes(grew_v1)} (full payload)")
 
-        # ---- v2: 8-byte poke at the middle ------------------------------
-        # CDC keeps the edit localized: at most a handful of chunks need
-        # re-uploading. Tolerance is generous to absorb chunk-boundary
-        # variance.
         v2_offset = BIG_FILE_BYTES // 2
         payload_v2 = (
             payload_v1[:v2_offset]
@@ -350,8 +295,8 @@ def phase_s3_dedup(
             git(["push", "origin", "main"], cwd=repo, env=env)
         after_v2 = storage.total_bytes()
         grew_v2 = after_v2 - after_v1
-        # Tolerance: a handful of 64 KiB chunks (each is ~64 KiB
-        # uncompressed) plus the new shard. 2 MiB is a generous cap.
+        # CDC re-uploads a handful of ~64 KiB chunks plus a shard; 2 MiB is
+        # slack for chunk-boundary variance.
         v2_max_growth = 2 * 1024 * 1024
         if grew_v2 > v2_max_growth:
             raise TestFailure(
@@ -361,7 +306,6 @@ def phase_s3_dedup(
             )
         info(f"  s3-dedup v2: bucket +{fmt_bytes(grew_v2)} (8-byte edit)")
 
-        # ---- v3: 1 MiB region replacement -------------------------------
         v3_offset = BIG_FILE_BYTES // 4
         v3_len = 1024 * 1024
         v3_region = deterministic_payload(v3_len, seed=b"s3-dedup-v3-region")
@@ -381,7 +325,7 @@ def phase_s3_dedup(
             git(["push", "origin", "main"], cwd=repo, env=env)
         after_v3 = storage.total_bytes()
         grew_v3 = after_v3 - after_v2
-        # ~1 MiB of new content plus boundary chunks; cap at 3 MiB.
+        # ~1 MiB of new content plus boundary chunks.
         v3_max_growth = 3 * 1024 * 1024
         if grew_v3 > v3_max_growth:
             raise TestFailure(
@@ -390,12 +334,8 @@ def phase_s3_dedup(
             )
         info(f"  s3-dedup v3: bucket +{fmt_bytes(grew_v3)} (1 MiB edit)")
 
-        # ---- /v1/usage cross-check --------------------------------------
-        # raw_bytes counts each (commit, file_path) registration, so
-        # three distinct file_hashes (v1/v2/v3) yield ≈ 3 × BIG_FILE_BYTES.
-        # stored_bytes is on-disk xorb cost (chunk-deduped) — should stay
-        # close to one payload's worth despite three revisions.
-        # savings = raw - stored should be ≈ 2 × BIG_FILE_BYTES.
+        # raw_bytes sums the repo's distinct registered files (≈ 3× here);
+        # stored_bytes is chunk-deduped on-disk xorb cost (≈ 1×).
         usage = fetch_repo_usage(
             server,
             token=admin_jwt,
@@ -407,15 +347,13 @@ def phase_s3_dedup(
         stored = int(usage["stored_bytes"])
         savings = int(usage["dedup_savings_bytes"])
 
-        # raw ≥ 2× (be lenient; the precise multiplier depends on whether
-        # carried-forward pointers count as new registrations).
+        # Loose floor: only "three revisions counted distinctly" matters.
         if raw < 2 * BIG_FILE_BYTES:
             raise TestFailure(
                 f"s3-dedup: /v1/usage raw_bytes={raw} < expected ≥ "
                 f"{2 * BIG_FILE_BYTES} — accounting isn't counting the "
                 "three revisions distinctly"
             )
-        # stored ≤ 1.5× one payload — chunks dedup across revisions.
         if stored > BIG_FILE_BYTES * 3 // 2:
             raise TestFailure(
                 f"s3-dedup: /v1/usage stored_bytes={stored} > expected "
@@ -438,9 +376,7 @@ def phase_s3_dedup(
             f"({100.0 * savings / raw:.1f}% of raw)"
         )
 
-        # ---- Cold-clone history verification ----------------------------
-        # Every revision must check out to the right sha256 — proves the
-        # CDC-deduped chunks reassemble correctly per-revision from S3.
+        # HEAD (v3) must reassemble from chunks shared with v1/v2.
         clone_path, clone_env, _ = init_repo_for_clone(
             work_root=work_root,
             client=client,

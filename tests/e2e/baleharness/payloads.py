@@ -19,11 +19,9 @@ def deterministic_payload(size: int, *, seed: bytes = b"baleforgit-e2e") -> byte
 def lz4_friendly_payload(size: int, *, seed: bytes = b"lz4") -> bytes:
     """Compressible bytes that xet's auto policy stores as plain LZ4 (scheme 1).
 
-    Each 64 KiB window repeats a 4 KiB high-entropy block, so the window
-    compresses hard, but the 4-byte byte-lanes carry the same popcount
-    distribution (the block is sha256 bytes, period 4096 ≡ 0 mod 4) — so the
-    BG4 predictor stays below threshold and the compressor picks LZ4, not BG4.
-    Distinct per-window blocks keep windows from deduping into one chunk."""
+    Each 64 KiB window repeats a 4 KiB sha256 block: LZ4 compresses it hard, but
+    all four byte-lanes share one popcount distribution, so the BG4 predictor
+    stays below threshold. Distinct per-window blocks keep windows from deduping."""
     window = 64 * 1024
     block_len = 4096
     out = bytearray()
@@ -39,10 +37,9 @@ def lz4_friendly_payload(size: int, *, seed: bytes = b"lz4") -> bytes:
 def bg4_friendly_payload(size: int, *, start: int = 0) -> bytes:
     """Compressible bytes that xet's auto policy stores as BG4-LZ4 (scheme 2).
 
-    A little-endian u32 ramp: byte-lane 0 cycles fast while lanes 2-3 stay
-    near-zero, a strong per-lane popcount skew that pushes the BG4 predictor
-    over threshold. After byte-grouping the near-constant high lanes collapse,
-    so BG4-LZ4 shrinks the chunk and the compressor keeps scheme 2."""
+    A little-endian u32 ramp: lane 0 cycles while lanes 2-3 stay near zero, a
+    per-lane popcount skew that pushes the BG4 predictor over threshold, and the
+    near-constant high lanes collapse after grouping, so BG4-LZ4 wins and sticks."""
     n = size // 4
     arr = array.array("I", range(start, start + n))
     if arr.itemsize != 4:  # 'I' is 4 bytes on every platform we run on

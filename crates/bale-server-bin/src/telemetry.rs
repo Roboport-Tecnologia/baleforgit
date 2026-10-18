@@ -1,6 +1,6 @@
 //! Without `OTEL_EXPORTER_OTLP_ENDPOINT` (or its `_TRACES_` / `_METRICS_`
 //! siblings) no provider is installed globally and every instrument in the
-//! workspace becomes a no-op — that's the "do nothing without a collector" contract.
+//! workspace is a no-op.
 //!
 //! The exporter uses the **blocking** reqwest client (see the `opentelemetry-otlp`
 //! features in the root `Cargo.toml`): the batch processor and reader export from
@@ -44,7 +44,6 @@ pub fn init(service_name: &str) -> Result<Guard> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
     let fmt_layer = tracing_subscriber::fmt::layer();
 
-    // Per OTel spec: a per-signal var beats the generic one; empty counts as unset.
     let traces_endpoint = signal_endpoint("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "/v1/traces");
     let metrics_endpoint = signal_endpoint("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "/v1/metrics");
 
@@ -104,7 +103,6 @@ pub fn init(service_name: &str) -> Result<Guard> {
         guard.meter_provider = Some(provider);
     }
 
-    // Bridge tracing → OTel only when a tracer provider was installed.
     let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
     if let Some(tp) = guard.tracer_provider.as_ref() {
         let tracer = tp.tracer(service_name.to_string());
@@ -124,7 +122,7 @@ pub fn init(service_name: &str) -> Result<Guard> {
     Ok(guard)
 }
 
-/// Per-signal var verbatim, else the base endpoint + `signal_path`, per the OTLP/HTTP spec.
+/// Per-signal var verbatim, else base + `signal_path` (OTLP/HTTP spec); empty = unset.
 fn signal_endpoint(per_signal_var: &str, signal_path: &str) -> Option<String> {
     if let Ok(v) = env::var(per_signal_var) {
         let v = v.trim();

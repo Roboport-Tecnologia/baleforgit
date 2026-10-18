@@ -1,10 +1,10 @@
-//! Per-clean cache. Keyed by `blake3(pathname)`, verified by
-//! `(size, chunked_hashes)` so a modified large file misses in ~ms (size check,
-//! then priority/parallel chunk hashing that bails on first mismatch) instead
-//! of paying `O(file_size)` on every `git status`/`git diff`. Hits still hash
+//! Clean cache keyed by `blake3(pathname)` and verified by `(size, chunk
+//! hashes)`, so a modified large file misses in ~ms (size check, then
+//! priority-ordered parallel chunk hashing that bails on first mismatch)
+//! instead of a full re-clean on every `git status`/`git diff`. Hits still hash
 //! every chunk — a sample-only positive can't be trusted.
 //!
-//! Chunk fingerprints use xxh3-64 (change detection, not integrity; ~10× blake3).
+//! Chunk fingerprints are xxh3-64: change detection, not integrity (~10× blake3).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -18,9 +18,9 @@ use twox_hash::XxHash3_64;
 
 const CHUNK_SIZE: u64 = 1 << 20;
 /// Bump on any on-disk schema or chunk-hash change — old entries go invisible
-/// and rebuild. v3: chunk hashes are xxh3-64 hex (was blake3 hex in v2).
+/// and rebuild. v4 added `store`/`store_id`; v3 switched chunk hashes to xxh3-64.
 pub const CURRENT_VERSION: u32 = 4;
-/// Random middle-chunks checked before the linear sweep.
+/// Random middle chunks checked right after the first and last.
 const MIDDLE_SAMPLES: usize = 3;
 const VERIFY_PARALLELISM: usize = 3;
 
@@ -31,8 +31,7 @@ pub struct CacheEntry {
     pub v: u32,
     pub size: u64,
     pub chunks: Vec<Chunk>,
-    /// Pointer JSON returned verbatim (incl. trailing newline) on a hit, so we
-    /// stream it back to git without re-encoding.
+    /// Pointer JSON (incl. trailing newline) streamed back to git verbatim on a hit.
     pub pointer: String,
     /// Canonical object store the bytes were written to. A hit is honored only
     /// against the same store: after switching stores the pointer would name
@@ -90,7 +89,7 @@ pub fn load(git_dir: &Path, key: &PathKey) -> io::Result<Option<CacheEntry>> {
     Ok(Some(entry))
 }
 
-/// Atomic write via temp + rename so a partial flush never poisons lookups.
+/// Temp + fsync + rename so a partial flush never poisons lookups.
 pub fn save(git_dir: &Path, key: &PathKey, entry: &CacheEntry) -> io::Result<()> {
     crate::fs_util::create_bale_subdir(git_dir, "clean-cache")?;
     let dir = cache_dir(git_dir);
@@ -108,11 +107,10 @@ pub fn save(git_dir: &Path, key: &PathKey, entry: &CacheEntry) -> io::Result<()>
     crate::fs_util::fsync_dir(&dir)
 }
 
-/// Drop clean-cache entries whose pointer references one of `hashes` (file-level
-/// merkle). `git-bale gc` calls this when it orphans staged content: otherwise a
-/// later `git add` of the same bytes hits the cache and hands git a pointer
-/// whose xorbs/shards gc already swept and that was never pushed — smudge can
-/// then reconstruct from neither staging nor server. Returns entries removed.
+/// Drop entries whose pointer names one of `hashes` (file merkle hashes). gc
+/// calls this for content it sweeps: otherwise a later `git add` of the same
+/// bytes hits the cache and hands git a pointer to never-pushed, already-swept
+/// xorbs that smudge can reconstruct from neither staging nor the server.
 pub fn forget_hashes(git_dir: &Path, hashes: &BTreeSet<String>) -> io::Result<usize> {
     if hashes.is_empty() {
         return Ok(0);
@@ -250,8 +248,8 @@ pub fn verify_chunks(cached: &[Chunk], path: &Path, file_size: u64) -> io::Resul
         }
     }
 
-    // One File shared across stripes; stateless read_at/seek_read avoid cursor
-    // contention. Runs on every `git status`/`git diff`, so N opens → 1.
+    // One handle shared across stripes via positional reads: this runs on every
+    // `git status`/`git diff`, so N opens → 1.
     let file = Arc::new(fs::File::open(path)?);
 
     let order = priority_order(cached.len());
@@ -302,8 +300,6 @@ fn verify_stripe(
     Ok(())
 }
 
-/// Positional read (no seek cursor) so workers share one handle; loops over
-/// short reads.
 fn read_exact_at(file: &fs::File, buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     let mut remaining = buf;
     while !remaining.is_empty() {

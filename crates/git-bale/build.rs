@@ -12,10 +12,9 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=BALE_GIT_SHA");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
-    // Re-embed the SHA when HEAD moves in local dev. logs/HEAD changes on every
-    // commit/checkout/reset; a fresh CI checkout has no reflog and relies on the
-    // BALE_GIT_SHA env instead. Emitting any rerun-if also pins the build date —
-    // it won't drift on unrelated rebuilds.
+    // logs/HEAD changes on every commit/checkout/reset so the SHA re-embeds in
+    // local dev (CI has no reflog and sets BALE_GIT_SHA). Any rerun-if also pins
+    // the build date so it doesn't drift on unrelated rebuilds.
     for p in ["../../.git/HEAD", "../../.git/logs/HEAD"] {
         if Path::new(p).exists() {
             println!("cargo:rerun-if-changed={p}");
@@ -24,8 +23,7 @@ fn main() {
 }
 
 fn git_sha() -> String {
-    // CI passes BALE_GIT_SHA: the `cross`/musl containers may lack git, and a
-    // release checkout's commit is authoritative. Locally, fall back to git.
+    // CI passes BALE_GIT_SHA: the `cross`/musl containers may lack git.
     if let Ok(s) = std::env::var("BALE_GIT_SHA") {
         let s = s.trim();
         if !s.is_empty() {
@@ -44,8 +42,7 @@ fn git_sha() -> String {
 }
 
 fn build_date() -> String {
-    // SOURCE_DATE_EPOCH (CI sets it to the commit time) keeps the date
-    // reproducible; otherwise stamp the build wall-clock.
+    // CI sets SOURCE_DATE_EPOCH to the commit time for a reproducible date.
     let secs = std::env::var("SOURCE_DATE_EPOCH")
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
@@ -60,7 +57,7 @@ fn build_date() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-// Howard Hinnant's days-from-civil inverse: Unix day number -> (year, month, day).
+// Howard Hinnant's civil_from_days: Unix day number -> (year, month, day).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

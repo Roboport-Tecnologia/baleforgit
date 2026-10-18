@@ -1,35 +1,19 @@
 #!/usr/bin/env python3
-"""Cargo-style integration driver: runs `run.py` five times to exercise
-the e2e suite under different phase orderings + state policies.
-
-The matrix:
+"""Runs `run.py` five times under different phase orderings + state policies:
   1. forward,  clean slate
   2. reverse,  preserved state (continues from #1's data dir + repos)
   3. reverse,  clean slate
   4. forward,  preserved state (continues from #3's data dir + repos)
   5. random,   clean slate
 
-"Preserved state" means the same server data dir and bare git repos as the
-prior run, but a fresh client work dir and fresh client-side caches — so
-the test exercises whether persisted data survives ordering changes
-without being polluted by leftover client state.
+"Preserved" reuses the prior run's server data dir and bare repos with a
+fresh client work dir and caches, so persisted data must survive the
+reordering without help from leftover client state.
 
-"Within-group" reordering applies: group order is fixed (independent
-push-side → bigfile cluster → isolated), but the within-group order can
-flip. `bigfile` is anchored as the head of its group since the other
-group-2 phases consume the rev_state it builds.
+Only within-group order changes; groups stay g1 → g2 (bigfile pinned first,
+the rest consume its rev_state) → g3 (fully-local).
 
-Each inner run is a fresh `python3 tests/e2e/run.py` subprocess so a
-failure in one run doesn't bleed into the next. The matrix aggregates
-exit codes and prints a per-run pass/fail summary.
-
-Invoke directly:
-
-    python3 tests/e2e/run_matrix.py
-
-This script never builds the container image — it assumes the image is
-already cached. If not, run `python3 tests/e2e/run.py` once by hand
-first.
+Runs with --no-build: build the image first with `python3 tests/e2e/run.py`.
 """
 
 from __future__ import annotations
@@ -44,7 +28,6 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 HERE = Path(__file__).resolve().parent
 RUN_PY = HERE / "run.py"
@@ -56,7 +39,7 @@ class RunResult:
     cmd: list[str]
     exit_code: int
     elapsed_s: float
-    output_file: Optional[Path] = None
+    output_file: Path | None = None
 
 
 def _info(msg: str) -> None:
@@ -67,8 +50,8 @@ def _invoke(
     *,
     label: str,
     extra_args: list[str],
-    extra_env: Optional[dict] = None,
-    output_file: Optional[Path] = None,
+    extra_env: dict | None = None,
+    output_file: Path | None = None,
     stream: bool = True,
     runner: Path = RUN_PY,
 ) -> RunResult:
@@ -82,8 +65,6 @@ def _invoke(
     if stream:
         completed = subprocess.run(cmd, env=env)
     else:
-        # Capture to a file so we can show it on failure but keep the
-        # matrix output compact on success.
         assert output_file is not None
         with output_file.open("w") as fh:
             completed = subprocess.run(
@@ -98,7 +79,6 @@ def _invoke(
     )
     _info(f"<<< {label}: {status}  [{elapsed:.1f}s]")
     if completed.returncode != 0 and output_file is not None:
-        # Surface the failing run's tail so CI logs aren't a black box.
         _info(f"--- last 60 lines of {output_file.name} ---")
         with output_file.open() as fh:
             tail = fh.readlines()[-60:]
@@ -161,8 +141,8 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.s3 or args.postgres:
-        # Neither sidecar survives the run (bucket + database are torn down),
-        # so the ordering/preserved-state permutations collapse to one run.
+        # Neither sidecar's bucket/database survives a run, so preserved-state
+        # permutations are meaningless: run once.
         extra: list[str] = []
         labels: list[str] = []
         if args.s3:
@@ -232,7 +212,7 @@ def main() -> int:
                 _info("stopping early per --stop-on-failure")
                 break
     finally:
-        print("", flush=True)
+        print(flush=True)
         _info("=" * 60)
         _info("matrix summary")
         _info("=" * 60)

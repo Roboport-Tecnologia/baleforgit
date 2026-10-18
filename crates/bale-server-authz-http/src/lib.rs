@@ -16,8 +16,8 @@
 //! 403 Forbidden      — known user, insufficient access
 //! ```
 //!
-//! `hub_bearer` is opaque to baleforgit-server, so no long-lived credential
-//! reaches it.
+//! `hub_bearer` is the forge's short-lived JWT, opaque to baleforgit-server; the
+//! user's long-lived credential never reaches it.
 
 use async_trait::async_trait;
 use bale_server_core::{
@@ -29,8 +29,8 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// 5 minutes (UTC unix seconds). Short on purpose: clients refresh via the
-/// forge before expiry, so a leaked token has a small blast radius.
+/// Short on purpose: clients refresh via the forge before expiry, so a leaked
+/// token has a small blast radius.
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 300;
 
 /// Caps a hostile upstream that streams gigabytes; the real body is tiny JSON.

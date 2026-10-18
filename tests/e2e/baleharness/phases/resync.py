@@ -30,37 +30,26 @@ def phase_resync_after_cas_wipe(
     ssh_public_key: str,
     admin_token_hex: str,
 ) -> None:
-    """User-perspective disaster recovery. Push a binary file, then bring the
-    server back up with a BLANK CAS (fresh data dir, same bare repo). The user
-    deletes `.git`, re-inits, re-installs bale, and re-adds the same file —
-    which must re-chunk it into local staging — then force-pushes.
+    """Push, restart the server with a blank CAS (same bare repo), then delete
+    `.git`, re-init, re-add (must re-stage) and force-push.
 
-    The first force-push MUST be rejected: every chunk dedups against the
-    client's stale xet cache (which survives both the `.git` delete and the
-    server wipe), so the re-upload is skipped and the blank server rejects the
-    shard that references the now-absent xorbs. The client must explain the
-    cache mismatch in plain terms (not a bare `400`), and the rejected push must
-    leave staging intact and write nothing to the server.
-
-    Recovery then follows the error's own advice: point `BALE_XET_CACHE` at a
-    fresh cache directory and force-push again. With no stale dedup entries the
-    xorbs are re-uploaded, the push succeeds, and a cold clone reconstructs the
-    file byte-for-byte. Owns its own isolated container so wiping server state
-    doesn't disturb the shared-server phases."""
+    That push must fail: the client's xet cache (outside `.git`) survives, so
+    every chunk dedups, nothing is re-uploaded, and the blank server rejects the
+    shard. The error must explain the cache mismatch (not a bare `400`), keep
+    staging, and write nothing server-side. Following its advice
+    (`BALE_XET_CACHE` → fresh dir) the re-push succeeds and a cold clone
+    round-trips. Uses its own container so the wipe can't touch shared phases."""
     phase_root = work_root / "resync-wipe"
     phase_root.mkdir()
     data_root = phase_root / "data"
     data_root.mkdir()
-    # data2 is a SIBLING of data so start_container derives the same git-home
-    # (data_root.parent / "git-home") for both: the bare repo with its old
-    # `main` ref survives the wipe while the CAS comes back blank. That stale
-    # ref is what makes the user's `git push -f` a force (non-fast-forward).
+    # Sibling of `data` so start_container derives the same git-home: the old
+    # `main` ref survives the wipe, making the later push a non-fast-forward.
     data_root_wiped = phase_root / "data2"
     data_root_wiped.mkdir()
     jwt_secret = secrets.token_bytes(32).hex()
     transfer_secret = secrets.token_bytes(32).hex()
-    # One cas/ssh port pair across the restart so the URL the client resolved
-    # (and re-resolves after re-init) is identical before and after the wipe.
+    # Same ports across the restart so the resolved URL doesn't change.
     cas_port = pick_free_port()
     ssh_port = pick_free_port()
 
@@ -112,8 +101,7 @@ def phase_resync_after_cas_wipe(
                 f"({wiped.disk_total_bytes()} bytes of xorbs/shards on disk)"
             )
 
-        # Back in the original working tree (asset.bin + .gitattributes are
-        # still on disk): nuke .git, re-init, re-install the filter, re-add.
+        # asset.bin + .gitattributes stay in the worktree.
         info("  deleting .git and re-initializing the working repo")
         rmtree(repo / ".git")
         cache_dir = work_root / "cache-resync-client"  # outside .git, survived
@@ -136,8 +124,6 @@ def phase_resync_after_cas_wipe(
             "resync: re-add after wipe", bytes_moved=RESYNC_PAYLOAD_BYTES
         ):
             git(["add", "-A"], cwd=repo, env=env)
-        # The user's step-4 expectation: the re-added file is chunked into the
-        # local staging cache, ready to upload on the next push.
         if not staging_files(repo):
             raise TestFailure(
                 "resync: staging dir empty after re-add — the binary was not "
@@ -153,9 +139,6 @@ def phase_resync_after_cas_wipe(
         )
         git(["commit", "-m", "re-add binary asset after wipe"], cwd=repo, env=env)
 
-        # Force-push MUST be rejected: every chunk deduped against the stale
-        # local xet cache, so push-pending skipped re-uploading the xorbs, and
-        # the blank server rejects the shard that references them.
         with timings.measure("resync: force-push after wipe (expected reject)"):
             pushed = git(
                 ["push", "-f", "-u", "origin", "main"],
@@ -169,9 +152,7 @@ def phase_resync_after_cas_wipe(
                 "cannot hold xorbs the dedup cache skipped re-uploading"
             )
 
-        # The whole point of the phase: a plain-language cache-mismatch
-        # explanation, not the bare `400 Bad Request on /shards` that xet
-        # surfaces by default.
+        # xet alone surfaces a bare `400 Bad Request on /shards`.
         stderr = pushed.stderr.decode("utf-8", "replace")
         for needle in (
             "the server is missing content",
@@ -184,8 +165,7 @@ def phase_resync_after_cas_wipe(
                     f"explanation (missing {needle!r}). stderr:\n{stderr}"
                 )
 
-        # A rejected push must neither drain staging (the staged bytes are still
-        # the only local copy) nor leave a partial write on the server.
+        # Staged bytes are still the only copy.
         if not staging_files(repo):
             raise TestFailure(
                 "resync: staging drained despite a rejected push — push-pending "
@@ -197,10 +177,6 @@ def phase_resync_after_cas_wipe(
                 "xorbs/shards on the server — partial write on a failed push"
             )
 
-        # Recovery: follow the error's advice — point BALE_XET_CACHE at a fresh,
-        # empty cache. With no stale dedup entries, push-pending re-uploads every
-        # xorb from the still-intact staging, the shard's references resolve, and
-        # the server accepts the push.
         fresh_cache = phase_root / "fresh-xet-cache"
         recover_env = dict(env)
         recover_env["BALE_XET_CACHE"] = str(fresh_cache)
@@ -220,9 +196,6 @@ def phase_resync_after_cas_wipe(
                 "no xorbs/shards — nothing was actually uploaded"
             )
 
-        # Prove the bytes are genuinely retrievable from the server: a cold
-        # clone (fresh chunk cache → /v1/reconstructions/) must reconstruct the
-        # file byte-for-byte.
         with timings.measure(
             "resync: cold clone after recovery", bytes_moved=RESYNC_PAYLOAD_BYTES
         ):

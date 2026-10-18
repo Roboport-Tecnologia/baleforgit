@@ -19,16 +19,13 @@ def init_repo_for_push(
     repo: str,
     name: str = "alice",
 ) -> tuple[Path, dict]:
-    """Init a working repo, install the bale filter, set the SSH remote
-    pointing at `server`, and seed `.gitattributes`. Returns (repo_path,
-    env). The remote URL carries the server's SSH port, so multiple
-    servers can coexist without any ssh-config gymnastics."""
+    """Repo with the filter installed, an SSH `origin` on `server`, and
+    `*.bin` tracked. The URL carries the server's SSH port, so several servers
+    coexist without ssh-config."""
     env = client.make_env()
     work = work_root / name
     work.mkdir()
     git(["init", "-b", "main", "."], cwd=work, env=env)
-    # `install --local` writes filter.bale.process + required=true AND the
-    # pre-push hook that runs `git-bale push-pending`.
     run([str(client.git_bale_bin), "install", "--local"], cwd=work, env=env)
     cache_dir = work_root / f"cache-{name}"
     cache_dir.mkdir(exist_ok=True)
@@ -57,13 +54,11 @@ def init_repo_local(
     shared_store: Path | None = None,
     track_glob: str = "*.bin",
 ) -> tuple[Path, dict]:
-    """Init a working repo in fully-local mode. No server remote is configured.
-    With `shared_store`, all such repos point at one store dir."""
+    """Fully-local repo, no remote; `shared_store` makes repos share one store."""
     work = work_root / name
     work.mkdir(parents=True)
     env = client.make_env()
-    # Remove server-targeting vars so the smudge filter never tries a network
-    # path even if the harness env happened to carry stale server coordinates.
+    # Stale server coordinates in the harness env must not reach the filter.
     env.pop("BALE_SERVER_URL", None)
     env.pop("BALE_TOKEN", None)
     git(["init", "-b", "main", "."], cwd=work, env=env)
@@ -86,10 +81,9 @@ def init_repo_for_clone(
     repo: str,
     name: str,
 ) -> tuple[Path, dict, Path]:
-    """Clone over SSH with --no-checkout, install the filter, configure a
-    fresh cache dir, then checkout. Returns (repo_path, env, cache_dir).
-    The fresh cache means smudge will run through the cold network path,
-    which is what most clone-side checks need."""
+    """`--no-checkout` clone with the filter installed and a fresh cache dir;
+    the caller checks out, so smudge takes the cold network path.
+    Returns (repo_path, env, cache_dir)."""
     env = client.make_env()
     target = work_root / name
     cache_dir = work_root / f"cache-{name}"

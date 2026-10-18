@@ -11,9 +11,8 @@ from baleharness.timing import Timings
 
 
 def _count_tracked(attrs: bytes, pattern: str) -> int:
-    """How many active lines filter `pattern` through bale (mirrors the Rust
-    `pattern_already_tracked`: skip blank/`#` lines, first token == pattern,
-    `filter=bale` among the rest)."""
+    """Mirrors the Rust `pattern_already_tracked` (skip blank/`#` lines, first
+    token == pattern, `filter=bale` among the rest)."""
     n = 0
     for line in attrs.decode("utf-8", "replace").splitlines():
         t = line.strip()
@@ -31,12 +30,10 @@ def phase_track(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """`git-bale track <pattern>...` appends `<pattern> filter=bale -text` to
-    `.gitattributes` in the cwd (no git repo required): it creates the file
-    when absent, normalizes a missing trailing newline so a new pattern lands
-    on its own line, preserves the file's CRLF/LF convention for that inserted
-    separator, skips empty patterns, and never duplicates an already-tracked
-    one."""
+    """`git-bale track <pattern>...` appends `<pattern> filter=bale -text` to the
+    cwd's `.gitattributes` (no repo needed): creates it when absent, fixes a
+    missing trailing newline using the file's CRLF/LF convention, skips empty
+    patterns, and never duplicates an already-tracked one."""
     env = client.make_env()
     bale = str(client.git_bale_bin)
     root = work_root / "track"
@@ -52,7 +49,7 @@ def phase_track(
         return p.read_bytes() if p.exists() else b""
 
     with timings.measure("track: create / dedup / append / newline-fixups"):
-        # No .gitattributes yet: created with the single line (NotFound read).
+        # No .gitattributes yet: created with the single line.
         fresh = root / "fresh"
         fresh.mkdir()
         out = track(fresh, "*.bin").stdout.decode("utf-8", "replace")
@@ -61,8 +58,7 @@ def phase_track(
         if 'Tracking "*.bin"' not in out:
             raise TestFailure(f"track: no 'Tracking' line in stdout: {out!r}")
 
-        # Re-track the same pattern: reported already-tracked, no duplicate
-        # (the `appended == 0` early return).
+        # Re-track: reported already-tracked, no duplicate (`appended == 0` path).
         out = track(fresh, "*.bin").stdout.decode("utf-8", "replace")
         if _count_tracked(attrs(fresh), "*.bin") != 1:
             raise TestFailure(f"track: *.bin duplicated on re-track: {attrs(fresh)!r}")
@@ -76,9 +72,8 @@ def phase_track(
             if _count_tracked(a, pat) != 1:
                 raise TestFailure(f"track: {pat} count != 1 after append: {a!r}")
 
-        # Existing file with NO trailing newline, plus a comment and a blank
-        # line: the new pattern must not be concatenated onto the last line,
-        # and the already-tracked one must be found across the skipped lines.
+        # No trailing newline, plus comment/blank lines: the new pattern must not
+        # fuse onto the last line, and the tracked one is found past the skips.
         no_eol = root / "no-eol"
         no_eol.mkdir()
         (no_eol / ".gitattributes").write_bytes(
@@ -102,8 +97,7 @@ def phase_track(
         if 'Tracking "   "' in out:
             raise TestFailure(f"track: blank pattern should be skipped: {out!r}")
 
-        # CRLF file with no trailing newline: the inserted separator must be
-        # CRLF, matching the file's convention.
+        # CRLF file with no trailing newline: the inserted separator must be CRLF.
         crlf = root / "crlf"
         crlf.mkdir()
         (crlf / ".gitattributes").write_bytes(
@@ -116,8 +110,8 @@ def phase_track(
         if b"*.old filter=bale -text\r\n" not in a:
             raise TestFailure(f"track: separator before new pattern wasn't CRLF: {a!r}")
 
-        # `.gitattributes` that is a directory: the read fails with a non-
-        # NotFound error and track surfaces it instead of clobbering.
+        # A directory `.gitattributes` is a non-NotFound read error: surface it,
+        # don't clobber.
         baddir = root / "baddir"
         baddir.mkdir()
         (baddir / ".gitattributes").mkdir()

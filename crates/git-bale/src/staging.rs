@@ -1,6 +1,6 @@
-//! Per-repo staging area for pending uploads. `git add` writes xorbs/shards
-//! here via `TranslatorConfig::local_config`; `git-bale push-pending` (pre-push
-//! hook) re-translates and drains them. See [`crate::push_pending`].
+//! Per-repo staging area for pending uploads (server mode; local mode writes the
+//! store instead). Clean writes xorbs/shards here via
+//! `TranslatorConfig::local_config`; `push-pending` re-cleans and drains them.
 //!
 //! `git_dir` throughout is the repo's COMMON git dir (`.git`, never
 //! `.git/worktrees/<id>`), so every linked worktree shares one staging area.
@@ -30,10 +30,8 @@ fn file_marker_path(git_dir: &Path, file_hex: &str) -> PathBuf {
     file_index_dir(git_dir).join(file_hex)
 }
 
-/// Write the `<file_hex>` marker (body = file size, decimal ASCII) after clean,
-/// gating the lukewarm smudge and giving push-pending the reconstruct range.
-/// Durable (tmp → fsync → rename → fsync dir): gc/prune/push-pending trust
-/// markers as the inventory, so a torn or lost write must never be visible.
+/// Written after clean. Durable: gc/prune/push-pending trust markers as the
+/// inventory, so a torn or lost write must never be visible.
 pub fn mark_file_staged(git_dir: &Path, file_hex: &str, file_size: u64) -> std::io::Result<()> {
     crate::fs_util::create_bale_subdir(git_dir, "staging/file-index")?;
     crate::fs_util::write_durable(
@@ -48,21 +46,18 @@ pub fn file_is_staged(git_dir: &Path, file_hex: &str) -> bool {
     file_marker_path(git_dir, file_hex).exists()
 }
 
-/// Modification time of a `<file_hex>` marker, i.e. when its content was last
-/// cleaned (clean refreshes the marker on every add, hit or miss). `None` if the
-/// marker is absent or unstattable. Used by gc's reclaim grace.
+/// When the content was last cleaned (clean refreshes the marker on every add,
+/// hit or miss); gc's reclaim grace keys on it.
 pub fn marker_mtime(git_dir: &Path, file_hex: &str) -> Option<std::time::SystemTime> {
     std::fs::metadata(file_marker_path(git_dir, file_hex))
         .and_then(|m| m.modified())
         .ok()
 }
 
-/// Bump an existing marker's mtime to now, WITHOUT creating it. Used by the
-/// clean-cache-hit path so gc's reclaim grace keys on the most recent add. Must
-/// not create a missing marker: a hit can re-emit a pointer for content whose
-/// objects were already drained (server mode, post-push), and a marker with no
-/// staged backing would make `push-pending` try to re-translate from empty
-/// staging. Returns whether a marker was present. Preserves the size body.
+/// Bump an existing marker's mtime on a clean-cache hit, WITHOUT creating it: a
+/// hit can re-emit a pointer whose objects were already drained post-push, and a
+/// marker with no staged backing would make push-pending re-clean from empty
+/// staging. Returns whether a marker was present.
 pub fn touch_marker_if_exists(git_dir: &Path, file_hex: &str) -> std::io::Result<bool> {
     match std::fs::OpenOptions::new()
         .write(true)

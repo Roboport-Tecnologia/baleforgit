@@ -279,12 +279,10 @@ fn main() -> Result<()> {
     }
 }
 
-/// Point xet-runtime's cache root at a bale-branded path instead of
-/// `~/.cache/huggingface/xet`. Precedence: `BALE_XET_CACHE` (the bale-branded
-/// knob) wins, mapped onto the `HF_XET_CACHE` xet actually reads; else a
-/// directly-set `HF_XET_CACHE` is kept; else `<XDG_CACHE_HOME|~/.cache>/bale/xet`.
-/// Must run before any threads spawn — `set_var` is UB in a multi-threaded
-/// process on some platforms.
+/// Moves xet's cache off `~/.cache/huggingface/xet`. Precedence: `BALE_XET_CACHE`
+/// (mapped onto the `HF_XET_CACHE` xet reads), then an existing `HF_XET_CACHE`,
+/// then `<XDG_CACHE_HOME|~/.cache>/bale/xet`. Must run before any thread spawns:
+/// `set_var` is UB in a multi-threaded process on some platforms.
 fn set_default_xet_cache_root() {
     if let Some(bale_cache) = std::env::var_os("BALE_XET_CACHE") {
         // SAFETY: called from main() before any threads or async runtime spawn.
@@ -303,10 +301,9 @@ fn set_default_xet_cache_root() {
     unsafe { std::env::set_var("HF_XET_CACHE", path) };
 }
 
-/// xet's retry backoff is `base^n` ms (tokio-retry squares each step), so its
-/// 3 s default parks the 2nd retry of any 5xx/408/429 for up to ~2.5 h — a push
-/// against a briefly unhealthy server would hang for hours. A 10 ms base gives
-/// 10 ms, 100 ms, 1 s, 10 s, 100 s. An explicit setting wins.
+/// xet's backoff squares each step, so its 3 s default parks the 2nd retry of a
+/// 5xx/408/429 for up to ~2.5 h, hanging a push against a briefly unhealthy
+/// server. 10 ms gives 10 ms, 100 ms, 1 s, 10 s, 100 s.
 fn set_default_xet_retry_backoff() {
     if std::env::var_os("HF_XET_CLIENT_RETRY_BASE_DELAY").is_none() {
         // SAFETY: called from main() before any threads or async runtime spawn.

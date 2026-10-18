@@ -1,13 +1,11 @@
-//! Standalone profiling target for the clean filter's slow path.
+//! Profiling target for the clean filter's slow path.
 //!
-//! Three modes:
 //!   --full         Mirrors `filter_process::handle_clean`: FileUploadSession +
 //!                  clean_file(Sha256Policy::Compute) + finalize.
-//!   --full-no-sha  Same as --full but Sha256Policy::Skip (Option A measurement).
-//!   --hash-only    Uses `data_client::hash_files_async`: CDC + merkle hash only.
+//!   --full-no-sha  Same with Sha256Policy::Skip, to isolate the sha256 cost.
+//!   --hash-only    `data_client::hash_files_async`: CDC + merkle hash only.
 //!
-//! Optional: --staging <dir> reuses an existing staging dir across runs to
-//! exercise the xet dedup path on second/third invocations.
+//! `--staging <dir>` reuses a staging dir across runs to exercise xet dedup.
 
 use std::sync::Arc;
 use std::time::Instant;

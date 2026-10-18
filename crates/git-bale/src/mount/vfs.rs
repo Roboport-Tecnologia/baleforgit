@@ -1,8 +1,8 @@
-//! In-memory virtual filesystem for the mount backends. Two construction modes:
-//! `build` (diff) eagerly flattens a pre-walked entry list, folding the rev
-//! label into each basename (`foo.txt` → `foo__<labelA>.txt`); `build_single_lazy`
-//! allocates only the root and reads each dir's gix tree the first time FUSE
-//! looks inside. Inodes are stable for the life of the mount.
+//! In-memory virtual filesystem for the mount backends. `build` (diff) eagerly
+//! flattens a pre-walked entry list, folding the rev label into each basename
+//! (`foo.txt` → `foo__<labelA>.txt`); `build_single_lazy` allocates only the
+//! root and reads each dir's tree on first lookup. Inodes are stable for the
+//! life of the mount.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -58,8 +58,6 @@ pub struct DiffVfs {
 }
 
 impl DiffVfs {
-    /// Two-sided diff view: each side's path is labelled so one mount point
-    /// shows both versions without collision.
     pub fn build(entries: &[DiffEntry], label_a: &str, label_b: &str, reader: Arc<Reader>) -> Self {
         let mut state = empty_state();
         add_eager_root(&mut state);
@@ -78,8 +76,7 @@ impl DiffVfs {
         }
     }
 
-    /// Lazy single-rev view: only the root is allocated; each dir reads its tree
-    /// on first access. Pathspec entries (literal prefix) prune untouched subtrees.
+    /// Pathspec entries (literal prefix) prune untouched subtrees.
     pub fn build_single_lazy(
         repo: Arc<gix::ThreadSafeRepository>,
         root_tree: gix::ObjectId,
@@ -158,7 +155,7 @@ impl DiffVfs {
         }
         if let Err(e) = populate_dir_locked(state, parent, ctx) {
             // Clear the lazy flag so a broken tree doesn't hammer the ODB on
-            // every FUSE call; the lookup just sees ENOENT.
+            // every lookup; callers just see ENOENT.
             tracing::warn!("populate_dir({parent}) failed: {e:#}");
             if let Some(d) = state.dirs.get_mut(&parent) {
                 d.lazy = None;

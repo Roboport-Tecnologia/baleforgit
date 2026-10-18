@@ -40,13 +40,8 @@ AUTHZ_HTTP_REPOS = ["authz-http/allow", "authz-http/denied", "authz-http/error"]
 
 
 def _authz_http_decide(bearer: str, repo_id: str, scope: str) -> tuple[int, dict]:
-    """Decision function the MockAuthzServer uses in the authz-http phase.
-    Drives every branch of `HttpAuthz::check_repo_access`:
-      - 200 success  -> exercise the happy path + JWT mint
-      - 403 denied   -> exercise the Forbidden branch
-      - 500 internal -> exercise the catch-all upstream-error branch
-      - 401 unauth   -> tested via direct curl with an unknown bearer
-    """
+    """One response per `HttpAuthz::check_repo_access` branch: 200 allow,
+    403 denied, 500 upstream error, 401 unknown bearer (direct probe)."""
     if bearer != E2E_HUB_TOKEN:
         return 401, {"error": "unknown bearer"}
     if repo_id == "authz-http/allow":
@@ -71,21 +66,12 @@ def phase_https_origin_coverage(
     ssh_public_key: str,
     admin_token_hex: str,
 ) -> None:
-    """Drive the git-bale resolver's HTTP(S)-origin auth branch. When `origin`
-    is an `http://` URL the resolver POSTs the forge's `/info/bale/authenticate`
-    then exchanges the forge bearer for a bale token — versus the SSH
-    `git-bale-authenticate` command every other phase uses. The mock forge runs
-    with enforce_auth (private repo), so this covers resolver.rs `Http | Https`
-    arm, `authenticate_http` (both the anonymous probe and the credential'd
-    retry), `authenticate_http_with_fallback`'s 401→retry branch, and
-    `git_credential_fill`.
-
-    `git-bale push-pending` (op=upload) and a cold smudge (op=download) both
-    read `origin` and take the HTTP branch. Upload goes straight to Basic;
-    download probes anonymously first, gets 401, then falls back to Basic —
-    exercising both scope arms. Neither transfers git refs, so a single mock
-    endpoint suffices — no git smart-HTTP server needed.
-    """
+    """Resolver's HTTP(S)-origin auth (`/info/bale/authenticate`) instead of
+    the SSH `git-bale-authenticate` every other phase uses, against a private
+    mock forge. Upload (push-pending) goes straight to Basic via
+    `git_credential_fill`; download (cold smudge) probes anonymously, gets 401,
+    then retries with Basic (`authenticate_http_with_fallback`). Neither moves
+    git refs, so no smart-HTTP server is needed."""
     owner, name = HTTP_ORIGIN_REPO.split("/", 1)
     phase_root = work_root / "https-origin"
     phase_root.mkdir()
@@ -108,9 +94,7 @@ def phase_https_origin_coverage(
                 admin_token_hex=admin_token_hex,
                 name_suffix="https-origin",
             )
-        # enforce_auth=True + private (public=False): the download scope's
-        # anonymous probe gets 401, forcing the resolver's git_credential_fill
-        # fallback — the branch a public-repo (anon-accepted) forge never hits.
+        # Private repo: the download probe gets 401, forcing the credential fallback.
         forge = MockForgeServer(
             bale_href=server.public_host_url,
             hub_token=E2E_HUB_TOKEN,
@@ -120,8 +104,7 @@ def phase_https_origin_coverage(
         info(f"https-origin: mock forge at {forge.base_url}")
 
         env = client.make_env()
-        # The credential helper always supplies creds, but belt-and-suspenders
-        # against a hang if it ever doesn't.
+        # Fail instead of hanging if the canned helper ever doesn't answer.
         env["GIT_TERMINAL_PROMPT"] = "0"
         work = work_root / "https-origin-client"
         work.mkdir()
@@ -130,9 +113,7 @@ def phase_https_origin_coverage(
         cache_dir = work_root / "cache-https-origin"
         cache_dir.mkdir(exist_ok=True)
         git(["config", "--local", "bale.cacheDir", str(cache_dir)], cwd=work, env=env)
-        # git_credential_fill reads credential.helper from local config; this
-        # canned helper hands back fixed Basic creds (the mock forge accepts
-        # any) so the resolver never blocks on an interactive prompt.
+        # The mock forge accepts any Basic creds.
         git(
             [
                 "config",
@@ -155,13 +136,9 @@ def phase_https_origin_coverage(
         git(["add", "f.bin"], cwd=work, env=env)  # clean → staging (offline)
         git(["commit", "-m", "add f.bin"], cwd=work, env=env)
 
-        # Upload: push-pending resolves origin over HTTP (op=upload) and POSTs
-        # xorbs/shards to the bale href the forge returned, draining staging.
         with timings.measure("https-origin: push-pending (HTTP resolve + upload)"):
             run([str(client.git_bale_bin), "push-pending"], cwd=work, env=env)
 
-        # Download: with staging drained + caches wiped, the smudge must
-        # resolve origin over HTTP (op=download) and reconstruct over the wire.
         with timings.measure("https-origin: cold smudge (HTTP resolve + reconstruct)"):
             force_resmudge_cold(
                 work,
@@ -180,15 +157,12 @@ def phase_https_origin_coverage(
                 "missing upload/download — the HTTP resolver branch didn't drive "
                 "both scopes"
             )
-        # Upload never probes anonymously: every upload authenticate must be Basic.
         if not all(upload):
             raise TestFailure(
                 "https-origin: an upload authenticate arrived without Basic auth "
                 "— upload must skip the anon probe and use git_credential_fill"
             )
-        # Download must show the anon-first probe (no Basic) AND the
-        # git_credential_fill fallback after the 401 (Basic) — the whole point
-        # of this phase post anon-first.
+        # Download must show both the anon probe and the Basic retry.
         if not (any(not b for b in download) and any(b for b in download)):
             raise TestFailure(
                 "https-origin: download didn't exercise anon-probe → "
@@ -215,12 +189,9 @@ def phase_authz_http_coverage(
     ssh_public_key: str,
     admin_token_hex: str,
 ) -> None:
-    """Drive `bale-server-authz-http::HttpAuthz` via a Python mock of the
-    upstream /check_access endpoint. The server container is brought up
-    with `BALE_AUTHZ_HTTP_URL` set, which makes the bin choose the HTTP
-    branch in main.rs (winning over `BALE_GRANTS`). One container, three
-    push attempts against three repos so the mock can vary the response.
-    Plus one direct probe with a bogus bearer to hit the 401 branch."""
+    """`HttpAuthz` against a mock upstream `/check_access`
+    (`BALE_AUTHZ_HTTP_URL` wins over `BALE_GRANTS`): one push per repo so the
+    mock can vary the response, plus a bogus-bearer probe for 401."""
     phase_root = work_root / "authz-http"
     phase_root.mkdir()
     data_root = phase_root / "data"
@@ -283,10 +254,8 @@ def phase_authz_http_coverage(
         _push_small("authz-http/denied", expect_fail=True, label="denied")
         _push_small("authz-http/error", expect_fail=True, label="error")
 
-        # 401 branch — direct token-mint probe with an unknown hub bearer.
-        # Going via the git client would require overriding the baked-in
-        # `git-bale-authenticate` script in the image, which isn't worth
-        # the complexity for a single status-code branch.
+        # Direct probe: going through git would mean overriding the image's
+        # baked-in `git-bale-authenticate`.
         with timings.measure("authz-http: 401 probe (unknown bearer)"):
             req = urllib.request.Request(
                 f"{server.public_host_url}/api/models/authz-http/allow/"
@@ -328,17 +297,10 @@ def phase_otlp_telemetry(
     ssh_public_key: str,
     admin_token_hex: str,
 ) -> None:
-    """Boot the server with the OTLP env vars pointed at a host-side collector,
-    push a small file to generate request spans, and confirm the exporter
-    pipeline fires. Covers `telemetry.rs`'s endpoint-configured init (span +
-    metric provider build, the tracing→OTel bridge) and both arms of the
-    signal-endpoint URL resolver — all no-ops when the env is unset, which is
-    why every other phase leaves them uncovered.
-
-    Traces use the per-signal `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (verbatim
-    URL); metrics fall back to appending `/v1/metrics` onto the base
-    `OTEL_EXPORTER_OTLP_ENDPOINT` — between them they hit both branches of
-    `signal_endpoint`."""
+    """Push with OTLP pointed at a host-side collector and confirm traces
+    export; `telemetry.rs` init is a no-op in every other phase. Traces use the
+    per-signal endpoint verbatim and metrics append `/v1/metrics` to the base
+    one, covering both `signal_endpoint` arms."""
     phase_root = work_root / "otlp"
     phase_root.mkdir()
     data_root = phase_root / "data"
@@ -365,15 +327,12 @@ def phase_otlp_telemetry(
                 extra_env={
                     "OTEL_EXPORTER_OTLP_ENDPOINT": collector.url,
                     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": f"{collector.url}/v1/traces",
-                    # Flush promptly instead of on the multi-second SDK defaults
-                    # so the assert below doesn't wait a whole batch interval.
+                    # The multi-second SDK defaults would stall the assert.
                     "OTEL_BSP_SCHEDULE_DELAY": "500",
                     "OTEL_METRIC_EXPORT_INTERVAL": "500",
                 },
             )
 
-        # A real push drives the SSH authenticate + xorb/shard POST handlers,
-        # each carrying a tower_http request span → exported to /v1/traces.
         repo, env = init_repo_for_push(
             work_root=work_root,
             client=client,
@@ -403,8 +362,7 @@ def phase_otlp_telemetry(
                 "server's OTLP span pipeline did not fire"
             )
     finally:
-        # Clean stop (SIGTERM) lets main return so the OTLP Guard flushes a
-        # final batch AND the llvm atexit hook writes this container's profraws.
+        # SIGTERM lets main return so the OTLP guard flushes and profraws get written.
         if server is not None:
             server.stop()
         collector.stop()
@@ -420,20 +378,10 @@ def phase_postgres_coverage(
     ssh_public_key: str,
     admin_token_hex: str,
 ) -> None:
-    """Drive a server backed by the Postgres `MetadataStore` so
-    `bale-server-meta-postgres` shows up in the report. The whole suite runs on
-    Postgres via `run.py --meta postgres`, but that's mutually exclusive with
-    `--coverage`; this is the metadata-store analogue of the s3-basic/s3-dedup
-    phases — one focused push + re-push + cold clone + usage query against an
-    instrumented server with `BALE_POSTGRES_URL` set, covering register_files
-    (insert + content-addressed dedup), the reconstruction lookup, and the
-    usage aggregation SQL.
-
-    The blob store stays fs (the container's local data dir) — only the
-    metadata path is swapped to Postgres. The sidecar is brought up on its own
-    podman network and the server is attached to it so it reaches Postgres via
-    the host bridge route (same trick as the s3/MinIO and --meta postgres
-    plumbing in pgbackend.py)."""
+    """Postgres `MetadataStore` coverage (`--meta postgres` is mutually exclusive
+    with `--coverage`): push, dedup re-push, cold clone and usage query, with
+    the blob store left on fs. Postgres runs on its own podman network shared
+    with the server."""
     phase_root = work_root / "postgres"
     phase_root.mkdir()
     data_root = phase_root / "data"
@@ -473,7 +421,6 @@ def phase_postgres_coverage(
             name="postgres-client",
         )
 
-        # v1 → push: exercises register_files INSERT + blob registration.
         payload_v1 = deterministic_payload(SMALL_FILE_BYTES, seed=b"pg-cov-v1")
         sha_v1 = sha256_bytes(payload_v1)
         (repo / "f.bin").write_bytes(payload_v1)
@@ -490,8 +437,7 @@ def phase_postgres_coverage(
             git(["commit", "-m", "postgres v1"], cwd=repo, env=env)
             git(["push", "-u", "origin", "main"], cwd=repo, env=env)
 
-        # v2 (8-byte poke) → re-push: a distinct file_hash that shares chunks,
-        # so register_files takes the content-addressed dedup path.
+        # A new file hash sharing chunks takes register_files' dedup path.
         payload_v2 = (
             payload_v1[:1024] + b"\xde\xad\xbe\xef\x01\x02\x03\x04" + payload_v1[1032:]
         )
@@ -504,8 +450,6 @@ def phase_postgres_coverage(
             git(["commit", "-m", "postgres v2"], cwd=repo, env=env)
             git(["push", "origin", "main"], cwd=repo, env=env)
 
-        # Cold clone HEAD: the smudge hits /v1/reconstructions/ → the Postgres
-        # reconstruction lookup must reassemble v2's bytes.
         with timings.measure(
             "postgres: cold clone + checkout", bytes_moved=SMALL_FILE_BYTES
         ):
@@ -526,7 +470,6 @@ def phase_postgres_coverage(
             label="postgres:after-clone",
         )
 
-        # /v1/usage/repo: exercises the Postgres usage-aggregation SQL.
         admin_jwt = mint_bale_jwt(
             secret=bytes.fromhex(jwt_secret),
             sub=E2E_USER,

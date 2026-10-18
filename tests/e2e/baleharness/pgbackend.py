@@ -1,23 +1,10 @@
-"""Postgres metadata-backend plumbing for the e2e harness.
+"""Postgres metadata backend for `run.py --meta postgres` (analogue of `s3backend.py`).
 
-The metadata-store analogue of `s3backend.py`. `run.py --meta postgres` brings
-up a single Postgres sidecar on the per-run podman network and sets a
-process-global `ActivePostgresBackend`; every `start_container` call — the
-shared server and each phase's private one — then injects `BALE_POSTGRES_URL`
-(pointed at a per-`data_root` database) and the shared-network arg, so the whole
-fs/s3 phase registry runs with Postgres as the `MetadataStore` instead of the
-default SQLite.
-
-Per-`data_root` database isolation is the metadata-store analogue of the S3
-backend's per-`data_root` bucket prefix and the fs suite's per-phase
-`data_root/meta.db`: distinct across phases so they don't cross-contaminate
-accounting, and *stable* per `data_root` so a restart on the same dir
-(failure-kill, offline-restart) lands on the same database and its metadata
-persists.
-
-Importable without `run`/`s3lib`, so `server.py` and the failure phase can use
-it without a cycle. Reuses `Network` from `s3backend` so `--backend s3 --meta
-postgres` shares one network.
+One sidecar per run; every `start_container` injects `BALE_POSTGRES_URL` for a
+per-`data_root` database: distinct so phases don't cross-contaminate accounting,
+stable so a restart on the same dir (failure-kill, offline-restart) keeps its
+metadata. Importable without `run`/`s3lib` to avoid an import cycle with
+`server.py` and the failure phase.
 """
 
 from __future__ import annotations
@@ -33,34 +20,20 @@ from pathlib import Path
 from baleharness.logutil import TestFailure, info
 from baleharness.proc import host_primary_ip, pick_free_port
 from baleharness.runtime import Runtime
-from baleharness.s3backend import Network  # shared per-run podman network
-
-# =============================================================================
-# Constants
-# =============================================================================
+from baleharness.s3backend import Network  # shared with `--backend s3`
 
 PG_IMAGE = "docker.io/library/postgres:16-alpine"
 PG_USER = "bale"
 PG_PASSWORD = "bale-e2e-pw"
 PG_INTERNAL_PORT = 5432
-# Generous: covers a cold image pull on a fresh runner.
+# Covers a cold image pull on a fresh runner.
 PG_READY_TIMEOUT_S = 180
 
 
-# =============================================================================
-# Postgres sidecar
-# =============================================================================
-
-
 class PostgresGuard:
-    """Single Postgres container + per-database provisioning helpers.
-
-    Mirrors `MinioGuard`: publish on `0.0.0.0:<host_port>:5432` and connect via
-    the host's primary IP, so the server (in its container) reaches Postgres
-    through the bridge → host route — the same trick MinIO uses to side-step
-    flaky container-to-container DNS on macOS rootless podman. The harness
-    itself provisions databases over the in-container unix socket via
-    `podman exec psql`, never the published port.
+    """Like `MinioGuard`, the server connects via the host's primary IP and a
+    published port to dodge flaky container-to-container DNS on macOS rootless
+    podman; the harness provisions over `podman exec psql` instead.
     """
 
     def __init__(
@@ -101,7 +74,6 @@ class PostgresGuard:
                 f"POSTGRES_USER={PG_USER}",
                 "-e",
                 f"POSTGRES_PASSWORD={PG_PASSWORD}",
-                # Default maintenance DB; per-phase databases are created on top.
                 "-e",
                 "POSTGRES_DB=postgres",
                 PG_IMAGE,
@@ -153,14 +125,7 @@ class PostgresGuard:
         )
 
     def ensure_database(self, name: str) -> None:
-        """Idempotently create database `name` (no-op if it already exists).
-
-        `CREATE DATABASE` can't run inside a transaction and errors if the DB
-        exists, so guard it with a `pg_database` existence check. `name` is a
-        sanitized identifier (`[a-z0-9_]`), but quote it anyway for safety.
-        Stable per `data_root`, so a restart re-uses the same database and its
-        metadata survives.
-        """
+        """Idempotent; `CREATE DATABASE` has no IF NOT EXISTS, so check first."""
         exists = subprocess.run(
             self.rt.cmd(
                 "exec",
@@ -195,7 +160,7 @@ class PostgresGuard:
         )
         if created.returncode != 0:
             stderr = created.stderr.decode("utf-8", "replace")
-            # A concurrent creator winning the race is benign (the DB now exists).
+            # Losing a creation race is benign.
             if "already exists" not in stderr:
                 raise TestFailure(f"create database {name!r} failed: {stderr}")
 
@@ -212,19 +177,10 @@ class PostgresGuard:
         )
 
 
-# =============================================================================
-# data_root -> database-name derivation
-# =============================================================================
-
-
 def db_for_data_root(data_root: Path, anchor: Path) -> str:
-    """Stable, distinct, valid Postgres database name for a server's `data_root`.
-
-    `anchor` is the run's tmpdir (an ancestor of every server's data_root), so
-    the relative path is unique per server and identical across a restart on the
-    same dir. A short hash of that key guarantees a valid, length-bounded
-    identifier; a readable slug from the basename is prepended for debuggability.
-    """
+    """Database name keyed on `data_root` relative to the run tmpdir `anchor`:
+    unique per server, identical across a restart; hashed to stay a valid,
+    length-bounded identifier."""
     try:
         key = str(data_root.resolve().relative_to(anchor.resolve()))
     except ValueError:
@@ -234,17 +190,10 @@ def db_for_data_root(data_root: Path, anchor: Path) -> str:
     return f"bale_{slug or 'root'}_{digest}"
 
 
-# =============================================================================
-# Active Postgres backend (process-global; mirrors ActiveS3Backend)
-# =============================================================================
-
-
 @dataclass
 class ActivePostgresBackend:
-    """The Postgres metadata backend in force for the whole run, set by
-    `run.py --meta postgres`. Held process-global so `start_container` picks it
-    up for every container. `prefix_anchor` is the run's tmpdir; each server's
-    database name is derived relative to it."""
+    """Process-global so `start_container` applies it to every container.
+    `prefix_anchor` is the run's tmpdir (see `db_for_data_root`)."""
 
     guard: PostgresGuard
     network: Network

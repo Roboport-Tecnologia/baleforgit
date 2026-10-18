@@ -1,10 +1,8 @@
 //! Per-repo cache of reconstruction *terms* under
 //! `<git-dir>/bale/manifests/<file_id_hex>.json`.
 //!
-//! Stores only `terms` (xorb hash + chunk range), not the full reconstruction
-//! response: the `fetch_info` URLs have a 10-minute TTL (`SIGNATURE_TTL_SECS`)
-//! and aren't safe to persist, but the terms are content-addressed by `file_id`
-//! and immutable. Misses fall back to the server for fresh URLs.
+//! Only `terms` are stored: they're immutable per `file_id`, while the
+//! `fetch_info` URLs expire after the server's `SIGNATURE_TTL_SECS` (10 min).
 
 use std::fs;
 use std::io::{self, Write};
@@ -37,8 +35,8 @@ pub fn manifest_path(git_dir: &Path, file_id_hex: &str) -> PathBuf {
     manifest_dir(git_dir).join(format!("{file_id_hex}.json"))
 }
 
-/// `Ok(None)` covers missing, malformed, *and* unknown-version manifests —
-/// the caller treats them all as cold-path-and-overwrite.
+/// `Ok(None)` for missing, malformed, or unknown-version manifests: all mean
+/// cold path and overwrite.
 pub fn load(git_dir: &Path, file_id_hex: &str) -> io::Result<Option<CachedManifest>> {
     let path = manifest_path(git_dir, file_id_hex);
     let bytes = match fs::read(&path) {
@@ -56,8 +54,7 @@ pub fn load(git_dir: &Path, file_id_hex: &str) -> io::Result<Option<CachedManife
     Ok(Some(manifest))
 }
 
-/// Atomic temp + rename. Hand-rolled `<final>.tmp.<pid>` keeps the temp in the
-/// target dir, required for `rename` to be atomic on the same fs.
+/// Temp lives in the target dir so the rename is atomic (same fs).
 pub fn save(git_dir: &Path, file_id_hex: &str, manifest: &CachedManifest) -> io::Result<()> {
     crate::fs_util::create_bale_subdir(git_dir, "manifests")?;
     let dir = manifest_dir(git_dir);
@@ -76,8 +73,8 @@ pub fn save(git_dir: &Path, file_id_hex: &str, manifest: &CachedManifest) -> io:
     crate::fs_util::fsync_dir(&dir)
 }
 
-/// Drop a manifest whose reconstruction failed verification so the next
-/// smudge goes back to the server for fresh terms.
+/// For a manifest whose reconstruction failed verification: the next smudge
+/// refetches terms from the server.
 pub fn remove(git_dir: &Path, file_id_hex: &str) -> io::Result<()> {
     match fs::remove_file(manifest_path(git_dir, file_id_hex)) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),

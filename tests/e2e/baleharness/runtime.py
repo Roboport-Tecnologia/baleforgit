@@ -20,10 +20,8 @@ class Runtime:
 
 
 def host_mount_path(p: Path) -> str:
-    """Host side of a `-v host:container` bind mount. On Windows, podman/docker
-    want forward-slash paths — a backslash `WindowsPath` would make the `-v`
-    parser split on the wrong colon (the drive-letter `C:` vs the `:` separator).
-    The drive letter is preserved (`C:/Users/...`), which both runtimes accept."""
+    # Windows: podman/docker's `-v` parser needs `C:/Users/...`; a backslash path
+    # gets split on the wrong colon.
     return p.as_posix() if os.name == "nt" else str(p)
 
 

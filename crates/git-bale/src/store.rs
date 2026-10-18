@@ -311,12 +311,12 @@ pub fn lock_path(store: &Path) -> PathBuf {
 }
 
 /// Exclusive advisory lock serializing mutations to one store (clean writes,
-/// gc sweeps, prune swaps, push-pending drains). Held only
-/// around local filesystem work. The OS releases the lock when the process
-/// dies, so a crash never leaves a stale lock. Reads (smudge) do not lock.
-/// `try_exclusive` is for best-effort contexts (post-commit gc hooks) where
-/// blocking would deadlock against the filter that holds the lock. flock is
-/// per open file description: never take it twice in one process.
+/// gc sweeps, prune swaps, push-pending drains), held only around local
+/// filesystem work. The OS drops it when the process dies, so a crash never
+/// leaves a stale lock. Reads (smudge) don't lock. `try_exclusive` is for
+/// best-effort callers (gc hooks, smudge's clean-cache seed) that must never
+/// block behind a held lock. flock is per open file description: never take
+/// it twice in one process.
 pub struct StoreLock {
     // Holding the File keeps the flock; dropping it (closing the fd) releases.
     _file: std::fs::File,
@@ -346,8 +346,7 @@ impl StoreLock {
         Ok(Self { _file: file })
     }
 
-    /// `None` if another holder has the lock; errors only on open/syscall
-    /// failure.
+    /// `None` if another holder has the lock.
     pub fn try_exclusive(store: &Path) -> Result<Option<Self>> {
         let (file, path) = Self::open(store)?;
         match <std::fs::File as FileExt>::try_lock_exclusive(&file) {
@@ -411,8 +410,7 @@ impl ObjectSnapshot {
                     }
                 }
             }
-            // Also covers entries of older, re-verified xorbs that were never
-            // synced.
+            // Also persists dir entries of older, re-verified xorbs never synced.
             if dir.is_dir() {
                 crate::fs_util::fsync_dir(&dir)
                     .with_context(|| format!("fsync {}", dir.display()))?;
@@ -475,10 +473,9 @@ const SELF_OWNER: &str = "@containing-git-dir";
 
 /// A non-shared local store belongs to exactly one repo: gc sweeps it once
 /// that repo's markers are gone, which would destroy any other repo's content
-/// in it. `init-local` (or the first clean) records the owner in
-/// `.bale-owner`, which is authoritative — even for a store inside a repo's
-/// git dir, since another repo can be pointed at that path with `--store`.
-/// Caller holds the store lock.
+/// in it. `init-local` (or the first clean) records the owner in `.bale-owner`, which is
+/// authoritative — even for a store inside a repo's git dir, since another
+/// repo can be pointed at that path with `--store`. Caller holds the store lock.
 pub fn claim_store(store: &Path, common: &Path, _held: &StoreLock) -> Result<()> {
     ensure_store_not_mid_swap(store)?;
     let others: Vec<PathBuf> = registered_repos(store)?

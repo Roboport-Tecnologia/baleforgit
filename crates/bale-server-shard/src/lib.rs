@@ -25,10 +25,9 @@ pub const MDB_SHARD_FOOTER_VERSION: u64 = 1;
 const FLAG_WITH_VERIFICATION: u32 = 1 << 31; // 0x8000_0000
 const FLAG_WITH_METADATA_EXT: u32 = 1 << 30; // 0x4000_0000
 
-/// Canonical 32-byte shard magic, verbatim from xet-core's
-/// `mdb_shard::shard_format::MDB_SHARD_HEADER_TAG` (git-xet-v0.2.1). Parse only
-/// checks length so older shards round-trip; serialize emits this so xet-core's
-/// strict check accepts ours.
+/// Shard magic, verbatim from xet-core's `metadata_shard::shard_format::MDB_SHARD_HEADER_TAG`.
+/// Parse only checks length so older shards round-trip; serialize emits this so
+/// xet-core's strict check accepts ours.
 pub const MDB_SHARD_HEADER_TAG: [u8; HASH_LEN] = [
     b'H', b'F', b'R', b'e', b'p', b'o', b'M', b'e', b't', b'a', b'D', b'a', b't', b'a', 0, 85, 105,
     103, 69, 106, 123, 129, 87, 131, 165, 189, 217, 92, 205, 209, 74, 169,
@@ -418,13 +417,11 @@ pub fn serialize(s: &ParsedShard) -> Vec<u8> {
         out.extend_from_slice(&ft.version.to_le_bytes());
         out.extend_from_slice(&file_info_offset.to_le_bytes());
         out.extend_from_slice(&cas_info_offset.to_le_bytes());
-        // file/xorb/chunk lookup tables are omitted (counts = 0), but each
-        // offset must still point at the section end, not 0: xet's
+        // Lookup tables are omitted (counts = 0) but each offset must still be
+        // the section end, as xet's own serializer writes it: xet's
         // read_all_truncated_hashes takes file_lookup_offset as the *end* of the
-        // xorb-info range, so a zero here makes (end - xorb_info_offset)
-        // underflow — debug panic, release OOM — when the client ingests the
-        // dedup shard. Mirror xet's own serializer, which sets the offset even
-        // when the table is absent.
+        // xorb-info range, so 0 underflows (debug panic, release OOM) when the
+        // client ingests the dedup shard.
         for offset_or_count in [footer_offset, 0, footer_offset, 0, footer_offset, 0] {
             out.extend_from_slice(&offset_or_count.to_le_bytes());
         }

@@ -13,11 +13,8 @@
 #   KEEP=1             keep the tempdir for poking around
 #   BUILD=0            skip cargo build (use stale binary)
 #
-# Profiling tips after a run:
-#   cd $WORK && samply record git diff --quiet
-#   cargo flamegraph --release --bin git-bale -- filter-process < fixture
-# The clean filter speaks git's pkt-line protocol on stdin, so the easiest
-# end-to-end profile target is `git diff` itself with samply.
+# The filter speaks pkt-line on stdin, so profile `git diff` itself, not
+# git-bale directly: KEEP=1, then `cd <workdir> && samply record git diff --quiet`.
 
 set -euo pipefail
 
@@ -61,7 +58,7 @@ git add .gitattributes
 git commit -q -m "enable bale filter"
 
 echo ">> writing $SIZE_MIB MiB random payload to big.bin"
-# bs=1048576 works on both macOS and Linux (macOS dd uses 1m, Linux uses 1M).
+# Numeric bs: BSD dd wants `1m`, GNU dd `1M`.
 dd if=/dev/urandom of=big.bin bs=1048576 count="$SIZE_MIB" status=none
 
 echo
@@ -96,8 +93,7 @@ done
 
 echo
 echo "=== control: git diff with NO modification (clean-cache hit, expected fast) ==="
-# Truncate the appended bytes off so size matches the cache entry; clean-cache
-# should now verify by chunks and short-circuit before the xet-data pipeline.
+# Restore the committed size so the clean-cache verifies by chunks and skips CDC.
 truncate -s "$((SIZE_MIB * 1048576))" big.bin
 /usr/bin/time -p git diff --quiet || true
 /usr/bin/time -p git diff --quiet || true

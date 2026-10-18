@@ -1,7 +1,6 @@
-//! Git pkt-line framing. See `Documentation/gitprotocol-common.txt`:
-//! 4-byte hex length prefix (including header), then payload; `0000` =
-//! flush, `0001` = delim, `0002` = response-end. Max packet = 65520, so
-//! max payload = 65516.
+//! Git pkt-line framing (`Documentation/gitprotocol-common.txt`): 4-hex-digit
+//! length including the header; `0000` flush, `0001` delim, `0002` response-end;
+//! max packet 65520, so max payload 65516.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 
@@ -96,8 +95,7 @@ impl<R: Read> PktReader<R> {
         }
     }
 
-    /// Binary data packets until flush, copied into `out`. Errors if the total
-    /// exceeds `max_total_bytes` (guards against unbounded heap growth).
+    /// Data packets until flush, copied into `out`; errors past `max_total_bytes`.
     pub fn read_binary_to<W: Write>(
         &mut self,
         out: &mut W,
@@ -158,14 +156,13 @@ impl<W: Write> PktWriter<W> {
     }
 
     pub fn flush_packet(&mut self) -> io::Result<()> {
-        // "0000" has no trailing newline, so a LineWriter-backed stdout would
-        // hold it in the buffer indefinitely. Explicit flush every time.
+        // "0000" has no newline, so a LineWriter-backed stdout would hold it forever.
         self.inner.write_all(b"0000")?;
         self.inner.flush()
     }
 
     pub fn write_text(&mut self, line: &str) -> io::Result<()> {
-        // Append \n so payloads round-trip through newline-aware peers (as git-lfs does).
+        // Trailing \n like git-lfs, for newline-aware peers.
         let bytes = line.as_bytes();
         if bytes.len() + 1 > MAX_PKT_PAYLOAD {
             return Err(io::Error::new(
@@ -186,7 +183,7 @@ impl<W: Write> PktWriter<W> {
         self.flush_packet()
     }
 
-    /// Binary blob as data packets; no trailing flush — call [`flush_packet`] when done.
+    /// No trailing flush — call [`Self::flush_packet`] when done.
     pub fn write_binary(&mut self, mut data: &[u8]) -> io::Result<()> {
         while !data.is_empty() {
             let n = data.len().min(MAX_PKT_PAYLOAD);

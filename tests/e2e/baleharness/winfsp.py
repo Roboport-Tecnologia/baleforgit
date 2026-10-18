@@ -1,8 +1,6 @@
-"""Windows-only: make sure WinFsp is installed so git-bale's WinFsp mount
-backend can run. WinFsp ships the FUSE-compat `winfsp-x64.dll` plus a kernel
-driver; if the DLL isn't loadable we download the official MSI and install it
-(`msiexec /qn`, which needs admin). Imported lazily by `mount.py` — never on
-non-Windows hosts."""
+"""Windows-only WinFsp provisioning for the mount phase: if the FUSE-compat DLL
+isn't loadable, install the official MSI (`msiexec /qn`, needs admin). Imported
+lazily by `mount.py`, never on non-Windows hosts."""
 
 from __future__ import annotations
 
@@ -19,13 +17,11 @@ from baleharness.logutil import info, warn
 
 
 class WinfspUnavailable(Exception):
-    """WinFsp isn't installed and couldn't be provisioned (no admin, no
-    network, etc.). The mount phase turns this into a skip, not a failure."""
+    """Raised when WinFsp can't be provisioned; the mount phase skips, not fails."""
 
 
 _RELEASES_API = "https://api.github.com/repos/winfsp/winfsp/releases/latest"
-# Last-resort direct MSI if the releases API is unreachable. Best-effort: the
-# API lookup above is the canonical source and yields the current URL.
+# Used only when the releases API is unreachable; may lag the latest release.
 _FALLBACK_MSI = (
     "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
 )
@@ -41,9 +37,8 @@ def _dll_name() -> str:
 
 
 def _dll_loads() -> bool:
-    """True if the WinFsp user-mode FUSE DLL can be loaded — by bare name (it's
-    on PATH or in the app dir) or from the default `%ProgramFiles*%\\WinFsp\\bin`
-    install location. The kernel driver is exercised only when a mount runs."""
+    # Bare name covers PATH; also probe the default `WinFsp\bin` install dirs.
+    # Only the DLL is checked; the kernel driver is exercised by the mount itself.
     name = _dll_name()
     candidates = [name]
     for var in ("ProgramFiles(x86)", "ProgramW6432", "ProgramFiles"):
@@ -79,8 +74,6 @@ def _latest_msi_url() -> str:
 
 
 def ensure_winfsp() -> None:
-    """Ensure WinFsp is installed, downloading + installing the MSI if needed.
-    Raises WinfspUnavailable if it can't be provisioned (so the caller skips)."""
     if os.name != "nt":
         raise WinfspUnavailable("WinFsp is only available on Windows")
     if _dll_loads():

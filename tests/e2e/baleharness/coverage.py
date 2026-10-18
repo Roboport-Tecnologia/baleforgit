@@ -15,7 +15,6 @@ from baleharness.logutil import TestFailure, die, info, warn
 from baleharness.runtime import Runtime, build_image, image_exists
 
 if TYPE_CHECKING:
-    # Referenced only in the string annotations of run_s3_coverage_phases.
     from baleharness.client import ClientEnv
     from baleharness.timing import Timings
 
@@ -29,9 +28,8 @@ class CoverageConfig:
 
     @property
     def container_profile_template(self) -> str:
-        # %m is the binary hash; %p is the PID. Both required so the many
-        # short-lived `git-bale filter-process` PIDs and the long-lived
-        # server don't clobber each other.
+        # %m (binary hash) + %p (PID) so short-lived filter processes and the
+        # server don't clobber each other's profiles.
         return "/coverage/server-%m-%p.profraw"
 
     @property
@@ -40,9 +38,7 @@ class CoverageConfig:
 
 
 def _find_llvm_tool(name: str) -> Path | None:
-    # llvm-tools-preview ships its binaries under
-    # `<sysroot>/lib/rustlib/<host-triple>/bin/`, not under any path
-    # `rustup which` knows about. Resolve via rustc's --print queries.
+    # llvm-tools-preview installs under <sysroot>/lib/rustlib/<host>/bin, off PATH.
     try:
         sysroot = subprocess.run(
             ["rustc", "--print", "sysroot"],
@@ -74,16 +70,13 @@ def _find_llvm_tool(name: str) -> Path | None:
 
 
 def build_instrumented_git_bale() -> Path:
-    """Build `git-bale` with `-C instrument-coverage` into a dedicated
-    target dir so the prod release build isn't clobbered. Returns the
-    binary path."""
+    """Separate target dir so the release build the harness drives isn't clobbered."""
     target_dir = REPO_ROOT / "target" / "coverage-e2e" / "cargo"
     info("building instrumented git-bale (RUSTFLAGS=-C instrument-coverage)")
     env = os.environ.copy()
     env["RUSTFLAGS"] = "-C instrument-coverage"
-    # `--features coverage` enables an explicit __llvm_profile_write_file()
-    # call right after fuse_main_real returns, because libfuse-t kills the
-    # process by SIGPIPE on macOS unmount teardown before atexit can flush.
+    # `coverage` arms a SIGPIPE handler that flushes profiles: fuse-t SIGPIPEs the
+    # process inside fuse_main_real on unmount, so atexit never runs.
     r = subprocess.run(
         [
             "cargo",
@@ -113,9 +106,7 @@ def build_instrumented_git_bale() -> Path:
 
 
 def extract_server_bin(rt: Runtime, image_tag: str, dest: Path) -> Path:
-    """Copy /usr/local/bin/baleforgit-server out of the built image so
-    llvm-cov can read its coverage sections at report time. Built id
-    matches the binary the container ran, so .profraw files line up."""
+    """llvm-cov needs the exact server binary the container ran to map its .profraw."""
     info(f"extracting server binary from {image_tag} for llvm-cov")
     created = subprocess.run(
         rt.cmd("create", image_tag),
@@ -150,28 +141,20 @@ def setup_coverage(
     coverage_dir_arg: str | None,
     no_build: bool = False,
 ) -> CoverageConfig:
-    """Build instrumented binaries, build instrumented image, extract the
-    server binary, and prepare the host profile dir. The prod image_tag
-    is NOT touched — coverage uses its own tag. `no_build` skips both
-    the instrumented git-bale build and the image build, but only if
-    both artifacts already exist (otherwise we have nothing to run)."""
+    """Uses its own image tag, never the prod one. `no_build` requires both
+    instrumented artifacts to already exist."""
     if coverage_dir_arg:
         cov_root = Path(coverage_dir_arg).resolve()
     else:
         cov_root = REPO_ROOT / "target" / "coverage-e2e"
     cov_root.mkdir(parents=True, exist_ok=True)
     profile_dir = cov_root / "profiles"
-    # Wipe stale .profraw from previous runs — otherwise the merged
-    # profdata would conflate runs and llvm-cov would complain about
-    # mismatched build ids.
+    # Stale profraws would conflate runs and trip llvm-cov's build-id check.
     if profile_dir.exists():
         shutil.rmtree(profile_dir)
     profile_dir.mkdir(parents=True)
-    # World-writable so the container's `bale` user (uid 10001, mapped
-    # through rootless podman) can write profraws to the bind-mount.
-    # Bind-mounted into every container so the in-container `bale` user can
-    # write .profraw files. Windows ACLs differ and coverage mode isn't
-    # supported there, so guard the POSIX chmod.
+    # World-writable so the container's `bale` user (uid 10001 via rootless
+    # podman) can write to the bind-mount; coverage isn't supported on Windows.
     if os.name != "nt":
         os.chmod(profile_dir, 0o777)
     html_out = cov_root / "html"
@@ -193,7 +176,6 @@ def setup_coverage(
             die("--no-build with --coverage: coverage image not built yet")
         git_bale_bin = existing_git_bale.resolve()
         if not server_bin_host_path.is_file():
-            # Image is here, just need to re-extract the binary.
             extract_server_bin(rt, COVERAGE_IMAGE_TAG, server_bin_host_path)
         server_bin_host = server_bin_host_path
     else:
@@ -224,19 +206,12 @@ def run_s3_coverage_phases(
     skip: set,
     only: set = frozenset(),
 ) -> None:
-    """Run s3-basic + s3-dedup with the same instrumented image so
-    bale-server-storage-s3 shows up in the coverage report.
-
-    Imported lazily because `s3lib` imports from `run` — putting the
-    import at module top would deadlock the load order.
-
-    s3-failure-kill / s3-failure-conndrop are NOT run in coverage mode
-    for the same reason as the fs failure-* phases: SIGKILL prevents the
-    LLVM atexit hook from flushing .profraw."""
+    """s3-basic + s3-dedup on the instrumented image so bale-server-storage-s3
+    shows up in the report. `s3lib` is imported lazily: it imports `run`, and a
+    top-level import would be circular. The s3-failure-* phases are excluded:
+    their SIGKILL skips the atexit hook that flushes .profraw."""
     s3_phase_names = ("s3-basic", "s3-dedup")
-    # Bail before the MinIO sidecar even starts if --skip/--only leave no
-    # S3 phase to run — otherwise we'd pay for a network + container we
-    # never use.
+    # Don't pay for a network + MinIO sidecar when --skip/--only leave nothing.
     if not [
         n for n in s3_phase_names if n not in skip and not (only and n not in only)
     ]:
@@ -248,8 +223,6 @@ def run_s3_coverage_phases(
         phase_s3_basic,
         phase_s3_dedup,
     )
-    # All container-launching code shares one coverage-state global
-    # (baleharness.covstate), so no cross-module mirroring is needed.
 
     network: Network | None = None
     minio: MinioGuard | None = None
@@ -290,9 +263,7 @@ def run_s3_coverage_phases(
 
 
 def generate_coverage_report(cov: CoverageConfig) -> None:
-    """Merge profraws + render HTML. Best-effort: any failure here
-    warns but does NOT flip the test exit code, since we want phase
-    results to surface even if the llvm tooling is broken."""
+    """Best-effort: llvm tooling failures warn but never flip the exit code."""
     profraws = sorted(cov.profile_dir.glob("*.profraw"))
     if not profraws:
         warn(
@@ -338,11 +309,9 @@ def generate_coverage_report(cov: CoverageConfig) -> None:
             f"-instr-profile={profdata}",
             "-format=html",
             f"-output-dir={cov.html_out}",
-            # /src/* paths come from the Dockerfile build stage's WORKDIR.
-            # Remap to the host repo root so llvm-cov can find sources.
+            # The Dockerfile build stage's WORKDIR is /src.
             f"-path-equivalence=/src,{REPO_ROOT}",
             "-ignore-filename-regex=(/\\.cargo/|/rustc/|/registry/|/\\.rustup/)",
-            # First positional is the "main" binary; -object adds more.
             str(cov.git_bale_bin),
             "-object",
             str(cov.server_bin_host),

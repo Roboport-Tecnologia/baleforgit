@@ -2,19 +2,17 @@
 //! reachability, dropping markers (and, once none remain, objects) that
 //! nothing references.
 //!
-//! `git add` stages a bale file's xorbs/shards offline (see [`crate::staging`])
-//! plus a `<file_hex>` marker. Without gc, content `git add`ed then abandoned
-//! (`git reset`, `git checkout`) lingers forever. Wired into
-//! post-checkout/-commit/-merge hooks; safe to run by hand.
+//! Without gc, content `git add`ed then abandoned (`git reset`, `git checkout`)
+//! lingers in staging forever. Run by the post-checkout/-commit/-merge hooks;
+//! safe to run by hand.
 //!
 //! Liveness mirrors git's own gc: a staged file is live if any pointer to it is
 //! reachable from any ref (local OR remote-tracking), any reflog entry (incl.
 //! `stash@{n}`), any worktree's HEAD or index. Remote-tracking reachability is
 //! NOT proof of upload (`push --no-verify`, plain-git remotes); in server mode
-//! the only thing that releases committed staged content is push-pending's
-//! drain after a successful upload. Every error while computing liveness
-//! aborts gc and keeps everything — an unreadable ref must never read as
-//! "unreferenced".
+//! only push-pending's drain after a successful upload releases committed staged
+//! content. Any liveness error aborts gc and keeps everything: an unreadable ref
+//! must never read as "unreferenced".
 //!
 //! Xorbs are shared across files by xet-data's local dedup, so per-xorb deletion
 //! is unsafe: the object sweep runs only once no marker remains (and, in local
@@ -72,9 +70,8 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Shared local store: append-only. Other repos may reference these
-    // objects and markers are the only record of what's in the store;
-    // `git-bale prune --shared` reclaims.
+    // Shared local store is append-only: other repos may reference its objects
+    // and markers are the only record of what it holds; only `prune --shared` reclaims.
     if raw.local_mode && raw.local_shared {
         store::register_repo_locked(&store, &common, &lock)?;
         let _ = remove_empty_dirs(&staging);
@@ -103,11 +100,10 @@ pub fn reconcile(start_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Reclaim grace: a marker cleaned within the window is kept regardless —
-    // the backstop for the one gap `git_op_in_flight` can't see (a `git
-    // stash`'s lock-free commit-object write). Filtering BEFORE the scan keeps
-    // hooks cheap: young markers (every `git status` re-clean makes one) would
-    // otherwise force a full-history walk on every checkout/commit.
+    // Young markers are kept regardless: the backstop for the gap
+    // `git_op_in_flight` can't see (a `git stash`'s lock-free commit-object
+    // write). Filtering BEFORE the scan keeps hooks cheap, since every
+    // `git status` re-clean makes a young marker that would force a full walk.
     let grace = reclaim_grace();
     let now = SystemTime::now();
     let candidates: BTreeSet<String> = staged
@@ -374,8 +370,6 @@ impl Scan<'_, '_> {
         self.diff(&empty, &tree)
     }
 
-    /// Record Added/Modified blobs between the trees that parse as a wanted
-    /// pointer.
     fn diff(&mut self, from: &gix::Tree<'_>, to: &gix::Tree<'_>) -> Result<()> {
         let mut platform = from.changes().context("preparing tree diff")?;
         // No rename tracking (O(N²)): a moved pointer still surfaces as an
@@ -533,8 +527,8 @@ fn tip_ids(repo: &gix::Repository, common: &Path) -> Result<Vec<ObjectId>> {
         for name in PSEUDO_REFS {
             ids.extend(read_ref_file(&dir.join(name))?);
         }
-        // A stopped `rebase --autostash` / `merge --autostash` holds the
-        // user's uncommitted changes ONLY here, in no ref or reflog.
+        // Stopped rebase/merge/sequencer state can name commits no ref or reflog
+        // does, e.g. an autostash of the user's uncommitted changes.
         for name in OP_STATE_REFS {
             ids.extend(read_ref_file(&dir.join(name))?);
         }
@@ -633,17 +627,15 @@ fn walk_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// True if any git operation that could be cleaning bale content and recording
-/// it (in an index or a ref) is in flight in ANY worktree, detected by its
-/// `*.lock` file. gc reads liveness from indexes + refs, both of which lag the
-/// clean filter, so it must defer or it may sweep an in-flight file's only copy.
+/// True if a git op that may be cleaning bale content is in flight in ANY
+/// worktree, detected by its `*.lock`. Indexes and refs lag the clean filter, so
+/// gc must defer or it may sweep an in-flight file's only copy.
 ///
-/// Covers `git add`/`commit` (`index.lock`), `git stash` (a temporary
-/// `index.<temp>.lock` during the clean, then `refs/stash.lock` — stash does NOT
-/// use the main `index.lock`), and ref updates generally. The lock-free
-/// residual (a stash's commit-object write) is covered by the reclaim grace.
-/// A stopped rebase/am/sequencer/autostash merge also counts. An unreadable
-/// dir counts as "in flight" (skip, never guess).
+/// `git stash` cleans under a temporary `index.<temp>.lock` then takes
+/// `refs/stash.lock`, never the main `index.lock`, hence the any-`*.lock` scan.
+/// Its lock-free commit-object write is covered by the reclaim grace instead.
+/// A stopped rebase/am/sequencer/autostash merge also counts, and an unreadable
+/// dir counts as in flight (skip, never guess).
 pub fn git_op_in_flight(common: &Path) -> Result<bool> {
     if let Some(idx) = std::env::var_os("GIT_INDEX_FILE") {
         let mut lock = idx;
@@ -688,12 +680,10 @@ fn dir_has_lock(dir: &Path, recurse: bool) -> bool {
     false
 }
 
-/// Grace before an unreferenced marker may be reclaimed. `BALE_GC_GRACE_SECS`
-/// overrides. Default matches git's `gc.pruneExpire` (2 weeks), with the same
-/// clock: git prunes an unreachable loose object once its mtime (written or
-/// last freshened) is older than that, not counting from when it became
-/// unreachable; ours counts from the marker's mtime (last clean). So content
-/// is reclaimable no earlier than git would drop a dangling commit naming it.
+/// Grace before an unreferenced marker may be reclaimed (`BALE_GC_GRACE_SECS`).
+/// Default matches git's `gc.pruneExpire` (2 weeks) on the same clock: git counts
+/// from a loose object's mtime, we from the marker's (last clean), so content is
+/// reclaimable no earlier than git would drop a dangling commit naming it.
 pub fn reclaim_grace() -> Duration {
     let secs = std::env::var("BALE_GC_GRACE_SECS")
         .ok()

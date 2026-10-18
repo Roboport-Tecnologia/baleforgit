@@ -4,12 +4,12 @@
 //!
 //! 1. Parse the remote (`origin` unless overridden) → HTTPS or SSH URL.
 //! 2. Obtain a forge-minted JWT + baleforgit-server URL:
-//!    - HTTPS: `git credential fill`, then POST
-//!      `.../info/bale/authenticate?op=<op>` with Basic auth; the forge verifies
-//!      locally and returns `{href, header.Authorization=Bearer <jwt>}`.
+//!    - HTTPS: POST `.../info/bale/authenticate?op=<op>` (read tries anonymous
+//!      first, else Basic auth from `git credential fill`); the forge returns
+//!      `{href, header.Authorization=Bearer <jwt>}`.
 //!    - SSH: `ssh git@host git-bale-authenticate <repo> <op>` returns the same.
-//! 3. Token exchange: `GET .../bale-{rw}-token/<rev>` with the forge JWT →
-//!    final bale token.
+//! 3. Token exchange: `GET .../api/models/<owner>/<repo>/bale-{read,write}-token/<rev>`
+//!    with the forge JWT → final bale token.
 
 use std::io::Write;
 use std::path::Path;
@@ -51,11 +51,9 @@ pub async fn resolve(raw: &RawConfig, scope: Scope) -> Result<ResolvedAuth> {
     resolve_for_remote(raw, scope, None).await
 }
 
-/// Like [`resolve`], but auth is minted against `remote_override` instead of
-/// `origin`. The pre-push hook passes the remote git is actually pushing to so
-/// the token (and thus the server-side repo scope of any upload) matches the
-/// push target — not whichever repo `origin` happens to name. `None` falls back
-/// to `origin` (manual invocation, smudge, gc).
+/// Like [`resolve`], but minted against `remote_override` (`None` = `origin`).
+/// The pre-push hook passes the actual push target so the token, and thus the
+/// server-side repo scope of any upload, matches it rather than `origin`.
 pub async fn resolve_for_remote(
     raw: &RawConfig,
     scope: Scope,
@@ -129,9 +127,8 @@ pub async fn resolve_for_remote(
     Ok(resolved)
 }
 
-/// Refuse a cleartext `http://` endpoint for a remote reached over https/ssh:
-/// the forge JWT and bale token would cross the network unencrypted. Loopback
-/// is exempt (local dev, test harness).
+/// Refuses cleartext `http://` for a remote reached over https/ssh: the forge JWT
+/// and bale token would cross the network unencrypted. Loopback is exempt.
 fn require_tls(remote: &RemoteUrl, url: &str, what: &str) -> Result<()> {
     if remote.scheme == RemoteScheme::Http {
         return Ok(());
@@ -164,28 +161,22 @@ fn require_tls(remote: &RemoteUrl, url: &str, what: &str) -> Result<()> {
     ))
 }
 
-/// Mirrors xet's private `REFRESH_BUFFER_SEC`: xet treats a token as expired
-/// once it lapses within this window, so a freshly minted token whose `exp` is
-/// already inside it would be re-refreshed immediately.
+/// Mirrors xet's private `REFRESH_BUFFER_SEC`: a fresh token whose `exp` is
+/// already inside this window is treated as expired and refreshed immediately.
 const REFRESH_BUFFER_SEC: u64 = 30;
 
-/// Stop after this many consecutive re-mints that come back already-expired.
-/// That only happens when client and server clocks differ by more than the
-/// token TTL — a fresh token won't help, so we surface the skew rather than
-/// storm the forge re-minting doomed tokens forever.
+/// Consecutive already-expired re-mints mean client/server clock skew exceeds
+/// the token TTL; surface it instead of storming the forge with doomed re-mints.
 const MAX_EXPIRED_REFRESHES: u32 = 3;
 
-/// A [`TokenRefresher`] that re-runs [`resolve`] through the forge to mint a
-/// fresh bale token. Wired into every CAS client so xet swaps in a new token
-/// ~30s before the short-lived current one lapses (`is_expired`), instead of
-/// hard-failing — and so a single operation can outlive one token's TTL.
+/// Re-mints through the forge so xet swaps in a new token ~30s before the
+/// short-lived one lapses; lets a single operation outlive one token's TTL.
 pub fn forge_refresher(raw: &RawConfig, scope: Scope) -> Arc<dyn TokenRefresher> {
     forge_refresher_for_remote(raw, scope, None)
 }
 
-/// [`forge_refresher`] bound to a specific remote (see [`resolve_for_remote`]),
-/// so a token re-mint during a push to a non-`origin` remote stays scoped to
-/// that remote's repo.
+/// [`forge_refresher`] bound to a remote, so re-mints during a push to a
+/// non-`origin` remote stay scoped to that remote's repo.
 pub fn forge_refresher_for_remote(
     raw: &RawConfig,
     scope: Scope,
@@ -209,9 +200,8 @@ struct ForgeTokenRefresher {
 #[async_trait::async_trait]
 impl TokenRefresher for ForgeTokenRefresher {
     async fn refresh(&self) -> std::result::Result<TokenInfo, AuthError> {
-        // Floor of 1s between re-mints. xet serializes refresh() (it's `&mut
-        // self` on the TokenProvider), so this throttles a near-expiry or
-        // skew-driven retry from hammering the forge before the cap below trips.
+        // xet serializes refresh() (`&mut self` on TokenProvider), so this 1s
+        // floor throttles skew-driven retries before the cap below trips.
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let resolved = resolve_for_remote(&self.raw, self.scope, self.remote.clone())
             .await
@@ -240,11 +230,9 @@ struct AuthenticateHTTPResponse {
     header: std::collections::HashMap<String, String>,
 }
 
-/// A `download` resolve (clone/smudge) of a public repo must not prompt for
-/// credentials. So for read scope we probe the forge anonymously first; only if
-/// the forge refuses anonymous access (401/403 — private repo, or anonymous read
-/// disabled) do we fall back to `git credential fill` + Basic auth. Upload scope
-/// always authenticates: anonymous writes are never granted.
+/// Read scope probes anonymously first so cloning a public repo never prompts
+/// for credentials; only a 401/403 falls back to `git credential fill`. Upload
+/// scope always authenticates: anonymous writes are never granted.
 async fn authenticate_http_with_fallback(
     remote: &RemoteUrl,
     owner: &str,
@@ -255,7 +243,7 @@ async fn authenticate_http_with_fallback(
     if scope == Scope::Read {
         match authenticate_http(remote, owner, repo, scope, None).await {
             Ok(outcome) => return Ok(outcome),
-            Err(AuthHttpError::NeedsAuth) => {} // private repo — retry with creds
+            Err(AuthHttpError::NeedsAuth) => {}
             Err(AuthHttpError::Other(e)) => return Err(e),
         }
     }
@@ -274,8 +262,7 @@ async fn authenticate_http_with_fallback(
 }
 
 enum AuthHttpError {
-    /// 401/403 from the forge — credentials are required (private repo, or the
-    /// forge doesn't grant anonymous read).
+    /// 401/403: private repo, or the forge doesn't grant anonymous read.
     NeedsAuth,
     Other(anyhow::Error),
 }
@@ -291,9 +278,7 @@ impl AuthHttpError {
     }
 }
 
-/// POST `.../info/bale/authenticate?op=...` → forge JWT + baleforgit-server URL.
-/// `creds = None` sends no `Authorization` header (the anonymous probe for
-/// public repos). See `docs/BALE_FORGE_PROTOCOL.md`.
+/// `creds = None` is the anonymous probe: no `Authorization` header at all.
 async fn authenticate_http(
     remote: &RemoteUrl,
     owner: &str,
@@ -380,9 +365,8 @@ async fn ssh_authenticate(
     let host = remote.host.as_str();
     let user = remote.user.as_deref().unwrap_or("git");
     crate::remote::validate_ssh_target(user, host)?;
-    // ssh first-occurrence-wins per keyword, so a user's GIT_SSH_COMMAND /
-    // core.sshCommand can override either of these; they're the safe default
-    // when it doesn't (no interactive prompt, accept an unknown host once).
+    // ssh is first-occurrence-wins per keyword, so a user's GIT_SSH_COMMAND /
+    // core.sshCommand options override these safe defaults.
     let mut args: Vec<String> = vec![
         "-o".into(),
         "BatchMode=yes".into(),
@@ -393,17 +377,15 @@ async fn ssh_authenticate(
         args.push("-p".into());
         args.push(port.to_string());
     }
-    // `--` ends option parsing (OpenSSH getopt), so even a destination that
-    // slipped past validation can't be read as `-oProxyCommand=…`. With a
-    // configured GIT_SSH_COMMAND these args are appended after the user's own
-    // options, so `--` still precedes only the destination and command.
+    // `--` ends option parsing, so even a destination that slipped past
+    // validation can't be read as `-oProxyCommand=…` (also after a user's
+    // GIT_SSH_COMMAND options, since these args are appended).
     args.push("--".into());
     args.push(format!("{user}@{host}"));
     args.push(format!("git-bale-authenticate {owner}/{repo} {op}"));
 
     let ssh_command = ssh_command.map(str::to_owned);
     let args_clone = args.clone();
-    // Run blocking, off the async executor.
     let out = tokio::task::spawn_blocking(move || {
         ssh_subprocess(ssh_command.as_deref(), &args_clone)
             .stderr(Stdio::piped())
@@ -440,12 +422,10 @@ async fn ssh_authenticate(
     })
 }
 
-/// Build the ssh subprocess. With a configured command (`GIT_SSH_COMMAND` /
-/// `core.sshCommand`) we mirror git: run it through `/bin/sh` with our args
-/// appended as `"$@"`, so the shell honors the quoting in the configured string
-/// (e.g. `ssh -F "/path with spaces"`). Falls back to bare `ssh` when unset, or
-/// on non-unix where we can't assume a POSIX shell (Windows forge-auth ssh has
-/// always used ssh's own default identity/host-key lookup).
+/// Like git, runs a configured `GIT_SSH_COMMAND` / `core.sshCommand` through
+/// `/bin/sh` with our args as `"$@"` so its quoting is honored (e.g.
+/// `ssh -F "/path with spaces"`). Bare `ssh` when unset, or on non-unix where
+/// there's no POSIX shell to assume.
 fn ssh_subprocess(ssh_command: Option<&str>, args: &[String]) -> Command {
     #[cfg(unix)]
     if let Some(cmd) = ssh_command.map(str::trim).filter(|c| !c.is_empty()) {
@@ -461,9 +441,7 @@ fn ssh_subprocess(ssh_command: Option<&str>, args: &[String]) -> Command {
     c
 }
 
-/// `git credential fill` → `(username, password)` for the remote's host. The
-/// password goes only to the forge's authenticate endpoint (never to
-/// baleforgit-server). `cwd` is the repo so its local `credential.helper` applies.
+/// `cwd` is the repo so its local `credential.helper` applies.
 fn git_credential_fill(remote: &RemoteUrl, cwd: Option<&Path>) -> Result<(String, String)> {
     let protocol = match remote.scheme {
         RemoteScheme::Http => "http",
@@ -491,6 +469,7 @@ fn git_credential_fill(remote: &RemoteUrl, cwd: Option<&Path>) -> Result<(String
         .spawn()
         .with_context(|| "spawning git credential fill")?;
     {
+        // Can't fail: stdin is Stdio::piped() above.
         let mut stdin = child.stdin.take().expect("piped stdin");
         stdin.write_all(stdin_body.as_bytes())?;
     }
@@ -515,8 +494,8 @@ fn git_credential_fill(remote: &RemoteUrl, cwd: Option<&Path>) -> Result<(String
     }
     let password =
         password.ok_or_else(|| anyhow!("git credential fill returned no password field"))?;
-    // Username may be absent if the credential helper only stored a token;
-    // forges typically accept "<any>:token" via Basic auth, so default to "git".
+    // A helper that only stored a token omits username; forges accept any
+    // username with a token over Basic auth.
     let username = username.unwrap_or_else(|| "git".to_string());
     Ok((username, password))
 }
@@ -571,11 +550,8 @@ async fn exchange_token(
         .as_deref()
         .map(|s| s.trim_end_matches('/').to_string())
         .unwrap_or_else(|| server_url.trim_end_matches('/').to_string());
-    // `exp` is UTC unix seconds (server `tokens::mint`); xet's TokenProvider
-    // compares it to the *local* UTC clock, so client and server clocks must
-    // agree (NTP) — a skew larger than the TTL makes a fresh token look
-    // already-expired. The token is short-lived; xet calls our
-    // `ForgeTokenRefresher` ~30s before it lapses to re-mint via the forge.
+    // xet compares `exp` (server clock) to the local clock, so skew larger than
+    // the TTL makes a fresh token look already-expired.
     Ok(ResolvedAuth {
         server_url: resolved_url,
         token: body.access_token,
@@ -595,9 +571,8 @@ fn strip_bearer(authz: &str) -> Option<&str> {
     authz.strip_prefix("Bearer ").map(str::trim)
 }
 
-/// Accept only `[A-Za-z0-9._-]+`, no leading dot, length 1..=100 — rejects path
-/// traversal and shell metacharacters that could survive ssh-argv quoting and be
-/// re-parsed server-side.
+/// Rejects path traversal and shell metacharacters that could survive ssh-argv
+/// quoting and be re-parsed server-side.
 fn validate_segment(label: &str, s: &str) -> Result<()> {
     if s.is_empty() || s.len() > 100 {
         return Err(anyhow!("{label} {s:?} has invalid length"));
@@ -616,8 +591,6 @@ fn validate_segment(label: &str, s: &str) -> Result<()> {
     Ok(())
 }
 
-/// UTC seconds since the unix epoch (same basis as the server's `tokens::mint`
-/// and xet's `is_expired`).
 fn now_utc() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -626,15 +599,9 @@ fn now_utc() -> u64 {
         .unwrap_or(0)
 }
 
-/// "Effectively never expires" sentinel (now + ~100 years, UTC) for a token
-/// with no client-side refresh path: the literal `bale.token` / `BALE_TOKEN`
-/// "static service token" mode, where the user hands us a token string but no
-/// `exp` and there's no forge to re-mint from. xet's `TokenProvider` *requires*
-/// an expiry and refreshes once it lapses, so a near-term value would make it
-/// try to refresh a token it can neither refresh nor needs to. Used only when
-/// `bale.tokenExpiration` is unset — set that if your static token has a real
-/// expiry. (Forge-resolved tokens use their server `exp` + `ForgeTokenRefresher`
-/// instead and never reach here.)
+/// Expiry for a static `bale.token` / `BALE_TOKEN` without `bale.tokenExpiration`:
+/// xet requires an expiry and refreshes once it lapses, but there's no forge to
+/// re-mint from, so a near-term value would trigger a refresh that can't succeed.
 fn far_future_epoch() -> u64 {
     now_utc() + 100 * 365 * 24 * 60 * 60
 }

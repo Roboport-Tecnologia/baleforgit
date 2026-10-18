@@ -1,5 +1,3 @@
-//! Small helpers shared across the `<git_dir>/bale/` cache modules.
-
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -72,7 +70,6 @@ pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     handle.read(buf)
 }
 
-/// fsync a file's contents to stable storage.
 pub fn fsync_file(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -133,8 +130,8 @@ pub fn fsync_ancestors(dir: &Path, levels: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// Crash-safe replace: `<dir>/<tmp_name>` → write → fsync → rename onto
-/// `final_path` → fsync `dir`. Readers see the old file or the complete new one.
+/// Crash-safe replace: write `<dir>/<tmp_name>`, fsync, rename onto `final_path`,
+/// fsync `dir` and its ancestors. Readers see the old file or the complete new one.
 pub fn write_durable(dir: &Path, tmp_name: &str, final_path: &Path, body: &[u8]) -> io::Result<()> {
     let tmp = dir.join(tmp_name);
     let res = (|| {
@@ -152,7 +149,6 @@ pub fn write_durable(dir: &Path, tmp_name: &str, final_path: &Path, body: &[u8])
     res
 }
 
-/// fsync every file and directory under `root` (bottom-up), then `root`.
 pub fn fsync_tree(root: &Path) -> io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;

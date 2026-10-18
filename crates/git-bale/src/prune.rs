@@ -1,8 +1,8 @@
 //! `git-bale prune --shared` — reclaim a shared local store by compacting it
 //! down to the files any present registered repo still reaches.
 //!
-//! Holds the shared `StoreLock` for the whole run (excludes gc/clean/
-//! push-pending/other prunes). Liveness is the same as gc's (refs, reflogs,
+//! Holds the shared `StoreLock` for the whole run (excludes gc, clean and
+//! other prunes). Liveness is the same as gc's (refs, reflogs,
 //! indexes, worktree HEADs, rebase/merge state) unioned over every present
 //! repo, plus young markers — never "which repo holds a marker": content
 //! cleaned by repo B may be referenced only by repo A, and B may be gone. The
@@ -69,8 +69,7 @@ pub fn run(force: bool) -> Result<()> {
                 .with_context(|| format!("computing liveness in {}", m.common.display()))?,
         );
     }
-    // Same reclaim grace as gc: a just-cleaned marker may not be in any index
-    // or ref yet.
+    // Same reclaim grace as gc: a just-cleaned marker may not be in any index or ref yet.
     let grace = reclaim_grace();
     let now = SystemTime::now();
     for m in &members {

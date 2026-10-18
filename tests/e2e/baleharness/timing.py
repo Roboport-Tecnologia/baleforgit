@@ -14,7 +14,7 @@ from baleharness.logutil import fmt_bytes, info
 class TimingEntry:
     name: str
     elapsed_s: float
-    bytes_moved: int = 0  # populated only for throughput-relevant phases
+    bytes_moved: int = 0
 
     def throughput_mb_s(self) -> float | None:
         if self.bytes_moved <= 0 or self.elapsed_s <= 0:

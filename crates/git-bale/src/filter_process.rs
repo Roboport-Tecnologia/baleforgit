@@ -65,8 +65,8 @@ pub fn run() -> Result<()> {
     // need it. Defer construction so pointer-cache hits stay fast.
     let mut rt_slot: Option<Arc<XetRuntime>> = None;
 
-    // Clean doesn't need auth — it writes to staging; upload is deferred to
-    // `git-bale push-pending`. Only smudge resolves auth, cached for the process.
+    // Clean is offline (upload is deferred to push-pending); only smudge
+    // resolves auth, cached for the process.
     let mut smudge_cfg: Option<BaleConfig> = None;
 
     loop {
@@ -241,22 +241,17 @@ fn max_inline_clean() -> usize {
         .unwrap_or(MAX_INLINE_CLEAN)
 }
 
-/// TEST-ONLY: widen the window between "objects written" and "marker written"
-/// so the e2e harness can deterministically drive the gc/clean race. A no-op
-/// unless `BALE_TEST_CLEAN_MARKER_DELAY_MS` is set.
+/// TEST-ONLY: widens the objects-written → marker-written window (gc vs clean race).
 fn maybe_test_marker_delay() {
     test_delay("BALE_TEST_CLEAN_MARKER_DELAY_MS");
 }
 
-/// TEST-ONLY: widen the cache-HIT emit window so the e2e harness can
-/// deterministically drive the cache-hit-clean vs gc race. No-op unless
-/// `BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS` is set.
+/// TEST-ONLY: widens the cache-hit emit window (cache-hit clean vs gc race).
 fn maybe_test_cache_hit_delay() {
     test_delay("BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS");
 }
 
-/// TEST-ONLY: widen the window between loading a clean-cache entry and taking
-/// the store lock. No-op unless `BALE_TEST_CLEAN_CACHE_PRELOCK_DELAY_MS` is set.
+/// TEST-ONLY: widens the gap between loading a clean-cache entry and locking.
 fn maybe_test_cache_hit_prelock_delay() {
     test_delay("BALE_TEST_CLEAN_CACHE_PRELOCK_DELAY_MS");
 }
@@ -404,12 +399,11 @@ fn do_clean<W: Write>(
     }
 
     let rt = ensure_runtime(rt_slot)?;
-    // Brief per-file lock across {write objects → write marker}, so a concurrent
+    // Per-file lock across {write objects → write marker} so a concurrent
     // gc/prune/push-pending sweep can't delete a half-written file's only copy.
-    // Scoped to THIS file's write, not the filter-process lifetime: a long hold
-    // deadlocks when a git porcelain op (stash/commit) nests another clean while
-    // this filter still holds the lock. The separate marker-vs-index gap is
-    // closed by gc skipping while an index/ref `*.lock` is held.
+    // Never held for the filter-process lifetime: a porcelain op (stash/commit)
+    // nesting another clean would deadlock. The marker-vs-index gap is closed by
+    // gc skipping while an index/ref `*.lock` is held.
     let _store_lock = lock_for_write(raw, &store, git_dir)?;
     match payload {
         Payload::InMemory(buf) => handle_clean_in_memory(
@@ -655,12 +649,10 @@ impl<W: Write> Write for StallGuardWriter<W> {
     }
 }
 
-/// Cold-path reconstruction guarded by a no-progress watchdog. xet-core classifies
-/// a "host not found" DNS error as *retryable* and backs off with a base-squared
-/// exponential delay (3s, then ~2.5h on the second retry), so an unreachable blob
-/// store would hang `git checkout` silently for hours. Abort instead once no bytes
-/// have arrived for `stall_secs` — dropping the future cancels the in-flight
-/// request and its multi-hour backoff sleep — and surface a user-facing error.
+/// Cold-path reconstruction under a no-progress watchdog. xet-core retries a DNS
+/// "host not found" with base-squared backoff (3s, then ~2.5h), so an unreachable
+/// blob store would hang `git checkout` for hours; after `stall_secs` with no
+/// bytes, dropping the future cancels the request and its backoff sleep.
 pub(crate) async fn download_cold<W: Write + Send + 'static>(
     session: &FileDownloadSession,
     info: &XetFileInfo,
@@ -873,15 +865,12 @@ fn handle_smudge<W: Write>(
         server_backed = true;
     }
 
-    // We hold both sides of the content→pointer mapping, so seed the clean
-    // cache to make the next `git status`/`git diff` hit without CDC — but only
-    // while something guarantees the bytes stay retrievable (the server, or a
-    // marker checked under the store lock). Otherwise a seed racing gc's
-    // `forget_hashes` would let a later add emit a pointer with no backing.
-    // The chunk index is computed before locking; only the check + save hold it.
-    // Best-effort: a seed is only an optimization, so it never blocks on the
-    // lock or fails the smudge. A hot-path hit in local mode isn't seeded: a
-    // marker alone doesn't prove the current store holds the bytes.
+    // Seed the clean cache so the next `git status` hits without CDC, but only
+    // while the bytes are guaranteed retrievable (server, or a marker checked
+    // under the store lock): a seed racing gc's `forget_hashes` would let a later
+    // add emit a pointer with no backing. Best-effort: never blocks on the lock
+    // or fails the smudge. A local-mode hot-path hit isn't seeded: a marker
+    // alone doesn't prove the current store holds the bytes.
     if let (Some(gd), true) = (git_dir, server_backed || store_backed) {
         if let Ok(store) = store::object_store_root(raw) {
             if let Some(entry) =
@@ -919,7 +908,6 @@ fn try_smudge_from_cache(
             return Ok(false);
         }
     };
-    // Reopen so the async block owns its own handle.
     let dest_file = tmp.reopen()?;
     let rt_for_cache = rt.clone();
     let cache = chunk_cache.clone();
@@ -1029,12 +1017,8 @@ fn smudge_cache_entry(
     }
 }
 
-/// Reconstruct from a local store dir. `Ok(false)` means the store dir does not
-/// exist; on-disk/runtime errors propagate so callers can fall through (server
-/// mode) or hard-error (local mode).
-/// Lukewarm path (server mode only): bytes still staged locally, not yet
-/// pushed. Gated on the per-file marker (see staging::mark_file_staged).
-/// `Ok(true)` only once the bytes in `tmp` are verified.
+/// Lukewarm path (server mode only): bytes staged but not yet pushed, gated on
+/// the per-file marker. `Ok(true)` only once the bytes in `tmp` are verified.
 pub(crate) fn try_smudge_from_staging(
     rt: &Arc<XetRuntime>,
     git_dir: &Path,
@@ -1098,6 +1082,9 @@ pub(crate) fn smudge_from_local_store(
     Ok(())
 }
 
+/// Unverified: callers check size + sha256. `Ok(false)` means the store dir
+/// doesn't exist; other errors propagate so callers fall through (server mode)
+/// or hard-error (local mode).
 fn try_smudge_from_store(
     rt: &Arc<XetRuntime>,
     store: &Path,

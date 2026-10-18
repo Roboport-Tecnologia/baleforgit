@@ -1,5 +1,5 @@
-//! Filesystem-backed `BlobStore`. Fanout dirs use plain lowercase hex of the
-//! hash — the Xet hex encoding is only relevant on the wire, not on disk.
+//! Filesystem-backed `BlobStore`. Fanout paths use plain lowercase hex; the Xet
+//! hex encoding is wire-only.
 
 use async_trait::async_trait;
 use bale_server_core::{BlobStore, CoreError, CoreResult, Hash32, ShardHash, XorbHash};
@@ -43,9 +43,8 @@ impl FsBlobStore {
                 .await
                 .map_err(|e| CoreError::Internal(format!("mkdir {sub}: {e}")))?;
         }
-        // A crash mid-write leaves its tmp file behind; nothing else would ever
-        // reclaim it. Age-gated so a concurrently starting instance's in-flight
-        // writes are spared.
+        // Nothing else reclaims tmp files a crash left behind. Age-gated so a
+        // concurrently running instance's in-flight writes are spared.
         if let Ok(mut entries) = fs::read_dir(root.join("tmp")).await {
             while let Ok(Some(e)) = entries.next_entry().await {
                 let stale = e
@@ -102,9 +101,8 @@ impl FsBlobStore {
             .map_err(|e| CoreError::Internal(format!("create tmp: {e}")))?;
         if let Err(e) = async {
             f.write_all(body.as_ref()).await?;
-            // Test-only: simulate a write/fsync failure to exercise the tmp-cleanup
-            // path below (no e2e-reachable way to force ENOSPC without breaking the
-            // same-fs rename). Inert in production — the var is never set there.
+            // Test hook for the tmp-cleanup path: ENOSPC can't be forced in e2e
+            // without breaking the same-fs rename.
             if std::env::var_os("BALE_TEST_FS_WRITE_FAIL").is_some() {
                 return Err(std::io::Error::other("BALE_TEST_FS_WRITE_FAIL"));
             }
@@ -148,9 +146,8 @@ impl FsBlobStore {
         Ok(inserted)
     }
 
-    // fsync `dir` and every ancestor up to the root. Unconditional: whichever
-    // writer created a fanout dir may not have synced it yet, and a crash could
-    // then drop the whole subtree while metadata already points into it.
+    // Unconditional: whichever writer created a fanout dir may not have synced it
+    // yet, and a crash could drop the subtree while metadata points into it.
     async fn sync_chain(&self, dir: &Path) -> CoreResult<()> {
         let mut cur = dir;
         loop {

@@ -1,21 +1,15 @@
 """The git-bale upload progress indicator: a validation phase + a hand demo.
 
-The phase runs in two modes, both on their own isolated container so they
-never touch other phases' shared-server state:
+Both modes run on their own container, away from shared-server state:
 
-  * Normal sweep (`from_only=False`) — validates the indicator without any
-    env knobs. It pushes a couple of fixed variants through `git-bale
-    push-pending` with stderr *captured*, and asserts the git-styled summary
-    line it leaves behind. No TTY, no live bar drawn; we only check the final
-    `Uploading bales: 100% (N/N), …, done.` line (and that the deduped variant
-    reports the already-present bytes instead of an upload size). Nothing is
-    printed to the screen.
+  * Normal sweep (`from_only=False`) — pushes fixed variants through
+    `git-bale push-pending` with stderr captured (no TTY, no live bar) and
+    asserts the final `Uploading bales: 100% (N/N), …, done.` line, including
+    that the deduped variant reports already-present bytes, not an upload size.
 
-  * `--only progress-demo` (`from_only=True`) — a hand-driven *visual* demo.
-    It reads FILE_TIMER / FILE_COUNT and pushes with capture turned OFF so the
-    pre-push hook inherits your terminal; on a TTY git-bale then draws the live
-    bar. A throttle proxy in front of the CAS port stretches the upload so the
-    bar is watchable. See `tests/e2e/README.md`.
+  * `--only progress-demo` (`from_only=True`) — a hand-driven visual demo:
+    pushes uncaptured so the pre-push hook draws the live bar on your terminal,
+    behind a throttle proxy that makes it watchable. See `tests/e2e/README.md`.
 
 Env knobs (only read in the `--only` demo):
   FILE_TIMER  (default 1, decimals OK) — seconds the server should "take" per
@@ -96,9 +90,7 @@ def phase_progress_demo(
     cas_port = pick_free_port()
     ssh_port = pick_free_port()
 
-    # The live bar is only watchable if the upload is slowed down, so the demo
-    # fronts the CAS port with a throttle proxy. The sweep variants don't draw a
-    # bar (captured, non-TTY), so they talk to the server directly.
+    # Only the demo draws a live bar, so only it needs the throttle proxy.
     proxy = None
     public_host_url_override = None
     if from_only:
@@ -173,9 +165,8 @@ def _interactive_demo(
         git(["commit", "-m", f"add {file_count} files"], cwd=repo, env=env)
 
     info("progress-demo: pushing — watch for the upload line below (TTY only)")
-    # capture=False lets the pre-push hook's git-bale push-pending write its
-    # progress line straight to this terminal. expect_fail=True keeps run()
-    # from trying to .decode() the (uncaptured, None) stdout on a bad exit.
+    # capture=False lets push-pending draw straight to this terminal;
+    # expect_fail=True keeps run() from .decode()-ing the None stdout on failure.
     with timings.measure("progress-demo: git push", bytes_moved=total_bytes):
         res = git(
             ["push", "-u", "origin", "main"],
@@ -248,9 +239,8 @@ def _validation_variants(
             "progress-demo[fresh]: staging not drained after push-pending"
         )
 
-    # Variant 2: a byte-identical copy of v0 → fully deduped against content the
-    # server already holds, so nothing is uploaded and the summary names the
-    # already-present bytes (`100% (1/1), <size> already on server, done.`).
+    # Variant 2: a byte-identical copy of v0 → fully deduped, so the summary
+    # names the already-present bytes (`100% (1/1), <size> already on server, done.`).
     (repo / "dup.bin").write_bytes((repo / "v0.bin").read_bytes())
     git(["add", "dup.bin"], cwd=repo, env=env)
     git(["commit", "-m", "duplicate of v0"], cwd=repo, env=env)
@@ -262,7 +252,6 @@ def _validation_variants(
             "progress-demo[dedup]: staging not drained after push-pending"
         )
 
-    # Confirm the uploaded bytes round-trip: push the refs, then cold-clone.
     git(["push", "-u", "origin", "main"], cwd=repo, env=env)
     clone_path, clone_env, _ = init_repo_for_clone(
         work_root=work_root,
@@ -285,11 +274,9 @@ def _validation_variants(
 
 
 def _assert_summary(stderr_bytes: bytes, *, count: int, kind: str, label: str) -> None:
-    """Validate the git-styled push-pending summary line.
-
-    `kind` selects the expected remainder after `100% (N/N),`:
-      * "uploaded" — a real upload: `<size>[ | <rate>][ (+ <size> deduped)], done.`
-      * "deduped"  — nothing new (full dedup): `<size> already on server, done.`
+    """`kind` selects the expected remainder after `100% (N/N),`:
+    * "uploaded" — a real upload: `<size>[ | <rate>][ (+ <size> deduped)], done.`
+    * "deduped"  — nothing new (full dedup): `<size> already on server, done.`
     """
     text = stderr_bytes.decode("utf-8", "replace")
     line = next(

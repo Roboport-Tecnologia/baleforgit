@@ -1,9 +1,7 @@
-//! Backend abstraction for the mount-diff VFS.
-//!
-//! The VFS layer (`mount/vfs.rs`) and the byte source (`mount/reader.rs`) are
-//! backend-agnostic. A `MountBackend` is responsible for binding the chosen
-//! kernel/userspace interface (libfuse today; fuse-t, WinFsp, etc. later) to
-//! that VFS, blocking until the user unmounts, then returning.
+//! Binds the backend-agnostic VFS (`mount/vfs.rs`, bytes via `mount/reader.rs`)
+//! to the platform filesystem interface: libfuse/fuse-t on Unix, WinFsp on
+//! Windows. Exactly one compiles per target; `mount/mod.rs` reaches it through
+//! the `PlatformBackend` / `ensure_available` re-exports.
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -14,10 +12,6 @@ use anyhow::Result;
 
 use crate::mount::vfs::{DiffVfs, Node, ROOT_INODE};
 
-// libfuse (Linux/macOS) and WinFsp (Windows) bind the same backend-agnostic VFS
-// to their respective kernel/userspace interface. Exactly one compiles per
-// target; `mount/mod.rs` reaches both through the `PlatformBackend` /
-// `ensure_available` aliases below.
 #[cfg(unix)]
 pub mod libfuse;
 #[cfg(windows)]
@@ -29,14 +23,12 @@ pub use libfuse::{ensure_available, LibfuseBackend as PlatformBackend};
 pub use winfsp::{ensure_available, WinfspBackend as PlatformBackend};
 
 pub trait MountBackend {
-    /// Mount the VFS read-only at `mount_point` and block in the foreground
-    /// until the filesystem is unmounted (e.g. via Ctrl-C, `fusermount -u`, or
+    /// Mounts read-only and blocks until unmounted (Ctrl-C, `fusermount -u`,
     /// `net use <drive> /delete` on Windows).
     fn mount(&self, mount_point: &Path, vfs: Arc<DiffVfs>) -> Result<()>;
 }
 
-/// Both backends speak the path-based FUSE high-level API, so they share the
-/// `const char *path` → UTF-8 decode and the slash-walk to a VFS node.
+/// Both backends speak the path-based FUSE high-level API; non-UTF-8 paths map to `None`.
 pub(crate) fn cstr_to_path(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;

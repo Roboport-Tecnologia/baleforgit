@@ -14,7 +14,6 @@ pub struct MemBlobStore {
     shards: RwLock<HashMap<[u8; 32], Bytes>>,
     // Counted outside the maps so a put can be rejected before taking the write lock.
     stored_bytes: AtomicU64,
-    // None = unbounded.
     max_bytes: Option<u64>,
 }
 

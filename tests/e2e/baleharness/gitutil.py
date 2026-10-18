@@ -55,7 +55,6 @@ def verify_worktree(
     expected_size: int,
     label: str,
 ) -> None:
-    """Assert the worktree file `rel` exists with the expected size + sha256."""
     p = repo / rel
     if not p.exists():
         raise TestFailure(f"[{label}] worktree file missing: {rel}")
@@ -80,9 +79,7 @@ def verify_pointer_at(
     expected_size: int,
     label: str,
 ) -> bytes:
-    """Assert the object at git `spec` (e.g. ':small.bin' or 'HEAD:big.bin') is
-    a Bale pointer whose `sha256` and `file_size` match the expected payload.
-    Returns the pointer bytes so callers can chain additional checks."""
+    """Assert `spec` (e.g. 'HEAD:big.bin') is a matching pointer; returns it."""
     blob = cat_file_bytes(repo, env, spec)
     if not is_bale_pointer(blob):
         raise TestFailure(
@@ -111,11 +108,8 @@ def force_resmudge_and_verify(
     expected_size: int,
     label: str,
 ) -> None:
-    """Hot-path resmudge: delete the worktree file, run `git checkout --`,
-    and verify sha256 + size. Asserts the chunk cache AND manifest cache
-    are populated as a precondition — otherwise the filter would silently
-    fall through to lukewarm/cold and the test wouldn't actually be
-    measuring the hot path."""
+    """Hot-path resmudge. Requires both chunk and manifest caches populated, or
+    the filter would silently fall through to lukewarm/cold."""
     manifests = repo / ".git" / "bale" / "manifests"
     cache_dir = get_bale_cache_dir(repo, env)
     if not _has_any_file(manifests):
@@ -146,10 +140,7 @@ def force_resmudge_and_verify(
 
 
 def get_bale_cache_dir(repo: Path, env: dict) -> Path:
-    """The chunks cache directory the bale filter writes to (from
-    `bale.cacheDir` in the per-repo git config). The test sets this
-    explicitly in init_repo_for_push / init_repo_for_clone, so missing
-    config here is a harness bug, not a product bug."""
+    """`bale.cacheDir`; init_repo_for_push/clone set it, so unset = harness bug."""
     out = (
         git(
             ["config", "--local", "--get", "bale.cacheDir"],
@@ -177,15 +168,8 @@ def force_resmudge_cold(
     expected_size: int,
     label: str,
 ) -> None:
-    """Wipe the per-repo manifest cache, the chunk cache pointed to by
-    `bale.cacheDir`, and the worktree file — then force `git checkout --`.
-    With nothing on disk to hit the hot or lukewarm path, the bale filter
-    has to traverse `/v1/reconstructions/` against the server.
-
-    Verifies sha256 + size of the re-materialized file. Also asserts the
-    chunk cache repopulated, which is what proves the round-trip actually
-    went over the wire (an empty cache that stayed empty would mean the
-    smudge silently produced bytes from somewhere this test can't see).
+    """Wipe manifest + chunk caches so smudge must go through `/v1/reconstructions/`.
+    The chunk cache repopulating is what proves the round-trip went over the wire.
     """
     manifests = repo / ".git" / "bale" / "manifests"
     if manifests.exists():
@@ -223,20 +207,10 @@ def force_resmudge_lukewarm(
     expected_size: int,
     label: str,
 ) -> None:
-    """Wipe the hot-path caches BEFORE the file has been pushed, then force
-    `git checkout --`. With no chunks on the server yet (`/v1/reconstructions/`
-    would 404), the smudge filter can only succeed by reading from
-    `.git/bale/staging/` — `try_smudge_from_staging` in filter_process.rs.
+    """Smudge from `.git/bale/staging/` (`try_smudge_from_staging`) with caches wiped.
 
-    Precondition: the file must be staged (xorbs/shards in staging/) but
-    NOT pushed. Caller is responsible for ordering this between `git add`
-    and `git push`.
-
-    Verifies:
-      - staging is populated before the test runs (otherwise lukewarm has
-        nothing to read from and the assertion would be vacuous),
-      - bytes after re-materialization match the expected payload,
-      - staging is still populated after — lukewarm reads but mustn't drain.
+    Call between `git add` and `git push`: with nothing on the server yet, only
+    staging can satisfy the smudge. Staging must survive it (read, not drained).
     """
     if not staging_files(repo):
         raise TestFailure(f"[{label}] staging dir empty — lukewarm needs a staged file")
@@ -266,9 +240,7 @@ def force_resmudge_lukewarm(
 
 
 def pointer_hash_at(repo: Path, env: dict, spec: str, *, label: str) -> str:
-    """The bale pointer `hash` (merkle file id) for the blob at git `spec`
-    (e.g. `HEAD:data.bin` for the committed version or `:data.bin` for the
-    staged-in-index version)."""
+    """Pointer `hash` (merkle file id) at `spec`, e.g. `HEAD:x.bin` or `:x.bin`."""
     blob = cat_file_bytes(repo, env, spec)
     if not is_bale_pointer(blob):
         raise TestFailure(

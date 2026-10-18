@@ -30,13 +30,10 @@ def phase_push_pending_noop(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """`git-bale push-pending` with nothing staged is a clean no-op.
-
-    The pre-push hook runs push-pending on *every* push, including pushes
-    that touched no bale-tracked file — those leave `.git/bale/staging/`
-    absent. push-pending must short-circuit and exit 0, never error
-    (which would block the push). This drives the `!staging.exists()`
-    early return before any auth resolution or server contact."""
+    """`git-bale push-pending` with nothing staged exits 0 without creating
+    staging: the pre-push hook runs it on every push, so an error would block
+    pushes that touch no bale file. Drives the nothing-to-drain early return
+    taken before any auth resolution."""
     repo, env = init_repo_for_push(
         work_root=work_root,
         client=client,
@@ -52,8 +49,6 @@ def phase_push_pending_noop(
             "bale-tracked file was added"
         )
     with timings.measure("push-pending-noop: drain with no staging dir"):
-        # check=True: a non-zero exit here is a real product bug (the hook
-        # would block every push), so let `run` raise with the output.
         run([str(client.git_bale_bin), "push-pending"], cwd=repo, env=env)
     if staging.exists():
         raise TestFailure(
@@ -68,21 +63,12 @@ def phase_push_pending_corrupt_staging(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """A failed re-translate must abort WITHOUT draining staging.
+    """A failed local reconstruct must abort WITHOUT draining staging: clearing
+    the marker for a file that never uploaded silently loses its bytes.
 
-    push-pending reconstructs each staged file from `.git/bale/staging/`
-    through a local download session, then re-cleans it through the online
-    upload session. If the local reconstruct fails — staging corruption, or
-    a `file-index/` marker outliving the xorb it points at — push-pending
-    must error and leave the marker + remaining objects in place. The
-    load-bearing property: it must never clear the marker (report the file
-    as drained) when it couldn't actually upload it, or the staged bytes
-    are silently lost.
-
-    We simulate the corruption by deleting the staged xorb data after
-    `git add` while keeping the marker, then assert push-pending fails at
-    the local-reconstruct step, the marker survives, and nothing reached
-    the server."""
+    Deletes the staged xorb after `git add` (marker + shard kept), then asserts
+    push-pending fails at the local-reconstruct step, the marker survives, and
+    nothing reached the server."""
     repo, env = init_repo_for_push(
         work_root=work_root,
         client=client,
@@ -93,8 +79,6 @@ def phase_push_pending_corrupt_staging(
     )
     payload = deterministic_payload(GC_PAYLOAD_BYTES, seed=b"pp-corrupt")
     (repo / "corrupt.bin").write_bytes(payload)
-    # Clean is offline, so this stages xorbs/shards + a file-index marker
-    # without any server contact.
     git(["add", "corrupt.bin"], cwd=repo, env=env)
     # push-pending only uploads content the pushed refs (here: HEAD) reach.
     git(["commit", "-m", "corrupt"], cwd=repo, env=env)
@@ -104,11 +88,8 @@ def phase_push_pending_corrupt_staging(
             f"pp-corrupt: expected a staging marker for {file_hex} after add, "
             f"got {sorted(staged_markers(repo))}"
         )
-    # Delete the xorb data (the bytes), keeping shards + marker: the marker
-    # still advertises the file and the shard still resolves it to chunks,
-    # but the chunks' backing xorb is gone — exactly the "marker outlives
-    # its xorb" corruption. The local download session reads only from
-    # staging (never bale.cacheDir or the server), so this is unrecoverable.
+    # The local download session reads only staging (never bale.cacheDir or the
+    # server), so a marker outliving its xorb is unrecoverable there.
     xorbs = [p for p in staging_files(repo) if p.name.startswith("default.")]
     if not xorbs:
         raise TestFailure(
@@ -179,8 +160,7 @@ def phase_push_pending_only_pushed(
     git(["commit", "-m", "p v1"], cwd=repo, env=env)
     h1 = pointer_hash_at(repo, env, "HEAD:p.bin", label="pp-only")
 
-    # Uncommitted edit, cleaned by `git status` (git re-runs the filter on a
-    # stat-dirty file) — plus an explicit add/reset to be sure a marker exists.
+    # `git status` re-cleans a stat-dirty file; the add/reset guarantees a marker.
     (repo / "p.bin").write_bytes(v2)
     git(["status"], cwd=repo, env=env)
     git(["add", "p.bin"], cwd=repo, env=env)

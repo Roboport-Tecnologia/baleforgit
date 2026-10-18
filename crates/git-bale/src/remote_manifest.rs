@@ -1,6 +1,5 @@
-//! Fetch a reconstruction manifest and convert it to [`CachedManifest`]
-//! (cold path only). Calls `get_reconstruction_v1` directly: the `Client` trait
-//! probes `/v2/...` first, and baleforgit-server only speaks v1.
+//! Cold-path manifest fetch. Calls `get_reconstruction_v1` directly: the
+//! `Client` trait probes `/v2/...` first, and baleforgit-server only speaks v1.
 
 use std::sync::Arc;
 
@@ -12,8 +11,7 @@ use xet_core_structures::merklehash::MerkleHash;
 use crate::config::BaleConfig;
 use crate::manifest_cache::{CachedManifest, CachedTerm, CURRENT_VERSION};
 
-/// Returns the content-addressed parts only. `fetch_info` is discarded —
-/// signed URLs expire (`SIGNATURE_TTL_SECS` = 600s) and aren't safe to persist.
+/// Drops `fetch_info`: its signed URLs expire and must not be persisted.
 pub async fn fetch_manifest(
     cfg: &BaleConfig,
     refresher: Arc<dyn TokenRefresher>,
@@ -32,8 +30,8 @@ pub async fn fetch_manifest(
         .with_context(|| format!("fetching reconstruction manifest for {}", file_id.hex()))?
         .ok_or_else(|| anyhow!("server returned no reconstruction for {}", file_id.hex()))?;
 
-    // Normalize to hex `String` + `u64` so our persisted shape isn't tied to
-    // xet-client's `HexMerkleHash` / `u32` internal types.
+    // Hex `String` + `u64` keep the persisted shape independent of xet-client's
+    // `HexMerkleHash` / `u32`.
     let terms = response
         .terms
         .into_iter()

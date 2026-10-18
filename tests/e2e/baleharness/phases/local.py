@@ -43,7 +43,7 @@ def phase_local_basic(*, timings: Timings, client: ClientEnv, work_root: Path) -
         if not staged_markers(repo):
             raise TestFailure("[local-basic] add wrote no file-index marker")
 
-        # Force a real smudge: drop the worktree file + caches, re-checkout.
+        # Drop the worktree file + manifest cache so checkout really smudges.
         (repo / rel).unlink()
         run(["rm", "-rf", str(repo / ".git" / "bale" / "manifests")], cwd=repo, env=env)
         git(["checkout", "--", rel], cwd=repo, env=env)
@@ -190,25 +190,18 @@ def phase_local_prune_shared(
 def phase_local_clean_gc_race(
     *, timings: Timings, client: ClientEnv, work_root: Path
 ) -> None:
-    """Demonstrates the clean-vs-gc data race in local mode.
+    """clean-vs-gc race: gc must not sweep a new xorb whose marker isn't written yet.
 
-    Setup: add file1 (marker M1 + xorb X1 in store), then unstage it so M1
-    becomes a dead marker (never committed, so no reflog keeps it live).
-    While gc would sweep ALL objects
-    (remaining == 0 after dropping M1), concurrently start a second `git add`
-    with a test-knob delay so xorb X2 is written to the store but marker M2
-    has not yet appeared.  gc fires in that window, drops M1, sees remaining==0,
-    and sweeps X1 + X2.  file2 can no longer be reconstructed → data loss.
-
-    This phase EXPECTS to FAIL (raise TestFailure) until gc respects the store
-    lock (Task 15)."""
+    file1 is added then unstaged (dead marker M1). A second `git add` is held
+    between writing xorb X2 and marker M2 (BALE_TEST_CLEAN_MARKER_DELAY_MS) and
+    gc fires in that window: an unprotected gc would drop M1, see zero markers
+    and sweep X2. Clean holds the store lock across that window, so gc skips."""
     with timings.measure("local-clean-gc-race"):
         repo, env = init_repo_local(
             work_root=work_root, client=client, name="local-race"
         )
         store = per_repo_store(repo)
 
-        # Step 1: add file1 so M1 + X1 land in the store.
         p1 = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"local-race-1")
         (repo / "file1.bin").write_bytes(p1)
         git(["add", "file1.bin"], cwd=repo, env=env)
@@ -217,15 +210,11 @@ def phase_local_clean_gc_race(
         if not staged_markers(repo):
             raise TestFailure("[local-race] step1: no markers after adding file1")
 
-        # Step 2: unstage so M1 becomes a dead marker (pointer in no index,
-        # commit, or reflog entry).
+        # M1 becomes dead: its pointer is in no index, commit or reflog.
         git(["reset"], cwd=repo, env=env)
 
-        # Record baseline: how many xorbs are in the store before file2 is added.
         baseline_xorbs = len(local_store_xorbs(store))
 
-        # Step 3: start a second `git add` in the background with a 3 s
-        # marker-delay so xorb X2 lands in the store before M2 is written.
         p2 = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"local-race-2")
         (repo / "file2.bin").write_bytes(p2)
         add_env = {**env, "BALE_TEST_CLEAN_MARKER_DELAY_MS": "3000"}
@@ -237,18 +226,12 @@ def phase_local_clean_gc_race(
             stderr=subprocess.PIPE,
         )
 
-        # Step 4: poll until X2 (file2's NEW xorb) is in the store and M2 is
-        # NOT yet written — the vulnerable window.  We need the xorb count to
-        # EXCEED the pre-add baseline so we know X2 is present.  gc in this
-        # window sees only M1 (dead), drops it, remaining==0, and sweeps ALL
-        # objects including X2.
+        # Window: X2 present (count above baseline) but M2 not yet written.
         deadline = time.monotonic() + 2.5
         window_hit = False
         while time.monotonic() < deadline:
             xorbs = local_store_xorbs(store)
             markers = staged_markers(repo)
-            # Window: file2's NEW xorb is present (count > baseline) and M2 is
-            # not yet written (markers still == {M1} only, i.e. len==1).
             if len(xorbs) > baseline_xorbs and len(markers) == 1:
                 info(
                     f"[local-race] vulnerable window: {len(xorbs)} xorb(s) "
@@ -266,14 +249,11 @@ def phase_local_clean_gc_race(
             f"{markers_before_gc} marker(s), window_hit={window_hit}"
         )
 
-        # Fire gc.  Without the store lock: drops dead M1, remaining==0,
-        # sweeps X1 + X2 (collateral data loss).
         run([str(client.git_bale_bin), "gc"], cwd=repo, env=env)
 
         xorbs_after_gc = len(local_store_xorbs(store))
         info(f"[local-race] after gc: {xorbs_after_gc} xorb(s)")
 
-        # Wait for the background git add to finish, then commit.
         stdout, stderr = proc.communicate()
         if proc.returncode != 0:
             raise TestFailure(
@@ -289,10 +269,6 @@ def phase_local_clean_gc_race(
             f"{len(staged_markers(repo))} marker(s)"
         )
 
-        # Assert X2 survived gc.  Without the store lock, gc swept X2 as
-        # collateral damage when it dropped dead M1 and saw remaining==0.
-        # This is the teeth of the test: it FAILS now (data loss) and passes
-        # once Task 15 makes gc take the store lock before sweeping.
         if not local_store_xorbs(store):
             raise TestFailure(
                 "[local-race] gc swept the store during the marker-delay window "
@@ -301,7 +277,6 @@ def phase_local_clean_gc_race(
                 "data loss: file2 cannot be reconstructed"
             )
 
-        # Reconstruct file2 from the store (drop worktree + manifest cache).
         (repo / "file2.bin").unlink()
         run(
             ["rm", "-rf", str(repo / ".git" / "bale" / "manifests")],
@@ -322,27 +297,19 @@ def phase_local_clean_gc_race(
 def phase_local_concurrent_stress(
     *, timings: Timings, client: ClientEnv, work_root: Path
 ) -> None:
-    """Hammer concurrent store mutations under natural timing; assert zero data
-    loss and no deadlock.
+    """Concurrent store mutations under natural timing: zero data loss, no deadlock.
 
-    Part A exercises per-repo store contention: each round backgrounds a
-    `git add` and immediately fires `git-bale gc` — the lock ensures gc never
-    sweeps an in-flight xorb, so every committed file must reconstruct after all
-    rounds finish.
-
-    Part B exercises shared-store contention: adds in two repos interleaved with
-    `git-bale prune --shared` runs — prune holds the exclusive lock for its whole
-    run, so a racing add serialises behind it and the shared store stays consistent.
+    Part A: per-repo store, each round races a background `git add` against gc.
+    Part B: shared store, adds in two repos interleaved with `prune --shared`,
+    which holds the store lock for its whole run so a racing add blocks on it.
     """
     with timings.measure("local-concurrent-stress"):
         git_bale_bin = str(client.git_bale_bin)
 
-        # ── Part A: per-repo store, concurrent add + gc ───────────────────────
         repo, env = init_repo_local(
             work_root=work_root, client=client, name="stress-perrepo"
         )
 
-        # (filename, sha256, size) for post-run verification.
         committed: list[tuple[str, str, int]] = []
 
         for rnd in range(8):
@@ -352,7 +319,6 @@ def phase_local_concurrent_stress(
             rel = f"f{rnd}.bin"
             (repo / rel).write_bytes(payload)
 
-            # Background add — no artificial delay; races naturally with gc.
             proc = subprocess.Popen(
                 ["git", "add", rel],
                 cwd=str(repo),
@@ -361,8 +327,6 @@ def phase_local_concurrent_stress(
                 stderr=subprocess.PIPE,
             )
 
-            # gc races the in-flight add; with the store lock it must serialise
-            # and never sweep a live xorb being written by the add.
             run([git_bale_bin, "gc"], cwd=repo, env=env)
 
             try:
@@ -384,7 +348,6 @@ def phase_local_concurrent_stress(
             git(["commit", "-m", f"f{rnd}"], cwd=repo, env=env)
             committed.append((rel, sha256_bytes(payload), len(payload)))
 
-        # Verify all committed files reconstruct after the concurrent storm.
         for rel, expected_sha, expected_size in committed:
             (repo / rel).unlink()
         run(
@@ -402,7 +365,6 @@ def phase_local_concurrent_stress(
                 label="stress-A",
             )
 
-        # A final gc must not sweep any data that is still referenced.
         run([git_bale_bin, "gc"], cwd=repo, env=env)
         run(
             ["rm", "-rf", str(repo / ".git" / "bale" / "manifests")],
@@ -421,7 +383,6 @@ def phase_local_concurrent_stress(
                 label="stress-A-post-gc",
             )
 
-        # ── Part B: shared store, concurrent adds + prune ────────────────────
         shared = work_root / "stress-shared"
         repo_a, env_a = init_repo_local(
             work_root=work_root, client=client, name="stress-sh-a", shared_store=shared
@@ -430,10 +391,9 @@ def phase_local_concurrent_stress(
             work_root=work_root, client=client, name="stress-sh-b", shared_store=shared
         )
 
-        # (repo, rel, sha256, size) for verification.
         shared_committed: list[tuple[Path, dict, str, str, int]] = []
 
-        # Interleave 4 files per repo; pair 0 races a background add with prune.
+        # Round 0 races a background add with prune.
         for i in range(4):
             for repo_x, env_x, tag in (
                 (repo_a, env_a, "A"),
@@ -446,7 +406,6 @@ def phase_local_concurrent_stress(
                 (repo_x / rel).write_bytes(payload)
 
                 if i == 0:
-                    # Race: background add in repo_x while prune holds the lock.
                     proc = subprocess.Popen(
                         ["git", "add", rel],
                         cwd=str(repo_x),
@@ -482,10 +441,8 @@ def phase_local_concurrent_stress(
                     (repo_x, env_x, rel, sha256_bytes(payload), len(payload))
                 )
 
-        # Final prune — must not delete anything still referenced by either repo.
         run([git_bale_bin, "prune", "--shared"], cwd=repo_a, env=env_a)
 
-        # Verify every committed file in both repos still reconstructs.
         for repo_x, env_x, rel, _sha, _sz in shared_committed:
             (repo_x / rel).unlink()
         for repo_x, env_x, _rel, _sha, _sz in shared_committed:
@@ -513,30 +470,19 @@ def phase_local_concurrent_stress(
 def phase_local_cache_hit_gc_race(
     *, timings: Timings, client: ClientEnv, work_root: Path
 ) -> None:
-    """Demonstrates the cache-hit-clean vs gc data race in local mode.
+    """cache-hit-clean vs gc race: gc must not sweep content a cache hit is re-emitting.
 
-    Setup: add f.bin so the clean-cache is populated for f.bin→H, plus marker
-    H and objects H are in the store.  Then unstage it so H is reachable from
-    no index, commit or reflog entry, but the clean-cache entry, marker, and
-    objects are still on disk.
-
-    Re-add f.bin with BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS=3000 so the cache-
-    hit path sleeps for 3 s before emitting the pointer.  Sleep 0.5 s after
-    starting the add (the filter enters the delay in < 100 ms), then fire gc.
-    Without the lock fix, gc acquires the lock, reads the stale index (f.bin
-    not yet re-added), classifies H as dead, removes the marker, remaining==0,
-    sweeps all objects — data loss: the committed pointer points to nowhere.
-    With the fix the filter holds the lock from before the cache-load, so gc
-    blocks on it until the add completes and git has updated the index."""
+    f.bin is added then unstaged, leaving its clean-cache entry, marker and
+    objects on disk but H unreferenced. The re-add's cache hit is held before
+    emitting the pointer (BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS) and gc fires: a gc
+    reading the stale index would sweep H and the committed pointer would point
+    nowhere. The delay sits under the store lock, so gc skips."""
     with timings.measure("local-cache-hit-gc-race"):
         repo, env = init_repo_local(
             work_root=work_root, client=client, name="local-cachehit"
         )
         store = per_repo_store(repo)
 
-        # Step 1: add f.bin — populates clean-cache[f.bin→H], marker H,
-        # objects H.  We need the clean-cache entry to exist so the re-add
-        # takes the HIT path (not the miss path, which re-writes objects itself).
         payload = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"cachehit")
         (repo / "f.bin").write_bytes(payload)
         git(["add", "f.bin"], cwd=repo, env=env)
@@ -546,11 +492,10 @@ def phase_local_cache_hit_gc_race(
         if not staged_markers(repo):
             raise TestFailure("[cachehit] no markers after initial add")
 
-        # Step 2: dereference H while leaving the worktree intact: unstaging
-        # keeps the worktree file, the marker, the xorbs, and the cache entry.
+        # Unstaging keeps the worktree file, marker, xorbs and cache entry.
         git(["reset", "--mixed"], cwd=repo, env=env)
 
-        # Precondition check: cache entry must exist so the re-add is a HIT.
+        # Without a cache entry the re-add misses and re-writes objects itself.
         cache_dir = repo / ".git" / "bale" / "clean-cache"
         cache_entries = list(cache_dir.iterdir()) if cache_dir.exists() else []
         if not cache_entries:
@@ -563,9 +508,6 @@ def phase_local_cache_hit_gc_race(
         if not staged_markers(repo):
             raise TestFailure("[cachehit] precondition: marker gone before gc ran")
 
-        # Step 3: start `git add f.bin` with the cache-HIT delay so the filter
-        # sleeps for 3 s after verifying the cache hit and before emitting the
-        # pointer.  The filter enters the delay in < 100 ms.
         add_env = {**env, "BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS": "3000"}
         proc = subprocess.Popen(
             ["git", "add", "f.bin"],
@@ -575,11 +517,7 @@ def phase_local_cache_hit_gc_race(
             stderr=subprocess.PIPE,
         )
 
-        # Step 4: sleep 0.5 s so the filter is definitely inside the 3 s delay,
-        # then fire gc.  Without the lock fix, gc acquires the lock (the filter
-        # hasn't taken it yet), reads the stale index (no f.bin), marks H dead,
-        # sweeps the objects.  After the delay, the filter emits the cached
-        # pointer — but the objects are gone: data loss.
+        # Ensures gc fires inside the 3s delay (the filter reaches it in < 100 ms).
         time.sleep(0.5)
 
         if proc.poll() is not None:
@@ -600,7 +538,6 @@ def phase_local_cache_hit_gc_race(
         xorbs_after_gc = len(local_store_xorbs(store))
         info(f"[cachehit] after gc: {xorbs_after_gc} xorb(s)")
 
-        # Step 5: wait for the background add to complete.
         try:
             proc.wait(timeout=120)
         except subprocess.TimeoutExpired:
@@ -623,10 +560,7 @@ def phase_local_cache_hit_gc_race(
         xorbs_after_add = len(local_store_xorbs(store))
         info(f"[cachehit] after add+commit: {xorbs_after_add} xorb(s)")
 
-        # Step 6: integrity check — drop worktree + manifest cache and reconstruct
-        # from the local store.  If gc swept the objects during the cache-hit delay
-        # window, `git checkout -- f.bin` will fail here (smudge hard-errors when
-        # the local store cannot reconstruct the file).
+        # Smudge hard-errors if gc swept the objects during the delay.
         (repo / "f.bin").unlink()
         run(
             ["rm", "-rf", str(repo / ".git" / "bale" / "manifests")],
@@ -673,8 +607,8 @@ def phase_local_gc_grace(
         v1 = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"grace-v1")
         v2 = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"grace-v2")
 
-        # v1 committed (stays reachable); v2 staged then unstaged (a young,
-        # unreferenced marker — exactly the shape an in-flight op transits).
+        # v2 staged then unstaged: a young unreferenced marker, the shape an
+        # in-flight op transits.
         (repo / rel).write_bytes(v1)
         git(["add", rel], cwd=repo, env=env)
         git(["commit", "-m", "v1"], cwd=repo, env=env)
@@ -688,7 +622,6 @@ def phase_local_gc_grace(
                 f"[grace] expected v1+v2 markers after add/reset, got {markers_before}"
             )
 
-        # gc with a long grace must KEEP the young v2 marker.
         long_grace = {**env, "BALE_GC_GRACE_SECS": "600"}
         run([str(client.git_bale_bin), "gc"], cwd=repo, env=long_grace)
         if staged_markers(repo) != markers_before:
@@ -697,7 +630,6 @@ def phase_local_gc_grace(
                 f"grace: before={markers_before} after={staged_markers(repo)}"
             )
 
-        # gc with the grace disabled reclaims v2 (unreferenced) but keeps v1.
         no_grace = {**env, "BALE_GC_GRACE_SECS": "0"}
         run([str(client.git_bale_bin), "gc"], cwd=repo, env=no_grace)
         after = staged_markers(repo)
@@ -707,7 +639,6 @@ def phase_local_gc_grace(
                 f"before={markers_before} after={after}"
             )
 
-        # v1 is still committed → must reconstruct from the store.
         (repo / rel).unlink()
         run(["rm", "-rf", str(repo / ".git" / "bale" / "manifests")], cwd=repo, env=env)
         git(["checkout", "--", rel], cwd=repo, env=env)
@@ -724,10 +655,8 @@ def phase_local_gc_grace(
 def phase_local_stash_reflog(
     *, timings: Timings, client: ClientEnv, work_root: Path
 ) -> None:
-    """Reflog entries are live, like in git's own gc: content reachable only
-    from `stash@{1}` keeps its marker. Without that, dropping `stash@{0}` later
-    leaves no marker at all, gc sweeps the whole store, and `stash pop` of the
-    older entry can't be reconstructed."""
+    """Reflog entries are live, as in git's gc: content reachable only from
+    `stash@{1}` keeps its marker, so it still pops after `stash@{0}` is dropped."""
     with timings.measure("local-stash-reflog"):
         repo, env = init_repo_local(
             work_root=work_root, client=client, name="local-stash"
@@ -753,7 +682,6 @@ def phase_local_stash_reflog(
                 f"stash@{{1}}: want {{{h1[:8]}.., {h2[:8]}..}} have {markers}"
             )
 
-        # Drop v2; v2's marker is now dead, v1's must still be there.
         git(["stash", "drop", "stash@{0}"], cwd=repo, env=env)
         run([str(client.git_bale_bin), "gc"], cwd=repo, env=env)
         markers = staged_markers(repo)
@@ -778,8 +706,7 @@ def phase_local_worktree_gc(
 ) -> None:
     """gc in the main worktree must see a linked worktree's staged content: all
     bookkeeping lives in the common git dir and liveness covers every
-    worktree's index. Previously the linked worktree kept private markers, so
-    main's gc (seeing only its own dead marker) swept the shared store."""
+    worktree's index."""
     with timings.measure("local-worktree-gc"):
         repo, env = init_repo_local(
             work_root=work_root, client=client, name="local-worktree"
@@ -790,13 +717,11 @@ def phase_local_worktree_gc(
         pm = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"wt-main")
         pw = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"wt-linked")
 
-        # Main: an abandoned add (dead marker).
         (repo / "m.bin").write_bytes(pm)
         git(["add", "m.bin"], cwd=repo, env=env)
         hm = pointer_hash_at(repo, env, ":m.bin", label="worktree")
         git(["reset"], cwd=repo, env=env)
 
-        # Linked worktree: staged, not committed.
         (wt / "w.bin").write_bytes(pw)
         git(["add", "w.bin"], cwd=wt, env=env)
         hw = pointer_hash_at(wt, env, ":w.bin", label="worktree")
@@ -847,9 +772,9 @@ def phase_local_worktree_gc(
 def phase_local_prune_cross_repo(
     *, timings: Timings, client: ClientEnv, work_root: Path
 ) -> None:
-    """prune --shared must keep content cleaned in repo B but referenced only
-    by repo A (A fetched B's commit, so A holds no marker for it). Liveness is
-    the union of every repo's markers tested against EVERY repo."""
+    """prune --shared keeps content cleaned in B but referenced only by A (A
+    fetched B's commit, so holds no marker): every repo's markers are tested
+    against every repo."""
     with timings.measure("local-prune-cross-repo"):
         shared = work_root / "xrepo-store"
         a, ea = init_repo_local(
@@ -909,9 +834,7 @@ def phase_local_prune_cross_repo(
 def phase_local_tampered_store(
     *, timings: Timings, client: ClientEnv, work_root: Path
 ) -> None:
-    """Corrupt the local store's xorbs: smudge must fail the checkout instead
-    of writing wrong bytes into the worktree (content is verified against the
-    pointer's sha256 before git sees it)."""
+    """Corrupted local-store xorbs fail the checkout instead of writing wrong bytes."""
     with timings.measure("local-tampered-store"):
         repo, env = init_repo_local(
             work_root=work_root, client=client, name="local-tampered"
@@ -1100,7 +1023,6 @@ def phase_local_store_owner(
                 "[owner] init-local accepted another repo's non-shared store"
             )
 
-        # Point B at the store by hand anyway: gc must refuse, not sweep.
         for k, v in (
             ("filter.bale.process", "git-bale filter-process"),
             ("filter.bale.required", "true"),
@@ -1241,8 +1163,8 @@ def phase_local_reclone_same_path(
         h_tmp = pointer_hash_at(a, env, ":tmp.bin", label="reclone")
         git(["reset", "-q", "tmp.bin"], cwd=a, env=env)
         (a / "tmp.bin").unlink()
-        # A racy-git re-clean of the freshly smudged a.bin may have left a live
-        # marker, which would keep gc off the whole-store sweep path under test.
+        # A racy-git re-clean of the fresh a.bin may have left a live marker,
+        # which would keep gc off the whole-store sweep path under test.
         for h in staged_markers(a) - {h_tmp}:
             (a / ".git" / "bale" / "staging" / "file-index" / h).unlink()
         run([str(client.git_bale_bin), "gc"], cwd=a, env=env)
@@ -1298,7 +1220,7 @@ def phase_local_in_gitdir_store_claim(
                     f"[gitdir] init-local {extra} claimed another repo's in-gitdir store"
                 )
 
-        # Other order: C claims D's (not yet used) in-gitdir store first.
+        # Other order: C claims D's unused in-gitdir store first.
         d = work_root / "gitdir-d"
         d.mkdir()
         ed = client.make_env()
@@ -1413,8 +1335,7 @@ def phase_local_pointer_passthrough(
             expected_size=len(payload),
             label="passthrough",
         )
-        # A user file that merely looks pointer-ish (has a 64-hex "hash") is
-        # real content: it must be cleaned, not passed through.
+        # JSON with a 64-hex "hash" is real content: clean it, don't pass it through.
         run([str(client.git_bale_bin), "track", "*.json"], cwd=b, env=eb)
         meta = (
             '{"hash": "' + sha256_bytes(b"release") + '", "algorithm": "sha256", '
@@ -1523,8 +1444,7 @@ def phase_local_store_switch(
             label="switch",
         )
 
-        # Same path, new store (wiped, then re-created by init-local): the
-        # path matches but the store id doesn't, so the cache must not hit.
+        # Wiped and re-created at the same path: only the store id differs.
         subprocess.run(["rm", "-rf", str(store)], check=True)
         run(
             [str(client.git_bale_bin), "init-local", "--store", str(store)],

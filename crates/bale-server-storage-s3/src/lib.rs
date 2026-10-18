@@ -1,7 +1,6 @@
-//! S3-compatible `BlobStore`. Object layout mirrors `bale-server-storage-fs`
-//! (`<prefix>{xorbs,shards}/<aa>/<bb>/<full-hex>`) so the two backends can be
-//! rsynced without translation. `presign_xorb_range` returns real S3
-//! presigned URLs — reconstruction bytes then bypass our HTTP layer entirely.
+//! S3-compatible `BlobStore`. Key layout mirrors `bale-server-storage-fs`
+//! (`<prefix>{xorbs,shards}/<aa>/<bb>/<full-hex>`) so the backends rsync 1:1.
+//! Presigned URLs let reconstruction bytes bypass our HTTP layer.
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -18,36 +17,29 @@ use bytes::Bytes;
 use std::ops::Range;
 use std::time::Duration;
 
-/// Credentials fall back to the default AWS provider chain when
-/// `access_key_id` + `secret_access_key` are unset. `prefix` is concatenated
-/// verbatim — include a trailing `/` yourself if you want one.
+/// Without `access_key_id` + `secret_access_key`, uses the default AWS provider
+/// chain. `prefix` is concatenated verbatim (no implicit `/`).
 #[derive(Clone, Debug, Default)]
 pub struct S3Config {
     pub bucket: String,
     pub region: Option<String>,
     pub endpoint_url: Option<String>,
-    /// Endpoint baked into client-facing presigned URLs, when it must differ
-    /// from `endpoint_url`. Set this when the server reaches the blob store at
-    /// an address clients can't (e.g. a bundled MinIO at the compose-internal
-    /// `minio:9000`, where clients need `localhost:9000`). Unset → presign
-    /// against `endpoint_url`, correct for any endpoint reachable by both.
+    /// Endpoint signed into presigned URLs when clients can't reach
+    /// `endpoint_url` (e.g. compose-internal `minio:9000` vs `localhost:9000`).
     pub public_endpoint_url: Option<String>,
-    /// Required for MinIO and similar backends that don't do virtual-host addressing.
+    /// For MinIO and other backends without virtual-host addressing.
     pub force_path_style: bool,
     pub prefix: String,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
     pub session_token: Option<String>,
-    /// Disable AES-256 server-side encryption on uploaded objects. Default is
-    /// on; set this for S3-compatible backends that reject the header.
+    /// For S3-compatible backends that reject the AES-256 SSE header.
     pub disable_sse: bool,
 }
 
 pub struct S3BlobStore {
     client: Client,
-    /// Same client as `client`, except its endpoint is `public_endpoint_url`
-    /// so the URLs it signs carry a client-reachable host. Equal to `client`
-    /// when no public endpoint override is configured.
+    /// `client` re-pointed at `public_endpoint_url`, or `client` itself if unset.
     presign_client: Client,
     bucket: String,
     prefix: String,
@@ -146,11 +138,9 @@ impl S3BlobStore {
             .map(|_| ())
     }
 
-    // First-writer-wins xorb puts (and so layout/blob agreement) rely on
-    // `If-None-Match: *`. Some S3-compatible stores silently ignore it; refuse
-    // to run on one rather than risk an equal-hash body overwriting another.
-    /// `Ok(false)`: the endpoint accepted a second conditional write of the
-    /// same key, i.e. it ignores `If-None-Match`.
+    /// `Ok(false)`: the endpoint ignores `If-None-Match: *`. Some S3-compatibles
+    /// do silently, which would let an equal-hash body overwrite the one whose
+    /// layout was recorded (first-writer-wins), so the store refuses to run there.
     async fn probe_conditional_put(&self) -> CoreResult<bool> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -432,7 +422,7 @@ fn is_not_found_get<T>(
     matches!(err, SdkError::ServiceError(svc) if matches!(svc.err(), GetObjectError::NoSuchKey(_)))
 }
 
-/// SdkError's Display is generic; the inner service error has the real "AccessDenied" text.
+/// SdkError's Display is generic; the inner service error carries e.g. "AccessDenied".
 fn display_sdk_error<E: std::fmt::Display, R>(err: &SdkError<E, R>) -> String {
     match err {
         SdkError::ServiceError(svc) => format!("service error: {}", svc.err()),

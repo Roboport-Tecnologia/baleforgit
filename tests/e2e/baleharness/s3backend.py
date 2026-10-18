@@ -1,25 +1,14 @@
 """S3 backend plumbing for the e2e harness (MinIO sidecar + bucket views).
 
-This module holds everything needed to run the harness against an S3
-`BlobStore` *without* depending on `run`/`s3lib` — so `server.py` can import
-it to make `start_container` backend-aware without a circular import. The
-bespoke S3 phases in `s3lib.py` re-export these names for backwards compat.
+Kept free of `run`/`s3lib` imports so `server.py` can use it without a cycle.
+`run.py --backend s3` sets a process-global `ActiveS3Backend` and every
+`start_container` injects BALE_S3_* + the shared network, so the full phase
+registry runs on MinIO unchanged; `s3lib.py`'s coverage phases pass
+`s3_server_env`/`s3_run_args` explicitly instead.
 
-Two ways the S3 backend is wired in:
-
-  - `run.py --backend s3` sets a process-global `ActiveS3Backend` (mirrors
-    the `covstate` coverage global). Every `start_container` call — the
-    shared one and each phase's private one — then auto-injects the
-    BALE_S3_* env + shared-network args and derives a per-`data_root` bucket
-    prefix, so the *full* fs phase registry runs against MinIO unchanged.
-  - `s3lib.py`'s standalone phases pass `s3_server_env(...)` /
-    `s3_run_args(...)` explicitly and never set the global.
-
-Each server's writes are scoped under a unique `BALE_S3_PREFIX` derived from
-its `data_root` — the bucket-level analogue of the fs suite's per-phase
-`data_root` directories. The derivation is *stable* per `data_root` so a
-restart on the same dir (failure-kill, offline-restart) lands on the same
-bucket subtree, and *distinct* across phases so they don't cross-contaminate.
+Each server's `BALE_S3_PREFIX` derives from its `data_root`: distinct so phases
+don't cross-contaminate, stable so a restart on the same dir (failure-kill,
+offline-restart) lands on the same subtree.
 """
 
 from __future__ import annotations
@@ -38,27 +27,17 @@ from baleharness.logutil import TestFailure, info
 from baleharness.proc import host_primary_ip, pick_free_port
 from baleharness.runtime import Runtime
 
-# =============================================================================
-# Constants
-# =============================================================================
-
 MINIO_IMAGE = "quay.io/minio/minio:RELEASE.2025-01-20T14-49-07Z"
 MINIO_ACCESS_KEY = "minioadmin"
 MINIO_SECRET_KEY = "minioadmin"
 MINIO_BUCKET = "bale-e2e"
-# Generous: covers a cold image pull on a fresh runner.
+# Covers a cold image pull on a fresh runner.
 MINIO_READY_TIMEOUT_S = 180
 MINIO_INTERNAL_PORT = 9000
 
-# Throttle for the server↔MinIO proxy in the S3-conndrop phase. ~2 MiB/s is
-# slow enough that the kill reliably lands mid-stream on fast machines while
-# still finishing the 35 MiB payload in under 20s on retry.
+# failure-s3-conndrop's server↔MinIO proxy: slow enough that the kill lands
+# mid-stream on fast machines, fast enough that the 35 MiB retry takes < 20s.
 S3_PROXY_THROTTLE_BPS = 2 * 1024 * 1024
-
-
-# =============================================================================
-# Per-run podman network
-# =============================================================================
 
 
 @dataclass
@@ -81,8 +60,7 @@ class Network:
         return cls(rt, name)
 
     def destroy(self) -> None:
-        # Best-effort: containers attached to the net will block removal until
-        # they're stopped. Each MinioGuard/ServerHandle teardown precedes this.
+        # Best-effort: attached containers block removal, so tear them down first.
         subprocess.run(
             self.rt.cmd("network", "rm", self.name),
             capture_output=True,
@@ -90,34 +68,11 @@ class Network:
         )
 
 
-# =============================================================================
-# MinIO sidecar
-# =============================================================================
-
-
 class MinioGuard:
     """Single-node MinIO container + `mc` introspection helpers.
 
-    Lifecycle: launch, poll `/minio/health/ready`, provision the bucket
-    via `mc mb -p` (idempotent), tear down on `stop()`.
-
-    Two URL forms matter:
-      - `shared_url`    — http://<host_primary_ip>:<host_port>. Used by
-                          BOTH the server (reaches it via bridge → host)
-                          AND the host-side client (presigned URLs the
-                          server signs embed this hostname; the client
-                          must be able to resolve+connect to the same
-                          string for the signature to validate). Solves
-                          the chicken/egg of "server in container vs.
-                          client on host need to agree on MinIO's URL".
-      - `host_url`      — http://127.0.0.1:<host_port>. Used by the
-                          host-side TcpProxy upstream in the S3-conndrop
-                          phase (the host loopbacks faster than going
-                          out to its own primary IP).
-
-    MinIO binds on 0.0.0.0:<host_port>:9000 so both URL forms work — the
-    legacy 127.0.0.1-only bind would only let the host reach it, not
-    the container via the bridge.
+    Published on 0.0.0.0 so both the host loopback (`host_url`) and the
+    containers on the bridge (`shared_url`, via the host's primary IP) reach it.
     """
 
     def __init__(
@@ -152,10 +107,7 @@ class MinioGuard:
                 container,
                 "--network",
                 network.name,
-                # 0.0.0.0 (default when no bind address) so the published
-                # port is reachable both via the host's loopback (for the
-                # host-side TcpProxy + mc admin) AND via the host's
-                # primary IP (for containers on the shared bridge).
+                # No bind address = 0.0.0.0; see the class docstring.
                 "-p",
                 f"{host_port}:{MINIO_INTERNAL_PORT}",
                 "-e",
@@ -186,17 +138,14 @@ class MinioGuard:
 
     @property
     def shared_url(self) -> str:
-        """The endpoint URL both the server (in container) and the
-        client (on host) use. host_ip is the host's primary outbound IP
-        — kernel loopbacks for the host, the bridge routes for the
-        container, both end up at the same MinIO."""
+        """One URL for the server (in container) and the client (on host):
+        presigned URLs embed the host name, so both must reach the same string
+        for the signature to validate."""
         return f"http://{self.host_ip}:{self.host_port}"
 
     @property
     def host_url(self) -> str:
-        """The host-loopback URL. Used by the host-side TcpProxy
-        upstream in the S3-conndrop phase (loopback is faster + simpler
-        than re-routing through the host's primary IP)."""
+        """Host-loopback URL, for host-side health polling."""
         return f"http://127.0.0.1:{self.host_port}"
 
     def wait_ready(self) -> None:
@@ -219,8 +168,7 @@ class MinioGuard:
         )
 
     def provision_bucket(self) -> None:
-        # `mc` ships in the minio/minio image; alias set + mb -p covers the
-        # "already exists" case without SigV4 plumbing on the host.
+        # `mc` ships in the image, so no SigV4 plumbing is needed on the host.
         self._mc(
             "alias",
             "set",
@@ -229,9 +177,7 @@ class MinioGuard:
             MINIO_ACCESS_KEY,
             MINIO_SECRET_KEY,
         )
-        # mc mb -p is the idempotent form ("ignore already exists" + parent
-        # creation). Without -p, a second run aborts with "Bucket already
-        # owned" which would make stop+restart flow brittle.
+        # -p: idempotent; without it a rerun fails with "Bucket already owned".
         self._mc("mb", "-p", f"local/{MINIO_BUCKET}")
 
     def stop(self) -> None:
@@ -240,8 +186,6 @@ class MinioGuard:
             capture_output=True,
             check=False,
         )
-
-    # ---- `mc` subprocess helpers ----------------------------------------
 
     def _mc(self, *args: str, capture: bool = True) -> subprocess.CompletedProcess:
         cmd = self.rt.cmd("exec", self.container, "mc", *args)
@@ -255,16 +199,11 @@ class MinioGuard:
         return completed
 
     def list_objects(self, prefix: str) -> list[tuple[str, int]]:
-        """Returns [(key, size), ...] for every object under `prefix`, with
-        each key normalized to BUCKET-relative.
+        """[(bucket-relative key, size)] under bucket-relative `prefix`.
 
-        `prefix` is bucket-relative, e.g. "basic/xorbs/" — matches the
-        layout the server writes (BALE_S3_PREFIX + "xorbs/"/<aa>/<bb>/<hex>).
-        `mc ls --json` reports each `key` relative to the listed prefix (e.g.
-        "<aa>/<bb>/<hex>"), so we re-prepend `prefix` to get a key usable with
-        `mc cat`/`mc pipe`. (Guarded so a mc build that already returns
-        bucket-relative keys isn't double-prefixed.) Returns an empty list
-        when the prefix has no objects; `mc ls` emits nothing, not an error.
+        `mc ls --json` keys are relative to the listed prefix, so `prefix` is
+        re-prepended (unless already present) to make them usable with
+        `get_object`/`put_object`. A missing prefix yields [], not an error.
         """
         completed = subprocess.run(
             self.rt.cmd(
@@ -288,8 +227,6 @@ class MinioGuard:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            # mc ls error entries carry status="error"; skip them. Missing
-            # prefixes don't produce errors either, just no output.
             if obj.get("status") and obj["status"] != "success":
                 continue
             key = obj.get("key")
@@ -306,10 +243,7 @@ class MinioGuard:
         return sum(sz for _key, sz in self.list_objects(prefix))
 
     def get_object(self, prefix_key: str) -> bytes:
-        """Read an object's bytes via `mc cat` inside the container.
-
-        `prefix_key` is bucket-relative (e.g. "basic/xorbs/aa/bb/<hex>").
-        """
+        """`prefix_key` is bucket-relative (e.g. "basic/xorbs/aa/bb/<hex>")."""
         completed = subprocess.run(
             self.rt.cmd(
                 "exec",
@@ -329,10 +263,7 @@ class MinioGuard:
         return completed.stdout
 
     def put_object(self, prefix_key: str, data: bytes) -> None:
-        """Overwrite an object's bytes via `mc pipe` (stdin) inside the
-        container. The bucket-level analogue of writing a file under the
-        fs `data_root` — used by the tampered-xorb phase to corrupt a
-        stored xorb and then restore it."""
+        """Overwrite an object (adversarial phases corrupt, then restore, xorbs)."""
         completed = subprocess.run(
             self.rt.cmd(
                 "exec",
@@ -353,20 +284,9 @@ class MinioGuard:
             )
 
 
-# =============================================================================
-# StorageView (bucket-level analogue of ServerHandle.disk_*_bytes)
-# =============================================================================
-
-
 @dataclass
 class S3StorageView:
-    """Inspect a server's S3 footprint by prefix.
-
-    A server's `BALE_S3_PREFIX` (e.g. "dedup/") gets the same shape as
-    `ServerHandle.disk_xorb_bytes()` / `disk_total_bytes()`, but answered
-    by `mc ls` against the bucket. `ServerHandle` holds one of these in
-    S3 mode and delegates its `disk_*_bytes` to it.
-    """
+    """Bucket-side backing for `ServerHandle.disk_*_bytes` in S3 mode."""
 
     minio: MinioGuard
     prefix: str
@@ -381,21 +301,13 @@ class S3StorageView:
         return self.xorb_bytes() + self.shard_bytes()
 
 
-# =============================================================================
-# Env + run-arg helpers for start_container(extra_env=…, extra_run_args=…)
-# =============================================================================
-
-
 def s3_server_env(
     minio: MinioGuard,
     *,
     prefix: str,
     endpoint_override: str | None = None,
 ) -> dict[str, str]:
-    """BALE_S3_* env dict the server reads (see
-    crates/bale-server-bin/src/main.rs:97-160). `endpoint_override` lets
-    the S3-conndrop phase point at a proxy instead of MinIO directly.
-    """
+    """BALE_S3_* env (read in crates/bale-server-bin/src/main.rs)."""
     return {
         "BALE_S3_BUCKET": MINIO_BUCKET,
         "BALE_S3_ENDPOINT_URL": endpoint_override or minio.shared_url,
@@ -405,35 +317,24 @@ def s3_server_env(
         "BALE_S3_DISABLE_SSE": "1",
         "BALE_S3_ACCESS_KEY_ID": MINIO_ACCESS_KEY,
         "BALE_S3_SECRET_ACCESS_KEY": MINIO_SECRET_KEY,
-        # us-east-1 is what the AWS SDK assumes by default; the actual choice
-        # is moot for MinIO.
+        # Moot for MinIO; the SDK just needs one.
         "BALE_S3_REGION": "us-east-1",
-        # Per-server prefix — equivalent to the fs suite's per-phase data_root.
         # Trailing "/" matters: keys become "<prefix>xorbs/aa/bb/<hex>".
         "BALE_S3_PREFIX": prefix,
     }
 
 
 def s3_run_args(network: Network) -> list[str]:
-    """Attach the server container to the shared network so it can
-    resolve MinIO by container DNS — and also so its bridge route gets
-    it to the host's primary IP (where MinIO publishes on 0.0.0.0:<host
-    _port>). No `--add-host=…:host-gateway` here: on macOS rootless
-    podman `host-gateway` sometimes fails resolution, so we side-step
-    the whole magic-name layer by using the host's primary IP directly
+    """No `--add-host=…:host-gateway`: it sometimes fails to resolve on macOS
+    rootless podman, so MinIO is reached via the host's primary IP instead
     (`MinioGuard.shared_url`).
     """
     return ["--network", network.name]
 
 
 def prefix_for_data_root(data_root: Path, anchor: Path) -> str:
-    """Derive a stable, distinct bucket prefix from a server's `data_root`.
-
-    `anchor` is the run's tmpdir (an ancestor of every server's data_root),
-    so the relative path is unique per server and identical across a restart
-    on the same dir. Falls back to the basename only if `data_root` somehow
-    sits outside the anchor.
-    """
+    """Keyed on `data_root` relative to the run tmpdir `anchor`: unique per
+    server, identical across a restart on the same dir."""
     try:
         rel = data_root.resolve().relative_to(anchor.resolve())
         key = str(rel)
@@ -443,19 +344,11 @@ def prefix_for_data_root(data_root: Path, anchor: Path) -> str:
     return f"{safe or 'root'}/"
 
 
-# =============================================================================
-# Active S3 backend (process-global; mirrors covstate for coverage mode)
-# =============================================================================
-
-
 @dataclass
 class ActiveS3Backend:
-    """The S3 backend in force for the whole run, set by `run.py --backend s3`.
-
-    Held process-global (like the coverage config) so `start_container` picks
-    it up for every container without threading a flag through every phase
-    signature. `prefix_anchor` is the run's tmpdir; `start_container` derives
-    each server's bucket prefix relative to it.
+    """Process-global so `start_container` applies it to every container
+    without threading a flag through each phase. `prefix_anchor` is the run's
+    tmpdir (see `prefix_for_data_root`).
     """
 
     minio: MinioGuard

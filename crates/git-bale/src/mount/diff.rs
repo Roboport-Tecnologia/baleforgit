@@ -1,5 +1,4 @@
-//! Changed-files set between two commits via `gix`. Compares committed trees
-//! only (never the working tree); each entry carries an optional path/OID per side.
+//! Changed blobs between two committed trees (never the working tree).
 
 use std::path::Path;
 
@@ -12,7 +11,6 @@ pub enum DiffStatus {
     Added,
     Deleted,
     Modified,
-    /// Mode-only changes etc.
     Other,
 }
 
@@ -71,8 +69,8 @@ pub fn run_diff(
         .for_each_to_obtain_tree(
             &tree_b,
             |change| -> Result<Action, std::convert::Infallible> {
-                // Match the pathspec on the BStr before allocating OID/path
-                // strings — most of the work for a wide diff, narrow filter.
+                // Filter before allocating OID/path strings: most of the cost
+                // for a wide diff with a narrow pathspec.
                 if !change_in_pathspec(&change, paths) {
                     return Ok(std::ops::ControlFlow::Continue(()));
                 }
@@ -149,7 +147,7 @@ fn change_to_entry(change: Change<'_, '_, '_>) -> Option<DiffEntry> {
             if !entry_mode.is_blob() && !previous_entry_mode.is_blob() {
                 return None;
             }
-            // Mode-only change: identical bytes both sides, skip.
+            // Mode-only change: same bytes both sides.
             if previous_id.as_ref() == id.as_ref() {
                 return None;
             }

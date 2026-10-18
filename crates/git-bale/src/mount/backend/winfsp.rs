@@ -5,7 +5,7 @@
 //! without the WinFsp SDK installed — only `mount`/`mount-diff` need the DLL at
 //! runtime (mirroring how `libfuse.rs` treats libfuse).
 //!
-//! ABI notes (load-bearing — transcribed from WinFsp's `inc/fuse/*.h`):
+//! ABI notes (load-bearing, transcribed from WinFsp's `inc/fuse/*.h`):
 //! - The entry point is `fsp_fuse_main_real(env, argc, argv, ops, opsize,
 //!   data)` — libfuse's `fuse_main_real` plus a leading `struct fsp_fuse_env *`
 //!   the header would otherwise fill in via `fsp_fuse_env()`. We build that env
@@ -14,8 +14,8 @@
 //!   `malloc`/`free`, the rest are NULL.
 //! - WinFsp's `struct fuse_operations` is a single version-independent layout
 //!   (not gated on `FUSE_USE_VERSION` like libfuse's). It differs from our
-//!   libfuse 2.x binding: `getdir` is slot 1 / `readlink` slot 2, and every
-//!   path/offset uses WinFsp's own `fuse_off_t` (i64) and `struct fuse_stat`
+//!   libfuse 2.x binding: `getdir` is slot 1 / `readlink` slot 2, and offsets
+//!   and stat buffers use WinFsp's own `fuse_off_t` (i64) and `struct fuse_stat`
 //!   (NOT the platform `stat`). We pass `opsize = size_of::<fuse_operations>()`
 //!   so WinFsp reads the whole struct; unused slots are NULL.
 //! - `fuse_stat` / `fuse_file_info` are WinFsp's Win64 definitions; the field
@@ -93,8 +93,8 @@ impl MountBackend for WinfspBackend {
             .to_str()
             .ok_or_else(|| anyhow!("mount point path is not UTF-8: {}", mount_point.display()))?;
 
-        // FUSE-style argv: `-f` blocks in the foreground; `uid=-1,gid=-1` makes
-        // the current user own every file (read access). The mountpoint is last.
+        // `-f` blocks in the foreground; `uid=-1,gid=-1` makes the current user
+        // own every file.
         let argv_strings = [
             CString::new("git-bale-mount").unwrap(),
             CString::new("-f").unwrap(),
@@ -202,7 +202,7 @@ fn winfsp_candidates() -> Vec<PathBuf> {
     v
 }
 
-/// `Display` formats install hints; `mount::run` prints it as-is and exits.
+/// `Display` is the install hint; `mount::run`/`run_rev` print it and exit.
 #[derive(Debug)]
 pub struct WinfspUnavailable {
     tried: Vec<(String, String)>,
@@ -228,9 +228,8 @@ impl std::fmt::Display for WinfspUnavailable {
 
 impl std::error::Error for WinfspUnavailable {}
 
-/// Fail-fast probe (handle dropped) at the top of `mount::run`. Only checks the
-/// user-mode DLL loads — the WinFsp kernel driver must also be installed for an
-/// actual mount to succeed; that surfaces as a non-zero `fsp_fuse_main_real`.
+/// Only proves the user-mode DLL loads; a missing kernel driver surfaces later as
+/// a non-zero `fsp_fuse_main_real`.
 pub fn ensure_available() -> std::result::Result<(), WinfspUnavailable> {
     let mut tried = Vec::new();
     for path in winfsp_candidates() {
@@ -302,7 +301,7 @@ pub struct fuse_file_info {
     pub lock_owner: u64,
 }
 
-/// WinFsp `struct fuse_conn_info`. We never read it.
+/// WinFsp `struct fuse_conn_info`; never read.
 #[repr(C)]
 pub struct fuse_conn_info {
     pub proto_major: c_uint,

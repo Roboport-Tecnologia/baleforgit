@@ -1,13 +1,9 @@
-"""Logging + the TestFailure exception + byte formatting."""
-
 from __future__ import annotations
 
 import sys
 
-# On Windows the default stdio codec is the locale ANSI codepage (cp1252),
-# which can't encode the glyphs the harness prints (≈, →, —) — print() then
-# raises UnicodeEncodeError and aborts the suite mid-phase. Force UTF-8 with a
-# replacement fallback so output can never crash the run, on any host.
+# Windows' default cp1252 stdio can't encode the harness's glyphs (≈, →, —);
+# print() would raise UnicodeEncodeError and abort the suite mid-phase.
 for _stream in (sys.stdout, sys.stderr):
     _reconfigure = getattr(_stream, "reconfigure", None)
     if _reconfigure is not None:

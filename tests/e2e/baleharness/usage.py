@@ -31,8 +31,7 @@ def fetch_repo_usage(
 
 
 def usage_status(handle: ServerHandle, *, token: str, owner: str) -> int:
-    """GET /v1/usage/{owner}; return the HTTP status (even for 4xx) without
-    parsing the body — for the require_admin_or_owner authz negative tests."""
+    """HTTP status of GET /v1/usage/{owner}, 4xx included (authz negative tests)."""
     req = urllib.request.Request(
         f"{handle.public_host_url}/v1/usage/{owner}",
         headers={"Authorization": f"Bearer {token}"},
@@ -52,10 +51,10 @@ def http_get_file(
     repo: str,
     filename: str | None = None,
 ) -> tuple[int, bytes, dict[str, str]]:
-    """GET the browser-facing /v1/files/{id} download. The bearer rides in the
-    query (`?token=`) because the forge 302s here without an Authorization
-    header. Returns (status, body, headers) for both success and 4xx so the
-    caller can assert on tamper-rejection too."""
+    """GET /v1/files/{id}; returns (status, body, headers) for 4xx too.
+
+    The bearer rides in `?token=` because the forge 302s here without an
+    Authorization header."""
     params = {"token": token, "repo": repo}
     if filename is not None:
         params["filename"] = filename

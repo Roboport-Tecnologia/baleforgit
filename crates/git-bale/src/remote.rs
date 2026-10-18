@@ -22,18 +22,17 @@ pub enum RemoteScheme {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteUrl {
     pub scheme: RemoteScheme,
-    /// SSH user (defaults to `git` for ssh-style URLs). `None` for http/https.
+    /// Defaults to `git` for ssh; `None` for http/https unless the URL names one.
     pub user: Option<String>,
     pub host: String,
-    /// `None` means "use the scheme default" — 22 for ssh, 80 for http, 443 for https.
+    /// `None` = scheme default.
     pub port: Option<u16>,
-    /// "alice/repo", `.git` suffix stripped. May contain extra path segments
-    /// if a forge nests repos under additional path prefixes.
+    /// `owner/repo`, `.git` stripped; may contain extra segments when a forge
+    /// nests repos under a prefix.
     pub repo_path: String,
 }
 
 impl RemoteUrl {
-    /// "alice/repo" → ("alice", "repo"). Errors if no slash.
     pub fn owner_and_repo(&self) -> Result<(&str, &str)> {
         let (owner, repo) = self
             .repo_path
@@ -49,7 +48,7 @@ impl RemoteUrl {
     }
 
     /// Base URL for the forge's Bale endpoints. SSH remotes assume https on the
-    /// same host/default port.
+    /// same host, default port.
     pub fn https_base(&self) -> String {
         match self.scheme {
             RemoteScheme::Http => format!("http://{}", self.host_with_port(80)),
@@ -66,12 +65,10 @@ impl RemoteUrl {
     }
 }
 
-/// Parse one of the four supported remote URL shapes.
 pub fn parse_remote(s: &str) -> Result<RemoteUrl> {
     let s = s.trim();
 
-    // scp-style SSH: `[user@]host:path` — distinguishable by the FIRST `:`
-    // not being immediately followed by `//`, and no `://` prefix.
+    // scp-style SSH: `[user@]host:path`, i.e. no `://` anywhere.
     if !s.contains("://") {
         if let Some((before, path)) = s.split_once(':') {
             let (user, host) = match before.split_once('@') {
@@ -163,10 +160,8 @@ fn strip_dot_git(p: &str) -> &str {
         .unwrap_or(p.trim_start_matches('/'))
 }
 
-/// Every configured remote as `(name, parsed url)`, `origin` first, then the
-/// rest alphabetically; unparseable remotes are skipped. Used by `push-pending`
-/// to source a file's bytes from whichever remote already holds it when staging
-/// has been drained.
+/// `origin` first, then alphabetical; unparseable remotes are skipped.
+/// push-pending sources already-pushed files from whichever remote holds them.
 pub fn parse_all_remotes(repo: Option<&Path>) -> Vec<(String, RemoteUrl)> {
     let start_dir = match repo
         .map(|p| p.to_path_buf())
@@ -205,7 +200,6 @@ pub fn parse_all_remotes(repo: Option<&Path>) -> Vec<(String, RemoteUrl)> {
     out
 }
 
-/// Look up and parse `origin`'s fetch URL via gix (no `git remote` subprocess).
 pub fn parse_origin(repo: Option<&Path>) -> Result<RemoteUrl> {
     let start_dir = repo
         .map(|p| p.to_path_buf())

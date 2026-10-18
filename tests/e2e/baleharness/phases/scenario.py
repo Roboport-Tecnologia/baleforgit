@@ -100,9 +100,8 @@ def phase_basic_user_ops(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """Tracks a small file through the operations the user listed: stage,
-    unstage, re-stage, stash, pop, commit. Verifies the index entry shape
-    and worktree integrity at each step."""
+    """Stage, unstage, re-stage, stash, pop, commit, push a small file, checking
+    the pointer and worktree bytes at each step."""
     repo, env = init_repo_for_push(
         work_root=work_root,
         client=client,
@@ -156,7 +155,6 @@ def phase_basic_user_ops(
         git(["restore", "--staged", "small.bin"], cwd=repo, env=env)
     if git(["ls-files", "--stage", "small.bin"], cwd=repo, env=env).stdout.strip():
         raise TestFailure("small.bin still staged after `git restore --staged`")
-    # Unstage must not touch the worktree bytes.
     verify_worktree(
         repo,
         "small.bin",
@@ -165,13 +163,10 @@ def phase_basic_user_ops(
         label="basic:after-unstage",
     )
 
-    # Re-stage. The `git restore --staged` above fires the post-checkout hook →
-    # `git-bale gc`, which sweeps the now-unreferenced staging AND invalidates
-    # its clean-cache entry — otherwise a cache-hit re-add would short-circuit to
-    # a pointer whose bytes gc just deleted and which were never pushed (the
-    # stage→unstage→stash data-loss regression). So the re-add must do a full
-    # clean and re-populate staging; if it leaves staging empty, the stash/pop
-    # below would have nothing to reconstruct from offline.
+    # `git restore --staged` fires post-checkout → gc, which sweeps the staging
+    # and must also drop its clean-cache entry: else this re-add cache-hits to a
+    # pointer whose never-pushed bytes are gone (the stage→unstage→stash
+    # data-loss regression) and the stash/pop below can't reconstruct offline.
     with timings.measure("basic: re-stage (re-clean after gc-swept unstage)"):
         git(["add", "small.bin"], cwd=repo, env=env)
     if not staging_files(repo):
@@ -207,9 +202,7 @@ def phase_basic_user_ops(
         raise TestFailure(
             f"e2e-stash entry missing from `git stash list`:\n{stash_list}"
         )
-    # The stash itself encodes the file as a Bale pointer — verify the
-    # stash's index tree has a matching pointer so we know the stash
-    # captured the staged state intact, not the smudge-expanded bytes.
+    # The stash must hold the pointer, not smudge-expanded bytes.
     verify_pointer_at(
         repo,
         env,
@@ -229,8 +222,7 @@ def phase_basic_user_ops(
         label="basic:after-pop",
     )
 
-    # `git stash pop` (without --index) leaves the change unstaged, so the
-    # commit needs an explicit `git add` to pick the file back up.
+    # `stash pop` without --index leaves the change unstaged.
     git(["add", "small.bin"], cwd=repo, env=env)
     verify_pointer_at(
         repo,
@@ -259,9 +251,8 @@ def phase_basic_user_ops(
         label="basic:after-commit",
     )
 
-    # Pre-push lukewarm: chunks are in .git/bale/staging/ but not on the
-    # server yet — a successful re-smudge with the local caches wiped
-    # proves the filter is reconstructing from staging, not the wire.
+    # Nothing is on the server yet, so a re-smudge with caches wiped proves
+    # reconstruction from staging.
     with timings.measure("basic: lukewarm resmudge (pre-push)"):
         force_resmudge_lukewarm(
             repo,
@@ -272,7 +263,7 @@ def phase_basic_user_ops(
             label="basic:lukewarm-pre-push",
         )
 
-    # Pre-push: server must still be empty (defer-uploads contract).
+    # Clean is offline: nothing may reach the server before push.
     if server.disk_total_bytes() != 0:
         raise TestFailure(
             f"server disk non-zero before push: {fmt_bytes(server.disk_total_bytes())}"
@@ -284,7 +275,6 @@ def phase_basic_user_ops(
         raise TestFailure("staging not drained after push")
     if server.disk_total_bytes() <= 0:
         raise TestFailure("server disk still zero after push")
-    # Post-push: worktree + HEAD pointer must still match the original payload.
     verify_worktree(
         repo,
         "small.bin",
@@ -300,10 +290,8 @@ def phase_basic_user_ops(
         expected_size=SMALL_FILE_BYTES,
         label="basic:after-push",
     )
-    # Cold-then-hot ordering: the lukewarm step above wiped the local caches,
-    # and `git push` doesn't repopulate them, so the only way to genuinely
-    # measure the hot path post-push is to first run a cold smudge (which
-    # repopulates the cache from the server) and only then the hot smudge.
+    # Cold first: the lukewarm step wiped the caches and push doesn't refill
+    # them, so only a cold smudge makes the following hot one genuinely hot.
     with timings.measure(
         "basic: cold resmudge after push", bytes_moved=SMALL_FILE_BYTES
     ):
@@ -333,11 +321,10 @@ def phase_multi_remote_push(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """Push a bale file to `origin` (repo A), then add a second remote (repo B
-    on the same server) and push to it. The pre-push hook must register the
-    file under B's repo scope — even though staging was drained by the first
-    push — so a fresh clone of B can check it out. Before the multi-remote fix,
-    B's push uploaded nothing and B's clone 404'd on reconstruction."""
+    """Push to `origin` (repo A), then to a second remote B on the same server:
+    with staging already drained, B's push must still register the file under
+    B's scope or a clone of B 404s on reconstruction. Part 2 covers a remote
+    that already has the commits but not the bale objects."""
     repo, env = init_repo_for_push(
         work_root=work_root,
         client=client,
@@ -354,14 +341,12 @@ def phase_multi_remote_push(
 
     with timings.measure("multi-remote: push to origin (repo A)"):
         git(["push", "-u", "origin", "main"], cwd=repo, env=env)
-    # Staging must drain after the origin push — that's precisely the state that
-    # forces the second push to re-source the bytes from a server.
+    # Drained staging forces the second push to re-source the bytes from a server.
     if staging_files(repo):
         raise TestFailure("multi-remote: staging not drained after origin push")
     if server.disk_total_bytes() == 0:
         raise TestFailure("multi-remote: server disk still zero after origin push")
 
-    # Add a second remote pointing at repo B on the SAME server and push to it.
     git(
         [
             "remote",
@@ -375,13 +360,9 @@ def phase_multi_remote_push(
         env=env,
     )
     with timings.measure("multi-remote: push to second remote (repo B)"):
-        # The pre-push hook re-sources shared.bin from repo A and re-registers
-        # it under repo B. Staging is empty here, so this exercises the
-        # reachable-from-refs source path, not the staged-files path.
+        # Exercises the reachable-from-refs source path, not staged files.
         git(["push", "mirror", "main"], cwd=repo, env=env)
 
-    # The proof: a cold clone of repo B must reconstruct shared.bin. A 404 here
-    # is the bug — B's server scope never learned about the file.
     clone_path, clone_env, _cache = init_repo_for_clone(
         work_root=work_root,
         client=client,
@@ -399,15 +380,10 @@ def phase_multi_remote_push(
         )
     info("  repo B clone reconstructed shared.bin OK")
 
-    # --- Part 2: target already has the commits, but not the bale objects -----
-    # Reproduces the real-world report: a remote populated earlier by an
-    # argless/old client has the git history (so its remote-tracking refs cover
-    # it) but never received the bale objects. Pushing a NEW branch to it must
-    # re-register the objects under its scope, not skip them on the false premise
-    # that "the commits are already there, so the objects must be too".
-    #
-    # Simulate the stale remote by neutering the pre-push hook for one push (so
-    # only git objects land on repo C, no bale upload), then restoring it.
+    # Part 2: C gets the git history but no bale objects (as from an old/argless
+    # client), simulated by disabling the pre-push hook for one push. A NEW
+    # branch push must still register the objects, not assume "commits there ⇒
+    # objects there".
     git(
         [
             "remote",
@@ -427,10 +403,8 @@ def phase_multi_remote_push(
         git(["push", "staleobj", "main"], cwd=repo, env=env)
     hook_bak.rename(hook)
 
-    # Now push a NEW branch. The commits already exist on C (delta 0) and
-    # refs/remotes/staleobj/main covers them — the exact state the buggy
-    # remote-tracking-hiding skipped. The fix walks the full reachable set,
-    # probes C (404 → not registered), and re-sources shared.bin from origin.
+    # Delta 0 and refs/remotes/staleobj/main covers it, so push-pending must walk
+    # the full reachable set, probe C (404), and re-source from origin.
     with timings.measure("multi-remote: push new branch to stale-object repo C"):
         git(["push", "staleobj", "main:revive"], cwd=repo, env=env)
 
@@ -453,10 +427,8 @@ def phase_multi_remote_push(
 
 
 def _file_term_sum(server: ServerHandle, repo_id: str) -> tuple[str, int, int, int]:
-    """(hash, recorded size, Σ term unpacked_bytes, term count) for the single file
-    registered under `repo_id`, read straight from the server's metadata store. The
-    sum is over the GLOBAL (cross-repo) file_terms rows — the set a per-term merge
-    would corrupt. Only the hex-encode function differs by dialect."""
+    """(hash, size, Σ term unpacked_bytes, term count) for the one file under
+    `repo_id`, summed over the GLOBAL (cross-repo) file_terms rows."""
     size_sub = "(SELECT total_bytes FROM files WHERE file_hash = ft.file_hash LIMIT 1)"
     tail = (
         "FROM file_terms ft "
@@ -495,26 +467,14 @@ def phase_term_list_merge(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """Regression for the server's term-list consistency guard (corruption
-    containment).
+    """The server's lookup_file guard must refuse a term list with Σterms > size.
 
-    `file_terms` is keyed by file_hash alone and shared across repos, but a file's
-    term list is NOT canonical: re-cleaning the same content can segment it into a
-    different *number* of xorb-referencing terms. The pre-fix per-term INSERT OR
-    IGNORE could MERGE two registrations — keeping the old terms and appending the
-    longer list's tail — leaving Σterms > file_size. Reconstructing such a file
-    underflows xet's last-term trim (shrinkage = Σterms − file_size) and panics the
-    client with a ~2^64-byte slice (the symptom that started this).
-
-    That segmentation divergence can't be driven through the client (xet cuts xorbs
-    at file boundaries and the server pins a file's layout at first registration,
-    so re-pushes are byte-stable). So — like the tampered-xorb phase corrupts a
-    blob on disk — we reproduce the corrupt *state* directly: append duplicate
-    terms to the file's global term list in meta.db so Σterms = 3×|F|, the exact
-    over-describing shape the merge produced. Write-once registration prevents this
-    state; the lookup_file guard is the catch-all that refuses to serve it. We
-    assert a cold clone is rejected cleanly by the guard instead of handing the
-    client an over-describing reconstruction that panics."""
+    `file_terms` is global per file_hash, and the same content can be segmented
+    into a different number of terms; merging two registrations leaves Σterms >
+    file_size, which underflows xet's last-term trim and panics the client with a
+    ~2^64-byte slice. Write-once registration prevents that state and re-pushes
+    are byte-stable, so the client can't drive it: inject duplicate terms into
+    meta.db directly (Σterms = 3×|F|) and assert a cold clone fails cleanly."""
     repo, env = init_repo_for_push(
         work_root=work_root,
         client=client,
@@ -537,7 +497,6 @@ def phase_term_list_merge(
             f"term-merge: a clean push already left Σterms({term_sum}) != size({size})"
         )
 
-    # Baseline: a fresh cold clone reconstructs F before any corruption.
     clean_clone, clean_env, _ = init_repo_for_clone(
         work_root=work_root,
         client=client,
@@ -550,10 +509,8 @@ def phase_term_list_merge(
     if sha256_file(clean_clone / "f.bin") != f_sha:
         raise TestFailure("term-merge: baseline cold clone reconstructed F wrong")
 
-    # Inject the corrupt state: append F's term 0 twice at the tail of its GLOBAL
-    # term list, so Σterms = 3×|F| and the over-sum (2×|F|) exceeds the last term
-    # (|F|) — the precise shape that underflows xet's trim. This is what the buggy
-    # per-term merge produced when a longer second registration arrived.
+    # Append term 0 twice: the over-sum (2×|F|) exceeds the last term (|F|), the
+    # shape that underflows xet's trim.
     inject_sql = (
         "INSERT INTO file_terms (file_hash, term_index, xorb_hash, "
         "chunk_idx_start, chunk_idx_end, unpacked_bytes, verification) "
@@ -582,10 +539,6 @@ def phase_term_list_merge(
         f"{fmt_bytes(term_sum)} for a {fmt_bytes(size)} file"
     )
 
-    # The proof: a fresh cold clone of the now-corrupt file must NOT panic the
-    # client. With the fix's guard the server returns a clean error (lookup_file
-    # refuses the inconsistent term list); without it the client slices past the
-    # reconstructed buffer and panics with a ~2^64 range end.
     bad_clone, bad_env, _ = init_repo_for_clone(
         work_root=work_root,
         client=client,
@@ -594,8 +547,7 @@ def phase_term_list_merge(
         repo=E2E_REPO_MERGE_A,
         name="merge-clone-corrupt",
     )
-    # The guard answers 5xx, which xet's client retries with backoff; trim the
-    # budget so the clean rejection surfaces in ~1s instead of minutes.
+    # The guard answers 5xx, which xet retries with backoff for minutes.
     bad_env = dict(bad_env)
     bad_env["HF_XET_CLIENT_RETRY_MAX_ATTEMPTS"] = "1"
     bad_env["HF_XET_CLIENT_RETRY_BASE_DELAY"] = "100ms"
@@ -625,19 +577,12 @@ def phase_cold_cache_repush(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """Measure whether a cold-cache re-push of content the server already has
-    RE-STORES it (double storage) or merely wastes upload bandwidth.
+    """A cold-cache re-push of content the server already has must not re-store it.
 
-    Push a big file to repo A alone. Wipe every local dedup index, then re-push it
-    to repo B bundled with a small new file — bundling forces the big file's chunks
-    to repack into a *fresh* xorb hash, so xorb-level content-addressing can't catch
-    the duplicate; only the server's global-dedup query could. We read the server's
-    on-disk xorb growth (ground truth, independent of the client's flaky
-    upload counters) to tell the two cases apart:
-      * growth ≈ small file → global dedup recognized the big file; not re-stored.
-      * growth ≈ big + small → the big file was re-stored (double storage).
-    Also logs the client's reported breakdown so we can see how far the client's
-    `total_bytes_uploaded` is from the on-disk truth."""
+    Bundling big.bin with a new small file repacks it into a fresh xorb hash, so
+    only the server's global-dedup query can catch the duplicate. On-disk xorb
+    growth is the ground truth (client upload counters aren't): ≈ small means
+    deduped, ≈ big + small means double storage."""
     repo, env = init_repo_for_push(
         work_root=work_root,
         client=client,
@@ -655,16 +600,14 @@ def phase_cold_cache_repush(
         git(["push", "-u", "origin", "main"], cwd=repo, env=env)
     disk_before = server.disk_xorb_bytes()
 
-    # Wipe every local dedup index so only the server's global-dedup query can
-    # prevent a re-store — this is the "fresh machine / cleared cache" condition.
+    # "Fresh machine": only the server's global-dedup query can prevent a re-store.
     cache_dir = get_bale_cache_dir(repo, env)
     shutil.rmtree(cache_dir, ignore_errors=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(repo / ".git" / "bale" / "manifests", ignore_errors=True)
     shutil.rmtree(repo / ".git" / "bale" / "clean-cache", ignore_errors=True)
 
-    # A small NEW file so the re-push bundles big.bin into a fresh session xorb
-    # (repack) instead of re-emitting big.bin's original solo xorb verbatim.
+    # Forces a repack instead of re-emitting big.bin's original solo xorb verbatim.
     small = deterministic_payload(COLD_SMALL_BYTES, seed=b"cold-repush-small")
     small_sha = sha256_bytes(small)
     (repo / "small.bin").write_bytes(small)
@@ -701,10 +644,8 @@ def phase_cold_cache_repush(
         f"  server xorb storage grew {fmt_bytes(growth)} on the cold re-push "
         f"(big={fmt_bytes(COLD_BIG_BYTES)}, small={fmt_bytes(COLD_SMALL_BYTES)})"
     )
-    # The unchanged big file must NOT be re-stored: re-sourcing it repopulates the
-    # chunk cache (the dedup index), so its xorbs dedup and only the genuinely-new
-    # small file lands. Growth approaching the big file's size would mean a cold
-    # re-push double-stores content already on the server — a real regression.
+    # Re-sourcing big.bin repopulates the chunk cache (the dedup index), so only
+    # the new small file should land.
     if growth >= COLD_BIG_BYTES * 3 // 4:
         raise TestFailure(
             f"cold-repush: server xorb storage grew {fmt_bytes(growth)} re-pushing a "
@@ -716,8 +657,6 @@ def phase_cold_cache_repush(
         f"(server grew {fmt_bytes(growth)} ≈ the new small file only)"
     )
 
-    # Integrity is non-negotiable regardless of the storage verdict: a cold clone of
-    # repo B must reconstruct both files correctly.
     clone_path, clone_env, _ = init_repo_for_clone(
         work_root=work_root,
         client=client,
@@ -742,17 +681,10 @@ def phase_cold_cache_repush_staged(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """Staged-path variant of cold-repush — the exact reported scenario.
-
-    Push a file, wipe every local dedup index, then APPEND to it and commit
-    WITHOUT pushing (so the modified file is *staged*, not re-sourced from a
-    server) and push to a fresh repo. Unlike the from-refs path, a staged file is
-    cleaned before any download repopulates the cache, so with a cold cache its
-    chunks aren't deduped; a sub-xorb file then forms a single new xorb and the
-    unchanged prefix is re-stored. We MEASURE the server's disk growth to quantify
-    that, and assert only data integrity (whether cold-cache double-store is worth
-    avoiding is a separate, xet-level question — it doesn't happen with a warm
-    cache, which is the normal `git add` → push flow)."""
+    """Staged-path cold-repush (the reported scenario): push, wipe every local
+    dedup index, APPEND and commit WITHOUT pushing, then push to a fresh repo.
+    The unchanged prefix must not be re-stored, and a cold clone must
+    reconstruct the modified file."""
     repo, env = init_repo_for_push(
         work_root=work_root,
         client=client,
@@ -775,7 +707,6 @@ def phase_cold_cache_repush_staged(
     shutil.rmtree(repo / ".git" / "bale" / "manifests", ignore_errors=True)
     shutil.rmtree(repo / ".git" / "bale" / "clean-cache", ignore_errors=True)
 
-    # Append + commit WITHOUT pushing → the modified file is staged.
     v2 = v1 + deterministic_payload(COLD_SMALL_BYTES, seed=b"cold-staged-tail")
     v2_sha = sha256_bytes(v2)
     (repo / "big.bin").write_bytes(v2)
@@ -813,9 +744,8 @@ def phase_cold_cache_repush_staged(
         f"{fmt_bytes(COLD_SMALL_BYTES)}); ~{fmt_bytes(max(0, re_stored))} of the "
         f"unchanged {fmt_bytes(COLD_BIG_BYTES)} prefix was re-stored"
     )
-    # Even cold and staged, the unchanged prefix must not be re-stored: the
-    # original file is reachable from the pushed history (from-refs) and the
-    # modified copy dedups against it in-session, so only the new tail lands.
+    # v1 is reachable from the pushed history (from-refs) and the modified copy
+    # dedups against it in-session, so only the new tail should land.
     if growth >= COLD_BIG_BYTES * 3 // 4:
         raise TestFailure(
             f"cold-staged: server xorb storage grew {fmt_bytes(growth)} re-pushing a "
@@ -824,7 +754,6 @@ def phase_cold_cache_repush_staged(
         )
     info("  the unchanged prefix was not re-stored — only the new tail landed")
 
-    # Integrity is the hard requirement regardless of the storage cost.
     clone_path, clone_env, _ = init_repo_for_clone(
         work_root=work_root,
         client=client,
@@ -848,22 +777,13 @@ def phase_offline_no_network(
     work_root: Path,
     jwt_secret_hex: str,
 ) -> None:
-    """Lock down the contract that *only* push/pull touch the CAS server.
+    """Only push/pull may touch the CAS server.
 
-    A counting TcpProxy sits between git-bale and the server. The resolver
-    fast-path (`bale.serverUrl` + `bale.token` both set) routes every CAS
-    round-trip through the proxy and skips the SSH forge handshake entirely,
-    so `proxy.connections` is an exact count of server contact attempts.
-
-    We assert it stays 0 across the full set of local operations — clean
-    (`git add`), `git status`/`git diff`, `git commit`, smudge
-    (`git checkout`), `git stash`/`pop`, unstage, and `git-bale gc` — then
-    flip to a positive control: `git push` MUST make the count non-zero,
-    proving the proxy is a working detector rather than a dead listener.
-
-    The token is self-minted with the server's JWT secret (write scope,
-    `repo_id = e2e/offline-net`), which the server's auth middleware accepts
-    by signature alone — no SSH handshake needed to obtain it."""
+    With `bale.serverUrl` + `bale.token` both set the resolver skips the SSH
+    handshake, so a counting TcpProxy in front of the server sees every contact
+    attempt. Every local op (add, status/diff, commit, checkout, stash/pop,
+    unstage, gc) must open 0 connections; push is the positive control. The token
+    is self-minted with the server's JWT secret."""
     repo, env = init_repo_for_push(
         work_root=work_root,
         client=client,
@@ -929,9 +849,7 @@ def phase_offline_no_network(
             git(["commit", "-m", "add data.bin"], cwd=repo, env=env)
             assert_offline("commit")
 
-            # checkout = smudge. The file is committed but unpushed, so the
-            # filter must reconstruct from `.git/bale/staging/` (lukewarm),
-            # never the wire.
+            # Committed but unpushed: smudge must reconstruct from staging.
             (repo / "data.bin").unlink()
             git(["checkout", "--", "data.bin"], cwd=repo, env=env)
             verify_worktree(
@@ -943,7 +861,6 @@ def phase_offline_no_network(
             )
             assert_offline("checkout-smudge")
 
-            # A second revision driven through stash/pop and then abandoned.
             payload2 = replace_region(
                 payload, offset=4096, length=4096, seed=b"offline-v2"
             )
@@ -963,8 +880,7 @@ def phase_offline_no_network(
             )
             assert_offline("stash-pop")
 
-            # Stage v2, then unstage it (fires the post-checkout gc hook) and
-            # run gc explicitly — all of which reconcile local staging only.
+            # Unstage fires the post-checkout gc hook; then gc explicitly too.
             git(["add", "data.bin"], cwd=repo, env=env)
             git(["restore", "--staged", "data.bin"], cwd=repo, env=env)
             assert_offline("unstage")
@@ -976,11 +892,7 @@ def phase_offline_no_network(
             "connection(s) — fully offline"
         )
 
-        # ---- positive control: push MUST hit the server -------------------
-        # Without this, a misconfigured proxy that never sees traffic would
-        # make every assertion above pass vacuously. Re-stage + commit v2 so
-        # push-pending has xorbs to upload, then push (its pre-push hook runs
-        # `git-bale push-pending`) and assert the proxy saw the upload.
+        # Positive control, else a dead proxy passes everything above vacuously.
         git(["add", "data.bin"], cwd=repo, env=env)
         git(["commit", "-m", "offline v2"], cwd=repo, env=env)
         proxy.reset_counters()
@@ -1010,13 +922,9 @@ def phase_spilled_clean(
     client: ClientEnv,
     work_root: Path,
 ) -> None:
-    """Drive the clean filter's spill-to-tmpfile path. The in-memory cap
-    defaults to 4 GiB, so no realistic e2e file ever spills and `handle_clean`
-    (the NamedTempFile branch) plus the file-backed `clean_cache::verify_chunks`
-    go uncovered. Capping `BALE_MAX_INLINE_CLEAN` at 1 MiB and pushing a 5 MiB
-    file forces the spill: the first `git add` stages via the tmpfile path; a
-    touch + re-add reloads the clean-cache and verifies the spilled payload
-    through the file-backed `verify_chunks`."""
+    """Clean's spill-to-tmpfile path (`handle_clean`'s NamedTempFile branch) and
+    the file-backed `clean_cache::verify_chunks`, reached by capping
+    `BALE_MAX_INLINE_CLEAN` at 1 MiB (the 4 GiB default never spills)."""
     repo, env = init_repo_for_push(
         work_root=work_root,
         client=client,
@@ -1025,8 +933,7 @@ def phase_spilled_clean(
         repo=E2E_REPO_SPILL,
         name="spilled",
     )
-    # The filter reads this from the env git hands it, so the cap applies to
-    # every clean below; the production default (4 GiB) would never spill.
+    # git passes its env to the filter, so this applies to every clean below.
     env["BALE_MAX_INLINE_CLEAN"] = str(SPILL_INLINE_THRESHOLD)
 
     payload = deterministic_payload(SPILL_FILE_BYTES, seed=b"spilled-clean")
@@ -1052,13 +959,9 @@ def phase_spilled_clean(
     if not clean_cache_entries(repo):
         raise TestFailure("spilled: clean-cache empty after `git add`")
 
-    # Bump mtime (content unchanged) to invalidate git's stat cache, forcing the
-    # next `git add` to re-run clean. That second clean reloads the clean-cache
-    # and, because the payload still spills, verifies it through the file-backed
-    # `verify_chunks` (not the in-memory variant). We deliberately do NOT unstage
-    # here: `git restore --staged` would fire the post-checkout gc hook, which
-    # sweeps + invalidates staging, turning this into a cache miss. A cache hit
-    # must not produce new staging artifacts.
+    # Bump mtime so git re-runs clean, which must hit the clean-cache via the
+    # file-backed verify_chunks and add no staging. Don't unstage instead: the
+    # post-checkout gc would sweep staging and force a miss.
     os.utime(blob_path, None)
     with timings.measure("spilled: re-add (file-backed clean-cache hit)"):
         git(["add", "spilled.bin"], cwd=repo, env=env)
@@ -1079,8 +982,7 @@ def phase_spilled_clean(
     with timings.measure("spilled: commit"):
         git(["commit", "-m", "add spilled.bin"], cwd=repo, env=env)
 
-    # Lukewarm: reconstruct the spilled file from staging before it's pushed —
-    # proves the tmpfile clean produced valid staging artifacts.
+    # Proves the tmpfile clean produced valid staging artifacts.
     with timings.measure("spilled: lukewarm resmudge (pre-push)"):
         force_resmudge_lukewarm(
             repo,
@@ -1128,12 +1030,9 @@ def phase_big_file_dedup(
     work_root: Path,
     bale_admin_token: str,
 ) -> dict:
-    """Push a 35 MB binary, then a slightly-modified version, then a larger
-    1 MB-region edit. Asserts: storage growth per commit reflects the actual
-    change (chunk-level dedup), and the server's `/v1/usage` API agrees with
-    on-disk numbers.
-
-    Returns a dict of payload shas + commit oids the next phase needs.
+    """Push a 35 MiB file, an 8-byte edit, then a 1 MiB-region edit: per-push
+    storage growth must track the change (chunk dedup) and `/v1/usage` must
+    agree with disk. Returns the shas + commit oids the next phase needs.
     """
     repo, env = init_repo_for_push(
         work_root=work_root,
@@ -1147,7 +1046,6 @@ def phase_big_file_dedup(
     big_path = repo / "bigfile.bin"
     rev_state: dict = {"shas": [], "commits": [], "disk_after": [], "raw_after": []}
 
-    # ---- revision 1 ------------------------------------------------------
     payload_v1 = deterministic_payload(BIG_FILE_BYTES, seed=b"big-v1")
     big_path.write_bytes(payload_v1)
     sha_v1 = sha256_bytes(payload_v1)
@@ -1192,8 +1090,7 @@ def phase_big_file_dedup(
         expected_size=BIG_FILE_BYTES,
         label="bigfile-v1:after-commit",
     )
-    # Lukewarm reconstruction of 35 MB from staging only — the server has
-    # nothing under this repo yet, so the cold path is guaranteed unreachable.
+    # Nothing on the server under this repo yet, so this can only use staging.
     with timings.measure(
         "bigfile v1: lukewarm resmudge (pre-push)", bytes_moved=BIG_FILE_BYTES
     ):
@@ -1213,8 +1110,7 @@ def phase_big_file_dedup(
     rev_state["raw_after"].append(BIG_FILE_BYTES)
     growth_v1 = disk_after_v1 - disk_before
     if growth_v1 < BIG_FILE_BYTES * 0.5:
-        # Chunks compress some, but a totally-new 35 MB file should drive the
-        # disk into the MB range. <50% growth means something didn't upload.
+        # Even compressed, < 50% growth for new content means something was skipped.
         raise TestFailure(
             f"bigfile v1 push grew server by {fmt_bytes(growth_v1)} — "
             f"expected ≥ {fmt_bytes(BIG_FILE_BYTES // 2)}"
@@ -1235,9 +1131,7 @@ def phase_big_file_dedup(
         expected_size=BIG_FILE_BYTES,
         label="bigfile-v1:after-push",
     )
-    # Cold first to warm the cache via server download, then hot, otherwise
-    # the lukewarm step above would have left the cache empty and hot would
-    # silently fall through. See basic phase for the full rationale.
+    # Cold before hot: see phase_basic_user_ops.
     with timings.measure(
         "bigfile v1: cold resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
@@ -1264,7 +1158,6 @@ def phase_big_file_dedup(
         git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()
     )
 
-    # ---- revision 2: 8-byte poke in the middle --------------------------
     payload_v2 = modify_bytes(
         payload_v1,
         offset=BIG_FILE_BYTES // 2,
@@ -1306,7 +1199,6 @@ def phase_big_file_dedup(
         expected_size=BIG_FILE_BYTES,
         label="bigfile-v2:after-commit",
     )
-    # v1's pointer must still be reachable through HEAD's history.
     verify_pointer_at(
         repo,
         env,
@@ -1322,10 +1214,8 @@ def phase_big_file_dedup(
     rev_state["disk_after"].append(disk_after_v2)
     rev_state["raw_after"].append(BIG_FILE_BYTES * 2)
     growth_v2 = disk_after_v2 - disk_before_v2
-    # An 8-byte edit should touch ≤ 3 chunks (the one containing the edit
-    # plus shifted neighbors due to CDC boundaries). At ~64 KiB target chunks,
-    # we expect well under 2 MiB of new content. 5 MiB is a generous ceiling
-    # that still catches "no dedup happened" regressions.
+    # An 8-byte edit touches a few ~64 KiB CDC chunks; 5 MiB is a generous
+    # ceiling that still catches "no dedup".
     if growth_v2 > 5 * 1024 * 1024:
         raise TestFailure(
             f"bigfile v2 push grew server by {fmt_bytes(growth_v2)} for an "
@@ -1342,10 +1232,7 @@ def phase_big_file_dedup(
         expected_size=BIG_FILE_BYTES,
         label="bigfile-v2:after-push",
     )
-    # v2 has no preceding lukewarm — v1's cold left the cache populated with
-    # v1's chunks, but those won't satisfy v2's smudge (different pointer,
-    # likely different chunks after CDC shift). Cold-then-hot makes the
-    # ordering invariant across all revisions.
+    # v1's cached chunks won't satisfy v2's smudge, so cold-then-hot again.
     with timings.measure(
         "bigfile v2: cold resmudge after push", bytes_moved=BIG_FILE_BYTES
     ):
@@ -1372,7 +1259,6 @@ def phase_big_file_dedup(
         git(["rev-parse", "HEAD"], cwd=repo, env=env).stdout.decode().strip()
     )
 
-    # ---- revision 3: 1 MiB region replacement ---------------------------
     payload_v3 = replace_region(
         payload_v2,
         offset=BIG_FILE_BYTES // 3,
@@ -1417,7 +1303,6 @@ def phase_big_file_dedup(
         expected_size=BIG_FILE_BYTES,
         label="bigfile-v3:after-commit",
     )
-    # The whole history must still resolve to the right pointers.
     verify_pointer_at(
         repo,
         env,
@@ -1441,7 +1326,7 @@ def phase_big_file_dedup(
     rev_state["disk_after"].append(disk_after_v3)
     rev_state["raw_after"].append(BIG_FILE_BYTES * 3)
     growth_v3 = disk_after_v3 - disk_before_v3
-    # 1 MiB of new content plus a few touched neighbors. ≤ 4 MiB.
+    # 1 MiB of new content plus a few touched neighbor chunks.
     if growth_v3 > 4 * 1024 * 1024:
         raise TestFailure(
             f"bigfile v3 push grew server by {fmt_bytes(growth_v3)} for a 1 MiB edit "
@@ -1502,18 +1387,9 @@ def phase_usage_api(
     jwt_secret_hex: str,
     rev_state: dict,
 ) -> None:
-    """Verifies `GET /v1/usage/{owner}` and `GET /v1/usage/repo/{owner}/{repo}`
-    against the on-disk numbers, plus the two `require_admin_or_owner` authz
-    arms the owner-scoped happy path never hits (TODO item 7): the hex admin
-    bearer is accepted, and a JWT scoped to a *different* owner is forbidden
-    from reading this owner's usage.
-
-    Contract from the wire types: `raw_bytes` = sum of file sizes registered
-    for that scope (counting every revision separately), `stored_bytes` =
-    actually-attributable on-disk cost, `dedup_savings_bytes = raw - stored`.
-    The repo response also carries `exclusive_bytes` = on-disk cost of xorbs no
-    same-owner sibling repo references (`<= stored_bytes`). Storage growth from
-    this phase's pushes is the upper bound on `stored_bytes` for repo2.
+    """`/v1/usage/{owner}` and `/v1/usage/repo/{owner}/{repo}` against on-disk
+    numbers (field contract: `bale-server-wire`), plus the `require_usage_access`
+    arms the happy path misses: hex admin bearer accepted, other-owner JWT 403.
     """
     with timings.measure("usage api: fetch + verify"):
         owner_usage = fetch_usage(server, token=bale_admin_token, owner=E2E_OWNER)
@@ -1523,8 +1399,7 @@ def phase_usage_api(
         info(f"  /v1/usage/{E2E_OWNER}: {owner_usage}")
         info(f"  /v1/usage/repo/{E2E_OWNER}/{E2E_REPO_2}: {repo_usage}")
 
-        # raw_bytes for repo2 must equal 3 * BIG_FILE_BYTES (three revisions
-        # of the same logical 35 MB file).
+        # Every revision counts separately.
         expected_raw_repo2 = 3 * BIG_FILE_BYTES
         if repo_usage["raw_bytes"] != expected_raw_repo2:
             raise TestFailure(
@@ -1532,10 +1407,7 @@ def phase_usage_api(
                 f"{expected_raw_repo2} (3 × {BIG_FILE_BYTES})"
             )
 
-        # Owner stored_bytes vs xorbs-on-disk: every xorb in the data dir is
-        # owned by E2E_OWNER (the basic phase + the bigfile phase both push
-        # under the same owner, separate repos). So the owner-level number
-        # has to match the on-disk xorb total within filesystem rounding.
+        # Every xorb on this server so far is E2E_OWNER's.
         disk_xorbs = server.disk_xorb_bytes()
         delta = abs(int(owner_usage["stored_bytes"]) - disk_xorbs)
         if delta > SIZE_TOLERANCE_BYTES:
@@ -1545,27 +1417,18 @@ def phase_usage_api(
                 f"(> tolerance {SIZE_TOLERANCE_BYTES})"
             )
 
-        # Per-repo stored_bytes must be a subset of (≤) the owner total —
-        # repo2 doesn't own the small-file xorb the basic phase pushed under
-        # repo1, so it can be strictly less.
         if repo_usage["stored_bytes"] > owner_usage["stored_bytes"]:
             raise TestFailure(
                 f"repo stored_bytes={repo_usage['stored_bytes']} exceeds owner "
                 f"stored_bytes={owner_usage['stored_bytes']} — accounting inverted"
             )
-        # Repo's stored_bytes must be > 0 (we pushed 3 revisions of a 35 MB
-        # binary into it) and dominate the owner total (the basic phase's
-        # 8 KiB xorb is negligible relative to 35 MiB).
         if repo_usage["stored_bytes"] == 0:
             raise TestFailure(
                 "repo stored_bytes is 0 but we pushed 35 MB three times — "
                 "shard's CAS Info isn't reaching `xorbs`/`file_terms`"
             )
 
-        # exclusive_bytes (xorbs no same-owner sibling references) is bounded
-        # above by stored_bytes, and must be > 0 here: repo1 and repo2 share an
-        # owner but repo2's three 35 MB revisions share no chunks with repo1's
-        # 8 KiB file, so its big xorbs are exclusive to it.
+        # > 0: repo2's big xorbs share no chunks with any sibling repo's files.
         excl = int(repo_usage["exclusive_bytes"])
         if excl > int(repo_usage["stored_bytes"]):
             raise TestFailure(
@@ -1578,7 +1441,6 @@ def phase_usage_api(
                 "with no sibling repo — exclusive accounting is wrong"
             )
 
-        # dedup_savings_bytes is derivable from raw - stored at both scopes.
         for label, blob in [("owner", owner_usage), ("repo", repo_usage)]:
             expected_savings = blob["raw_bytes"] - blob["stored_bytes"]
             if blob["dedup_savings_bytes"] != expected_savings:
@@ -1589,16 +1451,12 @@ def phase_usage_api(
                 )
 
     with timings.measure("usage api: admin-token + cross-owner authz"):
-        # The hex admin bearer is accepted regardless of owner (the operator
-        # path); the owner-scoped JWT above always took the JWT branch, so this
-        # is the first call to exercise the admin-accept arm.
+        # Everything above took the JWT branch; this hits the admin-accept arm.
         status = usage_status(server, token=admin_token_hex, owner=E2E_OWNER)
         if status != 200:
             raise TestFailure(
                 f"hex admin token on /v1/usage/{E2E_OWNER} returned {status}, want 200"
             )
-        # A validly-signed JWT scoped to a *different* owner must not read this
-        # owner's usage — the cross-owner FORBIDDEN arm.
         intruder_jwt = mint_bale_jwt(
             secret=bytes.fromhex(jwt_secret_hex),
             sub="intruder",
@@ -1622,18 +1480,15 @@ def phase_browser_file_download(
     server: ServerHandle,
     rev_state: dict,
 ) -> None:
-    """Exercises the browser-facing `GET /v1/files/{id}` streaming download —
-    the endpoint the forge 302s into so reconstructed bytes never round-trip
-    through it. Three sub-cases:
+    """`GET /v1/files/{id}`, which the forge 302s into so bytes never transit it:
 
-    1. Opaque hub token, no filename → 200, bytes match HEAD, and *no*
-       `Content-Disposition` (the token carries no `FilenameSHA256` claim).
-    2. Forge JWT + matching filename → 200 with `Content-Disposition:
-       attachment; filename="bigfile.bin"` (the claim binds the name).
-    3. Forge JWT + tampered filename → 400 (the URL was rewritten).
+    1. Opaque hub token, no filename → 200, HEAD bytes, no `Content-Disposition`
+       (no `FilenameSHA256` claim).
+    2. Forge JWT + matching filename → 200 with `attachment; filename=…`.
+    3. Forge JWT + tampered filename → 400.
     """
     repo, env = rev_state["repo_path"], rev_state["env"]
-    # The staged/committed blob is the JSON pointer; its `hash` is the file id.
+    # The pointer's `hash` is the file id.
     file_id = pointer_field(cat_file_bytes(repo, env, "HEAD:bigfile.bin"), "hash")
     expected_sha = rev_state["shas"][-1]  # HEAD == v3
     repo_id = f"{E2E_OWNER}/{E2E_REPO_2}"
@@ -1703,15 +1558,10 @@ def phase_dedup_duplicate_file(
     server: ServerHandle,
     rev_state: dict,
 ) -> None:
-    """Adds a *second file* with the same content as bigfile.bin v3 in the
-    same repo. The server should store zero new xorb bytes (full dedup) and
-    only the shard for the new file's terms."""
+    """A second file with bigfile.bin v3's bytes must add zero xorb bytes."""
     repo, env = rev_state["repo_path"], rev_state["env"]
     expected_sha = rev_state["shas"][-1]
-    # Read the v3 content back from the worktree (filter is installed, so
-    # the worktree has the original bytes). Cross-check the sha before
-    # propagating it — if the worktree is wrong, the rest of this phase's
-    # assertions would be measuring the wrong invariant.
+    # A wrong worktree would make every assertion below measure the wrong thing.
     src = (repo / "bigfile.bin").read_bytes()
     if sha256_bytes(src) != expected_sha:
         raise TestFailure(
@@ -1734,8 +1584,6 @@ def phase_dedup_duplicate_file(
         "dedup: stage + commit + push duplicate", bytes_moved=BIG_FILE_BYTES
     ):
         git(["add", "bigfile_dup.bin"], cwd=repo, env=env)
-        # Staged dup pointer must match v3's pointer exactly — same hash,
-        # same size, same sha256 — otherwise the dedup signal is bogus.
         dup_staged = verify_pointer_at(
             repo,
             env,
@@ -1774,13 +1622,11 @@ def phase_dedup_duplicate_file(
         f"  dedup: total disk grew by {fmt_bytes(disk_after - disk_before)} "
         f"(xorbs: {fmt_bytes(xorbs_after - xorbs_before)})"
     )
-    # Xorbs must not grow at all — the chunks are bit-identical to v3's.
     if xorbs_after - xorbs_before > SIZE_TOLERANCE_BYTES:
         raise TestFailure(
             f"dedup violation: xorb bytes grew by {fmt_bytes(xorbs_after - xorbs_before)} "
             "for a bit-identical second file"
         )
-    # Post-push worktree must still hold both files intact.
     verify_worktree(
         repo,
         "bigfile.bin",
@@ -1795,9 +1641,8 @@ def phase_dedup_duplicate_file(
         expected_size=BIG_FILE_BYTES,
         label="dedup:after-push-dup",
     )
-    # The dup's pointer references xorbs the server owes from v3; cold-path
-    # smudge must download them under the *dup* repo's scope check and end
-    # up at the exact same bytes as the original.
+    # The dup was registered without uploading a single xorb; it must still
+    # reconstruct cold.
     with timings.measure("dedup: cold resmudge dup", bytes_moved=BIG_FILE_BYTES):
         force_resmudge_cold(
             repo,
@@ -1807,8 +1652,6 @@ def phase_dedup_duplicate_file(
             expected_size=BIG_FILE_BYTES,
             label="dedup:cold-resmudge-dup",
         )
-    # And the original itself: the prior cold resmudge wiped the cache, so
-    # this one starts from the same empty state and must also re-download.
     with timings.measure("dedup: cold resmudge orig", bytes_moved=BIG_FILE_BYTES):
         force_resmudge_cold(
             repo,
@@ -1818,10 +1661,7 @@ def phase_dedup_duplicate_file(
             expected_size=BIG_FILE_BYTES,
             label="dedup:cold-resmudge-orig",
         )
-    # Hot path now exercises the cache that the cold resmudges just warmed.
-    # Because orig and dup share chunks (same pointer hash, bit-identical
-    # bytes), the manifests + chunks left over from the orig cold pass also
-    # satisfy a hot smudge of the dup.
+    # orig's cold pass warmed manifests + chunks that also serve the identical dup.
     with timings.measure(
         "dedup: hot resmudge orig + dup", bytes_moved=2 * BIG_FILE_BYTES
     ):
@@ -1852,8 +1692,6 @@ def phase_push_idempotency(
     repo, env = rev_state["repo_path"], rev_state["env"]
     disk_before = server.disk_total_bytes()
     with timings.measure("idempotency: re-push"):
-        # Nothing new to push; git should short-circuit, and even if pre-push
-        # runs, push-pending finds nothing in staging.
         git(["push", "origin", "main"], cwd=repo, env=env)
     disk_after = server.disk_total_bytes()
     if abs(disk_after - disk_before) > SIZE_TOLERANCE_BYTES:
@@ -1871,8 +1709,7 @@ def phase_clone_and_verify_history(
     work_root: Path,
     rev_state: dict,
 ) -> None:
-    """Cold-clone the bigfile repo and check out each historical revision,
-    verifying sha256 against the recorded value at each point."""
+    """Cold-clone the bigfile repo and verify every historical revision's sha256."""
     clone_path, env, _cache = init_repo_for_clone(
         work_root=work_root,
         client=client,
@@ -1884,14 +1721,13 @@ def phase_clone_and_verify_history(
     disk_before_clone = server.disk_total_bytes()
     with timings.measure("clone: cold smudge HEAD", bytes_moved=BIG_FILE_BYTES):
         git(["checkout", "main"], cwd=clone_path, env=env)
-    # Server disk must not have grown — clone is read-only.
     disk_after_clone = server.disk_total_bytes()
     if disk_after_clone != disk_before_clone:
         raise TestFailure(
             f"server disk changed during clone: {disk_before_clone} → {disk_after_clone}"
         )
 
-    # HEAD = revision 3. dedup_dup.bin should equal v3.
+    # HEAD = v3, and so is bigfile_dup.bin.
     head_sha = sha256_file(clone_path / "bigfile.bin")
     expected_head_sha = rev_state["shas"][-1]
     if head_sha != expected_head_sha:
@@ -1902,7 +1738,6 @@ def phase_clone_and_verify_history(
         if sha256_file(clone_path / "bigfile_dup.bin") != expected_head_sha:
             raise TestFailure("dup file sha mismatch after clone")
 
-    # Walk back through revisions and verify each one's worktree state.
     for idx, (commit, expected_sha) in enumerate(
         zip(rev_state["commits"], rev_state["shas"])
     ):
@@ -1936,17 +1771,10 @@ def phase_offline_and_restart(
     ssh_port: int,
     admin_token_hex: str,
 ) -> ServerHandle:
-    """Three checks rolled into one so the orchestration stays linear:
-
-    1. Cold-clone to warm the cache (manifest + chunks).
-    2. Stop the server; re-smudge from cache — must succeed without network
-       (the hot path is by design offline).
-    3. Start a fresh container against the *same* bind-mounted data dir;
-       cold-clone again — proves data persists independently of the process.
-
-    Returns the new server handle so the rest of the test can keep going.
+    """Warm a clone's cache, stop the server and re-smudge (the hot path is
+    offline), then restart on the same data dir and cold-clone again. Returns
+    the new server handle.
     """
-    # ---- warm a clone --------------------------------------------------
     clone_path, env, _cache = init_repo_for_clone(
         work_root=work_root,
         client=client,
@@ -1959,12 +1787,8 @@ def phase_offline_and_restart(
         "offline: warm cache via cold checkout", bytes_moved=BIG_FILE_BYTES
     ):
         git(["checkout", "main"], cwd=clone_path, env=env)
-    # HEAD here is v3 (last revision pushed in phase_big_file_dedup, plus the
-    # bigfile_dup.bin from phase_dedup_duplicate_file). Cross-check the cold
-    # checkout against the known-good sha *before* using it as the reference
-    # for the offline + restart comparisons — otherwise the rest of this
-    # phase would be measuring "matches itself", not "matches the pushed
-    # content".
+    # Check against the recorded sha, or the comparisons below only prove
+    # "matches itself".
     expected_sha = rev_state["shas"][-1]
     cold_sha = sha256_file(clone_path / "bigfile.bin")
     if cold_sha != expected_sha:
@@ -1974,7 +1798,6 @@ def phase_offline_and_restart(
     if not manifest_cache_entries(clone_path):
         raise TestFailure("manifest cache empty after cold checkout")
 
-    # ---- offline smudge ------------------------------------------------
     (clone_path / "bigfile.bin").unlink()
     info("  stopping server to force offline smudge")
     server.stop()
@@ -1988,7 +1811,6 @@ def phase_offline_and_restart(
         label="offline:hot-smudge",
     )
 
-    # ---- restart on same data dir -------------------------------------
     with timings.measure("restart: fresh container on persisted data dir"):
         new_server = start_container(
             rt,
@@ -2031,9 +1853,7 @@ def phase_offline_and_restart(
         expected_size=BIG_FILE_BYTES,
         label="restart:post-restart-clone",
     )
-    # The duplicate must also survive the restart — the prior phase pushed
-    # bigfile_dup.bin to the same repo, and a clean post-restart checkout
-    # should rehydrate it from the persisted xorbs/shards.
+    # Present only when the dedup phase ran.
     if (after_path / "bigfile_dup.bin").exists():
         verify_worktree(
             after_path,
@@ -2052,8 +1872,7 @@ class _ChurnParams:
     rounds: int
     clone_after: tuple
     walk_stride: int  # verify every Nth revision within a clone's walk
-    # None = walk the whole history; int = walk only the most recent N revisions
-    # (a sliding window that tiles the history → linear total time).
+    # None = whole history; N = only the last N revisions (windows tile the history).
     walk_window: int | None
     base_files: tuple  # ((name, size), ...) created in round 0
     # Huge-mode-only knobs (ignored when huge is False).
@@ -2066,11 +1885,7 @@ class _ChurnParams:
 
 
 def _churn_params(huge_minutes: int) -> _ChurnParams:
-    """`huge_minutes` is N from `HUGE_CHURN=N` (≈ minutes of wall-clock); N ≥ 1
-    selects the scaled stress run, anything else the small default run. Rounds
-    scale linearly with N and a cold clone is taken every CLONE_EVERY rounds,
-    each walking the most recent CLONE_EVERY revisions — a window that tiles the
-    full history, so coverage is complete but per-clone cost is constant."""
+    """`huge_minutes` ≥ 1 (from `HUGE_CHURN=N`) selects the scaled stress run."""
     if huge_minutes >= 1:
         rounds = HUGE_CHURN_ROUNDS_PER_MIN * huge_minutes
         every = HUGE_CHURN_CLONE_EVERY
@@ -2167,11 +1982,7 @@ def _churn_mutate_huge(
     all_names: set,
     live: dict,
 ) -> None:
-    """Randomized mutation plan (seeded `rng`): each round edits a random
-    subset of the big base files at random offsets/lengths, rewrites a plain
-    text file, and probabilistically adds (bale or plain) / deletes extra
-    files. All choices flow from `rng`, so the logged seed reproduces the run.
-    Payload *bytes* stay sha-verifiable — only the structure is random."""
+    """Every choice flows from `rng`, so the logged seed reproduces the run."""
     if r == 0:
         for name, size in params.base_files:
             payload = deterministic_payload(size, seed=f"churn-base-{name}".encode())
@@ -2218,9 +2029,7 @@ def _churn_verify_snapshot(
     *,
     label: str,
 ) -> None:
-    """Assert the checked-out worktree exactly matches `snapshot`
-    ({name: (sha256, size)}): every file present with the right bytes, and
-    every file that ever existed but isn't in this revision is absent."""
+    """Worktree must match `snapshot`; every other ever-seen file must be absent."""
     for name, (sha, size) in snapshot.items():
         verify_worktree(
             repo, name, expected_sha=sha, expected_size=size, label=f"{label}:{name}"
@@ -2245,15 +2054,8 @@ def _churn_clone_and_verify(
     walk_stride: int = 1,
     walk_window: int | None = None,
 ) -> None:
-    """Cold-clone the churn repo as it stands after `round_idx`, then walk a
-    span of the revision history verifying each one reconstructs byte-for-byte.
-    A fresh cache dir forces every smudge through the cold
-    `/v1/reconstructions/` path against the reused server state.
-
-    `walk_window` bounds the span to the most recent N revisions (huge mode);
-    None walks the whole history (default mode). With clones placed every
-    `walk_window` rounds the windows tile, so every revision is still
-    cold-verified exactly once while each walk stays constant-cost."""
+    """Cold-clone after `round_idx` and verify each revision in the walk span
+    byte-for-byte; `walk_window` limits it to the last N revisions."""
     head = history[round_idx]
     clone_path, env, _cache = init_repo_for_clone(
         work_root=work_root,
@@ -2274,9 +2076,8 @@ def _churn_clone_and_verify(
         all_names,
         label=f"churn:clone-r{round_idx}:HEAD",
     )
-    # `git checkout <oid>` only re-smudges paths that differ from the current
-    # tree, so each step reconstructs just the delta against the accumulating
-    # server state.
+    # `git checkout <oid>` only re-smudges paths that differ, so each step
+    # reconstructs just the delta.
     start = 0 if walk_window is None else max(0, round_idx - walk_window + 1)
     revs = sorted(set(range(start, round_idx + 1, walk_stride)) | {round_idx})
     note = ""
@@ -2304,24 +2105,11 @@ def phase_repeated_churn(
     work_root: Path,
     huge_minutes: int = 0,
 ) -> None:
-    """Sustained churn against ONE reused repo: many rounds of
-    edit→commit→push, with cold clones taken at several different points that
-    each reconstruct the accumulated history byte-for-byte.
-
-    This is the regression guard for the "data got corrupted and the server
-    crashed after the Nth push" class of bug. Integrity is checked at every
-    step: the staged pointer after each `git add`, the committed pointer after
-    each commit, the server's `/healthz` after each push (a crash takes the
-    container down under `--rm`, so the probe goes false), the monotonic
-    server disk total, the post-push worktree, and a cold-clone history walk
-    at the clone rounds.
-
-    `huge_minutes >= 1` (opt-in via `HUGE_CHURN=N ... --only churn`) scales this
-    into a randomized stress run of roughly N minutes: rounds scale linearly
-    with N, several big base files are edited in random subsets, extra files
-    are randomly added/deleted, and a cold clone every CLONE_EVERY rounds
-    window-walks the history. The RNG seed is logged (override via
-    `HUGE_CHURN_SEED`)."""
+    """Many edit→commit→push rounds on ONE repo, guarding "data corrupted and
+    server crashed after the Nth push": every round checks staged + committed
+    pointers, `/healthz`, a non-shrinking disk total and the worktree, with
+    cold-clone history walks at the clone rounds. `HUGE_CHURN=N ... --only
+    churn` turns it into a randomized ~N-minute stress run (seed logged)."""
     params = _churn_params(huge_minutes)
     rng: random.Random | None = None
     if params.huge:
@@ -2344,12 +2132,12 @@ def phase_repeated_churn(
         name="churn",
     )
 
-    # Logical worktree model, mutated round by round. {name: (sha256, size)}.
+    # {name: (sha256, size)}
     files: dict[str, tuple[str, int]] = {}
     all_names: set[str] = set()
-    # Per-round: {"commit": oid, "snapshot": {name: (sha, size)}}.
+    # Per round: {"commit": oid, "snapshot": files}
     history: list[dict] = []
-    # Current bytes of every repeatedly-edited bale file (region edits chain).
+    # Current bytes of each edited file (region edits chain).
     live: dict[str, bytes] = {}
     prev_disk = server.disk_total_bytes()
 
@@ -2361,7 +2149,6 @@ def phase_repeated_churn(
 
         with timings.measure(f"churn r{r}: stage"):
             git(["add", "-A"], cwd=repo, env=env)
-        # Every bale file's staged pointer must match the bytes we just wrote.
         for name, (sha, size) in files.items():
             if name.endswith(".bin"):
                 verify_pointer_at(
@@ -2390,7 +2177,7 @@ def phase_repeated_churn(
             git(["push", "origin", "main"], cwd=repo, env=env)
         if staging_files(repo):
             raise TestFailure(f"churn r{r}: staging not drained after push")
-        # The crash guard: a push that took the server down fails this probe.
+        # A server crash removes the `--rm` container, so this probe fails.
         if not server.is_healthy():
             raise TestFailure(
                 f"churn r{r}: server unhealthy after push — the push appears to "
@@ -2403,7 +2190,6 @@ def phase_repeated_churn(
                 f"{fmt_bytes(disk)} across a push — CAS content went missing"
             )
         prev_disk = disk
-        # Worktree must still hold the just-pushed bytes (push mustn't disturb it).
         for name, (sha, size) in files.items():
             verify_worktree(
                 repo,

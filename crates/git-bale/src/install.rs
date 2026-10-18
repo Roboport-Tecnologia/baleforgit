@@ -1,12 +1,10 @@
-//! Install / uninstall the `bale` filter driver in git config.
+//! Sets only `filter.bale.process` (not `clean`/`smudge`) so git uses the
+//! long-running process instead of a per-file spawn.
 //!
-//! Sets only `filter.bale.process` (not `clean`/`smudge`): Git prefers the
-//! long-running process and skips a per-file subprocess spawn.
-//!
-//! Local-scope install also writes hooks: `pre-push` runs `git-bale
-//! push-pending` (xorbs/shards reach the server before push advertises pointers
-//! to them), and `post-checkout`/`-commit`/`-merge` run `git-bale gc` (clean
-//! only adds to staging; without gc, abandoned bytes linger until next push).
+//! Local-scope install also writes hooks: `pre-push` runs `push-pending` (xorbs/
+//! shards reach the server before the push advertises pointers to them), and
+//! `post-checkout`/`-commit`/`-merge` run `gc` (clean only adds to staging;
+//! without gc, abandoned bytes linger until the next push).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -63,13 +61,9 @@ pub fn install(scope: Scope, repo: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// Put the repo at `repo` (or cwd) into fully-local mode: register the filter,
-/// install only the gc hooks (no pre-push drain — nothing to drain), and write
-/// `bale.local*` config. `store` is the resolved, tilde-expanded store path;
-/// `shared` marks it as a cross-repo store.
-/// `store: None` is the per-repo default store, deliberately NOT recorded:
-/// it's derived from the current git dir, so a moved repo keeps finding it
-/// (a recorded absolute path would point at the old location).
+/// Fully-local mode: filter + gc hooks only (no pre-push — nothing to drain).
+/// `store` is the resolved, tilde-expanded path; `None` (per-repo default) is
+/// deliberately not recorded so a moved repo still derives it from its git dir.
 pub fn init_local(repo: Option<&Path>, store: Option<&Path>, shared: bool) -> Result<()> {
     set_config(Scope::Local, repo, "process", PROCESS_VALUE)?;
     set_config(Scope::Local, repo, "required", "true")?;
@@ -175,7 +169,6 @@ fn uninstall_managed_hook(repo: Option<&Path>, hook_name: &str) -> Result<()> {
     }
     let existing = std::fs::read_to_string(&hook_path)?;
     if !existing.contains(HOOK_MARKER) {
-        // Leave hand-written hooks alone.
         return Ok(());
     }
     std::fs::remove_file(&hook_path)
@@ -288,7 +281,7 @@ fn unset_config(scope: Scope, repo: Option<&Path>, key: &str) -> Result<()> {
 
 fn unset_full_key(scope: Scope, repo: Option<&Path>, full_key: &str) -> Result<()> {
     let out = run_git_config(scope, repo, &["--unset-all", full_key])?;
-    // Exit status 5 from `git config --unset-all` means "key not set" — fine.
+    // Exit 5 = key not set.
     if !out.status.success() && out.status.code() != Some(5) {
         return Err(anyhow!(
             "git config {} --unset-all {full_key} failed: {}",

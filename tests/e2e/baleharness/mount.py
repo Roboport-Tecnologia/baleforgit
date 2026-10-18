@@ -17,20 +17,16 @@ from baleharness.logutil import TestFailure, info
 
 
 class MountUnavailable(Exception):
-    """libfuse / fuse-t not installed on this host. The mount phase signals
-    this to its caller so the whole phase skips instead of failing.
+    """FS driver missing on this host: the mount phase skips instead of failing.
 
-    `stderr` carries the binary's full stderr so the skip handler can log
-    everything — under --coverage a mount-up timeout previously surfaced as
-    a single-line "skipped" without any clue what the binary was doing."""
+    `stderr` carries the binary's full stderr so the skip is diagnosable."""
 
     def __init__(self, reason: str, *, stderr: str = "") -> None:
         super().__init__(reason)
         self.stderr = stderr
 
 
-# git-bale's mount backends print one of these when their FS driver can't be
-# loaded — libfuse/fuse-t on POSIX, WinFsp on Windows. Either means "skip".
+# Printed by git-bale's mount backends when their FS driver can't be loaded.
 _LIBFUSE_HINT = "needs libfuse at runtime"
 _WINFSP_HINT = "needs WinFsp at runtime"
 
@@ -40,10 +36,8 @@ def driver_missing(err: str) -> bool:
 
 
 def ensure_fs_driver() -> None:
-    """On Windows, install WinFsp if absent (downloading the MSI) so the mount
-    backend can run, raising MountUnavailable to skip if it can't be
-    provisioned. No-op on POSIX — the git-bale binary's own libfuse probe
-    drives the skip there."""
+    """Provision WinFsp on Windows (MountUnavailable if impossible). No-op on
+    POSIX, where the binary's own libfuse probe drives the skip."""
     if os.name != "nt":
         return
     from baleharness import winfsp as _winfsp
@@ -55,11 +49,9 @@ def ensure_fs_driver() -> None:
 
 
 def _unmount_path(mount_point: Path) -> None:
-    """Best-effort unmount. fusermount3 / fusermount on Linux (rootless-safe),
-    plain `umount` everywhere else. Silent if not currently mounted."""
+    """Best-effort; fusermount first because it's rootless-safe on Linux."""
     if os.name == "nt":
-        # WinFsp auto-unmounts when the hosting git-bale process exits, which
-        # the session's finally block triggers; there's no fusermount step.
+        # WinFsp unmounts when the hosting git-bale process exits.
         return
     for cmd in (
         ["fusermount3", "-u", str(mount_point)],
@@ -74,10 +66,8 @@ def _unmount_path(mount_point: Path) -> None:
 
 
 def _is_mounted(mount_point: Path, parent: Path) -> bool:
-    """Has the FS come up at `mount_point`? On POSIX a FUSE mount makes its
-    st_dev differ from the parent's. On Windows the mount point is a directory
-    WinFsp *creates* (we ensure it didn't pre-exist), so its appearance as a
-    directory is the readiness signal."""
+    """POSIX: st_dev differs from the parent's. Windows: WinFsp creates the
+    (deliberately absent) mount directory, so its appearance is the signal."""
     if os.name == "nt":
         try:
             return mount_point.is_dir()
@@ -95,7 +85,7 @@ def _wait_mounted(
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            return  # caller will inspect the dead process
+            return
         if _is_mounted(mount_point, parent):
             return
         time.sleep(0.05)
@@ -111,17 +101,13 @@ def _mount_session(
     argv_tail: list[str],
     label: str,
 ) -> Iterator[Path]:
-    """Spawn `git-bale <argv_tail>` (mount or mount-diff), wait for the FUSE
-    mount to come up, yield the mount point. Cleans up the mount and the
-    process on exit even if the body raises.
+    """Run `git-bale <argv_tail> --mount <dir>` and yield the mount point once up.
 
-    Raises MountUnavailable when the FS driver (libfuse/fuse-t, or WinFsp on
-    Windows) is missing on the host so the caller can skip the phase."""
+    Raises MountUnavailable when the host lacks the FS driver."""
     ensure_fs_driver()
     mount_point = mount_root / f"mnt-{secrets.token_hex(3)}"
     if os.name == "nt":
-        # WinFsp creates the mount directory itself and refuses a pre-existing
-        # one, so ensure the parent exists and the target does not.
+        # WinFsp creates the mount directory itself and refuses a pre-existing one.
         mount_root.mkdir(parents=True, exist_ok=True)
         if mount_point.exists():
             shutil.rmtree(mount_point, ignore_errors=True)
@@ -137,9 +123,8 @@ def _mount_session(
     )
     mounted = False
     try:
-        # llvm-cov instrumentation slows the binary by ~5x on macOS; the
-        # prod 30s timeout would expire before fuse_main_real even returned
-        # from mount(), causing the whole subsystem to skip silently.
+        # llvm-cov slows the binary ~5x on macOS; 30s would expire before
+        # fuse_main_real finished mounting.
         wait_timeout = 120.0 if get_coverage() is not None else 30.0
         _wait_mounted(mount_point, mount_root, proc, timeout_s=wait_timeout)
         mounted = _is_mounted(mount_point, mount_root)
@@ -162,9 +147,8 @@ def _mount_session(
             )
         yield mount_point
     finally:
-        # Unmount first so libfuse returns from fuse_main_real and the
-        # foreground process exits on its own; killing while still mounted
-        # can leave a stale entry on macOS (fuse-t) for tens of seconds.
+        # Unmount first so the process exits on its own; killing it while
+        # mounted can leave a stale fuse-t entry on macOS for tens of seconds.
         if mounted:
             _unmount_path(mount_point)
         try:
@@ -180,11 +164,9 @@ def _mount_session(
             proc.communicate(timeout=1.0)
         except (subprocess.TimeoutExpired, ValueError):
             pass
-        # Under --coverage, .profraw files are only written on clean exit.
-        # fuse-t kills the mount process by SIGPIPE during teardown, so the
-        # binary installs a SIGPIPE handler that flushes the profile and
-        # _exit(0)s (see mount/backend/libfuse.rs). A non-zero/sig exit here
-        # means that handler regressed and this session's coverage is lost.
+        # .profraw is only written on clean exit; fuse-t SIGPIPEs the process at
+        # teardown, so libfuse.rs installs a handler that flushes and _exit(0)s.
+        # A non-zero exit here means that handler regressed.
         if get_coverage() is not None and proc.returncode not in (0, None):
             info(
                 f"-- [{label}] WARNING: mount proc exit={proc.returncode} "
@@ -234,8 +216,6 @@ def mount_diff_session(
     paths: list[str] | None = None,
     label: str = "mount-diff",
 ):
-    # Omitting --label-a/--label-b lets the binary derive labels from the revs
-    # via sanitize_label (mount/mod.rs); pass them to pin explicit labels.
     argv = ["mount-diff", rev_a, rev_b]
     if label_a is not None:
         argv += ["--label-a", label_a]

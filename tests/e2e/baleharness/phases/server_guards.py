@@ -1,8 +1,7 @@
-"""Server-side integrity guards against a hostile (or buggy) writer: shard
-registration must prove possession of the content it names, client-supplied
-CAS chunk lists must never reach the global dedup index, xorb decompression
-must be bounded, and the recorded frame layout must always describe the exact
-xorb bytes the blob store kept."""
+"""Server integrity guards against a hostile (or buggy) writer: shard
+registration proves possession, client CAS chunk lists never reach the global
+dedup index, xorb decompression is bounded, and the recorded frame layout always
+describes the exact xorb bytes the blob store kept."""
 
 from __future__ import annotations
 
@@ -200,7 +199,6 @@ def _race_posts(url: str, bearer: str, bodies: list[bytes]) -> list[int]:
 def _race_posts_full(
     urls: list[str], bearer: str, bodies: list[bytes]
 ) -> list[tuple[int, bytes]]:
-    """POST bodies[i] to urls[i] concurrently; (status, body) per request."""
     results: list[tuple[int, bytes]] = [(0, b"")] * len(bodies)
     gate = threading.Barrier(len(bodies))
 
@@ -463,12 +461,11 @@ def phase_xorb_layout_heal(
     client: ClientEnv,
     ssh_public_key: str,
 ) -> None:
-    """A xorb upload whose layout committed but whose blob write failed must
-    not pin that layout: a later upload of the same hash in a *different*
-    (equally valid) compression stores its own bytes, so the recorded frame
-    offsets must follow them, or every file using the xorb fails to
-    reconstruct. Driven with BALE_TEST_FS_WRITE_FAIL, so fs-backend only.
-    Own container, g3."""
+    """A xorb upload whose layout committed but whose blob write failed must not
+    pin that layout: a later upload of the same hash in a different valid
+    compression stores its own bytes, and the frame offsets must follow them or
+    every file using the xorb fails to reconstruct. Uses BALE_TEST_FS_WRITE_FAIL,
+    so fs-backend only. Own container, g3."""
     if get_active_s3_backend() is not None:
         info("-- xorb-layout-heal: fs write-fail hook is S3-skipped")
         return
@@ -619,12 +616,11 @@ def phase_global_dedup_hit(
     client: ClientEnv,
     ssh_public_key: str,
 ) -> None:
-    """A second user (fresh HOME and caches, so no local shard-cache dedup)
-    pushing content another repo already stored must dedup against the server:
-    the global-dedup response's wrapped chunk hashes have to match what xet
-    computes (keyed BLAKE3), and the resulting shard — terms into the other
-    repo's xorb — must pass the server's proof-of-possession check. Expect zero
-    xorb uploads for the second push and a byte-exact clone. Own container, g3."""
+    """A second user (fresh HOME, so no local shard-cache dedup) pushing content
+    another repo stored must dedup against the server: the response's keyed-BLAKE3
+    chunk hashes must match xet's, and the resulting shard (terms into the other
+    repo's xorb) must pass proof-of-possession. Expects zero xorb uploads and a
+    byte-exact clone. Own container, g3."""
     phase_root = work_root / "global-dedup-hit"
     phase_root.mkdir()
     data_root = phase_root / "data"
@@ -707,11 +703,9 @@ def phase_oversize_xorb(
     client: ClientEnv,
     ssh_public_key: str,
 ) -> None:
-    """xet cuts xorbs at 64 MiB of *unpacked* data and stores incompressible
-    chunks raw plus an 8-byte header each, so a legit serialized xorb can be
-    slightly over 64 MiB. Search seeds (offline `git add`, inspect staging)
-    for one that produces such a xorb, then push and cold-clone it. Own
-    container, g3."""
+    """xet cuts xorbs at 64 MiB *unpacked*, plus an 8-byte header per raw chunk,
+    so a legit serialized xorb can exceed 64 MiB. Searches seeds offline for one,
+    then pushes and cold-clones it. Own container, g3."""
     phase_root = work_root / "oversize-xorb"
     phase_root.mkdir()
     data_root = phase_root / "data"
@@ -869,10 +863,9 @@ def phase_fetch_overlap(
 ) -> None:
     """A file whose terms overlap within one xorb ([X 0..5] then [X 0..10]) must
     reconstruct. xet binds each term to the first fetch entry containing it and
-    dedups blocks by (xorb, range start), so per-term (overlapping) fetch
-    entries made it slice a 5-chunk block for the 10-chunk term and panic; the
-    server must emit disjoint merged ranges. Built with bale-e2e-tools, pushed
-    as a hand-made pointer, cold-cloned. Own container, g3."""
+    dedups blocks by (xorb, range start), so overlapping per-term fetch entries
+    make it slice a 5-chunk block for the 10-chunk term and panic: the server
+    must emit disjoint merged ranges. Hand-made pointer, own container, g3."""
     phase_root = work_root / "fetch-overlap"
     phase_root.mkdir()
     data_root = phase_root / "data"
@@ -1038,12 +1031,11 @@ def phase_dedup_repeated_chunk(
     client: ClientEnv,
     ssh_public_key: str,
 ) -> None:
-    """A xorb may hold the same chunk twice (xet dedups repeats only within one
-    file's new data). Clients dedup against a /v1/chunks response by chunk
-    *position*, so the response must list every position — the chunks table's
-    (chunk_hash, xorb) key collapses the repeat, and a list built from it
-    shifts every later index (silent wrong bytes). Also cold-clones a file that
-    references the repeated chunk. Own container, g3."""
+    """A xorb may hold the same chunk twice. Clients dedup against /v1/chunks by
+    chunk *position*, so the response must list every position: the chunks
+    table's (chunk_hash, xorb) key collapses the repeat, and a list built from it
+    shifts every later index (silent wrong bytes). Also cold-clones a file over
+    the repeat. Own container, g3."""
     phase_root = work_root / "dedup-repeated-chunk"
     phase_root.mkdir()
     data_root = phase_root / "data"
@@ -1195,11 +1187,10 @@ def phase_quota_atomic(
     client: ClientEnv,
     ssh_public_key: str,
 ) -> None:
-    """(1) Two shards that each fit an owner's quota but together don't, posted
-    at the same instant: the in-transaction recheck must let exactly one
-    through. (2) Xorbs uploaded without ever registering a file are charged to
-    the uploader, so they can't grow storage past the quota. Crafted with
-    bale-e2e-tools over direct HTTP. Own container, g3."""
+    """(1) Two concurrent shards that each fit the quota but not together: the
+    in-transaction recheck lets exactly one through; likewise for two new-xorb
+    uploads. (2) Xorbs never referenced by a file are still charged to the
+    uploader. Direct HTTP with bale-e2e-tools, own container, g3."""
     del client
     phase_root = work_root / "quota-atomic"
     phase_root.mkdir()
@@ -1418,12 +1409,11 @@ def phase_canonical_scope(
     client: ClientEnv,
     ssh_public_key: str,
 ) -> None:
-    """The authority's canonical scope key and accounting owner win over the
-    client-typed repo name: with a forge that resolves names case-insensitively
-    and keys repos by immutable id (`id/42`, owner `7`, as the gitea fork does),
-    a push via `canon/repo` must be readable via `Canon/Repo`, charged to owner
-    `7`, and stay readable after a simulated transfer to owner `8`. Mock
-    /check_access, own container, g3."""
+    """The authority's canonical scope key and owner win over the client-typed
+    name: with a case-insensitive forge keying repos by id (`id/42`, owner `7`),
+    a push via `canon/repo` is readable via `Canon/Repo`, charged to `7`, and
+    stays readable after a transfer to owner `8`. Mock /check_access, own
+    container, g3."""
     phase_root = work_root / "canonical-scope"
     phase_root.mkdir()
     data_root = phase_root / "data"

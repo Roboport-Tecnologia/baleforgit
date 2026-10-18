@@ -97,9 +97,8 @@ impl ConfigAuthz {
     }
 }
 
-/// 5 minutes (UTC unix seconds, like `tokens::mint`'s `exp`). Short on purpose:
-/// the client refreshes via the forge before expiry (`git-bale`'s
-/// `ForgeTokenRefresher`), so a leaked token has a small blast radius.
+/// Short on purpose: git-bale's `ForgeTokenRefresher` re-mints via the forge
+/// before expiry, so a leaked token has a small blast radius.
 pub const DEFAULT_TOKEN_TTL_SECS: u64 = 300;
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -124,7 +123,7 @@ impl RepoAuthz for ConfigAuthz {
         requested: Scope,
         _purpose: AccessPurpose<'_>,
     ) -> CoreResult<AccessGrant> {
-        // Iterate + ct_eq instead of a HashMap lookup so the hub bearer match doesn't leak via timing.
+        // Scan with ct_eq, not a HashMap lookup, so the bearer match doesn't leak via timing.
         let mut found: Option<&ConfigUser> = None;
         for (k, v) in &self.users {
             if ct_eq(k.as_bytes(), hub_bearer.as_bytes()) {

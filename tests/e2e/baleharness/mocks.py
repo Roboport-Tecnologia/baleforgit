@@ -23,20 +23,13 @@ from baleharness.server import ServerHandle
 
 
 class TcpProxy:
-    """Pure-stdlib forwarding proxy used by the failure-recovery phases.
-    Listens on 127.0.0.1:`listen_port` and shovels bytes to `upstream` in
-    both directions. `kill()` slams every socket shut to simulate an abrupt
-    connection drop (no FIN); `start()` may be called again afterwards to
-    bring the proxy back up on the same listen port for the retry leg.
+    """Forwarding proxy for the failure-recovery phases. `kill()` slams every
+    socket shut to simulate an abrupt drop; `start()` may be called again to
+    bring it back on the same port for the retry leg.
 
-    `throttle_bytes_per_sec` rate-limits the *client → server* direction
-    (the direction that carries xorb/shard upload bodies). Returning bytes
-    are passed through at full speed. The throttle exists so the upload
-    takes long enough for the harness to reliably interrupt it mid-flight
-    on localhost, where an unthrottled 35 MiB push completes in well under
-    a second and the race window vanishes.
-
-    NOT a general-purpose proxy — only safe for use in this test harness.
+    `throttle_bytes_per_sec` slows only client → server (the upload bodies):
+    an unthrottled 35 MiB push on localhost finishes in well under a second,
+    too fast to interrupt mid-flight.
     """
 
     def __init__(
@@ -51,9 +44,8 @@ class TcpProxy:
         self.listen_port = listen_port
         self.upstream = (upstream_host, upstream_port)
         self.throttle_bytes_per_sec = throttle_bytes_per_sec
-        # bind_host is "127.0.0.1" for the existing client↔server drop phase,
-        # and "0.0.0.0" for the S3-conndrop phase so the server container can
-        # reach the proxy via host.containers.internal.
+        # "0.0.0.0" for failure-s3-conndrop, so the server container can reach
+        # the proxy via host.containers.internal.
         self.bind_host = bind_host
         self._lock = threading.Lock()
         self._listen_sock: socket.socket | None = None
@@ -70,9 +62,8 @@ class TcpProxy:
 
     @property
     def connections(self) -> int:
-        """Count of inbound TCP connections accepted since the last
-        reset_counters(). The offline-no-network phase asserts this stays
-        0 across operations that must never touch the CAS server."""
+        """Inbound connections since the last reset_counters(); offline-no-network
+        asserts it stays 0 across ops that must never touch the CAS server."""
         with self._lock:
             return self._connections
 
@@ -116,8 +107,6 @@ class TcpProxy:
                 continue
             with self._lock:
                 self._active.extend((client_sock, upstream_sock))
-            # Only throttle the client → server direction; responses get
-            # passed through at full speed.
             threading.Thread(
                 target=self._pump,
                 args=(client_sock, upstream_sock),
@@ -162,8 +151,7 @@ class TcpProxy:
                     pass
 
     def kill(self) -> None:
-        """Slam all sockets. Active client/upstream sockets are closed without
-        a FIN, simulating an abrupt drop from the client's perspective."""
+        """Close every socket at once, simulating an abrupt connection drop."""
         with self._lock:
             self._stopped = True
             ls, self._listen_sock = self._listen_sock, None
@@ -188,9 +176,8 @@ class TcpProxy:
 
 
 class MockAuthzServer:
-    """Stand-in for the upstream `/check_access` endpoint a real forge
-    would expose. Used by the `authz-http` coverage phase to drive
-    `bale-server-authz-http::HttpAuthz`.
+    """Stand-in for a forge's `/check_access`, driving `HttpAuthz` in the
+    `authz-http` coverage phase.
 
     Wire contract (see `crates/bale-server-authz-http/src/lib.rs`):
         POST /check_access  { "hub_bearer": ..., "repo": {...}, "scope": ... }
@@ -199,12 +186,7 @@ class MockAuthzServer:
         403 Forbidden                   — known token, insufficient access
         any other (e.g. 500)            — upstream failure (HttpAuthz maps to Internal)
 
-    Binds 0.0.0.0:port so the server container can reach it via the
-    host's primary IP (the standard cross-bridge route).
-
-    The decision function receives (hub_bearer, repo_id, scope_str) and
-    returns (http_status:int, body_dict:dict). Each phase configures its
-    own decision logic.
+    `decide(hub_bearer, repo_id, scope)` returns `(status, body_dict)`.
     """
 
     def __init__(
@@ -224,9 +206,8 @@ class MockAuthzServer:
 
     @property
     def url(self) -> str:
-        # The container reaches us via the host's primary IP — the
-        # bridge routes to it for free. 127.0.0.1 wouldn't work because
-        # that's the container's own loopback inside its netns.
+        # The server container reaches us via the host's primary IP; 127.0.0.1
+        # would be its own loopback.
         return f"http://{host_primary_ip()}:{self.port}"
 
     def start(self) -> None:
@@ -234,8 +215,7 @@ class MockAuthzServer:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, fmt, *args):
-                # http.server's default writes one stderr line per request,
-                # which would drown our own info() output. Drop them.
+                # The default per-request stderr line drowns our info() output.
                 pass
 
             def do_POST(self):
@@ -281,23 +261,18 @@ class MockAuthzServer:
 
 
 class MockForgeServer:
-    """Stand-in for a git forge's `/<owner>/<repo>.git/info/bale/authenticate`
-    endpoint — the HTTPS half of the forge protocol the git-bale resolver uses
-    when `origin` is an `http(s)://` URL (instead of the SSH
-    `git-bale-authenticate` command). A real forge verifies the user's password
-    locally and returns the baleforgit-server href plus a short-lived Bearer;
-    we return a fixed href + hub token (`docs/BALE_FORGE_PROTOCOL.md`).
+    """Stand-in for a forge's `/<owner>/<repo>.git/info/bale/authenticate`, the
+    HTTPS half of the forge protocol (`docs/BALE_FORGE_PROTOCOL.md`); returns a
+    fixed href + hub token.
 
     Wire shape the resolver expects (resolver.rs `authenticate_http`):
         POST /<owner>/<repo>.git/info/bale/authenticate?op=upload|download
         Authorization: Basic <base64(user:pass)>
         200 { "href": "<bale-server-url>", "header": {"Authorization": "Bearer <tok>"} }
 
-    We do NOT serve git smart-HTTP: the two operations that drive the HTTP
-    resolver branch — `git-bale push-pending` and a cold smudge — only read
-    `origin`'s URL and POST to this endpoint; they never transfer git refs.
-    That keeps the mock to one endpoint instead of wrapping `git http-backend`.
-    The client runs on the host, so it reaches us on 127.0.0.1.
+    No git smart-HTTP: push-pending and a cold smudge only read `origin`'s URL
+    and POST here, so one endpoint suffices instead of wrapping
+    `git http-backend`. The client runs on the host, hence 127.0.0.1.
     """
 
     def __init__(
@@ -312,13 +287,10 @@ class MockForgeServer:
         self.bale_href = bale_href.rstrip("/")
         self.hub_token = hub_token
         self.port = port or pick_free_port()
-        # enforce_auth=False (default): every authenticate succeeds regardless
-        # of credentials — a forge with no visibility model, which the
-        # https-origin phase relies on. enforce_auth=True models a real forge:
-        # an anonymous request (no Basic auth) is granted only for `op=download`
-        # on a `public` repo; private downloads and every upload demand
-        # credentials (401). `public` is mutable so one mock can serve a public
-        # then a private sub-case. See `docs/BALE_FORGE_PROTOCOL.md`.
+        # enforce_auth=False: every request succeeds (https-origin relies on it).
+        # True models a real forge: anonymous is granted only `op=download` on a
+        # `public` repo, else 401. `public` is mutable so one mock can serve a
+        # public then a private sub-case.
         self.enforce_auth = enforce_auth
         self.public = public
         self.calls: list[tuple[str, bool]] = []  # (op, had_basic_auth)
@@ -350,10 +322,8 @@ class MockForgeServer:
                     self.rfile.read(length)
                 with outer._lock:
                     outer.calls.append((op, had_basic))
-                # Anonymous (no Basic auth) is granted only for a public-repo
-                # download; private downloads and every upload get 401. This is
-                # what lets the resolver's anon-first download path resolve a
-                # public repo and fall back to Basic auth on a private one.
+                # The 401 is what drives the resolver's anon-first download
+                # path to fall back to Basic auth on a private repo.
                 if outer.enforce_auth and not had_basic:
                     if not (op == "download" and outer.public):
                         self.send_response(401)
@@ -391,13 +361,9 @@ class MockForgeServer:
 
 
 class OtlpCollector:
-    """Minimal OTLP/HTTP collector for the telemetry phase. Binds 0.0.0.0 so
-    the server container reaches it via the host's primary IP, accepts POSTs on
-    any path (the exporter targets /v1/traces and /v1/metrics), drains the
-    protobuf body, and answers 200 with an empty body — which the
-    opentelemetry-rust HTTP exporter accepts as a successful export. Records a
-    per-path hit count so the phase can assert the server's exporter pipeline
-    actually fired."""
+    """Minimal OTLP/HTTP collector: answers every POST 200 with an empty body
+    (which opentelemetry-rust accepts as a successful export) and counts hits
+    per path so the phase can assert the exporter pipeline fired."""
 
     def __init__(self, *, port: int | None = None) -> None:
         self.port = port or pick_free_port()
@@ -408,9 +374,8 @@ class OtlpCollector:
 
     @property
     def url(self) -> str:
-        # Base endpoint; the server appends /v1/traces + /v1/metrics per the
-        # OTLP/HTTP spec. 127.0.0.1 is the container's own loopback, so we hand
-        # it the host's primary IP (same cross-bridge route as MockAuthzServer).
+        # Base endpoint; the exporter appends /v1/traces + /v1/metrics. Host IP
+        # for the same reason as MockAuthzServer.url.
         return f"http://{host_primary_ip()}:{self.port}"
 
     def hit_count(self, path: str) -> int:
@@ -454,10 +419,9 @@ class OtlpCollector:
 def wait_for_server_progress(
     server: ServerHandle, *, min_bytes: int, timeout_s: float = 15.0
 ) -> int:
-    """Poll the server's xorbs directory until at least `min_bytes` have
-    landed. Returns the disk total seen. The wait window must be short
-    enough that the in-flight push hasn't completed yet — we want to
-    catch it mid-upload, not after."""
+    """Poll until at least `min_bytes` of xorbs are on the server's disk;
+    returns the total seen. Keep `timeout_s` short enough to catch the push
+    mid-upload."""
     deadline = time.monotonic() + timeout_s
     last = 0
     while time.monotonic() < deadline:
@@ -473,24 +437,15 @@ def wait_for_server_progress(
 
 @contextmanager
 def hold_db_writer_lock(server: ServerHandle, hold_seconds: float) -> Iterator[None]:
-    """Open the server's SQLite meta.db from a sidecar `sqlite3` shell INSIDE
-    the container, take an IMMEDIATE write lock for `hold_seconds`, and
-    yield. Used by the transient-db-failure phase to force the server's
-    SQLite writes to hit SQLITE_BUSY transiently — sqlx's default 5s
-    busy_timeout should turn the contention into a brief wait, not an
-    error, so a concurrent client push sees no failure.
+    """Hold an IMMEDIATE write lock on the server's meta.db for `hold_seconds`
+    and yield, so failure-dbbusy's concurrent push hits SQLITE_BUSY; the
+    server's busy_timeout must turn that into a brief wait, not an error.
 
-    The lock-holder runs inside the container (not on the host) because
-    rootless podman bind mounts go through a VM on macOS, where host-side
-    fcntl locks don't propagate to the in-VM SQLite.
-
-    The sqlite3 CLI buffers its stdout when not on a TTY, so an
-    interactive driver from outside can't reliably detect "lock held" via
-    SELECT output. Instead, drive sqlite3 with a heredoc that touches a
-    marker file after BEGIN IMMEDIATE returns — we poll for the marker
-    to confirm the lock was acquired before yielding."""
+    Runs inside the container: on macOS rootless podman bind mounts go through
+    a VM, where host-side fcntl locks don't reach the in-VM SQLite. sqlite3
+    buffers stdout off a TTY, so "lock held" is signalled by a marker file
+    touched after BEGIN IMMEDIATE returns."""
     marker = "/tmp/bale-e2e-dblock-held"
-    # Wipe any leftover marker from an earlier run inside the same container.
     subprocess.run(
         server.rt.cmd("exec", server.name, "rm", "-f", marker),
         capture_output=True,
@@ -533,8 +488,7 @@ def hold_db_writer_lock(server: ServerHandle, hold_seconds: float) -> Iterator[N
     try:
         yield
     finally:
-        # The detached sqlite3 will COMMIT and exit on its own once
-        # `sleep hold_seconds` elapses; nothing to clean up here.
+        # The detached sqlite3 COMMITs and exits on its own after the sleep.
         pass
 
 
@@ -544,14 +498,10 @@ def meta_db_query(
     sqlite_sql: str,
     pg_sql: str,
 ) -> subprocess.CompletedProcess:
-    """Run one statement against the server's metadata store, picking the engine
-    the run is using, and return the raw CompletedProcess. Rows come back
-    '|'-separated, one per line, headerless. The query runs INSIDE a container
-    (the server's for SQLite, the sidecar's for Postgres) because rootless podman
-    bind mounts go through a VM on macOS where a host-side meta.db read is
-    unreliable. Statements differ only where the dialect does (e.g. `hex(x)` vs
-    `encode(x,'hex')`), so callers pass both forms; for dialect-neutral SQL pass
-    the same string twice."""
+    """Run one statement against whichever metadata engine the run uses; rows
+    come back '|'-separated, headerless. Runs inside a container because a
+    host-side meta.db read through the macOS podman VM is unreliable. Pass the
+    same string twice for dialect-neutral SQL."""
     pg = get_active_postgres_backend()
     if pg is not None:
         # Same per-data_root database start_container pointed this server at.

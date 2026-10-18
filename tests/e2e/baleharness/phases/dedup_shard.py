@@ -46,29 +46,23 @@ def phase_global_dedup_shard(
 ) -> None:
     """A global-dedup shard the server hands back must ingest without crashing.
 
-    `GET /v1/chunks/{prefix}/{hash}` returns a minimal shard with no lookup
-    tables. Its footer must still set each lookup-table *offset* to the section
-    end (== footer_offset), never 0: xet's `read_all_truncated_hashes` — run on
-    every shard the upload session's `ShardFileManager` ingests, in BOTH debug
-    and release builds — takes `file_lookup_offset` as the END of the xorb-info
-    byte range, so a 0 makes `file_lookup_offset - xorb_info_offset` underflow
-    (debug panic; release a multi-exabyte `Vec::with_capacity` → OOM). The
-    pre-push hook dies and `git push` fails.
+    `GET /v1/chunks/{prefix}/{hash}` returns a shard with no lookup tables, but
+    each lookup-table offset must still be the section end (== footer_offset),
+    never 0: xet's `read_all_truncated_hashes` (run on every ingested shard, in
+    debug and release) takes `file_lookup_offset` as the END of the xorb-info
+    range, so 0 underflows (debug panic, release OOM) and `git push` fails.
 
-    Reproducing the crash through a real push would need a chunk whose hash is
-    global-dedup eligible (`hash % 1024 == 0`, ~1 in 1024) and the release
-    binary can't lower that modulus (the `HF_XET_*` override is debug-only). So
-    we drive it deterministically:
+    A real push would need a dedup-eligible chunk (`hash % 1024 == 0`) and the
+    release binary can't lower that modulus, so instead:
 
-      1. Seed the server, fetch the dedup shard for a known chunk straight from
-         the endpoint, and assert its footer is well-formed.
-      2. Plant that exact shard into the client's xet shard-cache under a valid
-         `<64hex>.mdb` name and push again. The upload session scans + ingests
-         it through `read_all_truncated_hashes` — the precise crash path — so
-         the push must succeed.
+      1. Seed the server, fetch the dedup shard for a known chunk, and assert
+         its footer is well-formed.
+      2. Plant that shard into the client's xet shard-cache and push again; the
+         upload session ingests it through the crash path, so the push must
+         succeed.
 
-    Owns its own isolated container so the bare repo + grants don't have to be
-    threaded through the shared server (and its offline-restart rebind)."""
+    Own container so the bare repo + grants aren't threaded through the shared
+    server (and its offline-restart rebind)."""
     phase_root = work_root / "dedup-shard"
     phase_root.mkdir()
     data_root = phase_root / "data"
@@ -96,10 +90,8 @@ def phase_global_dedup_shard(
             repo=E2E_REPO_DEDUP_SHARD,
             name="dedup-shard-client",
         )
-        # Pin the xet cache: this is the dir the upload session caches global-
-        # dedup shards in, the dir we plant into, and the dir the second push's
-        # FileUploadSession::new scans. git-bale maps BALE_XET_CACHE onto xet's
-        # HF_XET_CACHE; the filter + pre-push hook inherit it from `env`.
+        # Pin the xet cache so we know which shard-cache the second push's
+        # upload session scans; the filter + pre-push hook inherit it from `env`.
         xet_cache = phase_root / "xet-cache"
         env["BALE_XET_CACHE"] = str(xet_cache)
 
@@ -115,11 +107,8 @@ def phase_global_dedup_shard(
         shard = _fetch_dedup_shard(server, jwt_secret)
         _assert_footer_wellformed(shard)
 
-        # Plant the server's dedup shard into the upload session's cache dir
-        # under a valid <64hex>.mdb name (scan_impl loads it by filename; the
-        # content-hash check is the debug-only verify, so any 64-hex name is
-        # ingested) and push again. The second push's FileUploadSession::new
-        # scans + ingests it via read_all_truncated_hashes — the crash path.
+        # Any <64hex>.mdb name is ingested: the content-hash check on scan is
+        # debug-only.
         shard_cache = _find_shard_cache_dir(xet_cache)
         planted = shard_cache / f"{sha256_bytes(shard)}.mdb"
         planted.write_bytes(shard)
@@ -130,8 +119,7 @@ def phase_global_dedup_shard(
         git(["add", "seed.bin"], cwd=repo, env=env)
         git(["commit", "-m", "edit triggers a fresh upload session"], cwd=repo, env=env)
         with timings.measure("global-dedup-shard: push with planted dedup shard"):
-            # Plain git(): a non-zero exit means push-pending's upload session
-            # crashed ingesting the planted shard (the bug). Let it raise.
+            # Non-zero exit: the upload session crashed ingesting the planted shard.
             git(["push", "origin", "main"], cwd=repo, env=env)
     finally:
         server.stop()
@@ -194,10 +182,8 @@ def _encode_hash(raw: bytes) -> str:
 def _find_shard_cache_dir(xet_cache: Path) -> Path:
     matches = sorted(xet_cache.glob("*/shard-cache"))
     if len(matches) != 1:
-        # The seed push's upload session mkdir's exactly one
-        # <server-key>/shard-cache. A different count means the xet cache layout
-        # changed and the plant-and-reingest guard is no longer wired — fail
-        # loudly rather than silently skip it.
+        # Another count means xet's cache layout changed and the plant would
+        # silently stop exercising the crash path.
         raise TestFailure(
             f"global-dedup-shard: expected one <server-key>/shard-cache under "
             f"{xet_cache} after the seed push, found {matches}"
@@ -230,17 +216,12 @@ def _assert_footer_wellformed(shard: bytes) -> None:
             f"global-dedup-shard: footer version {version}, expected "
             f"{SHARD_FOOTER_VERSION}"
         )
-    # A dedup response carries no lookup tables; this is the branch in
-    # read_all_truncated_hashes that underflowed.
+    # The no-lookup-table branch is the one that underflowed.
     if chunk_lookup_num != 0:
         raise TestFailure(
             f"global-dedup-shard: expected a lookup-table-less dedup shard "
             f"(chunk_lookup_num_entry == 0), got {chunk_lookup_num}"
         )
-    # The bug: file_lookup_offset == 0 < xorb_info_offset, so the xorb-info byte
-    # range (xorb_info_offset, file_lookup_offset) inverts and the client does
-    # (file_lookup_offset - xorb_info_offset) → underflow. With no lookup
-    # tables, every lookup offset must equal footer_offset (the section end).
     if not (xorb_info_offset <= file_lookup_offset == footer_offset != 0):
         raise TestFailure(
             "global-dedup-shard: malformed dedup shard footer — "

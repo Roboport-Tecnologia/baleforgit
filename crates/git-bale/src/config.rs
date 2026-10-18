@@ -36,22 +36,18 @@ pub struct RawConfig {
     /// not a load() failure.
     pub local_store: Option<PathBuf>,
     /// `bale.localShared` / `BALE_LOCAL_SHARED`: the store is shared across
-    /// repos, so gc must not delete objects (see `prune`).
+    /// repos, so gc must not delete objects (only `prune --shared` reclaims).
     pub local_shared: bool,
-    /// The ssh command git itself would use (`GIT_SSH_COMMAND` env, else
-    /// `core.sshCommand`). The forge-auth ssh handshake honors it so a user's
-    /// custom key/port/`UserKnownHostsFile`/jump-host applies there too — and so
-    /// the e2e harness's isolated `UserKnownHostsFile` keeps the handshake from
-    /// writing host keys into the developer's real `~/.ssh/known_hosts` (ssh
-    /// expands `~` via getpwuid, ignoring `$HOME`). `None` → bare `ssh`.
+    /// `GIT_SSH_COMMAND`, else `core.sshCommand`, for the forge-auth handshake: a
+    /// user's custom key/port/jump-host must apply, and the e2e harness's isolated
+    /// `UserKnownHostsFile` keeps ssh (which expands `~` via getpwuid, ignoring
+    /// `$HOME`) out of the real `~/.ssh/known_hosts`. `None` → bare `ssh`.
     pub ssh_command: Option<String>,
 }
 
 impl RawConfig {
-    /// Server URL and token are optional — the resolver auto-discovers them via
-    /// `git remote` + a forge roundtrip. Uses `gix::discover` (not `git`
-    /// subprocesses): this runs on every `git status`/`git diff`, and fork+exec
-    /// is ~5–15 ms per call on macOS.
+    /// Uses `gix::discover`, not `git` subprocesses: this runs on every
+    /// `git status`/`git diff`, and fork+exec is ~5–15 ms per call on macOS.
     pub fn load(repo: Option<&Path>) -> Result<Self> {
         let start_dir = repo
             .map(|p| p.to_path_buf())
@@ -192,10 +188,8 @@ fn cache_base() -> Option<PathBuf> {
     }
 }
 
-/// "Effectively never expires" sentinel for a literal `bale.token` with no
-/// `bale.tokenExpiration` set and no forge to re-mint from. See the fuller note
-/// on `resolver::far_future_epoch`; xet needs *some* expiry and would otherwise
-/// try to refresh a static token it can't.
+/// Never-expires sentinel for a static `bale.token` without `bale.tokenExpiration`:
+/// xet requires an expiry and would otherwise try to refresh a token it can't.
 fn far_future_epoch() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()

@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Full end-to-end test for git-bale + baleforgit-server.
+"""End-to-end harness entry point for git-bale + baleforgit-server.
 
-Thin entry point. The harness itself lives in the `baleharness` package
-(sliced out of the former monolithic run.py so it can keep growing); this
-module just runs it and re-exports the handful of names that `s3lib.py`
-pulls in via `from run import ...`.
-
-Not invoked by `cargo test` — run it directly:
+The harness lives in the `baleharness` package; this module runs it and
+re-exports the names `s3lib.py` imports via `from run import ...`.
 
     python3 tests/e2e/run.py              # filesystem blob store
     python3 tests/e2e/run.py --backend s3 # the whole suite against MinIO
@@ -20,8 +16,7 @@ import sys
 
 from baleharness.cli import main
 
-# Backwards-compat re-exports. `s3lib.py` does `from run import …`; keep those
-# names resolvable from this module after the package split.
+# `s3lib.py` does `from run import …`; keep these names resolvable here.
 from baleharness.client import ClientEnv, setup_client  # noqa: F401
 from baleharness.config import (  # noqa: F401
     BIG_FILE_BYTES,

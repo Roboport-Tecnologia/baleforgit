@@ -1,14 +1,9 @@
-//! Postgres-backed `MetadataStore` implementation.
-//!
-//! Dialect-free helpers and row decoders live in `bale-server-meta-common`. This
-//! crate is a near-mirror of `bale-server-meta-sqlite` with the dialect
-//! differences that matter: `$n` placeholders instead of `?`, `ON CONFLICT`
-//! instead of `INSERT OR IGNORE`/`INSERT OR REPLACE`, `BYTEA`/`BIGINT` column
-//! types, a `::BIGINT` cast on every `SUM(...)` (Postgres widens `SUM` over
-//! `bigint` to `numeric`, which `try_get::<i64>` can't decode), and — because
-//! READ COMMITTED can't serialize two concurrent *first* registrations of a
-//! file_hash the way SQLite's transaction does — an explicit
-//! `pg_advisory_xact_lock` around the write-once term check.
+//! Postgres `MetadataStore`: a near-mirror of `bale-server-meta-sqlite` (shared
+//! helpers in `bale-server-meta-common`). Non-obvious dialect differences: every
+//! `SUM(...)` is cast `::BIGINT` (Postgres widens it to `numeric`, which
+//! `try_get::<i64>` can't decode), and READ COMMITTED can't serialize two
+//! concurrent *first* registrations of a file_hash the way SQLite's transaction
+//! does, so `pg_advisory_xact_lock` guards the write-once term check.
 
 use async_trait::async_trait;
 use bale_server_core::{
@@ -107,9 +102,8 @@ CREATE TABLE IF NOT EXISTS file_terms (
 CREATE INDEX IF NOT EXISTS file_terms_by_xorb ON file_terms(xorb_hash);
 "#;
 
-// Arbitrary fixed key so concurrent server startups serialize their DDL — two
-// instances racing `CREATE TABLE/INDEX IF NOT EXISTS` can otherwise collide in
-// pg_catalog. Held only for the migration transaction.
+// Serializes concurrent startups' DDL: racing `CREATE ... IF NOT EXISTS` can
+// still collide in pg_catalog.
 const MIGRATION_LOCK_KEY: i64 = 0x42_41_4c_45_5f_4d_44_42; // "BALE_MDB"
 
 pub struct PostgresMetadataStore {
@@ -183,10 +177,9 @@ async fn stored_bytes_in_tx(
     nonneg_i64_to_u64(n, "stored_bytes_for_owner")
 }
 
-// On-disk bytes of `candidates` this owner neither references through its
-// files nor already pays for as its own unreferenced uploads — i.e. what
-// registering them would add to the owner's usage. Batched so a huge shard
-// stays under the bind-parameter limit (deduped batches sum exactly).
+// What registering `candidates` would add to the owner's usage: bytes it neither
+// references through its files nor pays for as unreferenced uploads. Batched
+// under the bind-parameter limit (deduped, so batches sum exactly).
 async fn unaccounted_bytes(
     conn: &mut sqlx::PgConnection,
     owner: &str,
@@ -234,9 +227,9 @@ async fn check_quota_in_tx(
     files: &[FileRegistration],
     quota: u64,
 ) -> CoreResult<()> {
-    // Terms are write-once: a file already registered keeps its stored
-    // terms, whatever this registration claims. Batched: this runs under the
-    // owner's write lock, so per-file queries would stall every writer.
+    // Terms are write-once, so an already-registered file is charged by its
+    // stored terms, not the claimed ones. Batched: per-file queries under the
+    // owner lock would stall every writer.
     let mut file_hashes: Vec<Vec<u8>> =
         files.iter().map(|f| hash_to_blob(&f.file_hash.0)).collect();
     file_hashes.sort();
@@ -293,8 +286,8 @@ async fn write_file_in_tx(
     let terms = &reg.terms;
     let total_bytes: u64 = terms.iter().map(|t| t.unpacked_segment_bytes as u64).sum();
 
-    // Taken before any row lock (and registrations are hash-sorted by the caller)
-    // so two shards registering overlapping files can't deadlock.
+    // Taken before any row lock, in `register_files`' hash order, so two shards
+    // registering overlapping files can't deadlock.
     let lock_key = hash_to_blob(&file_hash.0)
         .get(..8)
         .and_then(|s| s.try_into().ok())
@@ -327,18 +320,12 @@ async fn write_file_in_tx(
     .await
     .map_err(|e| CoreError::Internal(format!("insert file: {e}")))?;
 
-    // The term list for a file_hash is NOT canonical: global dedup segments the
-    // same content into a different *number* of xorb-referencing terms depending on
-    // which pre-existing xorbs it matches. file_terms is global (keyed by file_hash,
-    // not repo), so a per-term ON CONFLICT DO NOTHING would *merge* two
-    // differently-segmented registrations — keeping the old terms where indices
-    // collide and appending the longer list's tail — yielding Σunpacked > file_size
-    // and corrupting every reconstruction of this hash (xet's last-term trim then
-    // underflows). Register write-once: the first complete list fully describes the
-    // content, so skip insertion if any terms already exist. Under READ
-    // COMMITTED two concurrent *first* registrations wouldn't see each other's
-    // uncommitted rows; the advisory lock above serializes same-hash registers
-    // (auto-released at commit/rollback).
+    // Term lists aren't canonical (dedup segments the same content differently
+    // depending on which xorbs exist) and file_terms is global, so a per-term
+    // ON CONFLICT DO NOTHING would merge two segmentations into Σunpacked >
+    // file_size and corrupt every reconstruction. Write-once: the first complete
+    // list wins. The advisory lock above makes this check see a concurrent first
+    // registration under READ COMMITTED.
     let terms_exist = sqlx::query("SELECT 1 FROM file_terms WHERE file_hash = $1 LIMIT 1")
         .bind(hash_to_blob(&file_hash.0))
         .fetch_optional(&mut **tx)
@@ -461,9 +448,9 @@ impl MetadataStore for PostgresMetadataStore {
             .await
             .map_err(|e| CoreError::Internal(format!("begin: {e}")))?;
         if let Some(q) = quota {
-            // Serializes same-owner registrations (taken before any per-file
-            // lock, so lock order is consistent and can't deadlock). The
-            // two-int4 key space is disjoint from the file-hash bigint locks.
+            // Serializes same-owner quota checks so two shards can't each pass and
+            // jointly overshoot. Taken before any per-file lock (consistent lock
+            // order); the two-int4 key space is disjoint from the file-hash locks.
             sqlx::query("SELECT pg_advisory_xact_lock(1, hashtext($1))")
                 .bind(repo.owner())
                 .execute(&mut *tx)
@@ -505,12 +492,9 @@ impl MetadataStore for PostgresMetadataStore {
         let Some(terms) = self.stored_file_terms(file_hash).await? else {
             return Ok(None);
         };
-        // Defense in depth: the terms must sum to the file's recorded size. A
-        // mismatch means the term list is internally inconsistent (e.g. legacy data
-        // from before terms were registered write-once, where two differently-
-        // segmented registrations got merged into an over-describing list). Serving
-        // it would underflow xet's last-term trim and panic the client, so error.
-        // Any matching row suffices: one repo's bad row must not 500 every repo.
+        // Defense in depth against pre-write-once merged term lists: serving terms
+        // that don't sum to the recorded size panics xet's last-term trim. Any
+        // matching row suffices: one repo's bad row must not 500 every repo.
         let term_sum: u64 = terms.iter().map(|t| t.unpacked_segment_bytes as u64).sum();
         let row = sqlx::query(
             "SELECT COUNT(*)::BIGINT AS n,
@@ -584,8 +568,7 @@ impl MetadataStore for PostgresMetadataStore {
         if xorbs.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        // Batched IN queries: one per CHUNK_INSERT_BATCH xorbs keeps a huge
-        // shard under the bind-parameter limit.
+        // Batched to keep a huge shard under the bind-parameter limit.
         let uniq = dedup_sorted_xorbs(xorbs);
         let mut out: std::collections::HashMap<XorbHash, Vec<XorbFrameRow>> =
             std::collections::HashMap::new();
@@ -644,7 +627,7 @@ impl MetadataStore for PostgresMetadataStore {
         spans: &[(XorbHash, u32, u32)],
     ) -> CoreResult<Vec<Vec<XorbFrameRow>>> {
         let mut out: Vec<Vec<XorbFrameRow>> = vec![Vec::new(); spans.len()];
-        // 4 binds per span: stays far under both backends' bind limits.
+        // 4 binds per span: far under Postgres's 65535 bind limit.
         for (batch_no, batch) in spans.chunks(SPAN_QUERY_BATCH).enumerate() {
             let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
                 "SELECT s.idx AS idx, f.frame_index, f.on_disk_start, f.on_disk_len, \
@@ -920,11 +903,10 @@ impl MetadataStore for PostgresMetadataStore {
     }
 
     async fn exclusive_stored_bytes_for_repo(&self, repo_id: &str) -> CoreResult<u64> {
-        // Xorbs this repo references, minus any also referenced by a *sibling*
-        // repo of the same owner (from the files' recorded owner: a canonical
-        // key like `id/42` names none) — the amount the owner's stored_bytes would drop if
-        // this repo were deleted. Cross-owner sharing is ignored, matching the
-        // owner-independent accounting in stored_bytes_for_owner.
+        // What the owner's stored_bytes would drop if this repo were deleted:
+        // its xorbs minus those a same-owner sibling also references. Owner comes
+        // from the files' recorded owner (a canonical key like `id/42` names
+        // none); cross-owner sharing is ignored, as in stored_bytes_for_owner.
         let row = sqlx::query(
             "SELECT COALESCE(SUM(num_bytes_on_disk), 0)::BIGINT AS n
              FROM xorbs

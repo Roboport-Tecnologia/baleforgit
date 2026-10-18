@@ -39,7 +39,6 @@ pub fn decode_hash(s: &str) -> Result<Hash32, HexError> {
         for i in 0..8 {
             let hi = hex_nibble(bytes[str_off + i * 2])?;
             let lo = hex_nibble(bytes[str_off + i * 2 + 1])?;
-            // Reverse within group: i-th hex pair maps to byte (7 - i).
             out[byte_off + (7 - i)] = (hi << 4) | lo;
         }
     }
@@ -92,14 +91,13 @@ pub struct UploadXorbResponse {
     pub was_inserted: bool,
 }
 
-/// `result`: `0` = shard already existed, `1` = `SyncPerformed`; not meaningful
-/// beyond "200 means success" per spec.
+/// `result`: `0` = shard already existed, `1` = `SyncPerformed`; clients only rely on the 200.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UploadShardResponse {
     pub result: u32,
 }
 
-/// Mock HF Hub token endpoint response.
+/// HF Hub-style `/api/{type}/{ns}/{name}/bale-{read,write}-token/{rev}` response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct XetTokenResponse {
     #[serde(rename = "accessToken")]
@@ -119,20 +117,17 @@ pub struct OwnerUsageResponse {
     pub quota_bytes: Option<u64>,
 }
 
-/// Null `limit_bytes` clears the override. `deny_unknown_fields` so a typo'd key
-/// on the admin endpoint fails loudly instead of being silently ignored.
+/// Null `limit_bytes` clears the override; `deny_unknown_fields` makes a typo'd key fail loudly.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetOwnerQuotaRequest {
     pub limit_bytes: Option<u64>,
 }
 
-/// No quota field — quotas are owner-scoped. `raw_bytes` is the user-facing repo
-/// size (sum of file totals, ignoring cross-repo dedup); `stored_bytes` is the
-/// on-disk cost of every xorb the repo references (siblings may share some);
-/// `exclusive_bytes` is the subset no *sibling* repo (same owner) references —
-/// how much the owner's stored bytes would drop if the repo were deleted
-/// (`exclusive_bytes <= stored_bytes`; cross-owner sharing is ignored).
+/// No quota field — quotas are owner-scoped. `raw_bytes`: sum of file sizes;
+/// `stored_bytes`: every xorb the repo references (siblings may share some);
+/// `exclusive_bytes` (≤ `stored_bytes`): xorbs no same-owner sibling references,
+/// i.e. what deleting the repo would free for the owner (cross-owner sharing ignored).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepoUsageResponse {
     pub repo_id: String,

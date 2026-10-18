@@ -1,14 +1,11 @@
-"""Xorb compression coverage phase.
+"""Xorb compression coverage.
 
-The default sha256-chained payloads are high-entropy, so xet's auto policy
-reverts every chunk to scheme 0 (uncompressed) — leaving the server's LZ4 and
-BG4-LZ4 decompress arms (`verify_xorb_body` on upload, `decompress_xorb_chunks_into`
-on the browser file-download path) cold in coverage. This phase pushes two
-deliberately compressible files: one xet stores as plain LZ4 (scheme 1), one as
-BG4-LZ4 (scheme 2). It asserts both schemes actually landed on disk (so the test
-isn't vacuous if the heuristic shifts), then downloads both files over HTTP so
-the server-side decompress path runs each arm, and cold-clones to prove the
-smudge/reconstruction path round-trips compressed content intact.
+The default payloads are high-entropy, so xet stores every chunk as scheme 0
+and the server's LZ4/BG4-LZ4 decompress arms (`verify_xorb_body` on upload,
+`decompress_xorb_chunks_into` on file download) stay cold. This pushes one
+LZ4-friendly (scheme 1) and one BG4-friendly (scheme 2) file, asserts both
+schemes landed (so the test isn't vacuous if xet's heuristic shifts), downloads
+both over HTTP, and cold-clones.
 """
 
 from __future__ import annotations
@@ -34,15 +31,14 @@ from baleharness.usage import http_get_file
 
 
 def _frame_schemes(body: bytes) -> list[int]:
-    """The compression scheme byte of each chunk frame in a stored xorb body,
-    mirroring the server's `parse_xorb_frames`: 8-byte little-endian header,
-    `compressed_length` is a u24 at offset 1, `compression_scheme` at offset 4,
-    and a non-zero version byte marks the footer (stop)."""
+    """Mirrors the server's `parse_xorb_frames`: 8-byte header, u24 LE
+    `compressed_length` at offset 1, scheme at offset 4; a non-zero version
+    byte marks the footer."""
     schemes: list[int] = []
     pos = 0
     n = len(body)
     while pos + 8 <= n:
-        if body[pos] != 0:  # footer / unknown trailer
+        if body[pos] != 0:
             break
         compressed_length = body[pos + 1] | (body[pos + 2] << 8) | (body[pos + 3] << 16)
         frame_len = 8 + compressed_length
@@ -54,8 +50,6 @@ def _frame_schemes(body: bytes) -> list[int]:
 
 
 def _stored_xorb_schemes(server: ServerHandle) -> set[int]:
-    """The union of compression schemes across every xorb the server holds
-    (fs `data_root/xorbs` or the MinIO bucket prefix under S3)."""
     seen: set[int] = set()
     if server.s3_view is not None:
         view = server.s3_view
@@ -85,7 +79,6 @@ def phase_compression_schemes(
         name="compression",
     )
 
-    # *.bin is tracked through the bale filter (see init_repo_for_push).
     lz4_payload = lz4_friendly_payload(COMPRESS_FILE_BYTES)
     bg4_payload = bg4_friendly_payload(COMPRESS_FILE_BYTES)
     files = {
@@ -103,10 +96,7 @@ def phase_compression_schemes(
     ):
         git(["push", "-u", "origin", "main"], cwd=repo, env=env)
 
-    # Self-validation: the payloads must actually have been stored compressed,
-    # otherwise the upload/download below would only re-cover the scheme-0 path.
-    # Scheme 1 = LZ4, scheme 2 = BG4-LZ4 (presence, not absence — other phases
-    # store scheme-0 frames and that's fine).
+    # Check presence only: other phases' scheme-0 frames share the server.
     schemes = _stored_xorb_schemes(server)
     missing = {1, 2} - schemes
     if missing:
@@ -117,8 +107,7 @@ def phase_compression_schemes(
         )
     info(f"  stored xorb compression schemes: {sorted(schemes)} (LZ4 + BG4 present)")
 
-    # Browser file-download path → `fetch_and_decompress_term` →
-    # `decompress_xorb_chunks_into`, run once per scheme.
+    # `fetch_and_decompress_term` → `decompress_xorb_chunks_into`, once per scheme.
     repo_id = f"{E2E_OWNER}/{E2E_REPO_COMPRESS}"
     for name, (_payload, sha) in files.items():
         file_id = pointer_field(cat_file_bytes(repo, env, f"HEAD:{name}"), "hash")
@@ -139,8 +128,6 @@ def phase_compression_schemes(
                 "corrupted the file"
             )
 
-    # Cold clone proves the native smudge/reconstruction path also round-trips
-    # compressed content intact.
     clone_path, clone_env, _cache = init_repo_for_clone(
         work_root=work_root,
         client=client,

@@ -1,5 +1,3 @@
-"""Subprocess + small filesystem/socket/hash helpers."""
-
 from __future__ import annotations
 
 import hashlib
@@ -14,16 +12,13 @@ from baleharness.logutil import TestFailure
 
 
 def rmtree(path: str | Path) -> None:
-    """`shutil.rmtree` that also works on Windows git trees. Git writes loose
-    objects read-only, and Windows refuses `os.unlink` on a read-only file
-    (WinError 5), so clear the read-only bit across the tree first. No-op on
-    a missing path."""
+    """Git writes loose objects read-only and Windows refuses to unlink those
+    (WinError 5), so clear the read-only bit first. No-op on a missing path."""
     if not os.path.exists(path):
         return
     for root, dirs, files in os.walk(path):
-        # Only files get the bare write bit. A directory chmod'd to write-only
-        # loses its POSIX read/execute bits, and shutil.rmtree's safe-fd path
-        # then can't os.open it to recurse (EACCES) — so dirs keep owner rwx.
+        # Dirs need owner rwx: a write-only dir can't be os.open'd by
+        # shutil.rmtree's safe-fd path (EACCES).
         for name in dirs:
             try:
                 os.chmod(os.path.join(root, name), stat.S_IRWXU)
@@ -47,11 +42,7 @@ def run(
     capture: bool = True,
     expect_fail: bool = False,
 ) -> subprocess.CompletedProcess:
-    """Run a subprocess synchronously. Never uses a shell.
-
-    If `expect_fail` is True, returns the completed process regardless of
-    exit status (and `check` is ignored).
-    """
+    """`expect_fail` returns regardless of exit status (overrides `check`)."""
     completed = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd is not None else None,
@@ -85,15 +76,9 @@ def pick_free_port() -> int:
 
 
 def host_primary_ip() -> str:
-    """The host's primary outbound IP — the address the kernel would use
-    to send a packet to the public internet. The UDP `connect` is just a
-    routing decision; no packet is sent.
-
-    Used as a stable endpoint for host-bound services that have to be
-    reachable from BOTH the host AND a podman container — the host
-    loopbacks to it for free, and the container's default bridge routes
-    to it via the host's interface. macOS rootless podman's
-    `host-gateway` magic name is flaky, so we side-step it."""
+    """Primary outbound IP (the UDP `connect` only routes; nothing is sent).
+    Reachable from both the host and a podman container, unlike macOS rootless
+    podman's flaky `host-gateway`."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 1))

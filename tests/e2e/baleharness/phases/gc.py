@@ -25,12 +25,8 @@ from baleharness.timing import Timings
 def phase_gc_abandon_checkout(
     *, timings: Timings, server: ServerHandle, client: ClientEnv, work_root: Path
 ) -> None:
-    """The user-reported bug: stage a change, then abandon it entirely. The
-    post-checkout hook's gc must sweep the orphaned staging.
-
-    The baseline v1 is pushed first, so push-pending has already wiped its
-    staging and v1 lives on the server. After abandoning v2 there is nothing
-    left in git that references any staged bytes → gc does a full wipe."""
+    """Stage v2 over a pushed v1, then abandon it: the post-checkout hook's gc
+    must sweep the orphaned staging, since nothing in git references it."""
     with timings.measure("gc-abandon-checkout"):
         repo, env = init_repo_for_push(
             work_root=work_root,
@@ -54,7 +50,6 @@ def phase_gc_abandon_checkout(
                 f"but xorbs/shards remain: {[str(p) for p in staging_files(repo)]}"
             )
 
-        # Stage a change...
         (repo / rel).write_bytes(v2)
         git(["add", rel], cwd=repo, env=env)
         if not staging_files(repo):
@@ -62,8 +57,7 @@ def phase_gc_abandon_checkout(
         if not staged_markers(repo):
             raise TestFailure("[gc-abandon] git add should have written a marker")
 
-        # ...then abandon it: unstage, then discard the worktree edit. The
-        # `git checkout` fires the post-checkout hook → `git-bale gc`.
+        # The `git checkout` fires the post-checkout hook -> `git-bale gc`.
         git(["reset"], cwd=repo, env=env)
         git(["checkout", "--", rel], cwd=repo, env=env)
 
@@ -77,7 +71,6 @@ def phase_gc_abandon_checkout(
             raise TestFailure(
                 f"[gc-abandon] stale markers survived the discard: {staged_markers(repo)}"
             )
-        # Worktree is back to v1.
         verify_worktree(
             repo,
             rel,
@@ -91,15 +84,9 @@ def phase_gc_abandon_checkout(
 def phase_gc_keeps_unpushed(
     *, timings: Timings, server: ServerHandle, client: ClientEnv, work_root: Path
 ) -> None:
-    """DATA-LOSS GUARD. Two stacked commits, neither pushed: C1 adds v1, C2
-    changes it to v2. The branch tip references only v2, but a future `git
-    push` uploads BOTH commits, so v1's staged bytes are still needed. A
-    naive cleanup keyed on the worktree/tip would drop v1 and silently
-    corrupt history; gc must keep it.
-
-    Proof is end-to-end: after gc, push both commits, cold-clone, and check
-    out every revision — if v1 had been dropped the server would lack it and
-    the C1 checkout would fail or mismatch."""
+    """DATA-LOSS GUARD: unpushed C1 (v1) then C2 (v2). The tip references only
+    v2, but a push uploads both commits, so gc keyed on the tip would lose v1.
+    Proven end-to-end by pushing, cold-cloning and checking out both revisions."""
     with timings.measure("gc-keeps-unpushed"):
         repo, env = init_repo_for_push(
             work_root=work_root,
@@ -132,7 +119,6 @@ def phase_gc_keeps_unpushed(
                 f"staged; want {{{h1[:8]}.., {h2[:8]}..}} have {before}"
             )
 
-        # Manual gc — the tip only references v2, but v1 lives in unpushed C1.
         run([str(client.git_bale_bin), "gc"], cwd=repo, env=env)
 
         after = staged_markers(repo)
@@ -142,7 +128,6 @@ def phase_gc_keeps_unpushed(
                 f"unpushed content. before={before} after={after}"
             )
 
-        # Push both commits, cold-clone, verify EVERY revision reconstructs.
         git(["push", "-u", "origin", "main"], cwd=repo, env=env)
         clone, cenv, _cache = init_repo_for_clone(
             work_root=work_root,
@@ -174,9 +159,8 @@ def phase_gc_keeps_unpushed(
 def phase_gc_mixed(
     *, timings: Timings, server: ServerHandle, client: ClientEnv, work_root: Path
 ) -> None:
-    """The mixed case: one committed-but-unpushed version (must survive) plus
-    one staged-then-abandoned version (must be forgotten). gc keeps the live
-    marker and drops only the dangling one; v1 stays pushable + reconstructable."""
+    """Committed-but-unpushed v1 must survive gc; staged-then-abandoned v2 must
+    be dropped. v1 must still push and reconstruct."""
     with timings.measure("gc-mixed"):
         repo, env = init_repo_for_push(
             work_root=work_root,
@@ -216,7 +200,6 @@ def phase_gc_mixed(
                 f"{h2[:8]}..; markers={markers}"
             )
 
-        # v1 still uploads and reconstructs after a cold clone.
         git(["push", "-u", "origin", "main"], cwd=repo, env=env)
         clone, cenv, _cache = init_repo_for_clone(
             work_root=work_root,

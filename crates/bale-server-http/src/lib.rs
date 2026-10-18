@@ -1165,7 +1165,7 @@ struct FileDownloadQuery {
     filename: Option<String>,
 }
 
-// We do NOT verify the JWT signature here — `check_repo_access` does that on the
+// The JWT signature is NOT verified here — `check_repo_access` does that on the
 // forge, so an attacker can't swap in a different filename hash. Field name
 // matches gitea's `Claims.FilenameSHA256`.
 #[derive(Debug, Default, Deserialize)]
@@ -1204,10 +1204,9 @@ fn parse_owner_name(repo: &str) -> Result<RepoRef, ApiError> {
     })
 }
 
-// Outside [`auth_middleware`] because a 302 from the forge can't carry an
-// Authorization header — the bearer rides in `?token=`. Scope guarantees still
-// hold: `check_repo_access` runs on the forge and the M12 per-repo check runs
-// locally against `meta.file_in_repo`.
+// Outside `auth_middleware` because a 302 from the forge can't carry an
+// Authorization header, so the bearer rides in `?token=`. Scope still holds:
+// `check_repo_access` runs on the forge, then `meta.file_in_repo` locally.
 async fn get_file_download<B, M, A>(
     State(svc): State<Service<B, M, A>>,
     Path(file_hex): Path<String>,
@@ -1222,7 +1221,6 @@ where
         FileHash(decode_hash(&file_hex).map_err(|e| bad_req(format!("malformed file id: {e}")))?);
     let repo = parse_owner_name(&q.repo)?;
 
-    // Authoritative auth lives on the forge; we only learn the resolved user.
     let grant = svc
         .authz
         .check_repo_access(
@@ -1236,7 +1234,7 @@ where
     let user = grant.user;
     let repo_id = grant.canonical_repo_id.unwrap_or(repo.repo_id);
 
-    // M12 scope check: 404 (not 403) so cross-repo probes can't enumerate.
+    // 404 (not 403) so cross-repo probes can't enumerate files.
     if !svc.meta.file_in_repo(&file_hash, &repo_id).await? {
         return Err(ApiError(StatusCode::NOT_FOUND, "file not found".into()));
     }

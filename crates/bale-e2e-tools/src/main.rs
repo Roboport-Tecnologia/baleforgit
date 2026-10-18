@@ -47,8 +47,7 @@ fn main() -> ExitCode {
     }
 }
 
-// Uncompressed frames (scheme 0), no footer — what xet uploads for
-// incompressible chunks.
+// Uncompressed frames (scheme 0), no footer: what xet uploads for incompressible chunks.
 fn xorb(out: &str, chunk_files: &[String]) -> Res<Value> {
     let mut body = Vec::new();
     let mut chunks = Vec::new();

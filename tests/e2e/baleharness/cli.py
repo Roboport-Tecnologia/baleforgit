@@ -1,20 +1,13 @@
-"""Full end-to-end test for git-bale + baleforgit-server.
+"""End-to-end test for git-bale + baleforgit-server.
 
-Drives the release `git-bale` binary against a single bundled podman
-container that runs both `baleforgit-server` and `openssh-server`. The
-test pushes and clones over SSH (the production-shaped transport for
-both git operations and the Bale forge-auth handshake), exercises a wide
-range of user operations on a 35 MB Bale-tracked binary, verifies file
-integrity after every operation, verifies the `/v1/usage/...` API
-numbers against the on-disk storage, walks adversarial cases (wrong
-token, tampered xorb on disk, quota exceeded, missing auth), and prints
-per-phase timing + throughput.
+Drives the release `git-bale` binary against podman containers running
+`baleforgit-server` + `openssh-server`, pushing and cloning over SSH (git and
+the forge-auth handshake). Verifies file integrity after every operation and
+`/v1/usage` against on-disk storage, walks adversarial cases (wrong token,
+tampered xorb, quota exceeded, missing auth), and prints per-phase timing.
 
-Not invoked by `cargo test` — run it directly:
-
-    python3 tests/e2e/run.py
-
-See `tests/e2e/README.md` for prereqs and flags."""
+Not invoked by `cargo test` — run `python3 tests/e2e/run.py`. See
+`tests/e2e/README.md` for prereqs and flags."""
 
 from __future__ import annotations
 
@@ -301,8 +294,7 @@ def main() -> int:
         die("--reuse-from and --state-dir are mutually exclusive")
 
     if args.backend == "s3":
-        # Coverage runs its own MinIO sidecar for the bespoke s3-* phases;
-        # reuse-from would need bucket state we tear down at end of run.
+        # Coverage runs its own MinIO sidecar for the s3-* phases.
         if args.coverage:
             die("--backend s3 and --coverage are mutually exclusive")
         if args.reuse_from:
@@ -312,10 +304,8 @@ def main() -> int:
             )
 
     if args.meta == "postgres":
-        # Coverage's bespoke phases stand up their own containers without the
-        # global backend; postgres metadata adds little there and complicates
-        # the SIGKILL-skip logic. reuse-from would need the sidecar's database,
-        # which is torn down at end of run.
+        # Coverage has its own `postgres` phase; the global backend would only
+        # complicate the SIGKILL-skip logic.
         if args.coverage:
             die("--meta postgres and --coverage are mutually exclusive")
         if args.reuse_from:
@@ -336,10 +326,8 @@ def main() -> int:
 
     rt = detect_runtime()
 
-    # Coverage mode rebuilds both binaries with -C instrument-coverage, uses
-    # a separate image tag, and arms cov so start_container bind-mounts
-    # the profile dir into every server container. The prod (default) path
-    # is unchanged.
+    # Coverage builds instrumented binaries under a separate image tag;
+    # set_coverage makes start_container bind-mount the profile dir.
     image_tag = args.image_tag
     cov: CoverageConfig | None = None
     if args.coverage:
@@ -358,18 +346,11 @@ def main() -> int:
         set_coverage(cov)
         git_bale_bin = cov.git_bale_bin
         image_tag = COVERAGE_IMAGE_TAG
-        # Host-side processes (git, git-bale spawned by git, the pre-push
-        # hook) inherit os.environ unless a call site builds an explicit
-        # env dict — and the ones that do (`ClientEnv.make_env`) start
-        # from `os.environ.copy()`, so this propagates.
+        # Reaches every host-side git-bale: `ClientEnv.make_env` copies os.environ.
         os.environ["LLVM_PROFILE_FILE"] = cov.host_profile_template
         info(f"coverage: profile dir = {cov.profile_dir}")
         info(f"coverage: report will be at {cov.html_out / 'index.html'}")
-        # The failure-* phases SIGKILL the server (or kill a sidecar
-        # container) — the LLVM atexit hook can't flush profraws on
-        # SIGKILL, and these paths are exercised by other phases anyway.
-        # Skip them unless the user opted in via --no-skip-failure-phases
-        # (not exposed; reorder the if to override).
+        # These SIGKILL the server, so the LLVM atexit hook never flushes profraws.
         for name in ("failure-kill", "failure-conndrop", "failure-dbbusy"):
             if name not in args.skip:
                 args.skip.append(name)
@@ -384,15 +365,13 @@ def main() -> int:
         elif not image_exists(rt, image_tag):
             die(f"--no-build was passed but image {image_tag} doesn't exist")
 
-    # Resolve the on-disk layout. With --reuse-from the data_root + git-home
-    # already exist and must be left alone; with --state-dir we own the path
-    # and create the per-run subdirs inside it; otherwise it's a private
-    # mkdtemp.
     rng_seed = args.seed if args.seed is not None else secrets.randbits(64)
     rng = random.Random(rng_seed)
     if args.order == "random":
         info(f"random seed: {rng_seed}")
 
+    # --reuse-from: server state exists and must be left alone; --state-dir:
+    # the harness owns the path; otherwise a private mkdtemp.
     reused: dict | None = None
     delete_tmpdir_on_exit = True
     if args.reuse_from:
@@ -403,14 +382,13 @@ def main() -> int:
             reused = load_state(tmpdir)
         except (FileNotFoundError, json.JSONDecodeError) as e:
             die(f"--reuse-from: can't load {tmpdir / STATE_FILE}: {e}")
-        # Fresh client work dir under the reused tempdir so each preserved
-        # run gets clean client caches even though server state persists.
+        # Fresh client caches each run even though server state persists.
         work_root = tmpdir / f"work-{secrets.token_hex(3)}"
         work_root.mkdir()
         data_root = tmpdir / "server-data"
         if not data_root.is_dir():
             die(f"--reuse-from: server-data missing under {tmpdir}")
-        delete_tmpdir_on_exit = False  # never delete state owned by caller
+        delete_tmpdir_on_exit = False
     elif args.state_dir:
         tmpdir = Path(args.state_dir).resolve()
         tmpdir.mkdir(parents=True, exist_ok=True)
@@ -436,8 +414,7 @@ def main() -> int:
         jwt_secret_hex = secrets.token_bytes(32).hex()
         transfer_secret_hex = secrets.token_bytes(32).hex()
         admin_token_hex = secrets.token_bytes(32).hex()
-    # JWT minted from the same secret the server uses, scoped to the test
-    # owner — used by the test itself to call the usage admin endpoints.
+    # For the harness's own /v1/usage calls.
     admin_jwt = mint_bale_jwt(
         secret=bytes.fromhex(jwt_secret_hex),
         sub=E2E_USER,
@@ -458,18 +435,15 @@ def main() -> int:
     exit_code = 0
     rev_state: dict = {}
     if reused is not None:
-        # Seed rev_state from disk so read-only phases (clone, tampered-xorb)
-        # know what to verify against.
+        # Read-only phases (clone, tampered-xorb) verify against it.
         rev_state.update(reused.get("rev_state", {}))
 
     try:
         client = setup_client(work_root=work_root, git_bale_bin=git_bale_bin)
         ssh_public_key = client.ssh_pub.read_text().strip()
-        # S3 mode: bring up the shared network + MinIO sidecar BEFORE any
-        # container, then arm the process-global backend so every
-        # start_container call (the shared one and each phase's) auto-wires
-        # itself to MinIO under its own bucket prefix. tmpdir is the prefix
-        # anchor — every server's data_root sits under it.
+        # Sidecars come up before any server and are armed process-globally,
+        # so every start_container (shared and per-phase) wires itself to them
+        # under its own prefix, anchored at tmpdir (every data_root is under it).
         if args.backend == "s3" or args.meta == "postgres":
             with timings.measure("setup: podman network"):
                 shared_network = Network.create(rt)
@@ -526,11 +500,8 @@ def main() -> int:
                 admin_token_hex=admin_token_hex,
             )
 
-        # ---- phase registry ------------------------------------------------
-        # Each entry: (name, group, read_only, fn). fn is a thunk so we can
-        # rebuild and reorder it without re-binding the captured variables.
-        # rev_state and `server` are looked up at call time via the enclosing
-        # scope, so the offline-restart rebind is visible to later phases.
+        # Thunks look up rev_state and `server` at call time, so the
+        # offline-restart rebind is visible to later phases.
 
         def _phase_basic() -> None:
             phase_basic_user_ops(
@@ -999,8 +970,7 @@ def main() -> int:
                 client=client,
                 ssh_public_key=ssh_public_key,
                 admin_token_hex=admin_token_hex,
-                # --only progress-demo → the env-driven interactive visual demo;
-                # in a normal sweep → fixed, captured-and-asserted variants.
+                # Interactive demo under --only; asserted fixed variants in a sweep.
                 from_only="progress-demo" in args.only,
             )
 
@@ -1051,9 +1021,8 @@ def main() -> int:
             )
 
         def _phase_churn() -> None:
-            # HUGE mode is opt-in and only under `--only churn`, so a normal
-            # full sweep never balloons into the stress variant. HUGE_CHURN=N
-            # targets ~N minutes of wall-clock (N must be a positive int).
+            # HUGE_CHURN=N (~N minutes) applies only under `--only churn`, so a
+            # full sweep never balloons into the stress variant.
             huge_minutes = 0
             raw = os.environ.get("HUGE_CHURN")
             if "churn" in args.only and raw:
@@ -1168,125 +1137,90 @@ def main() -> int:
         # name -> (group, read_only, fn)
         REGISTRY: dict[str, tuple[str, bool, Callable[[], None]]] = {
             "basic": ("g1", False, _phase_basic),
-            # Two repos on one server: push to origin (A), then to a second
-            # remote (B). Independent (own repos + commits), so g1.
+            # Push to origin, then to a second remote on the same server.
             "multi-remote": ("g1", False, _phase_multi_remote),
-            # file_terms consistency guard: push F, then inject duplicate terms
-            # into its global term list via meta.db so Σterms > |F| (the corrupt
-            # shape a per-term merge produced), and assert a cold clone is rejected
-            # cleanly by the lookup_file guard instead of panicking the client.
-            # Own repo + direct DB fault injection, so g1.
+            # Duplicate terms injected via meta.db (Σterms > |F|, the shape a
+            # per-term merge produced) must be rejected cleanly by the
+            # lookup_file guard on cold clone, not panic the client.
             "term-merge": ("g1", False, _phase_term_merge),
-            # Measures whether a cold-cache re-push of content already on the
-            # server double-stores it (reads server-side xorb disk growth) — the
-            # ground-truth answer to "is it bandwidth or storage being wasted".
-            # Own repos, so g1.
+            # Does a cold-cache re-push of stored content grow server xorb disk?
             "cold-repush": ("g1", False, _phase_cold_repush),
-            # The staged variant: reproduces the reported "modify + commit (don't
-            # push) + push to a new remote with a cold cache" path and measures how
-            # much of the unchanged prefix gets re-stored. Own repos, so g1.
+            # Modify + commit (unpushed), then push to a new remote with a cold
+            # cache: how much of the unchanged prefix is re-stored.
             "cold-repush-staged": ("g1", False, _phase_cold_repush_staged),
             "wrong-token": ("g1", False, _phase_wrong_token),
-            # Routes git-bale's CAS traffic through a counting proxy and asserts
-            # only push/pull cross it. Own repo + commits, so g1 (independent).
+            # A counting proxy on CAS traffic: only push/pull may cross it.
             "offline-no-network": ("g1", False, _phase_offline_net),
-            # push-pending drain edge cases. Own ephemeral client repos against
-            # the shared server, never push successfully, so g1 (independent).
+            # Never push successfully, so the shared server is untouched.
             "push-pending-noop": ("g1", False, _phase_pp_noop),
             "push-pending-corrupt": ("g1", False, _phase_pp_corrupt),
-            # `git-bale track` .gitattributes editing. Pure-local (no server),
-            # own scratch dirs, so g1 (independent).
             "track": ("g1", False, _phase_track),
-            # Pushes two compressible files (one stored LZ4, one BG4-LZ4) and
-            # downloads them over HTTP, covering the server's xorb decompress
-            # arms that the incompressible default payloads never reach. Own
-            # repo + commits, so g1 (independent).
             "compression": ("g1", False, _phase_compression),
             "bigfile": ("g2-head", False, _phase_bigfile),
             "usage": ("g2-tail", True, _phase_usage),
-            # Dereferences rev_state["repo_path"]/["env"] (the live bigfile
-            # client repo) to read the pushed pointer's file id, so — like
-            # idempotency — it can't run from a --reuse-from (hence not
-            # read_only). Streams 35 MB back through the reconstruction path.
+            # browser-download and idempotency use the live bigfile client repo
+            # (rev_state["repo_path"]), which --reuse-from's JSON state lacks.
             "browser-download": ("g2-tail", False, _phase_browser_download),
             "dedup": ("g2-tail", False, _phase_dedup),
-            # idempotency dereferences rev_state["repo_path"] (the bigfile
-            # client repo from the same process), so it can't run from a
-            # --reuse-from where rev_state was reconstructed from JSON.
             "idempotency": ("g2-tail", False, _phase_idempotency),
             "clone": ("g2-tail", True, _phase_clone),
             "offline-restart": ("g2-tail", True, _phase_offline_restart),
             "tampered-xorb": ("g2-tail", True, _phase_tampered_xorb),
-            # Read-only FUSE mounts of pushed history. Skip cleanly when the
-            # host has no libfuse / fuse-t installed.
             "mount-rev": ("g2-tail", True, _phase_mount_rev),
             "mount-diff": ("g2-tail", True, _phase_mount_diff),
             "quota": ("g3", False, _phase_quota),
-            # PUT /v1/quotas/{owner} admin endpoint: 404 when disabled, 401 on
-            # missing/non-hex/wrong bearer, 204 set+clear, each proven to take
-            # effect on a push. Two own containers, g3.
+            # PUT /v1/quotas/{owner}: 404 disabled, 401 bad bearer, 204
+            # set/clear, each proven on a push.
             "quota-admin": ("g3", False, _phase_quota_admin),
-            # Isolates upload_shard's delta-quota gate: owner A seeds content
-            # unlimited, owner B (capped below it) pushes the same bytes → B's
-            # xorbs dedup (no disk growth) so only the shard-stage check can
-            # reject. Two owners, own container, g3.
+            # Owner B (capped) pushes bytes owner A already stored: xorbs dedup,
+            # so only upload_shard's delta-quota gate can reject.
             "shard-quota": ("g3", False, _phase_shard_quota),
-            # Direct HTTP negative tests of the upload integrity gate, signed
-            # transfer-URL guards, and write-scope enforcement. Own container, g3.
+            # Upload integrity gate, signed transfer-URL guards, write scope.
             "upload-guards": ("g3", False, _phase_upload_guards),
-            # Proof-of-possession on shard registration, dedup-index poisoning,
-            # LZ4 bomb, and two-encoding xorb races. Own container, g3.
+            # Shard proof-of-possession, dedup-index poisoning, LZ4 bomb,
+            # two-encoding xorb races.
             "shard-guards": ("g3", False, _phase_shard_guards),
             # A failed blob write must not pin its frame layout over a later,
-            # differently-compressed upload of the same xorb. fs-only, g3.
+            # differently-compressed upload of the same xorb. fs-only.
             "xorb-layout-heal": ("g3", False, _phase_layout_heal),
             # A fresh-cache second user pushing already-stored content must
-            # global-dedup (zero xorb uploads) and pass shard verification. g3.
+            # global-dedup (zero xorb uploads) and pass shard verification.
             "global-dedup-hit": ("g3", False, _phase_global_dedup_hit),
             # A legit xorb whose serialized size exceeds 64 MiB (raw chunks +
-            # headers) must upload. Own container, g3.
+            # headers) must upload.
             "oversize-xorb": ("g3", False, _phase_oversize_xorb),
             # 600 MiB: past xet's 2 × 256 MiB block threshold, so the client
-            # fetches reconstructions by Range. Own container, g3.
+            # fetches reconstructions by Range.
             "large-file": ("g3", False, _phase_large_file),
             # Overlapping terms within one xorb need disjoint fetch entries
-            # (crafted with bale-e2e-tools). Own container, g3.
+            # (crafted with bale-e2e-tools).
             "fetch-overlap": ("g3", False, _phase_fetch_overlap),
             # A xorb repeating a chunk: dedup responses must keep every chunk
-            # position (crafted with bale-e2e-tools). Own container, g3.
+            # position (crafted with bale-e2e-tools).
             "dedup-repeated-chunk": ("g3", False, _phase_dedup_repeated_chunk),
             # Concurrent shards can't jointly overshoot a quota; unreferenced
-            # uploads are charged (crafted with bale-e2e-tools). Own container, g3.
+            # uploads are charged (crafted with bale-e2e-tools).
             "quota-atomic": ("g3", False, _phase_quota_atomic),
             # The forge's canonical scope key + accounting owner win over the
-            # typed name; survives a transfer. Mock /check_access, g3.
+            # typed name; survives a transfer. Mock /check_access.
             "canonical-scope": ("g3", False, _phase_canonical_scope),
             # Incremental merkle hasher == xet's file_hash (no container).
             "file-hasher-selfcheck": ("g3", False, _phase_file_hasher_selfcheck),
-            # Public repo cloneable without credentials: the resolver probes the
-            # forge anonymously first for op=download and only falls back to
-            # `git credential fill` on 401. Own container + mock forge, so g3.
+            # Public repo clones without credentials: download probes the forge
+            # anonymously and falls back to `git credential fill` only on 401.
             "anon-public-clone": ("g3", False, _phase_anon),
-            # Independent (own repo + commits), so g3 — not read-only because
-            # it pushes new history that other phases shouldn't see.
+            # Not read-only: pushes history other phases shouldn't see.
             "mount-diff-mixed": ("g3", False, _phase_mount_diff_mixed),
-            # Own repo + commits, forces the clean filter's spill path via a
-            # capped BALE_MAX_INLINE_CLEAN. g3 for the same reason as above.
+            # A capped BALE_MAX_INLINE_CLEAN forces the clean filter's spill path.
             "spilled-clean": ("g3", False, _phase_spilled),
-            # mount/mount-diff arg+diff validation in mount/mod.rs (label
-            # collision, empty diff, empty mount, sanitize_label). Own local
-            # repo, no server, so g3 (independent).
             "mount-edge": ("g3", False, _phase_mount_edge),
-            # Fully-local mount: store-only reconstruction, no server. g3.
             "mount-local": ("g3", False, _phase_mount_local),
-            # Failure-recovery phases each own their own isolated container
-            # + data dir, so they can crash/restart the server or block its
-            # DB without disturbing earlier phases' state.
+            # Each owns its container + data dir, so crashing the server or
+            # blocking its DB can't disturb other phases.
             "failure-kill": ("g3", False, _phase_failure_kill),
             "failure-conndrop": ("g3", False, _phase_failure_conndrop),
             "failure-dbbusy": ("g3", False, _phase_failure_dbbusy),
-            # Server↔storage drop — only meaningful with a remote blob store,
-            # so it self-skips under the fs backend and runs only on --backend s3.
+            # Server↔storage drop; self-skips unless --backend s3.
             "failure-s3-conndrop": ("g3", False, _phase_failure_s3_conndrop),
             # Presign host the server can reach but the client can't: checkout
             # must fail fast via the cold-path watchdog, not hang on xet-core's
@@ -1296,56 +1230,39 @@ def main() -> int:
                 False,
                 _phase_failure_s3_presign_unreachable,
             ),
-            # fs BlobStore write_atomic integrity: a forced write failure must
-            # leave nothing (no half-write, no tmp leak), then a clean restart
-            # recovers; and two concurrent same-content pushes must converge to
-            # one stored copy. Both self-skip under --backend s3 (FsBlobStore
-            # unused there). Own isolated containers → g3.
+            # FsBlobStore: a forced write failure leaves no half-write or tmp
+            # leak and a restart recovers; concurrent same-content pushes
+            # converge to one copy. Both self-skip under --backend s3.
             "failure-fs-writefail": ("g3", False, _phase_failure_fs_writefail),
             "failure-fs-cput": ("g3", False, _phase_failure_fs_cput),
-            # Disaster recovery: wipe the server CAS, then re-add + force-push
-            # to repopulate it. Owns its own isolated container + data dir, so
-            # the wipe doesn't touch earlier phases' shared-server state.
+            # Wipe the server CAS, then re-add + force-push to repopulate it.
             "resync-wipe": ("g3", False, _phase_resync),
-            # Server global-dedup shard footer: fetch one from /v1/chunks, plant
-            # it in the client's xet shard-cache, and push again so the upload
-            # session ingests it via read_all_truncated_hashes (the path that
-            # underflowed on file_lookup_offset=0). Own container + repo, g3.
+            # A /v1/chunks dedup shard planted in the client's shard-cache is
+            # ingested via read_all_truncated_hashes on the next push (it
+            # underflowed on file_lookup_offset=0).
             "global-dedup-shard": ("g3", False, _phase_global_dedup_shard),
-            # gc staging reconciliation. Each owns its own bare repo + commits,
-            # so g3 — not read-only (they push new history).
             "gc-abandon-checkout": ("g3", False, _phase_gc_abandon),
             "gc-keeps-unpushed": ("g3", False, _phase_gc_keep),
             "gc-mixed": ("g3", False, _phase_gc_mixed),
             "push-pending-only-pushed": ("g3", False, _phase_pp_only_pushed),
             "push-pending-noverify-heal": ("g3", False, _phase_pp_noverify),
-            # Sustained churn: many edit→commit→push rounds against ONE reused
-            # repo, with cold clones at several rounds that reconstruct the full
-            # accumulated history. Integrity + server health checked every push.
-            # Owns its own bare repo + commits, so g3 (not read-only).
+            # Many edit→commit→push rounds on one repo, with periodic cold clones
+            # of the accumulated history; integrity + server health every push.
             "churn": ("g3", False, _phase_churn),
-            # Validates the upload progress indicator: a normal sweep pushes
-            # fixed variants and asserts the captured summary; `--only
-            # progress-demo` instead runs the env-driven interactive visual demo.
             "progress-demo": ("g3", False, _phase_progress_demo),
-            # Fully-local (no-server) mode: init-local → add + commit a big file
-            # → fresh checkout reconstructs from .git/bale/store. No server, so g3.
+            # Fully-local (no-server) mode.
             "local-basic": ("g3", False, _phase_local_basic),
             "local-gc-abandon": ("g3", False, _phase_local_gc),
             "local-shared-dedup": ("g3", False, _phase_local_shared),
             "local-prune-shared": ("g3", False, _phase_local_prune),
-            # Demonstrates the clean-vs-gc data race: gc fires in the window
-            # between xorb written and marker written, sweeping the only copy.
-            # Fails until gc respects the store lock (Task 15).
+            # gc fires between clean's xorb write and marker write; the store
+            # lock must keep it from sweeping the only copy.
             "local-clean-gc-race": ("g3", False, _phase_local_race),
-            # Natural-timing concurrent stress: per-repo add+gc races and shared
-            # add+prune races under no artificial delay. Proves no deadlock and
-            # no data loss under real contention.
+            # add+gc and shared add+prune races with no injected delay: no
+            # deadlock, no data loss.
             "local-concurrent-stress": ("g3", False, _phase_local_stress),
-            # Cache-hit clean vs gc data race: a re-add that hits the clean-cache
-            # must hold the store lock across the emit window, otherwise gc can
-            # sweep the object copy between the cache-hit check and git's index
-            # update. Fails without the lock-before-cache-load fix.
+            # A clean-cache hit must hold the store lock across the emit, else gc
+            # sweeps the object between the hit check and git's index update.
             "local-cache-hit-gc-race": ("g3", False, _phase_local_cachehit),
             "local-gc-grace": ("g3", False, _phase_local_grace),
             # Reflogs are live (stash@{1}), linked worktrees share one inventory,
@@ -1367,16 +1284,13 @@ def main() -> int:
             "local-prune-force-moved": ("g3", False, _phase_local_force_moved),
         }
 
-        # Build the within-group lists in declaration order, then apply
-        # --order per group.
         by_group: dict[str, list[str]] = {g: [] for g in PHASE_GROUPS_ORDER}
         for name, (g, _ro, _fn) in REGISTRY.items():
             by_group[g].append(name)
 
         ordered: list[str] = []
         for g in PHASE_GROUPS_ORDER:
-            # g2-head only ever has bigfile, but be defensive: never shuffle
-            # the head group's contents — it exists precisely to pin order.
+            # g2-head exists to pin order; never shuffle it.
             if g == "g2-head":
                 ordered.extend(by_group[g])
             else:
@@ -1385,9 +1299,7 @@ def main() -> int:
         in_reuse = reused is not None
         info(f"phase order resolved: {ordered}")
 
-        # --only is an allowlist. Validate its names against the full phase
-        # set (REGISTRY + the coverage-only phases) so a typo fails loudly
-        # instead of silently running nothing.
+        # A typo in --only must fail loudly, not silently run nothing.
         coverage_only_phases = {
             "s3-basic",
             "s3-dedup",
@@ -1407,7 +1319,6 @@ def main() -> int:
             info(f"--only active: running only {args.only}")
 
         def filtered_out(name: str) -> str | None:
-            """Reason `name` is excluded by --skip / --only, or None to run it."""
             if name in args.skip:
                 return "per --skip"
             if args.only and name not in args.only:
@@ -1418,8 +1329,7 @@ def main() -> int:
             group, read_only, fn = REGISTRY[name]
             reason = filtered_out(name)
             if reason is not None:
-                # Don't log the --only exclusion per phase — that's a line for
-                # every other phase, which is exactly the noise --only avoids.
+                # Logging every --only exclusion is exactly the noise --only avoids.
                 if reason == "per --skip":
                     info(f"-- skipping phase {name!r} ({reason})")
                 continue
@@ -1431,13 +1341,9 @@ def main() -> int:
                 continue
             fn()
 
-        # Coverage mode also exercises the S3 backend and the HttpAuthz
-        # path so the report includes bale-server-storage-s3 and
-        # bale-server-authz-http. The fs server is stopped first so its
-        # atexit flushes profraws (otherwise the still-running container
-        # would only flush in the outer `finally`, well after the extra
-        # phases have run). Each extra phase stands up its own
-        # containers and tears them down itself.
+        # Coverage-only phases (s3, authz-http, https-origin, otlp, postgres)
+        # each own their containers. Stop the fs server first so its atexit
+        # flushes profraws now rather than in the outer `finally`.
         if cov is not None and not in_reuse:
             if server is not None:
                 info("stopping fs server before extra coverage phases")
@@ -1493,15 +1399,10 @@ def main() -> int:
             server.stop()
         if client is not None and client.ssh_agent is not None:
             client.ssh_agent.stop()
-        # Note: per-phase containers (the offline-restart one and the quota
-        # one) are stopped inside their own phases via try/finally. We
-        # deliberately do NOT do a blanket `rm -f` on every container
-        # matching CONTAINER_NAME_PREFIX — that would clobber concurrent
-        # runs sharing the host (CI matrices, two devs on the same box).
-        # S3 / Postgres teardown comes after every server (shared + per-phase)
-        # is down, since a live container attached to the network blocks its
-        # removal. The shared network is destroyed last, once both sidecars are
-        # gone.
+        # Per-phase containers stop in their own try/finally; no blanket `rm -f`
+        # on CONTAINER_NAME_PREFIX, which would clobber concurrent runs on the
+        # host. Sidecars go after every server and the network last: a live
+        # attached container blocks removal.
         set_active_s3_backend(None)
         set_active_postgres_backend(None)
         if s3_minio is not None:
@@ -1517,10 +1418,7 @@ def main() -> int:
                 generate_coverage_report(cov)
             except Exception as e:
                 warn(f"coverage report generation raised: {e}")
-        # Persist state for a follow-up --reuse-from run (only when we own
-        # the path: explicit --state-dir, or --reuse-from itself updating
-        # its source. In a plain --reuse-from run we don't write — the
-        # caller's stash should stay frozen as the canonical reference.)
+        # Only --state-dir writes state; a --reuse-from source stays frozen.
         if exit_code == 0 and args.state_dir and rev_state:
             save_state(
                 tmpdir,

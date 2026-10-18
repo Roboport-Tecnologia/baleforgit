@@ -1,5 +1,4 @@
-//! Append `filter=bale` lines to `.gitattributes`. We don't claim `diff` /
-//! `merge` drivers — the pointer is JSON and Git's default diff handles it.
+//! No `diff`/`merge` drivers: the pointer is JSON, which Git's default diff handles.
 
 use std::fs;
 use std::io::Write;
