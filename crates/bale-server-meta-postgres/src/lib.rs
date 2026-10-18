@@ -175,7 +175,7 @@ async fn stored_bytes_in_tx(
 ) -> CoreResult<u64> {
     let row = sqlx::query(STORED_BYTES_SQL)
         .bind(owner)
-        .bind(now_unix() - RESERVATION_GRACE_SECS)
+        .bind(now_unix()? - RESERVATION_GRACE_SECS)
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| CoreError::Internal(format!("stored_bytes_for_owner: {e}")))?;
@@ -321,7 +321,7 @@ async fn write_file_in_tx(
     .bind(&repo.repo_id)
     .bind(&repo.revision)
     .bind(total_bytes as i64)
-    .bind(now_unix())
+    .bind(now_unix()?)
     .bind(repo.owner())
     .execute(&mut **tx)
     .await
@@ -416,7 +416,7 @@ impl MetadataStore for PostgresMetadataStore {
         .bind(xorb.num_chunks as i64)
         .bind(xorb.num_bytes_in_cas as i64)
         .bind(xorb.num_bytes_on_disk as i64)
-        .bind(now_unix())
+        .bind(now_unix()?)
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Internal(format!("insert xorb: {e}")))?;
@@ -749,7 +749,7 @@ impl MetadataStore for PostgresMetadataStore {
     async fn stored_bytes_for_owner(&self, owner: &str) -> CoreResult<u64> {
         let row = sqlx::query(STORED_BYTES_SQL)
             .bind(owner)
-            .bind(now_unix() - RESERVATION_GRACE_SECS)
+            .bind(now_unix()? - RESERVATION_GRACE_SECS)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| CoreError::Internal(format!("stored_bytes_for_owner: {e}")))?;
@@ -782,7 +782,7 @@ impl MetadataStore for PostgresMetadataStore {
              AND NOT EXISTS (SELECT 1 FROM xorbs WHERE hash = $1)",
         )
         .bind(hash_to_blob(&xorb.0))
-        .bind(now_unix() - RESERVATION_GRACE_SECS)
+        .bind(now_unix()? - RESERVATION_GRACE_SECS)
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Internal(format!("drop stale reservation: {e}")))?;
@@ -813,7 +813,7 @@ impl MetadataStore for PostgresMetadataStore {
         .bind(hash_to_blob(&xorb.0))
         .bind(owner)
         .bind(bytes as i64)
-        .bind(now_unix())
+        .bind(now_unix()?)
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Internal(format!("reserve_xorb_upload: {e}")))?

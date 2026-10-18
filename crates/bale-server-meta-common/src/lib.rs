@@ -18,11 +18,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // so 500 rows stays far under either ceiling.
 pub const CHUNK_INSERT_BATCH: usize = 500;
 
-pub fn now_unix() -> i64 {
-    SystemTime::now()
+// Never fall back to 0: a zeroed clock stamps rows as ancient, so live upload
+// reservations would look past their grace and stop counting toward quota.
+pub fn now_unix() -> CoreResult<i64> {
+    let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_err(|e| CoreError::Internal(format!("system clock before unix epoch: {e}")))?
+        .as_secs();
+    i64::try_from(secs).map_err(|_| CoreError::Internal("system clock out of range".into()))
 }
 
 pub fn hash_to_blob(h: &Hash32) -> Vec<u8> {

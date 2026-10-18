@@ -181,7 +181,7 @@ async fn stored_bytes_in_tx(
     let row = sqlx::query(STORED_BYTES_SQL)
         .bind(owner)
         .bind(owner)
-        .bind(now_unix() - RESERVATION_GRACE_SECS)
+        .bind(now_unix()? - RESERVATION_GRACE_SECS)
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| CoreError::Internal(format!("stored_bytes_for_owner: {e}")))?;
@@ -308,7 +308,7 @@ async fn write_file_in_tx(
     .bind(&repo.repo_id)
     .bind(&repo.revision)
     .bind(total_bytes as i64)
-    .bind(now_unix())
+    .bind(now_unix()?)
     .bind(repo.owner())
     .execute(&mut **tx)
     .await
@@ -400,7 +400,7 @@ impl MetadataStore for SqliteMetadataStore {
         .bind(xorb.num_chunks as i64)
         .bind(xorb.num_bytes_in_cas as i64)
         .bind(xorb.num_bytes_on_disk as i64)
-        .bind(now_unix())
+        .bind(now_unix()?)
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Internal(format!("insert xorb: {e}")))?;
@@ -724,7 +724,7 @@ impl MetadataStore for SqliteMetadataStore {
         let row = sqlx::query(STORED_BYTES_SQL)
             .bind(owner)
             .bind(owner)
-            .bind(now_unix() - RESERVATION_GRACE_SECS)
+            .bind(now_unix()? - RESERVATION_GRACE_SECS)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| CoreError::Internal(format!("stored_bytes_for_owner: {e}")))?;
@@ -752,7 +752,7 @@ impl MetadataStore for SqliteMetadataStore {
              AND NOT EXISTS (SELECT 1 FROM xorbs WHERE hash = ?)",
         )
         .bind(hash_to_blob(&xorb.0))
-        .bind(now_unix() - RESERVATION_GRACE_SECS)
+        .bind(now_unix()? - RESERVATION_GRACE_SECS)
         .bind(hash_to_blob(&xorb.0))
         .execute(&mut *tx)
         .await
@@ -783,7 +783,7 @@ impl MetadataStore for SqliteMetadataStore {
         .bind(hash_to_blob(&xorb.0))
         .bind(owner)
         .bind(bytes as i64)
-        .bind(now_unix())
+        .bind(now_unix()?)
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Internal(format!("reserve_xorb_upload: {e}")))?;

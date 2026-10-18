@@ -285,11 +285,17 @@ struct SignedRange {
     exp: u64,
 }
 
-fn now_unix() -> u64 {
+// Never fall back to 0: a zeroed clock would accept every expired transfer signature.
+fn now_unix() -> Result<u64, ApiError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("system clock before unix epoch: {e}"),
+            )
+        })
 }
 
 fn sign(secret: &[u8; 32], r: &SignedRange) -> String {
@@ -310,8 +316,8 @@ fn build_signed_url(
     xorb_hex: &str,
     start: u64,
     end_inclusive: u64,
-) -> String {
-    let exp = now_unix() + SIGNATURE_TTL_SECS;
+) -> Result<String, ApiError> {
+    let exp = now_unix()?.saturating_add(SIGNATURE_TTL_SECS);
     let sig = sign(
         secret,
         &SignedRange {
@@ -321,7 +327,9 @@ fn build_signed_url(
             exp,
         },
     );
-    format!("{base}/xorb/default/{xorb_hex}?s={start}&e={end_inclusive}&x={exp}&sig={sig}")
+    Ok(format!(
+        "{base}/xorb/default/{xorb_hex}?s={start}&e={end_inclusive}&x={exp}&sig={sig}"
+    ))
 }
 
 // Per-owner override beats the server default; `None` = unlimited.
@@ -1081,7 +1089,7 @@ where
                     &xorb_hex,
                     byte_start,
                     byte_end_inclusive,
-                ),
+                )?,
             };
             fetch_info
                 .entry(xorb_hex.clone())
@@ -1491,7 +1499,7 @@ where
         return Err(ApiError(StatusCode::NOT_FOUND, "chunk not found".into()));
     }
 
-    let now = now_unix();
+    let now = now_unix()?;
     let shard = ParsedShard {
         header: ShardHeader {
             tag: MDB_SHARD_HEADER_TAG,
@@ -1507,7 +1515,7 @@ where
             cas_info_offset: 0,
             chunk_hash_hmac_key: Hash32(hmac_key),
             shard_creation_timestamp: now,
-            shard_key_expiry: now + DEDUP_KEY_TTL_SECS,
+            shard_key_expiry: now.saturating_add(DEDUP_KEY_TTL_SECS),
             footer_offset: 0,
         }),
     };
@@ -1563,7 +1571,7 @@ where
     }
     // 403, not 401: xet refreshes the reconstruction (new URLs) only on 403,
     // so a 401 here fails any download that outlives the URL TTL.
-    if q.x < now_unix() {
+    if q.x < now_unix()? {
         return Err(ApiError(StatusCode::FORBIDDEN, "signature expired".into()));
     }
 
