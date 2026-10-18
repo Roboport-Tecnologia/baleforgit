@@ -1,0 +1,6 @@
+# Pinned so local clippy/fmt match CI; a new stable's lints otherwise break CI unannounced.
+# Bump together with `dtolnay/rust-toolchain@<version>` in .github/workflows/.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

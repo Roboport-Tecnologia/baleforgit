@@ -4,7 +4,7 @@ Building, testing and releasing. User docs are in [`README.md`](../README.md).
 
 ## Toolchain and checks
 
-Rust 1.94+ (`rust-version` in the workspace `Cargo.toml`).
+Rust 1.94+ (`rust-version` in the workspace `Cargo.toml`) builds the workspace; the Docker images build on 1.94. Development and CI use the exact toolchain pinned in `rust-toolchain.toml` (rustup installs it on first use) so local clippy matches CI. To upgrade, bump it there and in every `dtolnay/rust-toolchain@<version>` in `.github/workflows/`, then fix any new lints.
 
 ```bash
 cargo build --workspace
