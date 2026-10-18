@@ -1,31 +1,31 @@
 # git-bale forge protocol
 
-This document describes what a **git forge** (gitea, gitlab, sourcehut, a custom git host, …) must implement to support `git-bale` as a content-addressed alternative to git-lfs.
-
-The protocol is deliberately shaped to mirror git-lfs's authentication flow, so a forge that already speaks LFS will have most of the wire surface in place.
+What a **git forge** (gitea, gitlab, sourcehut, a custom git host, …) implements so `git-bale` clients can use a `baleforgit-server` without any per-user configuration. It mirrors git-lfs's authentication flow, so a forge that already speaks LFS has most of the pieces.
 
 ## Components
 
 ```
-   ┌──────────────┐   1. authenticate (HTTPS Basic / SSH)
-   │  git-bale     │ ───────────────────────────▶ ┌────────────┐
-   │  (client)    │ ◀────────────────────────────│   forge    │
-   └──────┬───────┘   {href, Bearer <jwt>, exp}  └─────┬──────┘
-          │                                            │
-          │ 2. exchange JWT for bale token              │ 3. /check_access
-          ▼                                            ▼  (verify jwt, return user_id)
-   ┌──────────────┐                              ┌────────────┐
-   │  baleforgit-server  │ ────────────────────────────▶│   forge    │
-   └──────────────┘                              └────────────┘
+   ┌───────────────────┐  1. authenticate (HTTPS Basic / SSH)  ┌────────────┐
+   │     git-bale      │ ────────────────────────────────────▶ │            │
+   │     (client)      │ ◀──────────────────────────────────── │   forge    │
+   └─────────┬─────────┘     {href, Bearer <forge jwt>}        │            │
+             │                                                 └─────▲──────┘
+             │ 2. exchange forge JWT for a Bale token                │ 3. POST /check_access
+             ▼                                                       │ (verify jwt, return user)
+   ┌───────────────────┐                                             │
+   │ baleforgit-server │ ────────────────────────────────────────────┘
+   └───────────────────┘
 ```
 
-Three things the forge owns:
+The forge owns:
 
-1. **Authenticate endpoints** (this document) — turn the user's long-lived credential into a short-lived JWT.
-2. **`POST /check_access`** — the upstream-authz hook baleforgit-server calls to verify the JWT and check repo access. See `crates/bale-server-authz-http` for the wire contract.
-3. **A discovery endpoint** for clients that haven't been pre-configured (optional but recommended).
+1. **Authenticate endpoints** (HTTPS and SSH) — turn the user's long-lived credential into a short-lived forge JWT plus the server URL.
+2. **`POST /check_access`** — called by baleforgit-server (configured with `BALE_AUTHZ_HTTP_URL`) to verify that JWT and the user's access to the repo.
+3. Optionally, a **discovery endpoint**.
 
-This document covers #1 and #3.
+In between, the client exchanges the forge JWT for a short-lived (5-minute) Bale token at baleforgit-server's `GET {href}/api/models/<owner>/<repo>/bale-{read,write}-token/main` (`Authorization: Bearer <forge jwt>` → `{accessToken, exp, casUrl}`), which is what triggers `/check_access`. The client re-runs the whole flow to refresh before the Bale token lapses. That endpoint is the server's; the forge doesn't implement it.
+
+**Repo paths.** The client derives `<owner>/<repo>` from the `origin` remote (or the push target) by stripping a trailing `.git`. It must be exactly two segments, each `[A-Za-z0-9._-]` with no leading dot, so nested groups and forges served under a URL subpath aren't supported.
 
 ## 1. HTTPS authenticate
 
@@ -36,6 +36,7 @@ Authorization: Basic <base64("<user>:<secret>")>
 
 Where:
 
+- `{forge}` is `http(s)://host[:port]` from the remote URL (an SSH remote uses the SSH flow below instead).
 - `<op>` is `download` (returns a read-scoped JWT) or `upload` (write-scoped).
 - The forge authenticates the user against its own user database (password, PAT, OAuth token — whatever it normally accepts on Basic auth). The credential **never leaves the forge**.
 - The `Authorization` header is **optional for `op=download`**. A request with no credentials is an *anonymous* read: if the repo is **public**, return a read-scoped JWT whose subject identifies the anonymous principal (e.g. `anonymous`); if the repo is **private**, return `401 Unauthorized`. `op=upload` **must** require credentials — anonymous writes are never granted (return `401`).
@@ -54,9 +55,9 @@ On success: `200 OK` with JSON body
 }
 ```
 
-- `href` is the base URL of the baleforgit-server the client should talk to next. Required.
-- `header.Authorization` carries the JWT the client will present to baleforgit-server. The full `Bearer <jwt>` prefix is included so the forge can rotate auth schemes later without a client change.
-- `expires_at` is informational (RFC 3339); the JWT's own `exp` is authoritative.
+- `href` (required) is the base URL of the baleforgit-server. For an `https://` or SSH remote the client refuses an `http://` href unless its host is loopback, so serve it over TLS.
+- `header.Authorization` (required) must be `Bearer <jwt>`; anything else is rejected.
+- `expires_at` is informational (RFC 3339) and ignored by the client.
 
 ## 2. SSH authenticate
 
@@ -64,9 +65,9 @@ On success: `200 OK` with JSON body
 ssh <user>@<host> git-bale-authenticate <owner>/<repo> <op>
 ```
 
-The forge's SSH server recognises `git-bale-authenticate` as a built-in command (alongside `git-receive-pack` / `git-upload-pack`). On success, write the same JSON body shown above to **stdout** and exit 0. On failure, exit non-zero with a human-readable message on stderr.
+The forge's SSH server recognises `git-bale-authenticate` as a built-in command (alongside `git-receive-pack` / `git-upload-pack`). On success, write the same JSON body to **stdout** and exit 0 (a top-level `"Authorization"` key is accepted in place of `header.Authorization`). On failure, exit non-zero with a message on stderr. The client runs ssh with `BatchMode=yes`, honoring `GIT_SSH_COMMAND` / `core.sshCommand`.
 
-SSH auth is identity-based (the user has already proven who they are by presenting their SSH key), so no additional credential is needed in the command line. Anonymous access does not apply over SSH — the transport itself requires a key, so there is no credential-less path to special-case; the anonymous-download flow above is HTTPS-only.
+The SSH key already identifies the user, so there is no credential argument and no anonymous path.
 
 ## 3. Discovery (optional)
 
@@ -80,46 +81,45 @@ GET  {forge}/<owner>/<repo>.git/info/bale
 { "server_url": "https://baleforgit-server.example.com" }
 ```
 
-Lets a client confirm a repo has Bale enabled before attempting to authenticate. `git-bale install` and CI scripts can use it as a feature probe. If the repo has Bale disabled, return `404`.
+A feature probe for scripts and tooling: return `404` if the repo has Bale disabled. `git-bale` itself doesn't call it.
 
 ## The JWT
 
-git-bale treats the JWT as opaque — it just forwards it to baleforgit-server as the `hub_bearer` (see `crates/bale-server-authz-http`). The **recommended** shape is:
+The JWT is opaque to both git-bale and baleforgit-server: the client presents it to the token endpoint, and the server passes it back to the forge's `/check_access` as `hub_bearer`. Since the forge both issues and verifies it, any scheme works. Recommended:
 
-- HS256 (or RS256) signed by the forge, with a secret known only to the forge.
-- Short TTL (5–15 minutes). Long enough to cover a single push/pull, short enough that revocation isn't a concern.
-- Claims: at minimum a user identifier; optionally repo / scope to let baleforgit-server cross-check.
+- Signed by the forge with a key only it holds.
+- Short TTL (~15 minutes; the client re-authenticates on every refresh).
+- Claims: at least the user, plus repo and scope so `/check_access` can check them.
 
-The forge then implements `POST /check_access` (see `bale-server-authz-http`) to verify the JWT it issued and return the user identity to baleforgit-server. Serve it directly at the configured URL: baleforgit-server does not follow redirects on this call (the request body carries the user's bearer). Because verification and issuance live in the same process, the forge can pick whatever JWT scheme it likes — baleforgit-server never tries to parse the bearer itself.
-
-**Anonymous reads need no special handling on baleforgit-server.** An anonymous read token is just an ordinary JWT with an anonymous subject; the client still presents `Authorization: Bearer <jwt>` to the token endpoint, and `/check_access` validates it and returns the anonymous identity (read scope) for the public repo exactly as for a logged-in user. The public-vs-private decision lives entirely in the forge — baleforgit-server has no concept of repo visibility.
+**Anonymous reads need no server-side support.** An anonymous token is an ordinary JWT with an anonymous subject; `/check_access` returns that identity with read access for a public repo exactly as for a logged-in user. Repo visibility is entirely the forge's decision.
 
 ### Browser file download (`GET /v1/files/{file_id}`)
 
-The forge can also use this JWT to 302 a browser straight into baleforgit-server's `GET /v1/files/{file_id}?token=&repo=&filename=` endpoint, so "view raw" / "download" links don't proxy file bytes through the forge. baleforgit-server delegates the JWT validation back to the forge via `check_access` exactly like the `git-bale` flow does — but with one extra invariant the forge participates in:
+A forge can 302 a browser to `GET {href}/v1/files/{file_id}?token=<jwt>&repo=<owner>/<name>&filename=<name>` so "raw" / "download" links don't proxy bytes through the forge. baleforgit-server validates `token` via `/check_access` with `purpose: "file-download"` and the `file_id`, then applies the same per-repo file check as reconstructions (404 on miss).
 
-- If the JWT is going to be used in a redirect URL, include a `FilenameSHA256` claim — hex SHA-256 of the filename the forge wants the browser to download as. baleforgit-server reads this claim out of the JWT payload (signature is irrelevant — `check_access` is the source of truth) and rejects any `?filename=` query that doesn't hash to it (HTTP 400). Without this binding, anyone with the redirect URL could rewrite the `Content-Disposition` filename and trick a browser into a different file type.
+To set the download name, put a `FilenameSHA256` claim (hex SHA-256 of the filename) in the JWT. The server reads it from the payload without checking the signature (`/check_access` is the authority) and answers 400 to a `filename` that doesn't hash to it; without the claim, `filename` is ignored and no `Content-Disposition` is sent. This stops anyone holding the URL from rewriting the filename to trick a browser into a different file type.
 
 ## `POST /check_access` request/response
 
 ```text
-POST {authz_base}/check_access
+POST {BALE_AUTHZ_HTTP_URL}/check_access
 { "hub_bearer": "<jwt>", "repo": { "repo_type": "model", "repo_id": "owner/name", "revision": "main" },
   "scope": "read" | "write",
   "purpose": "token" | "file-download",
   "file_id": "<64-hex xet file hash>"            // only for purpose = file-download }
 
 200 OK  { "user_id": "alice", "repo_id": "id/42", "owner": "7" }   // repo_id optional; owner required with repo_id
-401     unknown/invalid bearer        403  valid user, insufficient access
+401/403 denied (both refuse the request; see below for why 401 is preferred)
 ```
+
+`repo_type` is always `model` and `revision` always `main` from `git-bale`. Any other status, a body over 64 KiB, a returned `repo_id` that isn't exactly `<a>/<b>`, or an `owner` containing `/`, whitespace or control characters is treated as an upstream error (5xx to the client). The call times out after 10 s and redirects are not followed (the body carries the user's bearer), so serve it directly at the configured URL.
 
 What a forge implementation should do with the fields:
 
-- **Return a stable canonical `repo_id` and the accounting `owner`.** `repo_id` in the request is whatever the client typed into its remote URL. baleforgit-server scopes tokens, file registrations and downloads to the `repo_id` you return, and per-owner quota and accounting to the `owner` you return. `owner` is required whenever you return `repo_id` (a response with `repo_id` but no `owner` is rejected as an upstream error); with neither, the owner is the part of the typed `repo_id` before `/`. Return a key that survives renames *and* transfers, ideally derived from the repo's immutable ID (the bundled gitea fork returns `id/<repoID>` with `owner` = `<ownerID>`). A name-based key splits one repo's files across case variants (`Alice/Repo` vs `alice/repo`), lets case variants dodge owner quotas, and strands every registered file on rename or transfer. With an ID-based key, a transfer only leaves historical accounting with the previous owner; files stay reachable. The owner must contain no `/` or whitespace.
+- **Return a stable canonical `repo_id` and the accounting `owner`.** `repo_id` in the request is whatever the client typed into its remote URL (or the `repo` query of a file download). baleforgit-server scopes tokens, file registrations and downloads to the `repo_id` you return, and per-owner quota and accounting to the `owner` you return. `owner` is required whenever you return `repo_id` (a response with `repo_id` but no `owner` is rejected as an upstream error); with neither, the owner is the part of the typed `repo_id` before `/`. Return a key that survives renames *and* transfers, ideally derived from the repo's immutable ID (the bundled gitea fork returns `id/<repoID>` with `owner` = `<ownerID>`). A name-based key splits one repo's files across case variants (`Alice/Repo` vs `alice/repo`), lets case variants dodge owner quotas, and strands every registered file on rename or transfer. With an ID-based key, a transfer only leaves historical accounting with the previous owner; files stay reachable.
 - **Never reveal existence.** Verify the bearer before looking anything up, and answer every failure (bad token, unknown repo, mismatch, no permission) with the same 401, so the endpoint can't be used to enumerate private repos. The same goes for `/info/bale/authenticate`: an anonymous request for a missing repo gets the same 401 challenge as one for a private repo. Honor the forge's sign-in-required setting on every anonymous path (authenticate, discovery, and anonymous tokens at `check_access`, so tokens minted before the setting was turned on stop working).
 - **Enforce `purpose`.** A JWT minted for a browser download link (`/v1/files?token=`) should be accepted only for `purpose: "file-download"`, bound to the `file_id` named in it, and should expire in minutes, not hours. Such links end up in browser history, proxy logs and shared URLs, so a download link must not double as a repo-wide token-exchange credential (`purpose: "token"`).
-- **Honor credential scopes and keep tokens short-lived.** A personal access / OAuth token presented to `/info/bale/authenticate` must be held to its scopes (repository read for `download`, write for `upload`, public-only tokens only for public repos), exactly as the forge's git HTTP does. Mint the JWT for ~15 minutes (the client re-authenticates on refresh) and in its own token family: if it shares a signing key with LFS, tag it so an LFS token is never accepted by `check_access` and a Bale token never by LFS.
-- **Serve it directly at the configured URL.** baleforgit-server doesn't follow redirects on this call.
+- **Honor credential scopes and keep tokens short-lived.** A personal access / OAuth token presented to `/info/bale/authenticate` must be held to its scopes (repository read for `download`, write for `upload`, public-only tokens only for public repos), exactly as the forge's git HTTP does. Mint the JWT in its own token family: if it shares a signing key with LFS, tag it so an LFS token is never accepted by `check_access` and a Bale token never by LFS.
 
 ## Why this shape
 

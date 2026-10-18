@@ -71,4 +71,4 @@ There are **no Rust unit or integration tests** — `cargo test --workspace` bui
 
 libfuse in `mount/backend/libfuse.rs` (and WinFsp in `mount/backend/winfsp.rs`) is loaded with `libloading` at runtime, not linked at build time. Don't switch either to `extern "C"` linkage or a `-sys`/SDK crate — that would force every developer to install the FS driver (libfuse / the WinFsp SDK) just to build the workspace, even if they never run a mount.
 
-Don't "simplify" the client's dependency choices either: git access stays on `gix` except the three deliberate subprocesses (`git credential fill`, `ssh`, `git config` writes), and the `xet-*` crates stay pinned to `=1.5.2` (on-disk shard format).
+Don't "simplify" the client's dependency choices either: git access stays on `gix` except the deliberate subprocesses (`git credential fill`, `ssh`, `git config` writes, and push-pending's `git cat-file --batch-check` partial-clone fetch), and the `xet-*` crates stay pinned to `=1.5.2` (on-disk shard format).

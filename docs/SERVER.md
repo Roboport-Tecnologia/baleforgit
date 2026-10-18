@@ -1,10 +1,10 @@
 # Running `baleforgit-server`
 
-This document covers operating the server side. For the user-facing client (`git-bale`), see the top-level [`README.md`](../README.md). For the trait surface, request flows, storage layout, and protocol notes, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For the forge integration contract, see [`BALE_FORGE_PROTOCOL.md`](BALE_FORGE_PROTOCOL.md).
+Operating the server. The client is covered in [`README.md`](../README.md), internals in [`ARCHITECTURE.md`](ARCHITECTURE.md), and the forge integration contract in [`BALE_FORGE_PROTOCOL.md`](BALE_FORGE_PROTOCOL.md).
 
 ## Install
 
-Download the `bale-server-<version>-<target>` artifact for your platform from the [releases page](https://github.com/Roboport-Tecnologia/baleforgit/releases): a `.tar.gz` on Linux, or a signed `.pkg` on macOS (installs `baleforgit-server` to `/usr/local/bin`). Verify the artifact before running it — see "Verifying release artifacts" below. To run it in a container, build your own image as shown under "Container".
+Download the `bale-server-<version>-<target>` artifact from the [releases page](https://github.com/Roboport-Tecnologia/baleforgit/releases): a `.tar.gz` on Linux, or a signed `.pkg` on macOS (installs `baleforgit-server` to `/usr/local/bin`). Verify it first — see [Verifying release artifacts](#verifying-release-artifacts). No container image is published; see [Container](#container).
 
 ## Quick start
 
@@ -16,64 +16,65 @@ BALE_GRANTS=token-alice:alice:alice/my-model:write \
 ./baleforgit-server
 
 # In another shell, exchange your bearer token for a Bale token:
-curl -i -X GET \
-  -H 'Authorization: Bearer token-alice' \
+curl -i -H 'Authorization: Bearer token-alice' \
   http://127.0.0.1:8080/api/models/alice/my-model/bale-write-token/main
 
-# Liveness probe (unauthenticated, not access-logged):
+# Liveness probe (unauthenticated, not logged or metered):
 curl http://127.0.0.1:8080/healthz
 ```
 
-Send `SIGINT` (Ctrl-C) or `SIGTERM` to shut the server down gracefully — it stops accepting new connections and waits for in-flight requests to finish before exiting. Point an orchestrator's readiness probe at `GET /healthz`.
+`SIGINT`/`SIGTERM` shut down gracefully: the listener closes at once, open connections get up to 25 s to finish, then detached xorb commits up to 2 min. Point an orchestrator's readiness probe at `GET /healthz`. Connection caps and timeouts are described in [`ARCHITECTURE.md` § Connection and request limits](ARCHITECTURE.md#connection-and-request-limits); put a reverse proxy in front for TLS and per-client rate limits.
 
 ## Container
 
-No image is published; build one from the repo's `Dockerfile` (it compiles the
-server from source into a slim Debian image):
+Build an image from the repo's `Dockerfile` (compiles the server into a slim Debian image that runs as an unprivileged user, with `BALE_LISTEN=0.0.0.0:8080` and `BALE_DATA_ROOT=/var/lib/baleforgit-server/data` preset — mount a volume there to keep data):
 
 ```bash
 docker build -t baleforgit-server .
 docker run --rm -p 8080:8080 \
+  -v bale-data:/var/lib/baleforgit-server/data \
   -e BALE_JWT_SECRET_HEX=$(printf '%064x' 1) \
   -e BALE_TRANSFER_SECRET_HEX=$(printf '%064x' 2) \
   -e BALE_GRANTS=token-alice:alice:alice/my-model:write \
   baleforgit-server
 ```
 
-For a production setup that bind-mounts a release binary (no in-image build)
-alongside a forge, see [`prod-docker/`](../prod-docker/).
+[`demo-docker/compose.yml`](../demo-docker/compose.yml) is a working example of the server behind a forge with a MinIO blob store.
 
 ## Configuration
 
+All configuration is environment variables. Malformed secrets, numbers or grants, and a set-but-empty `BALE_POSTGRES_URL` / `BALE_S3_BUCKET` / `BALE_AUTHZ_HTTP_URL`, fail startup rather than falling back to a default.
+
 | Variable | Default | Notes |
 |----------|---------|-------|
-| `BALE_LISTEN` | `127.0.0.1:8080` | host:port to bind |
-| `BALE_DATA_ROOT` | `./xet-data` | blob storage root |
+| `BALE_LISTEN` | `127.0.0.1:8080` | host:port to bind. |
+| `BALE_PUBLIC_URL` | `http://<BALE_LISTEN>` | Absolute base URL clients use: returned as `casUrl` by the token endpoint and written into signed transfer URLs. Set it whenever clients reach the server through anything other than `BALE_LISTEN` (a startup warning fires if it is unset and `BALE_LISTEN` isn't loopback). |
+| `BALE_JWT_SECRET_HEX` | **required** | HS256 key for Bale tokens; must decode to ≥ 32 bytes. |
+| `BALE_TRANSFER_SECRET_HEX` | **required** | HMAC key for signed transfer URLs; must decode to exactly 32 bytes (64 hex chars). |
+| `BALE_DATA_ROOT` | `./xet-data` | Filesystem blob store root (created if missing; also holds the default SQLite file). |
 | `BALE_DB_PATH` | `<BALE_DATA_ROOT>/meta.db` | SQLite metadata path. Ignored when `BALE_POSTGRES_URL` is set. |
-| `BALE_POSTGRES_URL` | none | If set, store metadata in Postgres instead of SQLite. libpq connection string, e.g. `postgres://user:pass@host:5432/baledb`. Append `?sslmode=require` (or `disable`) to control TLS. The target database must already exist; the schema is created on first connect. |
-| `BALE_PUBLIC_URL` | `http://<BALE_LISTEN>` | absolute base URL written into signed download URLs |
-| `BALE_JWT_SECRET_HEX` | **required** | HS256 secret for Xet JWTs (≥ 32 bytes hex) |
-| `BALE_TRANSFER_SECRET_HEX` | **required** | HMAC secret for signed download URLs (exactly 32 bytes hex / 64 chars) |
-| `BALE_AUTHZ_HTTP_URL` | none | If set, delegate `check_repo_access` to this URL (see [`bale-server-authz-http`](../crates/bale-server-authz-http/src/lib.rs)). |
-| `BALE_GRANTS` | none | Used only when `BALE_AUTHZ_HTTP_URL` is unset. Comma-separated `bearer_token:user:repo_id:read\|write` tuples for the in-process static authz (dev/test). |
-| `BALE_S3_BUCKET` | none | If set, switch blob storage from the local filesystem to an S3-compatible bucket. Picks up credentials from the standard AWS provider chain. |
+| `BALE_POSTGRES_URL` | none | Store metadata in Postgres instead of SQLite, e.g. `postgres://user:pass@host:5432/baledb` (append `?sslmode=require` or `disable` to control TLS). The database must exist; the schema is created on first connect. |
+| `BALE_AUTHZ_HTTP_URL` | none | Delegate repo access checks to a forge: the server POSTs to `<url>/check_access` (redirects are not followed). Contract in [`BALE_FORGE_PROTOCOL.md`](BALE_FORGE_PROTOCOL.md#post-check_access-requestresponse). |
+| `BALE_GRANTS` | none | Static authz for dev/test, used only when `BALE_AUTHZ_HTTP_URL` is unset: comma-separated `bearer_token:user:repo_id:read\|write` tuples (one bearer maps to one user). With neither set, every request is refused. |
+| `BALE_S3_BUCKET` | none | Store blobs in this S3-compatible bucket instead of the filesystem. |
 | `BALE_S3_REGION` | SDK default | Region for the S3 client. |
-| `BALE_S3_ENDPOINT_URL` | none | Override the API endpoint (e.g. `https://minio.example:9000` for MinIO, R2's endpoint for Cloudflare). The server uses this both to talk to the store and to sign client-facing download URLs. |
-| `BALE_S3_PUBLIC_ENDPOINT_URL` | = `BALE_S3_ENDPOINT_URL` | Endpoint baked into client-facing presigned download URLs, for when the server reaches the store at an address clients can't (e.g. a bundled MinIO at the compose-internal `minio:9000` while clients need `localhost:9000`). Unset → presign against `BALE_S3_ENDPOINT_URL`, correct whenever that endpoint is reachable by both server and clients (real AWS S3, R2, B2). |
-| `BALE_S3_FORCE_PATH_STYLE` | `false` | Set to `true` for MinIO and other backends that expect `https://host/{bucket}/{key}` rather than virtual-host addressing. |
-| `BALE_S3_PREFIX` | empty | Optional key prefix inside the bucket (include a trailing `/` if you want one). |
-| `BALE_S3_DISABLE_SSE` | `false` | PUTs request SSE-S3 (AES256) by default. Set truthy to disable, for backends that don't support server-side encryption (e.g. MinIO). |
-| `BALE_S3_ACCESS_KEY_ID` / `BALE_S3_SECRET_ACCESS_KEY` / `BALE_S3_SESSION_TOKEN` | none | Explicit credentials. When unset, the SDK uses env vars, `~/.aws/credentials`, and IMDS as usual. |
-| `BALE_DEFAULT_QUOTA_BYTES` | none (unlimited) | Default per-owner storage cap, applied when no per-owner override is set via `PUT /v1/quotas/{owner}`. See [`ARCHITECTURE.md`](ARCHITECTURE.md#owner-accounting-and-quotas). |
-| `BALE_MAX_CONNECTIONS_PER_IP` | `512` | Open connections allowed per client IP, counting an IPv6 client per /64 (`0` = unlimited). Behind a reverse proxy every client shares the proxy's IP, so raise it or set `0` and rate-limit at the proxy. |
-| `BALE_ADMIN_TOKEN_HEX` | none (admin endpoint disabled, returns 404) | 64-char hex (32 bytes) bearer for `PUT /v1/quotas/{owner}`. Constant-time compared. Keep separate from your JWT secret. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | none (exporters disabled) | If set, the server exports traces + metrics over OTLP HTTP/protobuf to `<endpoint>/v1/traces` and `<endpoint>/v1/metrics`. Typical local-collector value: `http://localhost:4318`. See [Observability](#observability). |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | none | Per-signal override; used verbatim (no `/v1/...` suffix appended). Either alone is enough to enable just that signal. |
-| `OTEL_SERVICE_NAME` | `baleforgit-server` | Service-name resource attribute attached to all exported telemetry. |
+| `BALE_S3_ENDPOINT_URL` | none | API endpoint override (MinIO, R2, B2, …). Also used for client-facing presigned URLs unless `BALE_S3_PUBLIC_ENDPOINT_URL` is set. |
+| `BALE_S3_PUBLIC_ENDPOINT_URL` | = `BALE_S3_ENDPOINT_URL` | Endpoint baked into client-facing presigned URLs, for when clients can't reach the address the server uses (e.g. a bundled MinIO at compose-internal `minio:9000` that clients see as `localhost:9000`). Empty counts as unset. |
+| `BALE_S3_FORCE_PATH_STYLE` | `false` | Truthy (`1`/`true`/`yes`) for MinIO and other backends that need `https://host/{bucket}/{key}` addressing. |
+| `BALE_S3_PREFIX` | empty | Key prefix inside the bucket (include a trailing `/` if you want one). |
+| `BALE_S3_DISABLE_SSE` | `false` | PUTs request SSE-S3 (AES256) by default; set truthy for backends without server-side encryption (e.g. MinIO). |
+| `BALE_S3_ACCESS_KEY_ID` / `BALE_S3_SECRET_ACCESS_KEY` / `BALE_S3_SESSION_TOKEN` | none | Explicit credentials. Unset → the standard AWS provider chain (env, `~/.aws/credentials`, IMDS). |
+| `BALE_DEFAULT_QUOTA_BYTES` | none (unlimited) | Per-owner storage cap when no override is set via `PUT /v1/quotas/{owner}`. See [`ARCHITECTURE.md` § Owner accounting and quotas](ARCHITECTURE.md#owner-accounting-and-quotas). The server never deletes blobs, so this is what bounds disk growth. |
+| `BALE_ADMIN_TOKEN_HEX` | none (`PUT /v1/quotas` returns 404) | 64 hex chars (32 bytes). Bearer for `PUT /v1/quotas/{owner}`; also reads any owner's or repo's `/v1/usage`. Constant-time compared; keep it distinct from the JWT secret. |
+| `BALE_MAX_CONNECTIONS_PER_IP` | `512` | Open connections per client IP, an IPv6 client counted per /64 (`0` = unlimited). Behind a reverse proxy every client shares the proxy's IP, so raise it or set `0` and rate-limit at the proxy. |
+| `RUST_LOG` | `info,sqlx=warn,tower_http::trace=info,bale_server_http=info` | Log filter ([`tracing-subscriber` `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax). Access logs are at INFO; 4xx/5xx at WARN. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | none (exporters off) | Export traces + metrics over OTLP HTTP/protobuf to `<endpoint>/v1/traces` and `<endpoint>/v1/metrics`, e.g. `http://localhost:4318`. See [Observability](#observability). |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | none | Per-signal override, used verbatim (no `/v1/...` appended). Either alone enables just that signal. |
+| `OTEL_SERVICE_NAME` | `baleforgit-server` | Service name on exported telemetry. |
 
 ## Observability
 
-The server ships an [OpenTelemetry](https://opentelemetry.io) integration that is **off by default** — if no `OTEL_EXPORTER_OTLP_ENDPOINT` (or per-signal sibling) is set, no provider is installed, no background threads start, and every instrument in the request path is a global no-op. Point the env var at a running [OTel Collector](https://opentelemetry.io/docs/collector/) to turn it on:
+OpenTelemetry export is **off by default**: with no `OTEL_EXPORTER_OTLP_ENDPOINT` (or per-signal variant) no provider is installed and every instrument is a no-op. Point it at an [OTel Collector](https://opentelemetry.io/docs/collector/) to turn it on:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
@@ -83,44 +84,38 @@ BALE_GRANTS=token-alice:alice:alice/my-model:write \
 ./baleforgit-server
 ```
 
-When enabled, the server emits:
+When enabled, the server exports:
 
-- **Traces** — every `tracing` span from the request path (the existing `tower_http::trace` access-log span plus anything inside the handlers) is bridged into OTel and shipped via the OTLP HTTP/protobuf exporter.
-- **Metrics** (instrument names):
-  - `http.server.requests` — counter, labelled by `http.request.method`, `http.route` (axum's matched pattern, *not* the raw URI — keeps cardinality bounded), `http.response.status_code`.
-  - `http.server.duration` — histogram in seconds, labelled by method + matched route.
-  - `bale.xorbs.uploaded` — counter, labelled by `deduplicated=true|false` (a re-upload of existing content is `true`).
+- **Traces** — every `tracing` span in the request path (the access-log span records the path only, never the query string, which can carry bearers and transfer signatures).
+- **Metrics**:
+  - `http.server.requests` — counter, labelled `http.request.method`, `http.route` (the matched route pattern, not the raw URI), `http.response.status_code`.
+  - `http.server.duration` — histogram in seconds, labelled method + route.
+  - `bale.xorbs.uploaded` — counter, labelled `deduplicated=true|false` (`true` = re-upload of existing content).
   - `bale.shards.uploaded` — counter.
-  - `bale.reconstructions.served` — counter (only counts 200 responses; misses surface as `http.server.requests{status=404}`).
-  - `bale.upload.bytes` — counter in bytes, labelled by `kind=xorb|shard`.
+  - `bale.reconstructions.served` — counter of successful reconstructions (misses show up as `http.server.requests` with status 404).
+  - `bale.upload.bytes` — counter in bytes, labelled `kind=xorb|shard`.
 
-Standard OTel env vars apply: `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS`, etc. The `/healthz` probe is deliberately not metered or traced — Kubernetes probes would otherwise dominate the volume.
+Standard OTel env vars (`OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS`, …) apply. `/healthz` is never traced or metered. Implementation notes are in [`ARCHITECTURE.md` § Observability](ARCHITECTURE.md#observability).
 
 ## Verifying release artifacts
 
-Each release tarball is covered by a [SLSA Build Provenance v1](https://slsa.dev/spec/v1.0/provenance) attestation tying it back to the exact workflow run, commit SHA, and repository that produced it. Verify with the GitHub CLI (no extra signing keys to manage):
+Every release archive (`bale-*` `.tar.gz` / `.pkg` / `.zip`) carries a [SLSA Build Provenance v1](https://slsa.dev/spec/v1.0/provenance) attestation tying it to the workflow run, commit and repository that built it, plus an attested SPDX SBOM (`SBOM.spdx.json`) of the workspace dependency graph. Verify with the GitHub CLI:
 
 ```bash
-# Works on the file you just downloaded from the release page.
 gh attestation verify bale-server-<version>-<target>.tar.gz \
   --repo Roboport-Tecnologia/baleforgit
-```
-
-A passing verify means: the artifact was produced by this repo's GitHub Actions workflow at a specific commit, and nothing in transit has tampered with it. The release also ships a `SHA256SUMS` file covering every archive.
-
-Each release additionally publishes an SPDX SBOM (`SBOM.spdx.json`) of the workspace dependency graph, attested the same way:
-
-```bash
+# the SBOM attestation:
 gh attestation verify bale-server-<version>-<target>.tar.gz \
   --repo Roboport-Tecnologia/baleforgit \
   --predicate-type https://spdx.dev/Document
 ```
 
-For verification that doesn't depend on GitHub's attestation API, `SHA256SUMS` is also signed with [cosign](https://docs.sigstore.dev/) keyless (Sigstore). The signature (`SHA256SUMS.sig`) and certificate (`SHA256SUMS.pem`) ship alongside it:
+Independently of GitHub's attestation API, `SHA256SUMS` (covering every archive) is signed with [cosign](https://docs.sigstore.dev/) keyless; the Sigstore bundle ships as `SHA256SUMS.cosign.bundle`:
 
 ```bash
 cosign verify-blob SHA256SUMS \
-  --signature SHA256SUMS.sig --certificate SHA256SUMS.pem \
+  --bundle SHA256SUMS.cosign.bundle \
   --certificate-identity-regexp 'https://github.com/Roboport-Tecnologia/baleforgit/.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
+sha256sum --ignore-missing -c SHA256SUMS
 ```

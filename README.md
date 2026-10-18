@@ -4,16 +4,16 @@
 [![Latest release](https://img.shields.io/github/v/release/Roboport-Tecnologia/baleforgit?sort=semver)](https://github.com/Roboport-Tecnologia/baleforgit/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-A Git filter driver that stores large files as **content-defined chunks** on a Bale CAS server. It's meant to be a replacement for `git-lfs`. It can use a backend server, you can run your own or pester your favourite git forge to implement it, or you can run totally offline.
+A replacement for `git-lfs` that stores large files as deduplicated **content-defined chunks**. Use a Bale server (run your own, or get your favourite git forge to support it) or run fully offline.
 
 This repo ships two binaries:
 
-- **`git-bale`** — the client. A native Git filter driver (`filter.bale.process`) you install per-user or per-repo. Speaks Git's long-running filter protocol and talks to the server directly.
-- **`baleforgit-server`** — a content-addressed storage server for chunked large files. Pluggable storage (filesystem or S3) and authz (static, or delegated to your git forge). See [`docs/SERVER.md`](docs/SERVER.md) for ops; [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md) for integrating it with a forge.
+- **`git-bale`** — the client: a native Git filter driver (`filter.bale.process`) installed per-user or per-repo.
+- **`baleforgit-server`** — the content-addressed storage server, with pluggable storage (filesystem or S3), metadata (SQLite or Postgres) and authz (static, or delegated to your git forge). See [`docs/SERVER.md`](docs/SERVER.md) to run it and [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md) to integrate a forge.
 
 ## Install
 
-Grab the `bale-client-<version>-<target>` artifact for your platform from the [releases page](https://github.com/Roboport-Tecnologia/baleforgit/releases): a `.tar.gz` on Linux (unpack it and put `git-bale` on your `PATH`), a signed `.pkg` on macOS (run it — installs `git-bale` to `/usr/local/bin`), or a `.zip` on Windows. (The server ships separately as `bale-server-<version>-<target>`, Linux/macOS only.)
+Grab the `bale-client-<version>-<target>` artifact for your platform from the [releases page](https://github.com/Roboport-Tecnologia/baleforgit/releases): a `.tar.gz` on Linux (put `git-bale` on your `PATH`), a signed `.pkg` on macOS (installs to `/usr/local/bin`), or a `.zip` on Windows. The server ships separately as `bale-server-<version>-<target>` (Linux/macOS); see [`docs/SERVER.md`](docs/SERVER.md).
 
 ## Usage
 
@@ -30,11 +30,11 @@ git add some-binary-file.bin && git commit -m 'add binary file'
 git push
 ```
 
-`git add` chunks the file and stages xorbs/shards under `.git/bale/staging/` — no network. The actual upload happens at `git push`, via the pre-push hook installed by `git-bale install --local`. Only content the pushed commits reference is uploaded — an uncommitted edit that `git status` happened to re-chunk never leaves your machine. To upload explicitly, run `git-bale push-pending`: by hand it uploads the staged content reachable from `HEAD` to `origin`.
+`git add` chunks the file and stages xorbs/shards under `.git/bale/staging/`, with no network access. The upload happens at `git push`, via the pre-push hook that `git-bale install --local` installs, and covers only content the pushed commits reference: an uncommitted edit that `git status` happened to re-chunk never leaves your machine. Run `git-bale push-pending` by hand to upload the staged content reachable from `HEAD` to `origin`.
 
-If you stage a change and then abandon it (`git reset`, `git checkout`) before pushing, the staged bytes are no longer needed. `git-bale gc` reclaims that orphaned staging by reconciling it against everything git itself would keep — every ref (including remote-tracking), every reflog entry (so `stash@{1}` and reset-away commits stay safe), and every worktree's HEAD and index; committed content is only released once `git push` has uploaded it. `install --local` runs gc automatically via post-checkout/commit/merge hooks, and it's safe to run by hand anytime. `git-bale install` without `--local` only registers the filter: run `install --local` in each repo, or pushes won't upload.
+Staged content you abandon (`git reset`, `git checkout`) is reclaimed by `git-bale gc`, which keeps everything git itself would keep (every ref including remote-tracking, every reflog entry, every worktree's HEAD and index), anything cleaned within the last two weeks, and committed content until `git push` has uploaded it. `install --local` runs gc from post-checkout/commit/merge hooks; it's safe to run by hand anytime. Plain `git-bale install` (global; `--system` for system-wide) registers only the filter, not the hooks: run `install --local` in each repo, or pushes won't upload.
 
-**Public repos clone without credentials.** When the forge marks a repo public and grants anonymous read (see [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md)), cloning or checking out its Bale-tracked files over HTTPS needs no login: `git-bale` asks the forge anonymously first and only falls back to `git credential fill` for a private repo, so a public clone never prompts. Uploads (`git push`) always authenticate.
+Auth comes from the remote: over HTTPS `git-bale` uses your git credentials (`git credential fill`), over SSH your key (honoring `GIT_SSH_COMMAND` / `core.sshCommand`). Public repos clone without credentials: downloads ask the forge anonymously first and only fall back to `git credential fill` for a private repo. Uploads always authenticate.
 
 ### Without a forge (manual config)
 
@@ -45,7 +45,7 @@ git config --local bale.serverUrl http://127.0.0.1:8080
 git config --local bale.token "<a Bale JWT minted out-of-band>"
 ```
 
-Same env-var equivalents exist for ephemeral overrides: `BALE_SERVER_URL`, `BALE_TOKEN`. Set both or neither: if only one is set it's ignored (with a warning) and the forge flow runs, so a static token is never sent to a server some remote's forge advertises.
+`BALE_SERVER_URL` / `BALE_TOKEN` do the same from the environment. Set both or neither: a lone one is ignored (with a warning) and the forge flow runs, so a static token is never sent to a server some forge advertises. Without `bale.tokenExpiration` the token is treated as never expiring.
 
 ### Fully local (no server)
 
@@ -61,13 +61,13 @@ git push                                 # only pointer commits move; large-file
 git-bale prune --shared        # compact a shared store (per-repo stores are managed by gc)
 ```
 
-`git add` writes xorbs/shards to the durable store (no staging, no drain step). Checkout reconstructs from the store with a hard error if objects are missing — there is no network fallback. `git-bale gc` reclaims objects for abandoned changes, same as in server mode.
+`git add` writes straight to the durable store; checkout reads from it and fails hard if objects are missing (there is no network fallback). `git-bale gc` reclaims objects for abandoned changes in a per-repo store.
 
-**Limitation:** a per-repo store (`.git/bale/store`) is not carried by `git clone`. Cloning the repo elsewhere leaves the large-file data behind. Use `--shared` (store at `~/bale-local`) when you need multiple working copies on the same machine.
+**Limitation:** `git clone` doesn't carry a per-repo store (`.git/bale/store`), so a clone elsewhere has no large-file data. Use `--shared` for several working copies on one machine.
 
 ### Mounting a diff or a single rev
 
-`git-bale mount-diff` exposes both sides of `git diff <revA> <revB>` as a read-only filesystem, with the revision label folded into each filename. Useful for piping a diff through external tools (Beyond Compare, Meld, vimdiff over directories, etc.) without checking out either side.
+`git-bale mount-diff` exposes both sides of `git diff <revA> <revB>` as a read-only filesystem, with the revision label folded into each filename, so directory-diff tools (Beyond Compare, Meld, …) work without checking out either side.
 
 ```bash
 mkdir /tmp/diff
@@ -78,9 +78,9 @@ ls /tmp/diff/src/
 # Ctrl-C the mount-diff process to unmount.
 ```
 
-Supports the same arg shape as `git diff`: `<revA> <revB> [-- <paths>...]`. Custom labels via `--label-a` / `--label-b`.
+Arguments follow `git diff`: `<revA> <revB> [-- <paths>...]`; `--label-a` / `--label-b` override the labels.
 
-`git-bale mount` does the same for a *single* revision — every file from the tree appears under the mount point with its normal name. Useful for browsing a tag, an older commit, or another branch without `git checkout`.
+`git-bale mount <rev> --mount <dir> [-- <paths>...]` exposes a *single* revision with normal filenames, for browsing a tag, an older commit or another branch without `git checkout`.
 
 ```bash
 mkdir /tmp/v1
@@ -89,42 +89,34 @@ git-bale mount v1.0.0 --mount /tmp/v1
 ls /tmp/v1/        # files at v1.0.0, as they were committed
 ```
 
-Both modes: no bytes are copied to disk — each `read` streams from git's object DB or, for Bale-tracked files, the chunk cache (with a network fallback that also repopulates the cache).
+Nothing is checked out: plain files are read from git's object DB, and Bale-tracked files are rebuilt per open into a temp file from the chunk cache (falling back to the server, which repopulates the cache).
 
 Requires a userspace filesystem driver at runtime (not at build time): `libfuse2` on Linux (Debian/Ubuntu) — `fuse-libs` on Fedora/RHEL, `fuse2` on Arch — [fuse-t](https://www.fuse-t.org/) on macOS, and [WinFsp](https://winfsp.dev/) on Windows (`winget install WinFsp.WinFsp`). On Windows pass a free drive letter or a non-existent directory as `--mount` (e.g. `git-bale mount v1.0.0 --mount X:`). Everything else in `git-bale` (clean/smudge, `push-pending`, `gc`, `install`, `track`) works on Windows without it.
 
 ## Configuration
 
-| Source     | Key                     | Purpose                                                       |
-|------------|-------------------------|---------------------------------------------------------------|
-| env        | `BALE_SERVER_URL`       | baleforgit-server base URL — with `BALE_TOKEN`, skips forge auto-resolve |
-| env        | `BALE_TOKEN`            | Pre-minted Bale JWT — with `BALE_SERVER_URL`, skips forge auto-resolve |
-| env        | `BALE_TOKEN_EXPIRATION` | Unix timestamp when `BALE_TOKEN` expires                      |
-| env        | `BALE_CACHE_DIR`        | Override the shared chunk cache location                      |
-| env        | `XDG_CACHE_HOME`        | Used to derive the default cache dirs                         |
-| env        | `BALE_XET_CACHE`        | Override xet's own cache dir (default `<cache>/bale/xet`)     |
-| env        | `BALE_DOWNLOAD_STALL_SECS` | Abort a checkout download after this many seconds with no bytes (default 30, `0` disables) |
-| env        | `BALE_GC_GRACE_SECS`    | `git-bale gc` never reclaims content cleaned more recently than this (default 2 weeks) |
-| git config | `bale.serverUrl`        | Same as `BALE_SERVER_URL`                                     |
-| git config | `bale.token`            | Same as `BALE_TOKEN`                                          |
-| git config | `bale.tokenExpiration`  | Same as `BALE_TOKEN_EXPIRATION`                               |
-| git config | `bale.cacheDir`         | Same as `BALE_CACHE_DIR`                                      |
-| env        | `BALE_LOCAL`            | Enable fully-local (no-server) mode                           |
-| env        | `BALE_LOCAL_STORE`      | Object store directory (overrides `init-local` default)       |
-| env        | `BALE_LOCAL_SHARED`     | Mark the store as shared across repos                         |
-| git config | `bale.local`            | Same as `BALE_LOCAL`                                          |
-| git config | `bale.localStore`       | Same as `BALE_LOCAL_STORE`                                    |
-| git config | `bale.localShared`      | Same as `BALE_LOCAL_SHARED`                                   |
+Environment variables override git config.
 
-Defaults: cache directory is `$XDG_CACHE_HOME/bale/chunks` if set, otherwise `~/.cache/bale/chunks`. No default server URL or token — without forge auto-resolve, one of the env/config settings above is required.
+| Env | Git config | Purpose |
+|-----|------------|---------|
+| `BALE_SERVER_URL` | `bale.serverUrl` | Server base URL; together with the token, skips forge auto-resolve |
+| `BALE_TOKEN` | `bale.token` | Pre-minted Bale JWT; together with the URL, skips forge auto-resolve |
+| `BALE_TOKEN_EXPIRATION` | `bale.tokenExpiration` | Unix timestamp when that token expires (default: never) |
+| `BALE_CACHE_DIR` | `bale.cacheDir` | Chunk cache directory |
+| `BALE_XET_CACHE` | | xet's own cache directory (default `<cache-base>/bale/xet`; also honors `HF_XET_CACHE`) |
+| `BALE_DOWNLOAD_STALL_SECS` | | Abort a checkout download after this many seconds with no bytes (default 30, `0` disables) |
+| `BALE_GC_GRACE_SECS` | | `git-bale gc` never reclaims content cleaned more recently than this (default 2 weeks) |
+| `BALE_LOCAL` | `bale.local` | Fully-local (no-server) mode; set by `init-local` |
+| `BALE_LOCAL_STORE` | `bale.localStore` | Local object store directory; set by `init-local` |
+| `BALE_LOCAL_SHARED` | `bale.localShared` | The local store is shared across repos; set by `init-local --shared` |
+| `GIT_SSH_COMMAND` | `core.sshCommand` | ssh command for the forge auth handshake, as for git itself |
+| `RUST_LOG` | | Log filter (default `git_bale=info`; `-v` / `-vv` for debug / trace when unset) |
 
-## Self-hosting the server
-
-If you want to run your own CAS server (rather than point `git-bale` at someone else's), grab the `bale-server-<version>-<target>.tar.gz` artifact from the [releases page](https://github.com/Roboport-Tecnologia/baleforgit/releases). See [`docs/SERVER.md`](docs/SERVER.md) for the quick start, env vars, and container instructions; [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md) for what your forge needs to expose so clients can auto-resolve.
+Booleans accept `1`/`true`/`yes`/`on`. `<cache-base>` is `$XDG_CACHE_HOME`, else `~/.cache` (`%LOCALAPPDATA%` on Windows); the chunk cache defaults to `<cache-base>/bale/chunks`. There is no default server URL or token: without them the forge flow is used.
 
 ## Try it locally with Docker
 
-Want to see the whole thing working end-to-end without wiring up a forge yourself? [`demo-docker/`](demo-docker/) is a self-contained compose stack — [gitea](https://gitea.io/) (patched with the Bale forge-auth endpoints) + `baleforgit-server` + [MinIO](https://min.io/) — that lets a `git-bale` client on your host push and pull large files against a real forge. The server is built from this repo's root `Dockerfile`, so it always runs the code in your working tree.
+[`demo-docker/`](demo-docker/) is a self-contained compose stack — [gitea](https://gitea.io/) patched with the Bale forge endpoints, `baleforgit-server` (built from your working tree) and [MinIO](https://min.io/) — that lets a `git-bale` client on your host push and pull against a real forge.
 
 ```bash
 cd demo-docker
@@ -132,19 +124,19 @@ podman compose up -d    # or: docker compose up -d
 # first run writes .env with fresh secrets and exits; run it once more to start the stack
 ```
 
-Then open <http://localhost:3000>, register a user, create a repo, and use `git-bale` against it exactly as in [Usage](#against-a-bale-enabled-forge). See [`demo-docker/README.md`](demo-docker/README.md) for the full walkthrough, host-port and public-endpoint overrides, and teardown. Meant for trying Bale out locally, not for production.
+Then open <http://localhost:3000>, register a user, create a repo, and use `git-bale` against it as in [Usage](#against-a-bale-enabled-forge). [`demo-docker/README.md`](demo-docker/README.md) has the full walkthrough, port overrides and teardown. It's for trying Bale out, not for production.
 
 ## What this is, in context
 
-Bale for Git is a Git large-file system that does content-defined chunking + chunk-level deduplication, in the lineage of Git-LFS. The on-disk format and the chunk-dedup algorithm are derived from Hugging Face's open-source [Xet](https://huggingface.co/docs/xet/index) project (the `xet-core`/`xet-data` crates this client links against). `baleforgit-server` and `git-bale` are independent implementations of the server and client that wrap that format with their own wire protocol, auth, and forge-integration story.
+Bale for Git does content-defined chunking with chunk-level deduplication, in the lineage of Git-LFS. The on-disk format and dedup algorithm come from Hugging Face's open-source [Xet](https://huggingface.co/docs/xet/index) project (the client links its `xet-*` crates). `baleforgit-server` and `git-bale` are independent implementations that wrap that format with their own wire protocol, auth and forge integration.
 
 ## More docs
 
-- [`docs/SERVER.md`](docs/SERVER.md) — running `baleforgit-server`: install, configuration (incl. `BALE_DEFAULT_QUOTA_BYTES` and `BALE_ADMIN_TOKEN_HEX` for per-owner quotas), container, artifact verification.
+- [`docs/SERVER.md`](docs/SERVER.md) — running `baleforgit-server`: install, configuration, quotas, container, observability, artifact verification.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — request flows, trait surface, storage layout, protocol notes, and the "Tricky bits" section.
 - [`docs/BALE_FORGE_PROTOCOL.md`](docs/BALE_FORGE_PROTOCOL.md) — what a git forge has to implement to support `git-bale`.
-- [`docs/STATUS.md`](docs/STATUS.md) — feature breakdown with what each piece provides.
-- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — building from source, the test matrix, CI workflows, and how releases are cut.
+- [`docs/STATUS.md`](docs/STATUS.md) — what's shipped.
+- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — building from source, tests, CI and releases.
 - [`tests/e2e/README.md`](tests/e2e/README.md) — the end-to-end harness and its phase list.
 - Design notes: [`docs/CLEAN_FILTER_PERF.md`](docs/CLEAN_FILTER_PERF.md) (clean-path profiling and why the pointer cache looks the way it does), [`docs/SMART_DEDUP.md`](docs/SMART_DEDUP.md) (unimplemented proposal: decompress gzip containers before chunking), [`docs/DATA_LOSS_AUDIT.md`](docs/DATA_LOSS_AUDIT.md) (2026-05 data-loss audit with current fix status).
 

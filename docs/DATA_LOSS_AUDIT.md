@@ -1,14 +1,44 @@
 # Data-loss / corruption audit (2026-05-27)
 
-A pass over every crate in the workspace looking for places where user data could be lost, corrupted, or silently served wrong. One sub-agent per crate; findings consolidated below, then reviewed by three personas (engineer, mathematician, game developer).
+A pass over every crate looking for places where user data could be lost, corrupted, or silently served wrong: one sub-agent per crate, findings consolidated below, then reviewed by three personas (engineer, mathematician, game developer).
 
-Treat this as a snapshot in time — line numbers will drift. Re-verify before acting on any specific finding.
+Everything below the Status section is the original snapshot; its line numbers have drifted. Re-verify before acting on any finding.
 
 ## Status (re-checked 2026-10-17)
 
-**Resolved:** #1 (xorb layout is derived from the verified blob; a failed write can't pin it — `xorb-layout-heal`), #2 (quota check and `put_shard` precede `register_files`), #3 (every smudge path verifies size + `sha256` before success, and bad bytes never reach the clean-cache), #5 (term bounds checked), #8 (fs store fsyncs the tmp before `link(2)`; `git-bale` writes go through `fs_util::write_durable`), #9 (`busy_timeout` 30 s; `failure-dbbusy`), #11 (clean fsyncs new xorbs/shards and validates referenced xorbs before writing the marker), #12 (`quota-atomic`), #13 in part (tokens carry and require `iss`/`aud`), shard magic validated and shard verification hashes checked (`shard-guards`), `HttpAuthz` redirects disabled, dedup index built only from server-verified chunk hashes. Test gaps 1–5 are covered by `upload-guards`, `quota-atomic`, `failure-s3-conndrop` and `failure-dbbusy`.
+**Resolved:**
 
-**Still as described:** #4 (clean-cache chunk fingerprints are xxh3-64, by design as change detection), #6 (no checksum header on S3 PUTs), #7 in part (`http://` still accepted for `BALE_AUTHZ_HTTP_URL`), #10 (`BALE_DATA_ROOT` defaults to `./xet-data`), `now_unix()` falls back to 0, `RangeJson` serves both range kinds, the S3 `head_bucket` probe only warns, and an unset `BALE_PUBLIC_URL` only warns (and only beyond loopback).
+- #1: the xorb layout is derived from the stored blob after the put, so a failed write can't pin it (`xorb-layout-heal`). The fix suggested below (register the layout before the put) is unsafe and was dropped: a delayed request could pin offsets for bytes that lost the race ([`ARCHITECTURE.md`](ARCHITECTURE.md#tricky-bits)).
+- #2: the quota check and `put_shard` precede a single atomic `register_files` batch, which rechecks quota in-transaction.
+- #3: every smudge path, and the mount reader, verifies size + `sha256` (`filter_process::content_matches`) before success. Bad bytes never reach the worktree or the clean-cache.
+- #5: terms with `chunk_idx_start >= chunk_idx_end` or past the layout are rejected.
+- #7 in part: `HttpAuthz` disables redirects.
+- #8: the fs store fsyncs the tmp before `link(2)`/`rename`, then fsyncs the parent chain and propagates errors. `git-bale` bookkeeping goes through `fs_util::write_durable`.
+- #9: `busy_timeout` is 30 s (`failure-dbbusy`). The `synchronous` half was a false alarm: sqlx leaves SQLite's compiled default, `FULL`.
+- #11: clean fsyncs new xorbs/shards and validates referenced xorbs before writing the marker.
+- #12: quota is reserved per xorb before the blob write and rechecked inside `register_files` (`quota-atomic`).
+- #13 in part: tokens carry and require `iss`/`aud`.
+- Medium findings: shard magic is validated and shard verification hashes are checked (`shard-guards`). The dedup index is built only from server-verified chunk hashes.
+- Test gaps:
+  1. Crash mid-upload is `failure-kill`; concurrent identical pushes are `failure-fs-cput` (fs only).
+  2. A signed URL with a mismatched `Range` is covered by `upload-guards` (fs only).
+  3. The quota race is `quota-atomic`.
+  4. Partly covered: the S3 connection drop is `failure-s3-conndrop`, and an injected fs write failure is in `xorb-layout-heal`. There is no ENOSPC or S3 5xx injection.
+  5. SQLite lock contention is `failure-dbbusy`.
+
+**Still as described:**
+
+- #4: clean-cache chunk fingerprints are xxh3-64, by design as change detection.
+- #6: S3 PUTs send no checksum header.
+- #7 in part: `BALE_AUTHZ_HTTP_URL` still accepts `http://` for any host.
+- #10: `BALE_DATA_ROOT` defaults to `./xet-data`.
+- #13 in part: there is no `nbf`/`jti`.
+- `now_unix()` falls back to 0.
+- `RangeJson` serves both range kinds.
+- The S3 `head_bucket` probe only warns.
+- An unset `BALE_PUBLIC_URL` only warns, and only beyond loopback.
+
+On the open questions at the end: client-side gc exists (`git-bale gc`). The server deliberately has no GC ([`ARCHITECTURE.md`](ARCHITECTURE.md#no-server-side-gc)).
 
 ---
 
@@ -77,13 +107,11 @@ Two concurrent same-owner uploads both pass the check (`bale-server-http/src/lib
 
 ## Persona reviews
 
-Three independent reviewers, same findings, different lenses.
-
 ### 🛠 The Engineer (15 years of pager duty)
 
 *"I've seen this movie before."*
 
-- **Real fixes, do this week:** #1, #2 (same bug in two outfits — both write blob-before-metadata; #2 is worse because metadata can outlive the shard blob). #5 (5-line bounds check). #3 (defense in depth, not "users losing data today"). #7 (20 minutes — reject `http://`, kill redirects).
+- **Real fixes, do this week:** #1, #2 (same bug twice — blob-before-metadata; #2 is worse because metadata can outlive the shard blob). #5 (5-line bounds check). #3 (defense in depth, not "users losing data today"). #7 (20 minutes — reject `http://`, kill redirects).
 - **Disagrees with severity on #4 (xxh3-64):** clean cache is local to a dev's own working tree; threat model is collision-on-your-own-files. "Stop calling it critical." Bump to blake3 for consistency, that's it.
 - **Paper:** #6 (S3 already validates), #10 (deployment footgun, document it), #13/`jti` ("theater unless you build a revocation store, which you aren't"), #12 quota TOCTOU ("a few MB of slop on a GB quota is not a real concern").
 - **Missing from the list:** **no GC story** — refcounts vs. mark-sweep, decide *now*, write the test before the code. Also: backpressure on reconstructions, multipart S3 abort semantics, clock-skew tolerance.
@@ -128,9 +156,9 @@ Three independent reviewers, same findings, different lenses.
 
 All three independently nominate **#1/#2 (write ordering) and #5 (panic) as must-fix-now**, and all three flag **the GC / scope / parser-trust gaps not on the list** as the next-most-important work after the top fixes.
 
-They split on **#4 (xxh3-64)**: engineer says "stop calling it critical," mathematician proves it's 2.7% lifetime probability, game dev calls it a ship-blocker. The mathematician's number reconciles them — vanishing per-file, real per-lifetime-of-a-build-farm.
+They split on **#4 (xxh3-64)**: engineer says "stop calling it critical," mathematician proves it's 2.7% lifetime probability, game dev calls it a ship-blocker. The mathematician's number reconciles them: vanishing per file, real over a build farm's lifetime.
 
-## Suggested execution order
+## Suggested execution order (original; see Status for what landed)
 
 1. Reorder writes in #1 and #2 (metadata commits last, or content-addressed-tmp-then-rename for blob). Single architectural primitive fixes both.
 2. Bounds check in #5 (or `NonZero<u32>` on the parsed field).
