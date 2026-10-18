@@ -89,7 +89,7 @@ git-bale mount v1.0.0 --mount /tmp/v1
 ls /tmp/v1/        # files at v1.0.0, as they were committed
 ```
 
-Nothing is checked out: plain files are read from git's object DB, and Bale-tracked files are rebuilt per open into a temp file from the chunk cache (falling back to the server, which repopulates the cache).
+Nothing is checked out: plain files are read from git's object DB, and Bale-tracked files are rebuilt per open into a temp file, verified like a checkout — from the chunk cache, then your unpushed staging (or, in fully-local mode, the local store, never the network), then the server, which repopulates the cache.
 
 Requires a userspace filesystem driver at runtime (not at build time): `libfuse2` on Linux (Debian/Ubuntu) — `fuse-libs` on Fedora/RHEL, `fuse2` on Arch — [fuse-t](https://www.fuse-t.org/) on macOS, and [WinFsp](https://winfsp.dev/) on Windows (`winget install WinFsp.WinFsp`). On Windows pass a free drive letter or a non-existent directory as `--mount` (e.g. `git-bale mount v1.0.0 --mount X:`). Everything else in `git-bale` (clean/smudge, `push-pending`, `gc`, `install`, `track`) works on Windows without it.
 
@@ -138,7 +138,7 @@ Bale for Git does content-defined chunking with chunk-level deduplication, in th
 - [`docs/STATUS.md`](docs/STATUS.md) — what's shipped.
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — building from source, tests, CI and releases.
 - [`tests/e2e/README.md`](tests/e2e/README.md) — the end-to-end harness and its phase list.
-- Design notes: [`docs/CLEAN_FILTER_PERF.md`](docs/CLEAN_FILTER_PERF.md) (clean-path profiling and why the pointer cache looks the way it does), [`docs/SMART_DEDUP.md`](docs/SMART_DEDUP.md) (unimplemented proposal: decompress gzip containers before chunking), [`docs/DATA_LOSS_AUDIT.md`](docs/DATA_LOSS_AUDIT.md) (2026-05 data-loss audit with current fix status).
+- Design notes: [`docs/CLEAN_FILTER_PERF.md`](docs/CLEAN_FILTER_PERF.md) (clean-path profiling and why the pointer cache looks the way it does), [`docs/SMART_DEDUP.md`](docs/SMART_DEDUP.md) (unimplemented proposal: decompress gzip containers before chunking).
 
 ## License
 

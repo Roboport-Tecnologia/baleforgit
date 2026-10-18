@@ -397,7 +397,7 @@ Step 3 plus the server's `POST /check_access` callback is the whole forge-integr
 
 Two read-only FUSE mounts sharing one VFS, reader and backend: `mount-diff` shows both sides of a `git diff` with the label folded into each basename (`foo__<labelA>.txt`, `foo__<labelB>.txt`); `mount` shows the tree at one revision with original names. Usage and runtime driver requirements are in the [README](../README.md#mounting-a-diff-or-a-single-rev).
 
-Neither checks anything out: plain blobs are read from the ODB, Bale files reconstructed through smudge's verified hot and cold paths (no lukewarm or local-store path; the cold path also backfills `.git/bale/manifests/`).
+Neither checks anything out: plain blobs are read from the ODB, Bale files reconstructed through the same verified paths as smudge (`try_smudge_from_staging` / `smudge_from_local_store` are shared): hot, then lukewarm in server mode or the local store in local mode (a miss or mismatch is a hard read error, never a network fallback), then cold, which also backfills `.git/bale/manifests/`. `mount-local` guards the local-mode path.
 
 Layout (`crates/git-bale/src/mount/`):
 
@@ -592,6 +592,19 @@ Easy-to-get-wrong parts, called out so they don't get re-broken.
 - **Token `exp` is UTC unix seconds and is compared against the *local* clock — client and server clocks must agree (NTP).** Tokens live `DEFAULT_TOKEN_TTL_SECS` (5 min, in `bale-server-authz-{mem,http}`). xet's `TokenProvider` calls the refresher once `expiration <= local_now + 30s`; git-bale's `resolver::ForgeTokenRefresher` re-runs the full forge resolution and is wired into **every** CAS client (push-pending, cold smudge, `mount`, `fetch_manifest`), which is what lets one operation outlive a token and makes a 5-minute TTL safe (without a refresher, xet fails hard with `RefreshFunctionNotCallable`). It can't fix clock skew: `exp` is minted on the *server's* clock, so a client running more than the TTL ahead sees every fresh token as already expired. `ForgeTokenRefresher` counts consecutive already-expired re-mints and after `MAX_EXPIRED_REFRESHES` (3) fails with an explicit "sync clocks (NTP)" error instead of storming the forge. This bites podman on macOS, whose VM clock lags the host after sleep.
 - **The clean store lock is per-file (brief), and gc skips while a git op is in flight — do NOT "fix" this by holding the clean lock longer** (windows explained under *Store lock* in [Fully-local mode](#fully-local-mode)). Holding it for the filter-process lifetime **deadlocks**: a porcelain op (`git stash`, `git commit -a`) keeps the filter alive holding the lock, then nests another `git` whose clean blocks on it while the outer op waits for the inner one (it hung the `offline-no-network` phase). Don't narrow `git_op_in_flight` back to the main `index.lock` either: `git stash` cleans against a *temporary* index, so it must also see `index.<temp>.lock` / `refs/stash.lock`. `local-clean-gc-race` and `local-cache-hit-gc-race` (widened with `BALE_TEST_CLEAN_MARKER_DELAY_MS` / `BALE_TEST_CLEAN_CACHE_HIT_DELAY_MS`) prove both windows closed; `local-concurrent-stress` checks no deadlock.
 - **Dedup-shard footer lookup offsets must be non-zero even with no lookup tables.** `get_dedup_chunk`'s shard omits the file/xorb/chunk lookup tables (`*_num_entry = 0`), but `serialize` must still write each lookup *offset* as `footer_offset` (the section end), not 0. The client runs `read_all_truncated_hashes` on every dedup shard it ingests into its `ShardFileManager`; for a table-less shard it computes the xorb-info byte range as `(xorb_info_offset, file_lookup_offset)` and a 0 there underflows `file_lookup_offset - xorb_info_offset` → panic (debug) / multi-exabyte alloc → OOM (release), killing the push. xet's own serializer sets the offset even when the table is absent; we match it. Guarded by the `global-dedup-shard` e2e phase.
+
+## Known gaps
+
+Open items from the 2026-05 data-loss audit, kept here so they aren't lost:
+
+- **No S3 PUT checksum.** S3 `put_xorb`/`put_shard` send no `Content-MD5`/`x-amz-checksum-*`; integrity rests on the server re-verifying xorb hashes before the put and clients verifying sha256 on read.
+- **`BALE_AUTHZ_HTTP_URL` accepts `http://` for any host** (the client refuses cleartext to non-loopback forges; the server doesn't). Redirects are disabled.
+- **`BALE_DATA_ROOT` defaults to `./xet-data`** (relative to the server's cwd).
+- **Tokens carry no `nbf`/`jti`**; `iss`/`aud` are required.
+- **`RangeJson` serves both chunk-index (exclusive end) and byte (inclusive end) ranges** — see *`url_range.end` is inclusive* above.
+- **Startup only warns** when the S3 `head_bucket` probe fails or `BALE_PUBLIC_URL` is unset on a non-loopback bind.
+- **Clean-cache chunk fingerprints are xxh3-64** — change detection, not integrity; every smudge still verifies sha256.
+- **Test gaps:** no ENOSPC or S3 5xx injection (`failure-s3-conndrop` and the fs write-fail hook in `xorb-layout-heal` cover drops and fs write errors).
 
 ## Where to look in the code
 

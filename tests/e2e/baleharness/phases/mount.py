@@ -1,13 +1,20 @@
-"""Mount phases (mount-rev, mount-diff, mount-diff-mixed)."""
+"""Mount phases (mount-rev, mount-diff, mount-diff-mixed, mount-edge, mount-local)."""
 
 from __future__ import annotations
 
 import secrets
+import shutil
 import subprocess
 from pathlib import Path
 
 from baleharness.client import ClientEnv
-from baleharness.config import BIG_FILE_BYTES, E2E_OWNER, E2E_REPO_2, E2E_REPO_3
+from baleharness.config import (
+    BIG_FILE_BYTES,
+    E2E_OWNER,
+    E2E_REPO_2,
+    E2E_REPO_3,
+    LOCAL_PAYLOAD_BYTES,
+)
 from baleharness.gitutil import git, is_bale_pointer, pointer_field
 from baleharness.logutil import TestFailure, info
 from baleharness.mount import (
@@ -19,8 +26,9 @@ from baleharness.mount import (
 )
 from baleharness.payloads import deterministic_payload, modify_bytes
 from baleharness.proc import sha256_bytes, sha256_file
-from baleharness.repo import init_repo_for_clone, init_repo_for_push
+from baleharness.repo import init_repo_for_clone, init_repo_for_push, init_repo_local
 from baleharness.server import ServerHandle
+from baleharness.storage import local_store_xorbs, per_repo_store
 from baleharness.timing import Timings
 
 
@@ -605,3 +613,80 @@ def phase_mount_edge_cases(
             throwaway.rmdir()
         except OSError:
             pass
+
+
+def phase_mount_local(
+    *,
+    timings: Timings,
+    client: ClientEnv,
+    work_root: Path,
+) -> None:
+    """`mount` in fully-local mode reconstructs Bale files from the local
+    store with no server configured (a miss used to fall through to the
+    network path and fail auth), and a corrupted store fails the read rather
+    than serving wrong bytes. Skips cleanly when libfuse/fuse-t is absent."""
+    repo, env = init_repo_local(work_root=work_root, client=client, name="mount-local")
+    rel = "local.bin"
+    payload = deterministic_payload(LOCAL_PAYLOAD_BYTES, seed=b"mount-local")
+    (repo / rel).write_bytes(payload)
+    git(["add", rel], cwd=repo, env=env)
+    git(["commit", "-m", "local"], cwd=repo, env=env)
+    # Fresh chunk cache + no manifests, so the hot path can't serve it.
+    git(
+        ["config", "bale.cacheDir", str(work_root / "mount-local-cache")],
+        cwd=repo,
+        env=env,
+    )
+    shutil.rmtree(repo / ".git" / "bale" / "manifests", ignore_errors=True)
+
+    mount_root = work_root / "mount-local-points"
+    mount_root.mkdir()
+    try:
+        with (
+            timings.measure(
+                "mount-local: read bale file from local store",
+                bytes_moved=len(payload),
+            ),
+            mount_rev_session(
+                client=client,
+                repo=repo,
+                env=env,
+                mount_root=mount_root,
+                rev="HEAD",
+                label="mount-local",
+            ) as mp,
+        ):
+            got = sha256_file(mp / rel)
+            if got != sha256_bytes(payload):
+                raise TestFailure(
+                    f"mount-local: {rel} sha {got} != committed sha — "
+                    "local-store reconstruction served wrong bytes"
+                )
+
+        for x in local_store_xorbs(per_repo_store(repo)):
+            data = bytearray(x.read_bytes())
+            mid = len(data) // 2
+            for i in range(mid, min(mid + 4096, len(data))):
+                data[i] ^= 0xFF
+            x.chmod(0o644)  # xet stores objects read-only
+            x.write_bytes(bytes(data))
+        with mount_rev_session(
+            client=client,
+            repo=repo,
+            env=env,
+            mount_root=mount_root,
+            rev="HEAD",
+            label="mount-local-tampered",
+        ) as mp:
+            try:
+                got = sha256_file(mp / rel)
+            except OSError as e:
+                info(f"-- mount-local: corrupted store refused ({e})")
+            else:
+                raise TestFailure(
+                    f"mount-local: read through a corrupted store succeeded (sha {got})"
+                )
+    except MountUnavailable as e:
+        info(f"-- mount-local: skipping ({e})")
+        if e.stderr and e.stderr != str(e):
+            info(f"-- mount-local: binary stderr:\n{e.stderr}")

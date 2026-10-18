@@ -832,54 +832,17 @@ fn handle_smudge<W: Write>(
         }
     }
 
-    // Lukewarm path (server mode only): bytes still staged locally, not yet
-    // pushed. Gated on the per-file marker (see staging::mark_file_staged).
     if !done && !raw.local_mode {
         if let Some(gd) = git_dir {
-            if file_is_staged(gd, &file_id_hex) {
-                reset_tmp(&tmp)?;
-                match try_smudge_from_store(&rt, &staging_root(gd), &info, file_size, &tmp) {
-                    Ok(true) if content_matches(tmp.path(), &info, file_size)? => {
-                        done = true;
-                        store_backed = true;
-                    }
-                    Ok(true) => tracing::warn!(
-                        "staged reconstruction of {file_id_hex} failed verification; trying server"
-                    ),
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::debug!("staging reconstruction failed for {file_id_hex}: {e:#}")
-                    }
-                }
+            if try_smudge_from_staging(&rt, gd, &info, file_size, &tmp)? {
+                done = true;
+                store_backed = true;
             }
         }
     }
 
-    // Local mode: reconstruct only from the durable store. No network, no auth,
-    // no silent fallback — a miss or bad bytes is a hard error.
     if !done && raw.local_mode {
-        let store = store::object_store_root(raw).context("resolving object store root")?;
-        reset_tmp(&tmp)?;
-        let ok = try_smudge_from_store(&rt, &store, &info, file_size, &tmp)
-            .with_context(|| format!("reconstructing {file_id_hex} from local store"))?;
-        let written = std::fs::metadata(tmp.path()).map(|m| m.len()).unwrap_or(0);
-        if !ok || written != file_size {
-            return Err(anyhow!(
-                "local store at {} cannot reconstruct {} ({} of {} bytes); the object \
-                 data is missing — was this repo copied without its store, or the store pruned?",
-                store.display(),
-                file_id_hex,
-                written,
-                file_size
-            ));
-        }
-        if !content_matches(tmp.path(), &info, file_size)? {
-            return Err(anyhow!(
-                "local store at {} returned corrupt content for {file_id_hex} (sha256 mismatch); \
-                 refusing to write it to the worktree",
-                store.display()
-            ));
-        }
+        smudge_from_local_store(&rt, raw, &info, file_size, &tmp)?;
         done = true;
         store_backed = true;
     }
@@ -1069,6 +1032,72 @@ fn smudge_cache_entry(
 /// Reconstruct from a local store dir. `Ok(false)` means the store dir does not
 /// exist; on-disk/runtime errors propagate so callers can fall through (server
 /// mode) or hard-error (local mode).
+/// Lukewarm path (server mode only): bytes still staged locally, not yet
+/// pushed. Gated on the per-file marker (see staging::mark_file_staged).
+/// `Ok(true)` only once the bytes in `tmp` are verified.
+pub(crate) fn try_smudge_from_staging(
+    rt: &Arc<XetRuntime>,
+    git_dir: &Path,
+    info: &XetFileInfo,
+    file_size: u64,
+    tmp: &NamedTempFile,
+) -> Result<bool> {
+    let file_id_hex = info.hash().to_string();
+    if !file_is_staged(git_dir, &file_id_hex) {
+        return Ok(false);
+    }
+    reset_tmp(tmp)?;
+    match try_smudge_from_store(rt, &staging_root(git_dir), info, file_size, tmp) {
+        Ok(true) if content_matches(tmp.path(), info, file_size)? => Ok(true),
+        Ok(true) => {
+            tracing::warn!(
+                "staged reconstruction of {file_id_hex} failed verification; trying server"
+            );
+            Ok(false)
+        }
+        Ok(false) => Ok(false),
+        Err(e) => {
+            tracing::debug!("staging reconstruction failed for {file_id_hex}: {e:#}");
+            Ok(false)
+        }
+    }
+}
+
+/// Local mode: reconstruct only from the durable store into `tmp`, verified.
+/// No network, no auth, no silent fallback — a miss or bad bytes is a hard error.
+pub(crate) fn smudge_from_local_store(
+    rt: &Arc<XetRuntime>,
+    raw: &crate::config::RawConfig,
+    info: &XetFileInfo,
+    file_size: u64,
+    tmp: &NamedTempFile,
+) -> Result<()> {
+    let file_id_hex = info.hash().to_string();
+    let store = store::object_store_root(raw).context("resolving object store root")?;
+    reset_tmp(tmp)?;
+    let ok = try_smudge_from_store(rt, &store, info, file_size, tmp)
+        .with_context(|| format!("reconstructing {file_id_hex} from local store"))?;
+    let written = std::fs::metadata(tmp.path()).map(|m| m.len()).unwrap_or(0);
+    if !ok || written != file_size {
+        return Err(anyhow!(
+            "local store at {} cannot reconstruct {} ({} of {} bytes); the object \
+             data is missing — was this repo copied without its store, or the store pruned?",
+            store.display(),
+            file_id_hex,
+            written,
+            file_size
+        ));
+    }
+    if !content_matches(tmp.path(), info, file_size)? {
+        return Err(anyhow!(
+            "local store at {} returned corrupt content for {file_id_hex} (sha256 mismatch); \
+             refusing to serve it",
+            store.display()
+        ));
+    }
+    Ok(())
+}
+
 fn try_smudge_from_store(
     rt: &Arc<XetRuntime>,
     store: &Path,

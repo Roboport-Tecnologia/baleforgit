@@ -131,6 +131,7 @@ from baleharness.phases.mount import (
     phase_mount_diff,
     phase_mount_diff_mixed,
     phase_mount_edge_cases,
+    phase_mount_local,
     phase_mount_rev,
 )
 from baleharness.phases.progress import phase_progress_demo
@@ -754,6 +755,9 @@ def main() -> int:
                 work_root=work_root,
             )
 
+        def _phase_mount_local() -> None:
+            phase_mount_local(timings=timings, client=client, work_root=work_root)
+
         def _phase_quota() -> None:
             phase_adversarial_quota_exceeded(
                 timings=timings,
@@ -1273,6 +1277,8 @@ def main() -> int:
             # collision, empty diff, empty mount, sanitize_label). Own local
             # repo, no server, so g3 (independent).
             "mount-edge": ("g3", False, _phase_mount_edge),
+            # Fully-local mount: store-only reconstruction, no server. g3.
+            "mount-local": ("g3", False, _phase_mount_local),
             # Failure-recovery phases each own their own isolated container
             # + data dir, so they can crash/restart the server or block its
             # DB without disturbing earlier phases' state.

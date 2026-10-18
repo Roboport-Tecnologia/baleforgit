@@ -1,7 +1,8 @@
 //! Byte-source for virtual files. Plain git blobs come from the ODB (cached
 //! whole, capped at 16 MiB — bigger should've been Bale-tracked). Bale pointers
-//! reconstruct from the chunk cache (fast) with a `FileDownloadSession` fallback
-//! that repopulates it (cold), and are held in a byte-budgeted LRU (default 1 GiB).
+//! reconstruct like smudge — chunk cache, then staging (server mode) or the local
+//! store (local mode, never the network), then a `FileDownloadSession` fallback
+//! that repopulates the cache — and are held in a byte-budgeted LRU (default 1 GiB).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -368,13 +369,21 @@ impl Reader {
             false
         };
 
-        if !cache_hit {
-            // Discard any partial bytes from a failed hot-path attempt.
-            let mut trunc = tmp.reopen()?;
-            trunc.set_len(0)?;
-            std::io::Seek::seek(&mut trunc, std::io::SeekFrom::Start(0))?;
-            drop(trunc);
+        let mut done = cache_hit;
+        if !done && !raw.local_mode {
+            if let Some(git_dir) = raw.git_dir.as_deref() {
+                done = crate::filter_process::try_smudge_from_staging(
+                    rt, git_dir, info, file_size, &tmp,
+                )?;
+            }
+        }
+        // Local mode never touches the network: the store is the only copy.
+        if !done && raw.local_mode {
+            crate::filter_process::smudge_from_local_store(rt, raw, info, file_size, &tmp)?;
+            done = true;
+        }
 
+        if !done {
             let cfg = self.resolved_cfg()?;
             // A mismatch through the chunk cache is retried once without it
             // (the cache itself may be what's corrupt), like the smudge filter.
